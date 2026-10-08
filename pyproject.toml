@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simplewavemeterlock"
+version = "0.1.0"
+description = "Minimal, fast wavemeter lock for TOPTICA DLC pro lasers"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["PySide6>=6.4", "ifaddr>=0.2"]
+
+[project.optional-dependencies]
+server = ["fastapi", "uvicorn"]
+test = ["pytest", "fastapi", "httpx"]
+
+[project.gui-scripts]
+wmlock = "wmlock.__main__:main"
+
+[tool.setuptools]
+packages = ["wmlock"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
