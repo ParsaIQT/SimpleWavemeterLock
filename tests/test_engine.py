@@ -140,3 +140,97 @@ def test_channel_dropped_by_the_switch_unlocks(engine, demo):
     assert wait_for(lambda: engine.channels[1].state == "on", 2)
     engine.on_active([2, 3, 4, 5])  # as if 'Use' was unticked in the WLM software
     assert engine.channels[1].state == "off" and "no longer measured" in engine.channels[1].message
+
+
+def test_reference_holds_locked_lasers_true_frequency():
+    """End to end: the locked 397 laser's TRUE frequency (known to the simulator) stays put while
+    the wavemeter drifts and the reference laser mode-hops; without the reference it would not."""
+    import time
+
+    from wmlock.reference import TRACKING, RefParams
+    from wmlock.sim import Demo, SimWavemeter
+
+    eps = [0.0]
+    demo = Demo(discovery_port=0, wavemeter=SimWavemeter(noise=0.05, drift=lambda now: eps[0]), exposure=0.005)
+    laser = demo.laser(1)
+    laser.drift = 0.0  # no free-running walk: what moves it is the lock alone
+    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"])
+    e.start()
+
+    def true_mhz():
+        return laser.true_freq(time.monotonic()) * 1e6
+
+    try:
+        assert wait_for(lambda: all(n in e.channels and e.channels[n].freq > 0 for n in (1, 6)))
+        e.set_reference(6)
+        e.set_reference_params(RefParams(tau=3, max_drift=600, max_jump=50))  # a quick test wavemeter
+        assert wait_for(lambda: e.reference.state == TRACKING, 15)
+        e.link(1, demo.dlcs[0].key, 1)
+        e.setpoint_to_current(1)
+        e.engage(1)
+        ch = e.channels[1]
+        assert wait_for(lambda: ch.state == "on" and abs(ch.error_mhz) < 1, 5)
+        start = true_mhz()
+
+        raw0 = ch.raw
+        for i in range(1, 41):  # the wavemeter starts reading 4e-8 high: +30 MHz at 755 THz
+            eps[0] = 1e-9 * i
+            time.sleep(0.1)
+        time.sleep(3)
+        assert (ch.raw - raw0) * 1e6 == pytest.approx(30, abs=4)  # it reads differently...
+        assert abs(true_mhz() - start) < 3  # ...but the laser has not moved
+
+        demo.laser(6).mode_hop(1500, 3)  # the reference hops to another cavity mode for 3 s
+        time.sleep(2)
+        assert e.reference.state != TRACKING
+        assert abs(true_mhz() - start) < 3  # a naive correction would have moved it by 2.8 GHz
+        assert wait_for(lambda: e.reference.state == TRACKING, 15)
+        assert "recovered" in e.reference.message
+        assert abs(true_mhz() - start) < 3
+
+        e.clear_reference()  # control: now the lock follows the wavemeter's error
+        time.sleep(2)
+        assert true_mhz() - start == pytest.approx(-30, abs=4)
+    finally:
+        e.stop()
+        demo.close()
+
+
+def test_reference_survives_restart():
+    from wmlock.reference import HOLD, TRACKING
+    from wmlock.sim import Demo, SimWavemeter
+
+    demo = Demo(discovery_port=0, wavemeter=SimWavemeter(noise=0.05), exposure=0.005)
+    try:
+        e = Engine({"reference": {"channel": 6}}, demo.make_source, discovery_targets=["127.0.0.1"])
+        e.start()
+        try:
+            assert wait_for(lambda: e.reference.state == TRACKING, 20)
+            cfg = e.to_config()
+        finally:
+            e.stop()
+        assert cfg["reference"]["channel"] == 6 and "anchor_thz" in cfg["reference"]
+        again = Engine(cfg, demo.make_source, discovery_targets=["127.0.0.1"])
+        assert again.reference.state == HOLD and again.reference.anchor == cfg["reference"]["anchor_thz"]
+        assert again.reference.active  # the saved correction applies straight away
+        again.start()
+        try:
+            assert wait_for(lambda: again.reference.state == TRACKING, 20)
+            assert "recovered" in again.reference.message
+        finally:
+            again.stop()
+    finally:
+        demo.close()
+
+
+def test_reference_channel_cannot_be_wavemeter_locked(engine, demo):
+    engine.link(6, demo.dlcs[0].key, 1)
+    engine.set_reference(6)
+    engine.engage(6)
+    assert engine.channels[6].state == "off"
+    engine.link(1, demo.dlcs[0].key, 2)
+    engine.setpoint_to_current(1)
+    engine.engage(1)
+    assert wait_for(lambda: engine.channels[1].state == "on", 2)
+    engine.set_reference(1)  # taking a locked channel as the reference unlocks it
+    assert engine.channels[1].state == "off" and engine.reference.channel == 1

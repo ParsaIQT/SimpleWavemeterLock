@@ -35,6 +35,7 @@ def main(argv=None) -> int:
         demo = Demo()
         for ch, name in demo.names.items():
             config.setdefault("channels", {}).setdefault(str(ch), {"name": name})
+        config.setdefault("reference", {"channel": demo.REFERENCE})
         make_source, targets, extra = demo.make_source, demo.targets, demo.extra_devices
     else:
         if args.http:

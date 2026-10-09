@@ -9,6 +9,10 @@ Threads
   discovery    UDP broadcast + parallel probes, on demand
 The GUI reads plain attributes on a timer and calls the public methods, which
 only take a lock briefly and enqueue work: it never waits on the network.
+
+With a reference laser (reference.py), every reading is corrected for the
+wavemeter's drift before anything else sees it: channel.freq is corrected,
+channel.raw is what the wavemeter said.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .dlcpro import DLCPro, DecopError, Device, discover, probe
 from .lock import Lock, LockParams
+from .reference import Reference, RefParams
 from .wavemeter import C_NM_THZ, NAN
 
 log = logging.getLogger(__name__)
@@ -51,7 +56,8 @@ class Channel:
         self.laser = int(link.get("laser", 1))
         self.lock = Lock(LockParams.from_dict(cfg.get("lock")))
         # live state, written by engine threads and read by the GUI
-        self.freq = NAN       # THz, NaN when the last reading was invalid
+        self.freq = NAN       # THz, corrected by the reference if there is one; NaN if invalid
+        self.raw = NAN        # THz, as the wavemeter read it
         self.status = "no data"
         self.t = 0.0          # monotonic time of the last new reading
         self.state = "off"    # off | engaging | on
@@ -203,6 +209,8 @@ class Engine:
         self.scanning = False
         self.discovery_targets = discovery_targets
         self.controllers = {}
+        ref = config.get("reference")
+        self.reference = Reference.from_config(ref) if ref else None
         self.dirty = False       # settings changed since the last save
         self.source = make_source(self)
 
@@ -243,12 +251,19 @@ class Engine:
     def on_readings(self, readings):
         with self.lock:
             self._n_readings += len(readings)
+            ref = self.reference
+            if ref is not None:  # the reference first, so this batch gets the newest correction
+                for r in readings:
+                    if r.ch == ref.channel:
+                        ref.update(r.t, r.freq)
+                ref.tick(readings[-1].t)
             for r in readings:
                 ch = self.channels.get(r.ch)
                 if ch is None:
                     continue
-                ch.freq, ch.status, ch.t = r.freq, r.status, r.t
-                if ch.state == "on" and r.freq > 0:
+                ch.raw, ch.status, ch.t = r.freq, r.status, r.t
+                ch.freq = r.freq if ref is None or r.ch == ref.channel else ref.correct(r.freq)
+                if ch.state == "on" and ch.freq > 0:
                     self._step(ch)
 
     def _step(self, ch: Channel):
@@ -278,6 +293,8 @@ class Engine:
             ch = self.channels[n]
             if ch.state != "off":
                 return
+            if self.reference is not None and self.reference.channel == n:
+                return  # the reference laser is locked to its cavity, not to the wavemeter
             if not ch.device:
                 ch.message = "right-click to link a laser first"
                 return
@@ -423,6 +440,65 @@ class Engine:
             c.start()
         return c
 
+    # -------------------------------------------------------------- reference
+    def set_reference(self, n: int):
+        """Use the laser on channel n, locked to a stable cavity, as the reference.
+
+        Taking over from another reference keeps the correction continuous."""
+        with self.lock:
+            old = self.reference
+            if old is not None and old.channel == n:
+                return
+            ch = self.channels[n]
+            if ch.state != "off":
+                self._disengage(ch, "")
+            ch.message = ""
+            carry = old.eps_offset() if old is not None and old.active else None
+            self.reference = Reference(n, old.p if old else RefParams(), carry=carry)
+            self.dirty = True
+
+    def clear_reference(self):
+        with self.lock:
+            self.reference = None
+            self.dirty = True
+
+    def set_reference_params(self, params: RefParams):
+        with self.lock:
+            if self.reference is not None:
+                self.reference.p = params
+                self.dirty = True
+
+    def set_reference_anchor(self, thz: float):
+        """The reference laser's true frequency is known: calibrate everything against it."""
+        with self.lock:
+            if self.reference is not None:
+                self.reference.set_anchor(thz, time.monotonic())
+                self.dirty = True
+
+    def reference_accept_drift(self) -> bool:
+        with self.lock:
+            ok = self.reference is not None and self.reference.accept_as_drift(time.monotonic())
+            self.dirty |= ok
+            return ok
+
+    def reference_reanchor(self) -> bool:
+        with self.lock:
+            ok = self.reference is not None and self.reference.reanchor(time.monotonic())
+            self.dirty |= ok
+            return ok
+
+    def locked_shift_mhz(self, correct) -> float:
+        """How far the locked lasers would be moved if correct(raw THz) replaced the present correction."""
+        with self.lock:
+            return max((abs(correct(ch.raw) - ch.freq) * 1e6 for ch in self.channels.values()
+                        if ch.state == "on" and ch.raw > 0), default=0.0)
+
+    def tick(self):
+        """Call now and then from the GUI: keeps the reference's state current when readings stop."""
+        with self.lock:
+            if self.reference is not None:
+                self.reference.tick(time.monotonic())
+
     # -------------------------------------------------------------- discovery
     def start_discovery(self):
         with self.lock:
@@ -484,5 +560,9 @@ class Engine:
             cfg = dict(self.config)
             cfg["channels"] = {str(n): ch.to_config() for n, ch in sorted(self.channels.items())}
             cfg["known_devices"] = list(self.known)
+            if self.reference is not None:
+                cfg["reference"] = self.reference.to_config()
+            else:
+                cfg.pop("reference", None)
             self.dirty = False
             return cfg
