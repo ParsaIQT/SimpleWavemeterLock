@@ -67,7 +67,7 @@ def test_window_shows_channels_and_links_from_menu(app, demo):
         spin(app, 0.3)
         assert wait_for(lambda: (app.processEvents(), not e.scanning)[1], 3)
         spin(app, 0.3)
-        assert list(win.rows) == [1, 2, 3, 4, 5, 6]
+        assert list(win.rows) == [1, 2, 3, 4, 5, 6, 7]
         row = win.rows[1]
         assert len(row.wl.text()) == 10 and row.wl.text().startswith("396.959")
         assert win.rows[5].wl.text() == "no signal"
@@ -162,3 +162,60 @@ def test_dialogs_read_back_values(app, demo):
     d.boxes["ki"].setValue(-0.8)
     p = d.params()
     assert p.ki == -0.8 and p.capture == ch.lock.p.capture
+
+
+def test_hop_dialog_round_trip(app):
+    from wmlock.engine import Channel
+    from wmlock.modehop import HopParams
+
+    ch = Channel(7, {"hop": {"enabled": True, "cavity": True, "i_nom": 151.25, "kv": 402.0, "spacing": 6010.0}})
+    ch.current = 151.4
+    d = gui.HopDialog(None, ch)
+    assert d.params() == ch.hop
+    d.i_window.setValue(1.5)
+    d.who.setCurrentIndex(0)
+    d._forget()
+    p = d.params()
+    assert p == HopParams(enabled=True, cavity=False, i_nom=151.25, i_window=1.5)  # measured values forgotten
+
+
+def test_row_shows_a_recovery(app):
+    from wmlock.modehop import HopParams
+    from wmlock.sim import Demo, SimWavemeter
+
+    demo = Demo(discovery_port=0, wavemeter=SimWavemeter(noise=0.3, amplitude=0.0, walk=0.0), exposure=0.004)
+    demo.laser(1).drift = 0.0
+    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"])
+    win = gui.MainWindow(e, lambda: None)
+    e.start()
+    win.show()
+    try:
+        assert wait_for(lambda: (app.processEvents(), 1 in win.rows and e.channels[1].freq > 0)[1], 5)
+        e.link(1, demo.dlcs[0].key, 1)
+        e.set_hop_params(1, HopParams(enabled=True, step=0.2))
+        e.setpoint_to_current(1)
+        e.engage(1)
+        ch, row = e.channels[1], win.rows[1]
+        assert wait_for(lambda: (app.processEvents(), ch.guard.armed and ch.current is not None)[1], 5)
+        spin(app, 0.1)
+        assert row.btn.text() == "Locked" and row.info.text().endswith("150.00 mA")
+        row.show_menu(row.rect().center())
+        items = [a.text() for a in row._menu.actions()]
+        assert "Mode-hop recovery…" in items and "Recenter now" in items
+        row._menu.close()
+        demo.laser(1).hop_mode(+1)
+        assert wait_for(lambda: (app.processEvents(), ch.state == "recovering")[1], 3)
+        spin(app, 0.3)
+        assert row.btn.text() == "Recentering" and row._state == "recovering"
+        assert row.info.text().startswith("jumped +") and "mapping" in row.info.text() and "mA" in row.info.text()
+        row.show_menu(row.rect().center())
+        assert "Stop recentering" in [a.text() for a in row._menu.actions()]
+        row._menu.close()
+        assert wait_for(lambda: (app.processEvents(), ch.state == "on")[1], 30), ch.message
+        spin(app, 0.6)
+        assert row.btn.text() == "Locked" and "⟲" in row.info.text()
+        assert "last recovery: jumped" in row.wl.toolTip()
+    finally:
+        win.close()
+        spin(app, 0.1)
+        demo.close()

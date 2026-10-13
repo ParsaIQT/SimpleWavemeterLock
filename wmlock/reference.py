@@ -192,6 +192,14 @@ class Reference:
     def correction_mhz(self, f: float) -> float:
         return (self.correct(f) - f) * 1e6
 
+    def expected(self) -> float:
+        """Where the reference laser should read (THz) when it is where it belongs; NaN while
+        acquiring. Frozen, like the correction, while the reference is on hold."""
+        if self.state == ACQUIRING or not self.anchor:
+            return math.nan
+        eps, off = self.eps_offset()
+        return self.anchor * (1.0 + eps) if self.p.scale else self.anchor + off * 1e-6
+
     def preview(self, f: float, scale: bool | None = None, anchor: float | None = None,
                 accept: bool = False) -> float:
         """What correct(f) would become with another model, a new anchor (THz; the wavemeter error

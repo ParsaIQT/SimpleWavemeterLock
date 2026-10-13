@@ -13,12 +13,14 @@ import time
 
 from .engine import Engine
 from .lock import LockParams
+from .modehop import HopParams
 from .qt import Qt, QtCore, QtGui, QtWidgets
 from .reference import ACQUIRING, HOLD, MOVED, TRACKING, RefParams, fmt_duration
 from .wavemeter import C_NM_THZ
 
 REFRESH_MS = 33
 STALE_S = 3.0  # a channel without a new reading for this long is greyed out
+NOTE_S = 1800.0  # how long a row mentions its last mode-hop recovery
 
 C = {
     "bg": "#16171a", "row": "#1f2125", "line": "#2d3036", "fg": "#e8e9eb", "dim": "#80858f",
@@ -33,6 +35,7 @@ QFrame#row[state="error"] {{ border-left-color: {C['err']}; }}
 QFrame#row[state="ref"] {{ border-left-color: {C['accent']}; }}
 QFrame#row[state="ref-hold"] {{ border-left-color: {C['warn']}; }}
 QFrame#row[state="ref-moved"] {{ border-left-color: {C['err']}; }}
+QFrame#row[state="recovering"] {{ border-left-color: {C['warn']}; }}
 QPushButton#lock {{ min-width: 78px; min-height: 30px; border-radius: 5px; font-weight: 600;
     border: 1px solid {C['line']}; background: #2a2d33; }}
 QPushButton#lock:hover {{ border-color: {C['accent']}; }}
@@ -41,6 +44,7 @@ QPushButton#lock[state="engaging"] {{ background: #6b5418; border-color: {C['war
 QPushButton#lock[state="ref"] {{ border-color: {C['accent']}; color: {C['accent']}; }}
 QPushButton#lock[state="ref-hold"] {{ border-color: {C['warn']}; color: {C['warn']}; }}
 QPushButton#lock[state="ref-moved"] {{ border-color: {C['err']}; color: {C['err']}; }}
+QPushButton#lock[state="recovering"] {{ background: #6b5418; border-color: {C['warn']}; }}
 QMenu {{ background: #24262b; border: 1px solid {C['line']}; padding: 4px; }}
 QMenu::item {{ padding: 4px 22px 4px 18px; }}
 QMenu::item:selected {{ background: #363940; }}
@@ -249,6 +253,9 @@ class ChannelRow(QtWidgets.QFrame):
             self.sp_label.paint("ref" if is_ref else "set", "dim")
         if is_ref:
             self._refresh_reference(ch, ref, now)
+            if ch.state == "recovering":
+                self._show_recovery(ch, now)
+                self._set_state("recovering")
             return
         self.unit.paint("nm", "accent" if ref is not None and ref.active else "dim")  # referenced
         valid = ch.freq > 0
@@ -258,13 +265,16 @@ class ChannelRow(QtWidgets.QFrame):
             self.wl.paint(ch.status or "—", "err")
         state = ch.state
         if valid and ch.setpoint_nm:
-            self.dev.paint(fmt_mhz(ch.error_mhz), {"on": "ok", "engaging": "warn"}.get(state, "fg"))
+            color = {"on": "ok", "engaging": "warn", "recovering": "warn"}.get(state, "fg")
+            self.dev.paint(fmt_mhz(ch.error_mhz), color)
         else:
             self.dev.paint("", "fg")
         sp = ch.setpoint_nm or 0.0
         if sp != self._sp and not (self.sp.hasFocus() and self.sp.lineEdit().isModified()):
             self._show_setpoint(sp)
-        if ch.message:
+        if state == "recovering":
+            self._show_recovery(ch, now)
+        elif ch.message:
             self.info.paint(ch.message, "err")
         elif ch.device:
             dev = self.engine.devices.get(ch.device)
@@ -274,7 +284,7 @@ class ChannelRow(QtWidgets.QFrame):
                 self.info.paint(f"{where}   offline", "err")
             else:
                 off = "…" if ch.offset is None else f"{ch.offset:.3f} {ch.unit}"
-                self.info.paint(f"{where}   {off}", "dim")
+                self.info.paint(f"{where}   {off}{self._hop_text(ch, now)}", "dim")
         else:
             self.info.paint("right-click to link a laser", "dim")
         self._set_state(state if state != "off" else ("error" if ch.message else "off"))
@@ -305,6 +315,25 @@ class ChannelRow(QtWidgets.QFrame):
         self._set_state({TRACKING: "ref", MOVED: "ref-moved"}.get(state, "ref-hold"))
         self.name.paint(ch.name, "dim")
 
+    def _show_recovery(self, ch, now: float):
+        parts = [ch.hop_why, ch.hop_stage]
+        if ch.current is not None:
+            parts.append(f"{ch.current:.2f} mA")
+        parts.append(fmt_duration(now - ch.hop_t))
+        self.info.paint(" · ".join(p for p in parts if p), "warn")
+
+    @staticmethod
+    def _hop_text(ch, now: float) -> str:
+        """The current, the DLC pro lock and the last recovery, for a laser with mode-hop recovery on."""
+        if not ch.hop.enabled:
+            return ""
+        text = f"   {ch.current:.2f} mA" if ch.current is not None else ""
+        if ch.hop.cavity:
+            text += f"   cavity {ch.cavity_txt or ('on' if ch.cavity_on else 'off')}"
+        if ch.note and now - ch.note_t < NOTE_S:
+            text += f"   ⟲ {fmt_duration(now - ch.note_t)} ago"
+        return text
+
     def _set_state(self, state: str):
         if state == self._state:
             return
@@ -313,11 +342,14 @@ class ChannelRow(QtWidgets.QFrame):
             w.setProperty("state", state)
             w.style().unpolish(w)
             w.style().polish(w)
-        label = "Ref" if state.startswith("ref") else {"on": "Locked", "engaging": "Locking"}.get(state, "Lock")
+        label = "Ref" if state.startswith("ref") else {
+            "on": "Locked", "engaging": "Locking", "recovering": "Recentering"}.get(state, "Lock")
         self.btn.setText(label)
 
     def _clicked(self):
-        if self._is_ref:
+        if self.engine.channels[self.n].state == "recovering":
+            self.engine.cancel_recovery(self.n)
+        elif self._is_ref:
             self.win.reference_dialog()
         else:
             self.engine.toggle(self.n)
@@ -333,6 +365,12 @@ class ChannelRow(QtWidgets.QFrame):
                         f"{C_NM_THZ / ch.raw:.{self.win.digits}g} nm, corrected {(ch.freq - ch.raw) * 1e6:+.1f} MHz")
         if ref is not None and ref.channel == self.n:
             tip += f"\nreference laser: {ref.state}" + (f", {ref.message}" if ref.message else "")
+        if ch.hop.enabled:
+            hop = ch.hop
+            tip += (f"\nmode-hop recovery on: {hop.i_nom:.2f} ± {hop.i_window:g} mA"
+                    + (", takes over the DLC pro's cavity lock" if hop.cavity else ""))
+        if ch.note:
+            tip += f"\nlast recovery: {ch.note}"
         self.wl.setToolTip(tip)
 
     def _show_setpoint(self, nm: float):
@@ -369,6 +407,8 @@ class ChannelRow(QtWidgets.QFrame):
                 m.addAction(f"The wavemeter moved: accept {ref.offset:+.1f} MHz as drift", self.win.accept_drift)
             m.addAction("Stop using as reference", self.win.stop_reference)
             m.addSeparator()
+            self._hop_actions(m, ch)
+            m.addSeparator()
             m.addAction("Rename…", self.rename_dialog)
             m.addAction("Hide channel", lambda: e.set_hidden(self.n, True))
             m.popup(self.mapToGlobal(pos))
@@ -400,12 +440,21 @@ class ChannelRow(QtWidgets.QFrame):
         m.addSeparator()
         m.addAction("Setpoint = current reading", lambda: e.setpoint_to_current(self.n)).setEnabled(ch.freq > 0)
         m.addAction("Lock settings…", self.settings_dialog)
+        self._hop_actions(m, ch)
         m.addAction("Use as reference laser" + (f" (instead of channel {ref.channel})" if ref else ""),
                     lambda: self.win.use_as_reference(self.n))
         m.addSeparator()
         m.addAction("Rename…", self.rename_dialog)
         m.addAction("Hide channel", lambda: e.set_hidden(self.n, True))
         m.popup(self.mapToGlobal(pos))
+
+    def _hop_actions(self, m, ch):
+        m.addAction("Mode-hop recovery…", self.hop_dialog).setEnabled(bool(ch.device))
+        if ch.state == "recovering":
+            m.addAction("Stop recentering", lambda: self.engine.cancel_recovery(self.n))
+        else:
+            m.addAction("Recenter now", lambda: self.engine.recenter(self.n)).setEnabled(
+                bool(ch.device) and ch.state != "engaging")
 
     def _link(self, key: str, laser: int, *_):
         self.engine.link(self.n, key, laser)
@@ -422,6 +471,12 @@ class ChannelRow(QtWidgets.QFrame):
         d = LockDialog(self, ch)
         if d.exec():
             self.engine.set_params(self.n, d.params())
+
+    def hop_dialog(self):
+        ch = self.engine.channels[self.n]
+        d = HopDialog(self, ch)
+        if d.exec():
+            self.engine.set_hop_params(self.n, d.params())
 
     def rename_dialog(self):
         ch = self.engine.channels[self.n]
@@ -494,6 +549,96 @@ class LockDialog(QtWidgets.QDialog):
 
     def params(self) -> LockParams:
         return LockParams(**{k: sb.value() for k, sb in self.boxes.items()})
+
+
+class HopDialog(QtWidgets.QDialog):
+    def __init__(self, parent, ch):
+        super().__init__(parent)
+        self.setWindowTitle(f"Mode-hop recovery · channel {ch.n}")
+        self.ch = ch
+        p = self._p = ch.hop
+        form = QtWidgets.QFormLayout(self)
+
+        def row(*widgets):
+            box = QtWidgets.QHBoxLayout()
+            for w in widgets:
+                box.addWidget(Text(w, "dim") if isinstance(w, str) else w)
+            box.addStretch(1)
+            return box
+
+        def number(value, lo, hi, dec, step=None):
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setLocale(QtCore.QLocale.c())
+            sb.setRange(lo, hi)
+            sb.setDecimals(dec)
+            if step:
+                sb.setSingleStep(step)
+            sb.setValue(value)
+            return sb
+
+        self.enabled = QtWidgets.QCheckBox("Recover this laser when it mode-hops")
+        self.enabled.setChecked(p.enabled)
+        form.addRow(self.enabled)
+        self.who = QtWidgets.QComboBox()
+        self.who.addItems(["this program, to the wavemeter", "its DLC pro, to a cavity (PDH / FALC)"])
+        self.who.setCurrentIndex(1 if p.cavity else 0)
+        form.addRow("Locked by", self.who)
+        self.i_nom = number(p.i_nom or (ch.current or 0.0), 0, 10000, 3, 0.1)
+        use = QtWidgets.QPushButton("Use present")
+        use.setEnabled(ch.current is not None)
+        use.clicked.connect(lambda: self.i_nom.setValue(ch.current or 0.0))
+        now = f"now {ch.current:.3f} mA" if ch.current is not None else "read when enabled"
+        form.addRow("Nominal current", row(self.i_nom, "mA", use, now))
+        self.i_window = number(p.i_window, 0.1, 50, 2, 0.1)
+        form.addRow("Current stays within", row(self.i_window, "mA of nominal, and below the controller's limit"))
+        self.v_window = number(p.v_window, 0.5, 100, 1, 0.5)
+        form.addRow("Piezo moves at most", row(self.v_window, "V per recovery, inside the lock's offset limits"))
+        self.tolerance = number(p.tolerance, 5, 100000, 0, 10)
+        self.grace = number(p.grace, 0.2, 60, 1, 0.5)
+        form.addRow("A hop is", row("off target by more than", self.tolerance, "MHz for", self.grace, "s"))
+        self.margin = number(p.margin, 0.05, 5, 2, 0.05)
+        form.addRow("Keep a hop at least", row(self.margin, "mA away, both ways"))
+        self.step = number(p.step, 0.01, 1, 2, 0.01)
+        form.addRow("Map in steps of", row(self.step, "mA"))
+        self.per_hour = QtWidgets.QSpinBox()
+        self.per_hour.setRange(1, 60)
+        self.per_hour.setValue(p.max_per_hour)
+        form.addRow("At most", row(self.per_hour, "recoveries an hour"))
+        self.forget = False
+        if p.kv or p.spacing:
+            learned = []
+            if p.kv:
+                learned.append(f"piezo {p.kv / 1e3:+.2f} GHz/V")
+            if p.spacing:
+                learned.append(f"modes {p.spacing / 1e3:.1f} GHz apart")
+            self.learned = Text(", ".join(learned), "dim")
+            forget = QtWidgets.QPushButton("Forget")
+            forget.clicked.connect(self._forget)
+            form.addRow("Measured", row(self.learned, forget))
+        form.addRow(Text(
+            "After a hop the laser is taken over: its current is swept across the allowed window to map\n"
+            "its modes, set to the middle of the mode that reaches the target with the least piezo, the\n"
+            "piezo brings it onto the target, and stepping the current both ways checks it is clear of the\n"
+            "next hop. Then it goes back to its lock; for a cavity, the wavemeter must see the right peak.\n"
+            "If nothing works, current and offset go back to where they were and the lock stays off.", "dim"))
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def _forget(self):
+        self.forget = True
+        self.learned.paint("forgotten: measured again next time", "dim")
+
+    def params(self) -> HopParams:
+        p = self._p
+        return HopParams(
+            enabled=self.enabled.isChecked(), cavity=self.who.currentIndex() == 1,
+            i_nom=round(self.i_nom.value(), 3), i_window=self.i_window.value(), v_window=self.v_window.value(),
+            step=self.step.value(), margin=self.margin.value(), tolerance=self.tolerance.value(),
+            grace=self.grace.value(), max_per_hour=self.per_hour.value(),
+            kv=0.0 if self.forget else p.kv, spacing=0.0 if self.forget else p.spacing)
 
 
 class ReferenceDialog(QtWidgets.QDialog):
@@ -710,13 +855,23 @@ class MainWindow(QtWidgets.QWidget):
         m.addAction("Larger digits   Ctrl +", lambda: self.set_font_size(self.gui["font_pt"] + 2))
         m.addAction("Smaller digits   Ctrl −", lambda: self.set_font_size(self.gui["font_pt"] - 2))
         laser = getattr(e.source, "cavity_laser", lambda: None)()
-        if laser is not None:  # --sim only: try the reference logic out
+        if laser is not None:  # --sim only: try the reference and mode-hop logic out
             sim = m.addMenu("Simulate a fault")
             sim.addAction("Reference mode hop +1.5 GHz for 30 s", lambda: laser.mode_hop(1500, 30))
             sim.addAction("Reference mode hop +1.5 GHz, stays", lambda: laser.mode_hop(1500))
             sim.addAction("Reference cavity unlocked for 20 s", lambda: laser.unlock(20))
             sim.addAction("Reference light blocked for 15 s", lambda: laser.dark(15))
             sim.addAction("Wavemeter jumps +20 MHz", lambda: e.source.wavemeter.jump(20e-6 / laser.f0))
+            sim.addSeparator()
+            for las in e.source.lasers:
+                if las.ecdl is None:
+                    continue
+                name = e.channels[las.ch].name if las.ch in e.channels else ""
+                who = f"Channel {las.ch}" + (f" {name}" if name else "")
+                sim.addAction(f"{who}: mode hop up", functools.partial(las.hop_mode, 1))
+                sim.addAction(f"{who}: mode hop down", functools.partial(las.hop_mode, -1))
+                if las.lock is not None:
+                    sim.addAction(f"{who}: cavity lock jumps a peak", functools.partial(las.lock.jump, 1))
         self._menu = m
         m.popup(self.mapToGlobal(pos))
 

@@ -116,6 +116,12 @@ class DLCPro:
         r = self.get(param)
         return r[1:-1] if len(r) >= 2 and r[0] == r[-1] == '"' else r
 
+    def get_bool(self, param: str) -> bool:
+        r = self.get(param)
+        if r not in ("#t", "#f"):
+            raise DecopError(f"{param}: unexpected reply {r!r}")
+        return r == "#t"
+
     def set(self, param: str, value) -> int:
         r = self.command(f"(param-set! '{param} {encode(value)})")
         last = r.splitlines()[-1].strip() if r else ""

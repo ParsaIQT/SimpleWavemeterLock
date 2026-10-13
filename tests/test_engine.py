@@ -121,7 +121,8 @@ def test_discovery_lists_lasers(demo, monkeypatch):
         assert e.scanning
         assert wait_for(lambda: not e.scanning, 3)
         devs = e.device_list()
-        assert {d.serial: sorted(d.lasers) for d in devs} == {"SIM-000123": [1, 2], "SIM-000456": [1, 2]}
+        assert {d.serial: sorted(d.lasers) for d in devs} == {"SIM-000123": [1, 2], "SIM-000456": [1, 2],
+                                                              "SIM-000789": [1]}
         assert all(d.probed and not d.error for d in devs)
     finally:
         responder.close()
@@ -234,3 +235,123 @@ def test_reference_channel_cannot_be_wavemeter_locked(engine, demo):
     assert wait_for(lambda: engine.channels[1].state == "on", 2)
     engine.set_reference(1)  # taking a locked channel as the reference unlocks it
     assert engine.channels[1].state == "off" and engine.reference.channel == 1
+
+
+# ----------------------------------------------------------- mode-hop recovery
+@pytest.fixture
+def quiet_demo():
+    from wmlock.sim import Demo, SimWavemeter
+
+    d = Demo(discovery_port=0, wavemeter=SimWavemeter(noise=0.3, amplitude=0.0, walk=0.0), exposure=0.004)
+    for laser in d.lasers:
+        laser.drift = 0.0
+    yield d
+    d.close()
+
+
+def hop_engine(demo, n, key, laser, params):
+    from wmlock.modehop import HopParams
+
+    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"])
+    e.start()
+    assert wait_for(lambda: n in e.channels and e.channels[n].freq > 0, 5)
+    e.link(n, key, laser)
+    e.setpoint_to_current(n)
+    e.set_hop_params(n, HopParams(**params))
+    return e, e.channels[n]
+
+
+def currents_written(dlc, laser):
+    return [150.0] + dlc.written(f"laser{laser}:dl:cc:current-set")
+
+
+def assert_gentle(currents, lo, hi):
+    assert all(lo - 1e-9 <= c <= hi + 1e-9 for c in currents)
+    assert all(abs(a - b) <= 0.2 + 1e-9 for a, b in zip(currents, currents[1:]))
+
+
+def test_wavemeter_locked_laser_recovers_from_a_mode_hop(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[0]
+    e, ch = hop_engine(demo, 1, dlc.key, 1, dict(enabled=True, step=0.2))
+    try:
+        e.engage(1)
+        assert wait_for(lambda: ch.state == "on" and ch.guard.armed and ch.hop.i_nom == 150.0, 5)
+        demo.laser(1).hop_mode(+1)  # +6 GHz: a naive lock would chase it with the piezo
+        assert wait_for(lambda: ch.state == "recovering", 3)
+        assert wait_for(lambda: ch.state == "on", 30), ch.message
+        assert wait_for(lambda: abs(ch.error_mhz) < 3, 5)
+        assert demo.laser(1).ecdl.m == 0 and dlc.current(1) > 151.0  # back on its mode, by the current
+        assert "recentered" in ch.note and ch.message == ""
+        assert ch.hop.kv == pytest.approx(350, rel=0.1) and ch.hop.spacing == pytest.approx(6000, rel=0.05)
+        assert_gentle(currents_written(dlc, 1), 148.0, 152.0)
+        cfg = e.to_config()["channels"]["1"]["hop"]
+        assert cfg["enabled"] and cfg["kv"] == ch.hop.kv  # what it learned is kept
+    finally:
+        e.stop()
+
+
+def test_cavity_locked_laser_put_back_on_the_right_peak(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, step=0.2))
+    try:
+        assert wait_for(lambda: ch.cavity_on is True and ch.guard.armed, 5)
+        shg.lock.jump(1)  # 'locked', one free spectral range off
+        assert wait_for(lambda: ch.state == "recovering", 5)
+        assert wait_for(lambda: ch.state == "off" and shg.lock.state == "locked", 15), ch.message
+        assert abs(ch.error_mhz) < 3 and "laser itself was fine" in ch.note
+        assert dlc.written("laser1:dl:lock:lock-enabled") == [False, True]
+
+        assert wait_for(lambda: ch.guard.armed, 5)
+        shg.hop_mode(-1)  # the laser hops: its lock relocks 6 GHz away and calls that locked
+        assert wait_for(lambda: ch.state == "recovering", 5)
+        assert wait_for(lambda: ch.state == "off" and not ch.message and "recentered" in ch.note, 40), ch.message
+        assert shg.lock.state == "locked" and abs(ch.error_mhz) < 3 and shg.ecdl.m == 0
+        assert_gentle(currents_written(dlc, 1), 148.0, 152.0)
+    finally:
+        e.stop()
+
+
+def test_stopping_a_recovery_puts_current_and_offset_back(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[0]
+    e, ch = hop_engine(demo, 1, dlc.key, 1, dict(enabled=True, step=0.1))
+    try:
+        e.engage(1)
+        assert wait_for(lambda: ch.state == "on" and ch.guard.armed, 5)
+        offset = dlc.offset(1)
+        demo.laser(1).hop_mode(+1)
+        assert wait_for(lambda: "mapping" in ch.hop_stage and dlc.current(1) < 149.5, 10)
+        e.toggle(1)  # the button, while recentering: stop
+        assert wait_for(lambda: ch.state == "off", 5)
+        assert ch.message == "recovery stopped (current and offset put back)"
+        assert dlc.current(1) == 150.0 and dlc.offset(1) == pytest.approx(offset, abs=1e-6)
+        assert_gentle(currents_written(dlc, 1), 148.0, 152.0)
+    finally:
+        e.stop()
+
+
+def test_recoveries_are_rate_limited(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[0]
+    e, ch = hop_engine(demo, 1, dlc.key, 1, dict(enabled=True, max_per_hour=1, step=0.2))
+    try:
+        e.engage(1)
+        assert wait_for(lambda: ch.state == "on" and ch.guard.armed, 5)
+        demo.laser(1).hop_mode(+1)
+        assert wait_for(lambda: ch.state == "recovering", 3)
+        assert wait_for(lambda: ch.state == "on" and ch.guard.armed, 30), ch.message
+        demo.laser(1).hop_mode(+1)
+        assert wait_for(lambda: ch.state == "off", 10)
+        assert "1 recoveries within the hour" in ch.message and dlc.current(1) > 151.0  # left alone
+    finally:
+        e.stop()
+
+
+def test_recovery_refuses_a_current_outside_its_window(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[0]
+    e, ch = hop_engine(demo, 1, dlc.key, 1, dict(enabled=True, i_nom=145.0, i_window=1.0))
+    try:
+        e.recenter(1)
+        assert wait_for(lambda: ch.state == "off" and ch.message, 5)
+        assert "outside 144.00 … 146.00 mA" in ch.message and dlc.written("laser1:dl:cc:current-set") == []
+    finally:
+        e.stop()
