@@ -589,6 +589,22 @@ def test_falc_offset_left_alone_when_the_trace_does_not_show_it():
     assert any("does not follow" in n for n in rec.notes)
 
 
+def test_falc_offset_that_subtracts_is_learned_then_nulled_in_one_step():
+    b, lock = shg_bench(seed=24, falc_sign=-1)
+    lock.jump(1)
+    b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+    assert r.state == "done" and r.result.learned["falc_sign"] == -1, r.error
+    first = b.writes("falc1:input:offset")
+    assert len(first) >= 2 and first[-1] == pytest.approx(0.009, abs=0.001) and abs(lock.dc()) < 0.002
+    lock.pdh_dc = 0.02  # it drifts again: 11 mV more
+    lock.jump(1)
+    p = HopParams.from_dict({**SHG.to_dict(), **r.result.learned})
+    b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "done", r.error
+    assert len(b.writes("falc1:input:offset")) == len(first) + 1  # knowing which way: one step
+    assert abs(lock.dc()) < 0.002
+
+
 def test_falc_offset_moves_no_further_than_allowed():
     b, lock = shg_bench(seed=18, pdh_dc=0.08)
     lock.jump(1)

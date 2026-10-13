@@ -387,14 +387,15 @@ class SimLocked:
     def __init__(self, dlc: "FakeDLCPro", n: int, ecdl: "ECDL", f_res: float, shg: bool = True,
                  lockpoints: bool = True, fsr: float = 1.5, lw: float = 6.0, tem=((0.37, 0.18), (0.71, 0.08)),
                  t00: float = 0.8, pdh: float = 0.4, pdh_dc: float = 0.0, falc: int = 1, range_v: float = 30.0,
-                 falc_in_trace: bool = True, seed=None):
-        """falc_in_trace: the error signal on the scope includes the FALC's input offset."""
+                 falc_in_trace: bool = True, falc_sign: int = 1, seed=None):
+        """falc_in_trace: the error signal on the scope includes the FALC's input offset, which adds
+        to it (falc_sign 1) or subtracts (-1)."""
         self.dlc, self.n, self.ecdl = dlc, n, ecdl
         self.p = p = f"laser{n}:"
         self.f_res, self.fsr, self.lw, self.tem, self.t00 = f_res, fsr, lw, tuple(tem), t00
         self.pdh, self.pdh_dc, self.sideband = pdh, pdh_dc, 20.0
         self.has_shg, self.lockpoints, self.falc, self.range_v = shg, lockpoints, falc, range_v
-        self.falc_in_trace = falc_in_trace
+        self.falc_in_trace, self.falc_sign = falc_in_trace, falc_sign
         self.rng = random.Random(seed)
         self.mutex = threading.RLock()
         self.wobble = 0.0       # MHz: the free-running laser's drift (from SimLaser)
@@ -458,7 +459,7 @@ class SimLocked:
     def dc(self) -> float:
         """The error signal's DC level as the FALC sees it: its own offset plus the input offset."""
         off = self.dlc.params.get(f"falc{self.falc}:input:offset", 0.0) if self.falc else 0.0
-        return self.pdh_dc + off
+        return self.pdh_dc + self.falc_sign * off
 
     def shown_dc(self) -> float:
         """The error signal's DC level as the scope shows it."""

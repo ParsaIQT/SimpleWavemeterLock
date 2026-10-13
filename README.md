@@ -329,10 +329,13 @@ Things to know:
     read just before it, and a "not found" is tried once more with fresh ones.
   * Lockpoint candidates are read while the scan runs, after 3 scan periods.
   * "Locked" is the lock state 5, or a state text starting with "locked".
-  * Whether the error signal on the scope includes the FALC's input offset: checked each time
-    (if the trace does not follow the offset, the offset is put back and left alone).
-  * The wavemeter is assumed to read the fundamental (the master), which does not need the
-    SHG locked.
+  * The FALC pro's input offset moves the error signal straight up and down, so the first
+    recovery learns which way it moves, and later ones null the DC in one step. If the trace
+    ever did not follow the offset (the scope showing some other signal than the FALC's input),
+    the offset is put back and left alone, and the row says so.
+  * The wavemeter and the reference cavity get the 739 nm fundamental, picked off directly, so
+    the readings do not depend on the SHG cavity's lock, which stays off while the modes are
+    mapped.
   * A second mode can hide in the SHG sweep if the master's mode spacing is a whole number of
     SHG cavity free spectral ranges; its main peaks would still shrink, which is caught once
     the single-mode size is known.

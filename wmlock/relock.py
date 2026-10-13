@@ -26,7 +26,7 @@ import math
 
 from . import cavity
 from . import modehop as mh
-from .dlcpro import IO_VALUE, SHG_INTRA, DecopError, float_arrays, lock_points
+from .dlcpro import IO_VALUE, SHG_INTRA, DecopError, float_arrays, lock_points, signal_name
 
 LOCK = "dl:lock:lock-enabled"
 SCAN = "scan:enabled"
@@ -499,7 +499,9 @@ class CavitySteps:
             g = (dc2 - dc) / (new - cur)
             if not math.isfinite(g) or abs(g) < 0.3:
                 yield mh.Set(name, o0, restore=o0)
-                self.note("the error-signal trace does not follow the FALC pro's input offset: put back, left alone")
+                err = self.orig.get("dl:lock:error-channel")
+                self.note(f"the error signal on the scope ({signal_name(err)}) does not follow the FALC pro's input "
+                          f"offset, so it is not the FALC's input: offset put back, left alone")
                 self.learned["falc_sign"] = 0
                 return
             gain, cur, dc = g, new, dc2
@@ -526,8 +528,6 @@ def setup_report(client, laser: int, hop, lp) -> list:
     """Everything a recovery would use on this laser, read (only reads) from its controller, and
     what looks wrong: [(level, text)], level 'head', 'ok', 'info', 'warn' or 'error'.
     client: a DLCPro; hop: HopParams; lp: the wavemeter lock's LockParams."""
-    from .dlcpro import signal_name
-
     out = []
 
     def add(level, text):
