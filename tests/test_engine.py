@@ -249,10 +249,10 @@ def quiet_demo():
     d.close()
 
 
-def hop_engine(demo, n, key, laser, params):
+def hop_engine(demo, n, key, laser, params, log_path=None):
     from wmlock.modehop import HopParams
 
-    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"])
+    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"], log_path=log_path)
     e.start()
     assert wait_for(lambda: n in e.channels and e.channels[n].freq > 0, 5)
     e.link(n, key, laser)
@@ -290,24 +290,66 @@ def test_wavemeter_locked_laser_recovers_from_a_mode_hop(quiet_demo):
         e.stop()
 
 
-def test_cavity_locked_laser_put_back_on_the_right_peak(quiet_demo):
+def test_shg_laser_put_back_on_the_right_peak(quiet_demo, tmp_path):
     demo, dlc = quiet_demo, quiet_demo.dlcs[2]
     shg = demo.laser(demo.SHG)
-    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, step=0.2))
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, step=0.2),
+                       log_path=tmp_path / "log.jsonl")
     try:
-        assert wait_for(lambda: ch.cavity_on is True and ch.guard.armed, 5)
+        assert wait_for(lambda: ch.cavity_on is True and ch.guard.armed and ch.shg_txt == "locked", 5)
         shg.lock.jump(1)  # 'locked', one free spectral range off
         assert wait_for(lambda: ch.state == "recovering", 5)
-        assert wait_for(lambda: ch.state == "off" and shg.lock.state == "locked", 15), ch.message
-        assert abs(ch.error_mhz) < 3 and "laser itself was fine" in ch.note
+        assert wait_for(lambda: ch.state == "off" and shg.lock.locked(), 20), ch.message
+        assert abs(ch.error_mhz) < 3 and "laser itself was fine" in ch.note and not ch.message
+        assert shg.lock.peak == pytest.approx(shg.lock.f_res, abs=1e-12) and shg.lock.shg_state()[0] == 5
         assert dlc.written("laser1:dl:lock:lock-enabled") == [False, True]
+        assert ch.hop.lp_code == ord("t") and ch.hop.falc_sign == 1  # learned
+        assert abs(shg.lock.dc()) < 0.002  # the FALC's input offset nulled the error signal's DC level
 
         assert wait_for(lambda: ch.guard.armed, 5)
-        shg.hop_mode(-1)  # the laser hops: its lock relocks 6 GHz away and calls that locked
+        shg.hop_mode(-1)  # the master hops: its lock relocks 6 GHz away and calls that locked
         assert wait_for(lambda: ch.state == "recovering", 5)
-        assert wait_for(lambda: ch.state == "off" and not ch.message and "recentered" in ch.note, 40), ch.message
-        assert shg.lock.state == "locked" and abs(ch.error_mhz) < 3 and shg.ecdl.m == 0
+        assert wait_for(lambda: ch.state == "off" and not ch.message and "recentered" in ch.note, 60), ch.message
+        assert shg.lock.locked() and abs(ch.error_mhz) < 3 and shg.ecdl.m == 0
+        assert shg.lock.shg_state()[0] == 5 and "single mode" in ch.note
         assert_gentle(currents_written(dlc, 1), 148.0, 152.0)
+        assert ch.last["ok"] and ch.last["maps"] and ch.last["scan"]["x"]  # kept for a look...
+        lines = (tmp_path / "log.jsonl").read_text().splitlines()
+        assert len(lines) == 2 and "relocked, recentered" in lines[1]  # ...and logged
+    finally:
+        e.stop()
+
+
+def test_step_by_step_through_the_engine(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, confirm=True))
+    try:
+        assert wait_for(lambda: ch.cavity_on is True and ch.guard.armed, 5)
+        shg.lock.jump(-1)
+        assert wait_for(lambda: ch.hop_prompt.startswith("Take the laser over"), 5)
+        assert dlc.written("laser1:dl:lock:lock-enabled") == []  # nothing done before you say so
+        for _ in range(12):
+            if not wait_for(lambda: ch.hop_prompt or ch.state == "off", 10) or ch.state == "off":
+                break
+            e.confirm_step(demo.SHG)
+            assert wait_for(lambda: not ch.hop_prompt or ch.state == "off", 2)
+        assert wait_for(lambda: ch.state == "off", 10) and shg.lock.locked() and not ch.message, ch.message
+    finally:
+        e.stop()
+
+
+def test_setup_check_reads_only(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    try:
+        before = len(dlc.log)
+        e.check_setup(demo.SHG)
+        assert wait_for(lambda: ch.setup is not None, 5)
+        text = "\n".join(t for _, t in ch.setup)
+        assert "relock by lockpoint" in text and "falc1" in text and "SHG cavity lock on" in text
+        assert not [lvl for lvl, _ in ch.setup if lvl == "error"], ch.setup
+        assert len(dlc.log) == before  # nothing written
     finally:
         e.stop()
 

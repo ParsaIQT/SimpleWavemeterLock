@@ -97,3 +97,58 @@ def test_probe_unreachable_and_device_keys():
     assert Device.from_key("10.0.0.5").key == "10.0.0.5"
     assert Device.from_key("10.0.0.5:1998").key == "10.0.0.5"
     assert Device.from_key(" 10.0.0.5:2000 ").port == 2000
+
+
+def test_binary_tuples_ints_and_commands(fake):
+    from wmlock.dlcpro import encode_blocks, float_arrays, float_block, lock_points, points_block
+    from wmlock.sim import CommandError
+
+    trace = encode_blocks([float_block("x", [1.0, 2.0, 3.0]), float_block("y", [0.5, 0.25, 0.125])])
+    fake.params.update({"laser1:scope:data": trace, "laser1:dl:lock:lockpoint:position": (70.25, 0.5),
+                        "laser1:dl:lock:spectrum-input-channel": 0,
+                        "laser1:dl:lock:candidates": lambda: encode_blocks(
+                            [points_block("c", [(70.1, 0.8, "t"), (71.2, 0.2, "t")]), ("s", bytes([3]))])})
+    selected = []
+
+    def select(x, y, kind):
+        if abs(x - 70.1) > 1e-3:
+            raise CommandError("-7 lockpoint not found")
+        selected.append((x, y, kind))
+        return ""
+
+    fake.commands["laser1:dl:lock:select-lockpoint"] = select
+    c = DLCPro("127.0.0.1", fake.port)
+    data = float_arrays(c.get_bytes("laser1:scope:data"))
+    assert data == {"x": [1.0, 2.0, 3.0], "y": [0.5, 0.25, 0.125]}
+    assert c.get_tuple("laser1:dl:lock:lockpoint:position") == (70.25, 0.5)
+    assert c.get_int("laser1:dl:lock:spectrum-input-channel") == 0
+    pts = lock_points(c.get_value("laser1:dl:lock:candidates"))  # binary, by its name
+    assert pts["s"] == 3 and [(round(x, 3), t) for x, _, t in pts["c"]] == [(70.1, "t"), (71.2, "t")]
+    assert c.exec("laser1:dl:lock:select-lockpoint", 70.1, 0.8, 116) == ""
+    assert selected == [(70.1, 0.8, 116)]
+    with pytest.raises(DecopError, match="lockpoint not found"):
+        c.exec("laser1:dl:lock:select-lockpoint", 75.0, 0.8, 116)
+    with pytest.raises(DecopError, match="unknown command"):
+        c.exec("laser1:dl:lock:no-such-thing")
+    with pytest.raises(DecopError):
+        c.get_bytes("laser1:scan:offset")
+    assert c.get_value("laser1:scan:enabled") is False and c.get_value("laser1:scan:offset") == 70.0
+    assert c.is_open
+    c.close()
+
+
+def test_decode_and_bad_binary_data():
+    from wmlock.dlcpro import data_blocks, decode
+
+    assert decode("#t") is True and decode("3") == 3 and decode("2.5") == 2.5 and decode('"a b"') == "a b"
+    assert decode("'(1.5 2)") == (1.5, 2) and decode("(70.1 0.82)") == (70.1, 0.82)
+    assert decode("&AAE=") == b"\x00\x01"
+    with pytest.raises(DecopError):
+        decode("Error: -14 unknown parameter")
+    with pytest.raises(ValueError):
+        decode("what")
+    with pytest.raises(DecopError):
+        data_blocks(b"x10\x00abc")  # cut short
+    with pytest.raises(DecopError):
+        data_blocks(b"xab\x00abc")  # bad length
+    assert data_blocks(b"") == []

@@ -3,19 +3,33 @@
 Protocol, as implemented by TOPTICA's own SDK (toptica.lasersdk):
   * command line on TCP 1998; every reply, the welcome banner included, ends
     with the prompt '\\n> '
-  * (param-ref 'laser1:scan:offset)        -> '70.5', '"text"', '#t' or 'Error: ...'
+  * (param-ref 'laser1:scan:offset)        -> '70.5', '"text"', '#t', '(1.5 0.2)',
+                                              '&<base64>' (binary) or 'Error: ...'
   * (param-set! 'laser1:scan:offset 70.5)  -> status: 0 ok, >0 warning, <0 error
+  * (exec 'laser1:dl:lock:select-lockpoint 70.1 0.8 116)
+                                           -> output lines, the last one the return
+                                              value if any; 'Error: ...' on failure
   * discovery: UDP 'whoareyou?' to port 60010 on each subnet broadcast address;
     every device answers ("sn" "..." "..." "..." "..." "label" n "ip" cmd_port mon_port)
+  * binary data (scope traces, lock candidates) comes in blocks: an id letter, the
+    payload length in ASCII, a zero byte, the payload. Scope: 'x' the x axis, 'y'
+    channel 1, 'Y' channel 2 (float32, little endian). Lock: 'c' candidates, 'l' the
+    selected lockpoint, 't' the tracked position (x, y float32 and a type char each),
+    's' the lock state (one byte: 3 selected, 5 locked).
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import ipaddress
 import re
 import socket
+import struct
 import threading
 import time
+from array import array
 from dataclasses import dataclass, field
+from sys import byteorder
 
 COMMAND_PORT = 1998
 DISCOVERY_PORT = 60010
@@ -122,6 +136,45 @@ class DLCPro:
             raise DecopError(f"{param}: unexpected reply {r!r}")
         return r == "#t"
 
+    def get_int(self, param: str) -> int:
+        r = self.get(param)
+        try:
+            return int(r)
+        except ValueError:
+            raise DecopError(f"{param}: unexpected reply {r!r}") from None
+
+    def get_bytes(self, param: str) -> bytes:
+        """A binary parameter (scope data, lock candidates)."""
+        r = self.get(param)
+        text = r[1:] if r.startswith("&") else r[1:-1] if len(r) >= 2 and r[0] == r[-1] == '"' else None
+        try:
+            if text is None:
+                raise ValueError
+            return base64.b64decode(text, validate=True)
+        except (ValueError, binascii.Error):
+            raise DecopError(f"{param}: not binary data {r[:40]!r}") from None
+
+    def get_tuple(self, param: str) -> tuple:
+        """A tuple such as a lockpoint's position, '(70.1 0.82)'."""
+        r = self.get(param)
+        try:
+            value = decode(r)
+        except ValueError:
+            value = None
+        if not isinstance(value, tuple):
+            raise DecopError(f"{param}: unexpected reply {r!r}")
+        return value
+
+    def get_value(self, param: str):
+        """Any parameter, its type inferred from the reply; binary parameters as bytes."""
+        if param.endswith(BINARY):
+            return self.get_bytes(param)
+        r = self.get(param)
+        try:
+            return decode(r)
+        except ValueError:
+            raise DecopError(f"{param}: unexpected reply {r!r}") from None
+
     def set(self, param: str, value) -> int:
         r = self.command(f"(param-set! '{param} {encode(value)})")
         last = r.splitlines()[-1].strip() if r else ""
@@ -132,6 +185,130 @@ class DLCPro:
         if status < 0:
             raise DecopError(f"set {param} = {value}: error {status}")
         return status
+
+    def exec(self, name: str, *args) -> str:
+        """Run a command; returns what it printed (its return value on the last line)."""
+        cmd = f"(exec '{name}" + "".join(" " + encode(a) for a in args) + ")"
+        r = self.command(cmd)
+        lines = r.splitlines()
+        if lines and (lines[0].lower().startswith("error") or lines[-1].lower().startswith("error")):
+            bad = lines[0] if lines[0].lower().startswith("error") else lines[-1]
+            raise DecopError(f"{name}: {bad.strip()}")
+        return r
+
+
+BINARY = (":data", ":candidates", ":background-trace")  # parameters that are binary data
+
+
+def decode(text: str):
+    """A reply to (param-ref ...), its type inferred: bool, int, float, str, bytes or a tuple."""
+    text = text.strip()
+    if text.lower().startswith("error"):
+        raise DecopError(text)
+    if text in ("#t", "#T", "#f", "#F"):
+        return text in ("#t", "#T")
+    if text.startswith("&"):
+        try:
+            return base64.b64decode(text[1:], validate=True)
+        except binascii.Error:
+            raise ValueError(text) from None
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        return text[1:-1]
+    if text.startswith("'("):
+        text = text[1:]
+    if text.startswith("(") and text.endswith(")"):
+        return tuple(decode(t) for t in text[1:-1].split())
+    try:
+        return int(text)
+    except ValueError:
+        return float(text)  # ValueError if it is none of these
+
+
+# ------------------------------------------------------------- binary data
+def data_blocks(data: bytes) -> list:
+    """[(id, payload)] of the DLC pro's 'Scope, Lock, and Recorder Binary Data' format."""
+    out, i = [], 0
+    while i < len(data):
+        bid = chr(data[i])
+        try:
+            end = data.index(0, i + 1)
+            n = int(data[i + 1:end])
+        except ValueError:
+            raise DecopError(f"binary data: bad header of block {bid!r}") from None
+        if end + 1 + n > len(data):
+            raise DecopError(f"binary data: block {bid!r} is cut short")
+        out.append((bid, bytes(data[end + 1:end + 1 + n])))
+        i = end + 1 + n
+    return out
+
+
+def float_arrays(data: bytes) -> dict:
+    """Scope data: {'x': [...], 'y': [...], 'Y': [...]} (whichever blocks are there)."""
+    out = {}
+    for bid, payload in data_blocks(data):
+        if bid in "aAbBxyY":
+            if len(payload) % 4:
+                raise DecopError(f"binary data: block {bid!r} is not float32")
+            values = array("f")
+            values.frombytes(payload)
+            if byteorder != "little":
+                values.byteswap()
+            out[bid] = values.tolist()
+    return out
+
+
+_POINT = struct.Struct("<2fc")
+
+
+def lock_points(data: bytes) -> dict:
+    """Lock data: {'c': [(x, y, type char)], 'l': [...], 't': [...]} and 's': state (int)."""
+    out = {}
+    for bid, payload in data_blocks(data):
+        if bid in "clt":
+            if len(payload) % _POINT.size:
+                raise DecopError(f"binary data: block {bid!r} is not a list of points")
+            out[bid] = [(x, y, t.decode("latin-1")) for x, y, t in _POINT.iter_unpack(payload)]
+        elif bid == "s" and len(payload) == 1:
+            out["s"] = payload[0]
+    return out
+
+
+def encode_blocks(blocks) -> bytes:
+    """The inverse of data_blocks, for the simulation: blocks is [(id, payload bytes)]."""
+    return b"".join(bid.encode() + str(len(p)).encode() + b"\0" + p for bid, p in blocks)
+
+
+def float_block(bid: str, values) -> tuple:
+    a = array("f", values)
+    if byteorder != "little":
+        a.byteswap()
+    return bid, a.tobytes()
+
+
+def points_block(bid: str, points) -> tuple:
+    return bid, b"".join(_POINT.pack(x, y, t.encode("latin-1")) for x, y, t in points)
+
+
+# DLC pro signal ids (scope channels, lock inputs), from TOPTICA's SDK
+SIGNALS = {
+    -3: "none", -2: "time", -1: "frequency",
+    0: "Fine In 1", 1: "Fine In 2", 2: "Fast In 3", 3: "Fast In 3B", 4: "Fast In 4", 5: "Fast In 4B",
+    20: "Output A", 21: "Output B", 30: "Lock-in output", 31: "PID 1 output", 32: "PID 2 output",
+    34: "Scan output", 35: "Scan aux output",
+    40: "PDH 1 error 1", 41: "PDH 1 in 1", 42: "PDH 1 error 2", 43: "PDH 1 in 2",
+    44: "PDH 2 error 1", 45: "PDH 2 in 1", 46: "PDH 2 error 2", 47: "PDH 2 in 2",
+    50: "Piezo voltage", 51: "Current", 54: "DL photodiode",
+    80: "SHG cavity error signal", 81: "SHG cavity rejection signal", 82: "SHG intra-cavity signal",
+    83: "SHG power", 87: "SHG input power", 90: "SHG cavity piezo (slow)", 91: "SHG cavity piezo (fast)",
+    100: "Lock input", 101: "Scan output (alias)",
+}
+FINE_IN1, SCAN_OUTPUT, PIEZO, SHG_INTRA, LOCK_INPUT, SCAN_ALIAS, NONE = 0, 34, 50, 82, 100, 101, -3
+IO_VALUE = {0: "io:fine-1:value-act", 1: "io:fine-2:value-act", 2: "io:fast-3:value-act",
+            4: "io:fast-4:value-act"}  # the present value of an input, by signal id
+
+
+def signal_name(sig) -> str:
+    return SIGNALS.get(sig, f"signal {sig}") if isinstance(sig, int) else str(sig)
 
 
 # --------------------------------------------------------------------- discovery

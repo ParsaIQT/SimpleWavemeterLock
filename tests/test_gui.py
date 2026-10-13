@@ -7,7 +7,7 @@ from conftest import wait_for
 qt = pytest.importorskip("wmlock.qt", exc_type=ImportError)
 from wmlock import gui  # noqa: E402
 from wmlock.engine import Engine  # noqa: E402
-from wmlock.qt import QtWidgets  # noqa: E402
+from wmlock.qt import QtCore, QtWidgets  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -16,7 +16,15 @@ def app():
     a.setStyle("Fusion")
     a.setPalette(gui.dark_palette())
     a.setStyleSheet(gui.QSS)
-    return a
+    yield a
+    # every window gone before the interpreter takes Qt down (else PySide6 may crash on exit)
+    for w in a.topLevelWidgets():
+        w.close()
+        w.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+    a.processEvents()
+    if hasattr(a, "shutdown"):  # PySide6: destroy the application now, in order
+        a.shutdown()
 
 
 def spin(app, seconds):
@@ -168,15 +176,64 @@ def test_hop_dialog_round_trip(app):
     from wmlock.engine import Channel
     from wmlock.modehop import HopParams
 
-    ch = Channel(7, {"hop": {"enabled": True, "cavity": True, "i_nom": 151.25, "kv": 402.0, "spacing": 6010.0}})
+    ch = Channel(7, {"hop": {"enabled": True, "cavity": True, "shg": True, "i_nom": 151.25, "kv": 402.0,
+                             "spacing": 6010.0, "lp_kind": "t", "lp_code": 116, "peak_y": 0.8, "relock": "lockpoint"}})
     ch.current = 151.4
     d = gui.HopDialog(None, ch)
     assert d.params() == ch.hop
+    assert "lockpoint type 't' = 116" in d.learned.toolTip()
     d.i_window.setValue(1.5)
+    d.confirm.setChecked(True)
+    d.falc_max.setValue(0.02)
     d.who.setCurrentIndex(0)
+    assert not d.relock.isEnabled() and not d.falc.isEnabled()  # only for a cavity lock
     d._forget()
     p = d.params()
-    assert p == HopParams(enabled=True, cavity=False, i_nom=151.25, i_window=1.5)  # measured values forgotten
+    assert p == HopParams(enabled=True, cavity=False, shg=True, relock="lockpoint", i_nom=151.25, i_window=1.5,
+                          confirm=True, falc_max=0.02)  # measured values forgotten
+
+
+def test_recovery_and_setup_dialogs(app, demo):
+    rec = {"time": "2026-10-13 12:00:00", "channel": 7, "ok": True, "outcome": "jumped +6.000 GHz: relocked",
+           "took_s": 42.0, "notes": [[1.0, "map 1"], [None, "locked"]],
+           "maps": [{"v": 70.0, "points": [[150.0, 6000.0, 0, False], [149.9, 6025.0, 0, True],
+                                           [150.1, -10.0, 1, False]],
+                     "bands": [[150.6, 151.8, 151.2, -300.0]]}],
+           "sweeps": [{"why": "operating point", "i": 151.2, "ok": True, "text": "single mode", "y": [0.0, 1.0, 0.0]}],
+           "scan": {"x_pred": 70.0, "window_v": 0.375, "cands": [[70.01, 0.8, "t"], [71.4, 0.15, "t"]],
+                    "choice": [70.01, 0.8, "t", "peak at 70.010 V"], "x": [69.0, 70.0, 71.0], "y": [0.0, 0.8, 0.0]},
+           "falc": {"name": "falc1:input:offset", "offset0": 0.0, "dc0": 0.009, "error": [0.009, 0.01, 0.008],
+                    "offset": -0.009, "dc": 0.0001}}
+    d = gui.RecoveryDialog(None, rec)
+    d.show()
+    spin(app, 0.1)
+    tabs = d.findChild(QtWidgets.QTabWidget)
+    assert [tabs.tabText(k) for k in range(tabs.count())] == ["Steps", "Map", "SHG sweeps", "Cavity peaks",
+                                                              "Error signal"]
+    for k in range(tabs.count()):
+        tabs.setCurrentIndex(k)
+        spin(app, 0.05)  # every plot paints
+    d.close()
+    empty = gui.Plot()
+    empty.resize(300, 100)
+    empty.grab()  # nothing to show, no trouble
+
+    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"])
+    e.start()
+    try:
+        assert wait_for(lambda: 7 in e.channels, 5)
+        e.link(7, demo.dlcs[2].key, 1)
+        from wmlock.modehop import HopParams
+
+        e.set_hop_params(7, HopParams(enabled=True, cavity=True, shg=True))
+        s = gui.SetupDialog(None, e, 7)
+        assert wait_for(lambda: (app.processEvents(), e.channels[7].setup is not None)[1], 5)
+        spin(app, 0.2)
+        html = s.view.toPlainText()
+        assert "Cavity lock" in html and "relock by lockpoint" in html and "SHG" in html
+        s.close()
+    finally:
+        e.stop()
 
 
 def test_row_shows_a_recovery(app):
@@ -215,6 +272,44 @@ def test_row_shows_a_recovery(app):
         spin(app, 0.6)
         assert row.btn.text() == "Locked" and "⟲" in row.info.text()
         assert "last recovery: jumped" in row.wl.toolTip()
+    finally:
+        win.close()
+        spin(app, 0.1)
+        demo.close()
+
+
+def test_row_asks_before_each_step(app):
+    from wmlock.modehop import HopParams
+    from wmlock.sim import Demo, SimWavemeter
+
+    demo = Demo(discovery_port=0, wavemeter=SimWavemeter(noise=0.3, amplitude=0.0, walk=0.0), exposure=0.004)
+    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"])
+    win = gui.MainWindow(e, lambda: None)
+    e.start()
+    win.show()
+    try:
+        assert wait_for(lambda: (app.processEvents(), 7 in win.rows and e.channels[7].freq > 0)[1], 5)
+        e.link(7, demo.dlcs[2].key, 1)
+        e.setpoint_to_current(7)
+        e.set_hop_params(7, HopParams(enabled=True, cavity=True, shg=True, confirm=True))
+        ch, row = e.channels[7], win.rows[7]
+        assert wait_for(lambda: (app.processEvents(), ch.guard.armed)[1], 5)
+        demo.laser(7).lock.jump(1)
+        assert wait_for(lambda: (app.processEvents(), bool(ch.hop_prompt))[1], 5)
+        spin(app, 0.1)
+        assert row.btn.text() == "Continue" and row._state == "asking"
+        assert row.info.text().startswith("next: Take the laser over")
+        row.show_menu(row.rect().center())
+        items = [a.text() for a in row._menu.actions()]
+        assert any(t.startswith("Continue: Take the laser over") for t in items) and "Stop recentering" in items
+        row._menu.close()
+        row._clicked()  # Continue
+        assert wait_for(lambda: (app.processEvents(), ch.hop_prompt.startswith("The laser is"))[1], 5)
+        e.cancel_recovery(7)
+        assert wait_for(lambda: (app.processEvents(), ch.state == "off")[1], 5)
+        assert "recovery stopped" in ch.message and "cavity lock left off" in ch.message
+        spin(app, 0.1)
+        assert row.btn.text() == "Lock"
     finally:
         win.close()
         spin(app, 0.1)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from pathlib import Path
 
 from . import config as cfgfile
 from .engine import Engine
@@ -36,10 +37,10 @@ def main(argv=None) -> int:
         for ch, name in demo.names.items():
             config.setdefault("channels", {}).setdefault(str(ch), {"name": name})
         config.setdefault("reference", {"channel": demo.REFERENCE})
-        shg = config["channels"][str(demo.SHG)]  # cavity-locked, with mode-hop recovery on
+        shg = config["channels"][str(demo.SHG)]  # cavity-locked SHG laser, with mode-hop recovery on
         shg["link"] = {"device": demo.dlcs[2].key, "laser": 1}  # its port is new every time
         shg.setdefault("setpoint_nm", demo.wavelength(demo.SHG))
-        shg.setdefault("hop", {"enabled": True, "cavity": True, "i_nom": 150.0})
+        shg.setdefault("hop", {"enabled": True, "cavity": True, "shg": True, "i_nom": 150.0})
         make_source, targets, extra = demo.make_source, demo.targets, demo.extra_devices
     else:
         if args.http:
@@ -63,7 +64,10 @@ def main(argv=None) -> int:
             def make_source(sink):
                 return DllSource(sink, dll, interval, chans)
 
-    engine = Engine(config, make_source, discovery_targets=targets, extra_devices=extra)
+    log_path = Path(path).with_name(Path(path).stem.lstrip(".") + "-recoveries.jsonl")
+    if Path(path).name.startswith("."):
+        log_path = log_path.with_name("." + log_path.name)
+    engine = Engine(config, make_source, discovery_targets=targets, extra_devices=extra, log_path=log_path)
     try:
         from .gui import run
 
