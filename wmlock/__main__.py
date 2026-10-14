@@ -40,7 +40,7 @@ def main(argv=None) -> int:
         shg = config["channels"][str(demo.SHG)]  # cavity-locked SHG laser, with mode-hop recovery on
         shg["link"] = {"device": demo.dlcs[2].key, "laser": 1}  # its port is new every time
         shg.setdefault("setpoint_nm", demo.wavelength(demo.SHG))
-        shg.setdefault("hop", {"enabled": True, "cavity": True, "shg": True, "i_nom": 150.0})
+        shg.setdefault("hop", {"enabled": True, "cavity": True, "shg": True, "i_nom": 149.58})  # measured
         make_source, targets, extra = demo.make_source, demo.targets, demo.extra_devices
     else:
         if args.http:

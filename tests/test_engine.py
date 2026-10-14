@@ -296,23 +296,27 @@ def test_shg_laser_put_back_on_the_right_peak(quiet_demo, tmp_path):
     e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, step=0.2),
                        log_path=tmp_path / "log.jsonl")
     try:
+        e.engage(demo.SHG)  # Relock: watch it
+        assert ch.state == "on" and not ch.lock.active  # watched, not locked to the wavemeter
         assert wait_for(lambda: ch.cavity_on is True and ch.guard.armed and ch.shg_txt == "locked", 5)
         shg.lock.jump(1)  # 'locked', one free spectral range off
         assert wait_for(lambda: ch.state == "recovering", 5)
-        assert wait_for(lambda: ch.state == "off" and shg.lock.locked(), 20), ch.message
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked() and "fine" in ch.note, 20), ch.message
         assert abs(ch.error_mhz) < 3 and "laser itself was fine" in ch.note and not ch.message
         assert shg.lock.peak == pytest.approx(shg.lock.f_res, abs=1e-12) and shg.lock.shg_state()[0] == 5
         assert dlc.written("laser1:dl:lock:lock-enabled") == [False, True]
         assert ch.hop.lp_code == ord("t") and ch.hop.falc_sign == 1  # learned
         assert abs(shg.lock.dc()) < 0.002  # the FALC's input offset nulled the error signal's DC level
 
-        assert wait_for(lambda: ch.guard.armed, 5)
+        assert wait_for(lambda: ch.guard.armed, 5)  # watching it again
         shg.hop_mode(-1)  # the master hops: its lock relocks 6 GHz away and calls that locked
         assert wait_for(lambda: ch.state == "recovering", 5)
-        assert wait_for(lambda: ch.state == "off" and not ch.message and "recentered" in ch.note, 60), ch.message
+        assert wait_for(lambda: ch.state == "on" and not ch.message and "recentered" in ch.note, 60), ch.message
         assert shg.lock.locked() and abs(ch.error_mhz) < 3 and shg.ecdl.m == 0
         assert shg.lock.shg_state()[0] == 5 and "single mode" in ch.note
-        assert_gentle(currents_written(dlc, 1), 148.0, 152.0)
+        (lo, hi), off = ch.last["i_window"], ch.last["act_offset"]  # measured: 147.58 ... 151.58 mA
+        assert lo == pytest.approx(147.58) and hi == pytest.approx(151.58)
+        assert_gentle(currents_written(dlc, 1), lo - off - 1e-3, hi - off + 1e-3)  # set (off: as the piezo was)
         assert ch.last["ok"] and ch.last["maps"] and ch.last["scan"]["x"]  # kept for a look...
         lines = (tmp_path / "log.jsonl").read_text().splitlines()
         assert len(lines) == 2 and "relocked, recentered" in lines[1]  # ...and logged
@@ -325,16 +329,17 @@ def test_step_by_step_through_the_engine(quiet_demo):
     shg = demo.laser(demo.SHG)
     e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, confirm=True))
     try:
+        e.engage(demo.SHG)
         assert wait_for(lambda: ch.cavity_on is True and ch.guard.armed, 5)
         shg.lock.jump(-1)
         assert wait_for(lambda: ch.hop_prompt.startswith("Take the laser over"), 5)
         assert dlc.written("laser1:dl:lock:lock-enabled") == []  # nothing done before you say so
         for _ in range(12):
-            if not wait_for(lambda: ch.hop_prompt or ch.state == "off", 10) or ch.state == "off":
+            if not wait_for(lambda: ch.hop_prompt or ch.state != "recovering", 10) or ch.state != "recovering":
                 break
             e.confirm_step(demo.SHG)
-            assert wait_for(lambda: not ch.hop_prompt or ch.state == "off", 2)
-        assert wait_for(lambda: ch.state == "off", 10) and shg.lock.locked() and not ch.message, ch.message
+            assert wait_for(lambda: not ch.hop_prompt or ch.state != "recovering", 2)
+        assert wait_for(lambda: ch.state == "on", 10) and shg.lock.locked() and not ch.message, ch.message
     finally:
         e.stop()
 
@@ -395,5 +400,82 @@ def test_recovery_refuses_a_current_outside_its_window(quiet_demo):
         e.recenter(1)
         assert wait_for(lambda: ch.state == "off" and ch.message, 5)
         assert "outside 144.00 … 146.00 mA" in ch.message and dlc.written("laser1:dl:cc:current-set") == []
+    finally:
+        e.stop()
+
+
+def test_relock_only_watches_a_laser_its_dlc_pro_locks(quiet_demo):
+    """For a laser its DLC pro locks to a cavity the button is Relock: it watches the laser, and never
+    moves the piezo to the wavemeter (that is the cavity lock's job); after a hop it relocks it."""
+    import time
+
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, step=0.2))
+    try:
+        assert ch.relock
+        e.set_setpoint(demo.SHG, C_NM_THZ / (ch.freq + 20e-6))  # 20 MHz off: a wavemeter lock would pull
+        e.engage(demo.SHG)
+        assert ch.state == "on" and not ch.lock.active and not ch.message
+        time.sleep(1.0)
+        assert dlc.written("laser1:scan:offset") == []  # watched, not locked to the wavemeter
+        assert wait_for(lambda: ch.guard.armed, 5)
+        e.toggle(demo.SHG)  # click again: stop watching
+        assert ch.state == "off" and not ch.guard.armed
+        e.engage(demo.SHG)
+        assert wait_for(lambda: ch.guard.armed, 5)
+        shg.lock.jump(1)
+        assert wait_for(lambda: ch.state == "recovering", 5)
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked() and bool(ch.note), 30), ch.message
+        assert shg.lock.peak == pytest.approx(shg.lock.f_res, abs=1e-12)
+    finally:
+        e.stop()
+
+
+def test_relock_relocks_a_laser_found_unlocked(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, step=0.2))
+    try:
+        dlc.execute("(param-set! 'laser1:dl:lock:lock-enabled #f)")  # turned off by hand, say
+        assert wait_for(lambda: ch.cavity_on is False, 5) and not shg.lock.locked()
+        e.engage(demo.SHG)  # Relock
+        assert ch.state == "recovering" and ch.hop_why == "cavity lock off"
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 60), ch.message
+        assert abs(ch.error_mhz) < 3 and "relocked" in ch.note and shg.lock.shg_state()[0] == 5
+        assert wait_for(lambda: ch.guard.armed, 5)  # and watched from now on
+    finally:
+        e.stop()
+
+
+def test_relock_needs_recovery_enabled(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=False, cavity=True, shg=True))
+    try:
+        e.engage(demo.SHG)
+        assert ch.state == "off" and "mode-hop recovery is off" in ch.message
+        assert dlc.written("laser1:scan:offset") == []
+    finally:
+        e.stop()
+
+
+def test_nominal_current_is_the_measured_one(quiet_demo):
+    """The SHG laser's measured current is 0.42 mA below its set current: the nominal current, its
+    window and what is shown are measured; the recovery writes set currents to match."""
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, step=0.2))
+    try:
+        assert wait_for(lambda: ch.hop.i_nom and ch.current is not None, 5)
+        assert ch.hop.i_nom == pytest.approx(149.58, abs=1e-3) and ch.current == pytest.approx(149.58, abs=1e-3)
+        assert ch.current_set == pytest.approx(150.0)
+        e.engage(demo.SHG)
+        assert wait_for(lambda: ch.guard.armed, 5)
+        shg.hop_mode(+1)
+        assert wait_for(lambda: ch.state == "recovering", 5)
+        assert wait_for(lambda: ch.state == "on" and "recentered" in ch.note, 60), ch.message
+        assert_gentle(currents_written(dlc, 1), 148.0, 152.0)  # set: the measured 147.58 ... 151.58
+        assert "mA measured" in ch.note and ch.last["i_window"] == [147.58, 151.58]
+        assert ch.last["act_offset"] == pytest.approx(-0.42, abs=0.01)
     finally:
         e.stop()

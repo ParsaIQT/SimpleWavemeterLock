@@ -5,12 +5,13 @@ Every run checks the safety rules: the current never leaves its window and never
 than STEP_MAX in one write, and nothing is written that is not allowed."""
 import math
 import random
+import re
 
 import pytest
 
 from wmlock.dlcpro import DecopError, DLCPro
 from wmlock.modehop import (COMMANDS, FALC_OFFSET, STEP_MAX, WRITABLE, Failed, Guard, HopParams, Move, Point,
-                            Read, Recenter, Runner, Set, analyse, perform)
+                            Read, Recenter, Runner, Set, _steps, analyse, perform)
 from wmlock.sim import ECDL, FakeDLCPro, SimLocked
 
 I0, V0 = 150.0, 70.0
@@ -41,6 +42,12 @@ class Bench:
         self.rng = random.Random(seed)
         self.pending = []
         self.refuse = None  # (part of a name, exception): fail the next operation on it, once
+        for name in ("dl:cc:current-set", "scan:offset"):  # the laser follows each change as it is made
+            self.dlc.on_set["laser1:" + name] = self._settle
+
+    def _settle(self, _value):
+        if self.lock is None or not self.lock.locked():
+            self.laser.lase(self.V + (self.lock.dv if self.lock is not None else 0.0), self.act)
 
     def lock_it(self, **kwargs) -> SimLocked:
         self.lock = SimLocked(self.dlc, 1, self.laser, self.target, **kwargs)
@@ -54,10 +61,15 @@ class Bench:
     def V(self):
         return self.dlc.params["laser1:scan:offset"]
 
+    @property
+    def act(self):
+        """The current the laser runs at (measured)."""
+        return self.dlc.current_act(1)
+
     def freq(self):
         if self.lock is not None:
             return self.lock.frequency()
-        return self.laser.freq(self.V, self.I)
+        return self.laser.freq(self.V, self.act)
 
     def reading(self):
         self.t += self.dt
@@ -95,14 +107,14 @@ class Bench:
         """True distance (mA) from the operating point to the edge of the lasing mode's stable range."""
         las = self.laser
         v = self.V + (self.lock.dv if self.lock is not None else 0.0)
-        return (las.fsr / 2 - las.hysteresis - abs(las.misalignment(las.m, v, self.I))) / abs(las.ki - las.ksi)
+        return (las.fsr / 2 - las.hysteresis - abs(las.misalignment(las.m, v, self.act))) / abs(las.ki - las.ksi)
 
     def second_mode(self):
         """The power fraction in a second mode at the operating point."""
         las = self.laser
         v = self.V + (self.lock.dv if self.lock is not None else 0.0)
-        las.lase(v, self.I)
-        comps = las.components(v, self.I)
+        las.lase(v, self.act)
+        comps = las.components(v, self.act)
         return comps[1][0] if len(comps) > 1 else 0.0
 
     def single_mode(self):
@@ -236,7 +248,8 @@ def test_nothing_within_reach_fails_and_puts_everything_back():
     laser = ECDL(400.0, seed=7)
     target = laser.freq(V0, I0) + 60e-3  # 60 GHz away: another diode mode, beyond current and piezo
     b, rec, r = recover(laser, target)
-    assert r.state == "failed" and r.restored and "reach" in r.error
+    assert r.state == "failed" and r.restored and "piezo can bring onto the target" in r.error, r.error
+    assert float(re.search(r"the nearest mode was ([\d.]+) GHz", r.error).group(1)) > 50  # (less the tuning)
     assert (b.I, b.V) == (I0, V0)
 
 
@@ -309,6 +322,133 @@ def test_monte_carlo_over_random_lasers():
             feasible += 1
             succeeded += r.state == "done"
     assert feasible > 120 and succeeded >= 0.97 * feasible
+
+
+# ---------------------------------------------- hysteresis: which way the current comes
+def hysteretic_laser(h, a0, **kwargs):
+    """A laser on its target mode, a0 GHz from the middle of it, whose modes hold on h GHz past where
+    they would not have started: sweeping up, it hops onto a mode later than it hops off it sweeping
+    down, and in between either mode can lase, whichever it was on."""
+    laser = ECDL(400.0, hysteresis=h, seed=1, **kwargs)
+    target = laser.freq(V0, I0)
+    laser.nudge(-a0)
+    laser.freq(V0, I0)
+    assert laser.m == 0
+    return laser, target
+
+
+def test_a_mode_found_sweeping_one_way_is_used_sweeping_that_way():
+    """As on your laser: sweeping up, the target's mode lases over 2.5 mA of the window; sweeping
+    down, only over its last 0.1 mA. Where it lases both ways is too narrow to use: it is used as found
+    sweeping up, parked by sweeping up to the middle, and holds there."""
+    laser, target = hysteretic_laser(2.7, 3.5)
+    b, rec, r = recover(laser, target, quick=False)
+    assert r.state == "done" and rec.maps == 1, r.error
+    (mode,) = [m for m in rec.modes if abs(m.at(I0)) < 1000]
+    assert sum(z - a for a, z in mode.up) > 2.0 and sum(z - a for a, z in mode.stable) <= 0.1 + 1e-9
+    assert any(n.startswith("parked at 148.97 mA sweeping up") for n in rec.notes), rec.notes
+    parking = [pt[0] for pt in rec.record["maps"][0]["points"] if pt[2] == 3]
+    assert parking[0] < 148.2 and all(y > x for x, y in zip(parking, parking[1:]))  # from the bottom, up
+    assert laser.m == 0 and abs(b.off_mhz()) < 5
+    assert laser.margins(b.V, b.act)[1] > 2.0  # mA to where it would hop off, either way
+
+
+def test_parking_the_other_way_finds_another_mode():
+    """The same current, come to from above, gives the neighbouring mode: why it parks the way it found it."""
+    laser, target = hysteretic_laser(2.7, 3.5)
+    b, rec, r = recover(laser, target, quick=False)
+    assert r.state == "done" and laser.m == 0
+    for x in _steps(b.act, 152.0, 0.1) + _steps(152.0, b.act, 0.1):  # over the top, and back down to it
+        laser.lase(b.V, x)
+    assert laser.m == -1 and laser.margins(b.V, b.act)[1] > 0  # (it would hold that one too)
+
+
+def test_a_failed_recovery_leaves_the_laser_on_the_mode_it_began_on():
+    """With hysteresis, putting the current back is not enough: the laser can come back on another
+    mode. Giving up, it goes back the way that gives the mode it was on, as the first map saw."""
+    laser, f0 = hysteretic_laser(2.2, -3.0)
+    start = laser.freq(V0, I0)
+    b, rec, r = recover(laser, f0 + 60e-3, quick=False)  # 60 GHz away: out of reach
+    assert r.state == "failed" and r.restored and (b.I, b.V) == (I0, V0), r.error
+    assert any(n.startswith("back at 150.00 mA sweeping down") for n in rec.notes), rec.notes
+    assert laser.m == 0 and b.freq() == pytest.approx(start, abs=1e-9)  # as it was
+    laser.lase(V0, 148.0)  # (down to the bottom of the window and straight back: the next mode)
+    laser.lase(V0, I0)
+    assert laser.m == 1
+
+
+def test_scattered_readings_are_taken_for_two_modes():
+    """On two modes at once the wavemeter reads now one, now the other: readings scattered about the
+    mode's line are cut out of its ranges, as where the SHG sweep shows two modes."""
+    rng = random.Random(3)
+    pts = []
+    for leg, (a, b, up) in enumerate(((148.0, 152.0, True), (152.0, 148.0, False)), start=1):
+        for k in range(41):
+            i = a + (b - a) * k / 40
+            pts.append(Point(i, -250.0 * (i - 150.0) + rng.gauss(0, 30.0 if i > 151.0 else 1.0), leg, up))
+    res = analyse(pts, 0.1)
+    (m,) = res.modes
+    assert res.noise < 3 and m.up[0][0] == pytest.approx(148.0) and m.down[0][0] == pytest.approx(148.0)
+    widest = max(m.hold, key=lambda r: r[1] - r[0])
+    assert widest[0] == pytest.approx(148.0) and 150.8 <= widest[1] <= 151.05
+    assert sum(z - a for a, z in m.hold if a > 151.0) < 0.5  # what is left beyond: scraps
+
+
+def test_currents_are_shown_as_measured():
+    """The DLC pro measures 0.6 mA more than it is set to: the nominal current, the window and all it
+    says are measured currents; what it writes are set currents."""
+    laser = ECDL(400.0, i0=150.6, seed=1)  # (it lases on the measured current)
+    target = laser.freq(V0, 150.6)
+    laser.nudge(3.9)
+    laser.freq(V0, 150.6)
+    b = Bench(laser, target)
+    b.dlc.bias[1] = 0.6
+    p = HopParams(enabled=True, i_nom=150.6)
+    rec = Recenter(p, I0, V0, 148.0, 152.0, 60.0, 80.0, act_offset=0.6)
+    assert rec.nominal == pytest.approx(150.0)
+    r = b.run(rec)
+    check_safety(b, 148.0, 152.0, p)
+    assert r.state == "done", r.error
+    assert laser.m == 0 and abs(b.off_mhz()) < 5
+    assert r.result.summary.startswith("recentered 150.60 → ") and "mA measured" in r.result.summary
+    assert rec.final_act == pytest.approx(b.act) and rec.notes[0].startswith("map 1 at 70.00 V")
+    assert "148.60" in rec.notes[0] or "152.60" in rec.notes[0] or "sweeping" in rec.notes[0]
+    assert min(pt[0] for pt in rec.record["maps"][0]["points"]) == pytest.approx(148.6)
+
+
+def strong_case(seed):
+    """A random laser with strong hysteresis (up to 0.6 FSR, more one way than the other), on its
+    target mode anywhere it can lase: recentering it."""
+    rng = random.Random(seed)
+    fsr = rng.uniform(3, 10)
+    kv = rng.choice([-1, 1]) * rng.uniform(0.2, 0.8)
+    laser = ECDL(400.0, fsr=fsr, kv=kv, ki=rng.uniform(-0.5, -0.1), ksv=kv * rng.uniform(0.6, 0.95),
+                 ksi=rng.uniform(-4, -1), hysteresis=rng.uniform(0.15, 0.6) * fsr,
+                 multimode=rng.uniform(0.02, 0.1) * fsr, seed=seed, skew=rng.uniform(-0.5, 0.5))
+    lo, hi = laser.limits()
+    target = laser.freq(V0, I0)
+    laser.nudge(-rng.uniform(lo + 0.2, hi - 0.2))
+    laser.freq(V0, I0)
+    return laser, target, rng.choice([0.3, 1.0, 3.0])
+
+
+def test_monte_carlo_over_strongly_hysteretic_lasers():
+    done = 0
+    for seed in range(80):
+        laser, target, noise = strong_case(seed)
+        start = laser.freq(V0, I0)
+        b, rec, r = recover(laser, target, noise=noise, seed=seed, quick=False)
+        if r.state == "done":
+            done += 1
+            assert abs(b.off_mhz()) < 5 + 3 * noise, seed
+            laser.lase(b.V, b.act)
+            assert laser.margins(b.V, b.act)[1] > 0.25, seed  # well clear of where it hops off
+            assert len(laser.components(b.V, b.act)) == 1, seed  # one mode
+        else:
+            assert r.restored and (b.I, b.V) == (I0, V0), seed
+            if rec.home is not None:
+                assert b.freq() == pytest.approx(start, abs=1e-9), seed  # on the mode it began on
+    assert done >= 0.85 * 80, done
 
 
 # ------------------------------------------------------------------ runner
@@ -630,11 +770,13 @@ def test_step_by_step():
             runner.on_reading(*b.reading())
     assert runner.state == "done", runner.error
     steps = ["Take the laser over: turn its cavity lock off (now locked), turn the SHG cavity's lock off",
-             "Map the modes: sweep the current 148.00 … 152.00 mA in 0.1 mA steps (80 readings) at 70.00 V, "
-             "scanning the SHG cavity", "Go to ", "Lock the SHG cavity (single mode", "Start the scan and find the "
-             "cavity peak", "Null the error signal's DC level (+9.0 mV): FALC input offset +0.0000 → -0.0090 V",
+             "Map the modes: by way of 152.00 mA go to 148.00 mA, then sweep the current up to 152.00 mA and back "
+             "down in 0.1 mA steps (81 readings) at 70.00 V, scanning the SHG cavity",
+             "Park at 151.", "Lock the SHG cavity (single mode", "Start the scan and find the "
+             "cavity peak", "Null the error signal's DC level (+9.",
              "Select the lockpoint at ", "Lock to the peak at "]
     assert len(asked) == len(steps) and all(a.startswith(s) for a, s in zip(asked, steps)), asked
+    assert "mA, sweeping up from 148.00 mA as the map found the mode there (" in asked[2]
 
 
 def test_stopping_at_a_step_puts_everything_back():

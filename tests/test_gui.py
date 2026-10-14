@@ -293,7 +293,11 @@ def test_row_asks_before_each_step(app):
         e.setpoint_to_current(7)
         e.set_hop_params(7, HopParams(enabled=True, cavity=True, shg=True, confirm=True))
         ch, row = e.channels[7], win.rows[7]
+        spin(app, 0.1)
+        assert row.btn.text() == "Relock" and "does not lock it to the wavemeter" in row.btn.toolTip()
+        row._clicked()  # Relock: watch it (it is locked, on target: nothing else happens)
         assert wait_for(lambda: (app.processEvents(), ch.guard.armed)[1], 5)
+        assert row.btn.text() == "Watching" and row._state == "on" and not ch.lock.active
         demo.laser(7).lock.jump(1)
         assert wait_for(lambda: (app.processEvents(), bool(ch.hop_prompt))[1], 5)
         spin(app, 0.1)
@@ -309,7 +313,7 @@ def test_row_asks_before_each_step(app):
         assert wait_for(lambda: (app.processEvents(), ch.state == "off")[1], 5)
         assert "recovery stopped" in ch.message and "cavity lock left off" in ch.message
         spin(app, 0.1)
-        assert row.btn.text() == "Lock"
+        assert row.btn.text() == "Relock"  # click to relock it
     finally:
         win.close()
         spin(app, 0.1)

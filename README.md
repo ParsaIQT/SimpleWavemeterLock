@@ -14,7 +14,9 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
   way TOPAS finds them, by UDP broadcast) with its serial number, system label
   and the lasers it drives (`laser1` … `laser4`). Pick one. **Enter IP
   address…** is there for controllers on another subnet.
-* **Lock** runs a simple PI loop that only touches `laserN:scan:offset`.
+* **Lock** runs a simple PI loop that only touches `laserN:scan:offset`. For a laser its
+  DLC pro locks to a cavity, the button is **Relock** instead: it never touches the piezo, it
+  watches the laser and relocks it after a mode hop.
 * **Reference laser** (optional): a laser locked to a stable cavity corrects the
   wavemeter's drift for every other channel, and is ignored automatically while it
   mode-hops, unlocks or loses light.
@@ -64,6 +66,7 @@ channel as soon as the WLM has a new result, and shows the channels ticked
 |---|---|
 | Right-click a channel | Link laser ▸ controller ▸ laserN, Enter IP address…, Rescan LAN, Unlink, Setpoint = current reading, Lock settings…, Mode-hop recovery…, Recenter now, Check setup…, Last recovery…, Use as reference laser, Rename…, Hide channel |
 | **Lock** button | Engage or release. Without a setpoint it locks to the current reading. Green means locked; a red bar means it unlocked itself, and the reason is shown under the deviation. Amber *Recentering* means a mode-hop recovery is running: click to stop it (everything goes back). Blue *Continue*: step by step, it waits for you to allow the step shown on the row. |
+| **Relock** button | For a laser its DLC pro locks to a cavity (*Mode-hop recovery… ▸ Locked by its DLC pro*), in place of Lock: this program does not lock it to the wavemeter. Click it to have the laser watched (*Watching*, green) and relocked after a mode hop; if it is not locked on target when you click, it is relocked there and then. Normally it does nothing at all. Click *Watching* to stop. |
 | `set` field | Setpoint as vacuum wavelength in nm. Type and press Enter, or put the cursor next to a digit and use ↑/↓ or the mouse wheel to step that digit. This works while locked, so you can walk the laser. |
 | Double-click the name | Rename |
 | Right-click empty space | Rescan LAN (F5), Show hidden channels, Always on top, Larger/smaller digits (Ctrl +/−); with `--sim`, Simulate a fault |
@@ -180,24 +183,36 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   (a DLC pro lock with PDH and FALC, say).
 * **It has an SHG stage**: for a TA-SHG / DL-SHG pro. Its SHG cavity is used to see how
   single-mode the master is, and is relocked afterwards (see *SHG lasers* below).
-* **Nominal current**: the laser's normal current, read from the controller when you
-  enable recovery. The current always stays within **± 2 mA** of it (you set the
-  window), and never above the controller's own `current-clip`.
+* **Nominal current**: the laser's normal current **as measured** (`current-act`, the DLC pro's
+  actual current), read from the controller when you enable recovery. The current always stays
+  within **± 2 mA** of it (you set the window), and never above the controller's own
+  `current-clip`. The set current usually differs from the measured one (a current offset,
+  feedforward from the piezo, …): a recovery writes the set current, offset by the difference
+  it finds when it starts, and every current it shows is measured.
 * A **hop** is the laser off its target by more than 100 MHz for 2 s, after it has been on
   target. The target is the setpoint (`set`). For a cavity-locked laser, type the
   wavelength it has when locked on the right peak (or *Setpoint = current reading* while it
-  is), and leave it unlocked by this program. The target follows the wavemeter's slow
-  drift for such a laser. With a reference laser, the corrected reading is used. On the
-  reference laser itself, the target is where the reference says it should read.
-* **Relock** (cavity only): *by lockpoint*, as you would by hand, or *re-enable the lock*
+  is), then click **Relock** on its row: it is watched from then on. The target follows the
+  wavemeter's slow drift for such a laser. With a reference laser, the corrected reading is
+  used. On the reference laser itself, the target is where the reference says it should read.
+* **Relock by** (cavity only): *by lockpoint*, as you would by hand, or *re-enable the lock*
   for a lock that finds its resonance by itself (*lock without lockpoint*). The default
   follows the DLC pro's `lock-without-lockpoint` setting.
 * **The right peak is within ± 150 MHz** of where the wavemeter puts the setpoint.
 * **Null the error signal's DC level with the FALC pro's input offset, by at most 0.05 V.**
 * **Step by step**: before each step, the recovery waits for you (see *Before the first run*).
 
-What happens after a hop (the row turns amber and shows each step; it takes 10 to 60 s,
-depending on how often the wavemeter reads that channel, about a minute with an SHG stage):
+**Which way the current comes matters.** A mode, once lasing, holds on past the point where it
+would not have started: sweeping the current up, the laser hops onto a mode later than it hops
+off it sweeping down (hysteresis). So where a mode lases sweeping up can be quite different from
+where it lases sweeping down, and the same current gives one mode or the other depending on
+where the current came from. The map keeps the two directions apart; a range where the target's
+mode lases sweeping either way is enough; and the laser is brought to its operating point the
+way the map found its mode there.
+
+What happens after a hop (the row turns amber and shows each step; at 10 readings a second of
+that channel it takes about half a minute, a minute with an SHG stage, and proportionally longer
+if the wavemeter reads it less often):
 
 1. **Take over.** A wavemeter lock is suspended. A cavity lock is disabled
    (`laserN:dl:lock:lock-enabled`), so is the SHG cavity's lock, and if that leaves the
@@ -205,24 +220,35 @@ depending on how often the wavemeter reads that channel, about a minute with an 
    input, error signal, FALC pro, the lockpoint you selected, scope channels).
 2. **Quick check.** If the laser is close to its target (the cavity lock had caught a wrong
    peak, say), the piezo tunes it back, and steps of the current check that it is clear of
-   the next hop. If so, go to 6.
-3. **Map.** The current is swept across its window (down, up, down) at fixed piezo, one
-   reading per 0.1 mA step. The readings fall into straight lines, one per mode, broken
-   by hops. A mode's stable range is where it lases in both sweep directions; outside it,
-   hysteresis decides which of two modes you get. With an SHG stage, its cavity is scanned
-   meanwhile, and wherever the sweep shows a second mode is cut out of the stable ranges.
-4. **Choose.** The current is set to the middle of a stable range: the one that is wide
-   (up to 1 mA either side counts) and needs the least piezo to reach the target. A range
-   that ends at the window's edge is taken to go on a little beyond it. The piezo tuning
-   (MHz/V) is measured on the way.
-5. **Tune and check.** The piezo brings the laser onto the target, watching for hops. Then
+   the next hop. If so, go to 7.
+3. **Map.** At fixed piezo, the current is ramped to the top of its window and down to the
+   bottom (so the laser starts on the mode a sweep down leaves it on), then swept **up**
+   across the window and back **down**, one reading per 0.1 mA step. The readings fall into
+   straight lines, one per mode, broken by hops: for each mode, where it lases sweeping up and
+   where sweeping down. With an SHG stage its cavity is scanned meanwhile, and wherever the
+   sweep shows a second mode is cut out of that mode's ranges; so is wherever the readings
+   scatter off the mode's line (on two modes at once the wavemeter reads now one, now the
+   other).
+4. **Choose.** Every range where a mode lases, sweeping up or sweeping down, is a candidate.
+   Where to operate in it: in the middle of where the mode holds once it lases, between where
+   it hops off sweeping up and where it hops off sweeping down; seen one way only, between
+   where it hops on and where it hops off. At least 0.2 mA past where it hops on, clear of
+   where it hops off, and inside where it lases both ways if it does there. The best is the
+   widest that way that needs the least piezo to reach the target. A range that ends at the
+   window's edge is taken to go on a little beyond it.
+5. **Park.** The current goes round by the far end of the window to the end the map's sweep
+   that way started from, and is swept that way again, a reading a step, up (or down) to the
+   operating point: the laser comes to it as it did in the map. It must be on the mode the
+   map found there (else it maps again). The piezo tuning (MHz/V) is measured there.
+6. **Tune and check.** The piezo brings the laser onto the target, watching for hops. Then
    the current is stepped ±0.5 mA (*Keep a hop at least …*) around the operating point: the
    frequency must stay on one straight line and come back, and with an SHG stage the laser
    must be single-mode at both ends and in the middle. If not, or if the piezo moved a lot
    (the modes move with it), it maps again there, up to three times.
-6. **Hand back.** The wavemeter lock is re-engaged at the setpoint. For a cavity lock, see
-   below; the wavemeter must show the right peak (within half the tolerance) for 5 readings
-   in a row, or it unlocks and tries again, up to three times.
+7. **Hand back.** The wavemeter lock is re-engaged at the setpoint (a cavity-locked laser is
+   watched again). For a cavity lock, see below; the wavemeter must show the right peak
+   (within half the tolerance) for 5 readings in a row, or it unlocks and tries again, up to
+   three times.
 
 ### SHG lasers, relocked by lockpoint
 
@@ -233,7 +259,7 @@ recovery does what you would do by hand:
 | By hand | Here |
 |---|---|
 | Unlock the master and the SHG, stop the master's scan | step 1 |
-| Scan the SHG cavity, look at its intra-cavity signal: is the master single-mode? | throughout steps 2 to 5: every map point, both ends of the margin check, and the operating point |
+| Scan the SHG cavity, look at its intra-cavity signal: is the master single-mode? | throughout steps 2 to 6: every map point, both ends of the margin check, and the operating point |
 | Lock the SHG cavity | SHG scan off, `nlo:shg:lock:lock-enabled` on; the intra-cavity signal (`nlo:pd:shg-int:photodiode`) must come back to at least half of what it was, locked, when the recovery began |
 | Start the master's scan, bring the right cavity peak into it, pick it in the XY display (scan output against Fine In 1) | the scan runs; from the DLC pro's lockpoint candidates (`dl:lock:candidates`), the tall peak where the wavemeter puts the target (scan offset − deviation / piezo tuning), within ± 150 MHz, and the only one there; it must stand at least half as tall as the right peak did last time (from the lockpoint you selected), so a transverse mode is never taken for it |
 | Correct the FALC's input offset (~0.01 V) so the error signal has no DC | the error signal's level away from the resonances, from the scope; the input offset steps against it, checking on the trace after each step that it does what it should |
@@ -251,8 +277,9 @@ modes of equal power: twice the peaks, each half as big). A second mode with les
 
 ![last recovery](docs/last_recovery.png)
 
-*Right-click ▸ Last recovery…* shows what it saw and decided: the steps, each map (modes,
-stable ranges, where the SHG sweep showed two modes), SHG sweeps (a single-mode and a
+*Right-click ▸ Last recovery…* shows what it saw and decided: the steps, each map (the sweep
+up, the sweep down and the parking sweep, in measured current; where the candidates lase; where
+the laser showed two modes), SHG sweeps (a single-mode and a
 multimode example from the map, both ends of the check, the operating point), the cavity scan
 with the candidates, where the target should be and the peak picked, and the error signal
 before and after nulling its DC. Every recovery is also appended to
@@ -263,7 +290,8 @@ before and after nulling its DC. Every recovery is also appended to
 ![check setup](docs/setup_check.png)
 
 1. *Right-click ▸ Check setup…* reads (only reads) everything a recovery would use and says
-   what looks wrong: the current and its window, the scan, the lock's state, whether it relocks
+   what looks wrong: the current (measured and set, and what makes them differ: current offset,
+   feedforward from the piezo, a limited slew rate) and its window, the scan, the lock's state, whether it relocks
    by lockpoint, **the lockpoint you selected by hand** (its type and level are what the
    recovery looks for), the lock input (should be Fine In 1) and the error-signal channel, the
    FALC pro and its input offset, the scope channels, the SHG lock, scan and scope. Nothing is
@@ -271,11 +299,14 @@ before and after nulling its DC. Every recovery is also appended to
 2. Set the setpoint while it is locked on the right peak (*Setpoint = current reading*).
 3. Tick **Step by step** and press *Recenter now*. The row turns blue and says what it is
    about to do (*next: …*); **Continue** does it, *right-click ▸ Stop recentering* puts
-   everything back. Watch each step on the DLC pro: the SHG sweep, the XY display, the
-   lockpoint it selects, the FALC offset.
-4. Then *Last recovery…*: do you agree with its verdicts on the SHG sweeps, with the peak it
-   picked, with the DC level it saw?
-5. Untick *Step by step* once you trust it.
+   everything back. Watch each step on the DLC pro: the current sweeping up and down, the SHG
+   sweep, the current sweeping to where it parks, the XY display, the lockpoint it selects, the
+   FALC offset.
+4. Then *Last recovery…*: do you agree with its map (where the target's mode lases sweeping
+   up, and sweeping down), with its verdicts on the SHG sweeps, with the peak it picked, with
+   the DC level it saw?
+5. Click **Relock** on the row: it is watched from now on (*Watching*).
+6. Untick *Step by step* once you trust it.
 
 Safety:
 
@@ -287,8 +318,11 @@ Safety:
 * Besides current and offset, a recovery writes only: the cavity lock and SHG lock on/off, the
   scan and SHG scan on/off, a scope channel's signal (given back), a FALC pro's input offset
   (within its limit of where it was), and runs `select-lockpoint`. Anything else is refused.
-* If nothing works, or after 5 minutes, everything it changed goes back where it was and
-  the cavity lock stays off, with the reason on the row. Stopping it does the same. If it
+* If nothing works, or after 10 minutes, everything it changed goes back where it was and
+  the cavity lock stays off, with the reason on the row. Stopping it does the same. With
+  hysteresis, putting the current back can leave the laser on another mode than it was: so
+  before giving up it brings the current back the way that gives the mode it began on, if the
+  first map saw which way that is. If it
   cannot tell which cavity peak is right, or the DLC pro will not take the lockpoint, the
   laser is left at its target, unlocked and scanning, for you to pick the peak. If the lock
   caught a wrong peak three times, the laser is left on its new, good operating point with
@@ -299,7 +333,7 @@ Safety:
 * A recovery only starts from a current within the window. Set the nominal current again
   after changing it by hand.
 
-*Recenter now* runs steps 1 and 3 to 6 at any time, without a hop: it re-centers a laser
+*Recenter now* runs steps 1 and 3 to 7 at any time, without a hop: it re-centers a laser
 you suspect sits near the edge of its mode. It needs a setpoint and a valid reading.
 
 Recoveries learn the laser's piezo tuning and mode spacing, the right peak's height, the
@@ -310,16 +344,23 @@ shows them, *Forget* clears them) and make later recoveries quicker and surer.
 Things to know:
 
 * This has been tested against simulated lasers and a simulated DLC pro only. Mode-hop maps:
-  a Monte Carlo over random lasers (modes 3 to 10 GHz apart, chip modes shifting by 1 to
-  4 GHz/mA, hysteresis, noisy readings near a hop) fixed 99.6 % of the hops that could be
-  fixed within the windows, restored every other one, and never let a current leave its
-  window. SHG lasers: 300 random masters that go multimode over 15 % or more of each mode,
-  quietly for the wavemeter, with a random DC level of up to ±30 mV on the error signal: 180 of
-  the 181 fixable hops were fixed; every one of the 202 recoveries ended on the right peak with
-  the SHG cavity locked and the DC nulled, 198 strictly single-mode and the other 4 with less
-  than 10 % of the power in a second mode; all 98 failures were left unlocked with every
+  a Monte Carlo over 3000 random lasers (modes 3 to 10 GHz apart, chip modes shifting by 1 to
+  4 GHz/mA, hysteresis up to 0.15 of the mode spacing, noisy readings near a hop) fixed 99.4 %
+  of the hops that could be fixed within the windows (2083 of 2095), none off target, restored
+  every other one, and never let a current leave its window; about 25 s at 10 readings a
+  second. SHG lasers: 300 random masters that go multimode over 15 % or more of each mode,
+  quietly for the wavemeter, with a random DC level of up to ±30 mV on the error signal: 179 of
+  the 181 fixable hops were fixed; every one of the 205 recoveries ended on the right peak with
+  the SHG cavity locked and the DC nulled, 198 strictly single-mode and the other 7 with less
+  than 10 % of the power in a second mode; all 95 failures were left unlocked with every
   setting put back. Waiting for fresh scope traces after each step makes an SHG recovery
   slower: about a minute.
+* Strong hysteresis (0.15 to 0.6 of the mode spacing, more one way than the other), so that
+  where a mode lases sweeping up has little to do with where it lases sweeping down: of 300
+  random lasers recentered where they were on target, 270 came out on target and clear of a
+  hop either way (the previous version, which wanted a mode lasing both ways: 262); of 300
+  after a hop, 156 (145); SHG lasers, 151 of 200 (148). On lasers with little hysteresis the
+  two do about equally well; the parking sweep makes a recovery some 10 s longer.
 * What the simulation cannot settle about a real DLC pro, and how the recovery copes:
   * `select-lockpoint x y type` takes the type as a number. The recovery tries the
     candidate's type character code first, then 0 to 3, checks the lockpoint it got
@@ -339,14 +380,16 @@ Things to know:
   * A second mode can hide in the SHG sweep if the master's mode spacing is a whole number of
     SHG cavity free spectral ranges; its main peaks would still shrink, which is caught once
     the single-mode size is known.
-* While recovery is on, it acts whenever the laser is off target with its lock on. If you
-  change the current by hand, it stands by until the laser is back on target; to work on
-  the laser for longer, untick *Recover this laser*.
+* With recovery on, a wavemeter-locked laser is watched while it is locked (*Locked*), a
+  cavity-locked one while its row says *Watching* and its cavity lock is on. If you change
+  the current by hand, it stands by until the laser is back on target; to work on the laser
+  for longer, click *Watching* (or untick *Recover this laser*).
 * In `--sim`, channel 7 (739 nm TA-SHG pro) is locked to a cavity by its DLC pro by
   lockpoint, PDH through a FALC pro with a 9 mV DC level on its error signal, and its SHG
-  cavity is locked; recovery is on. *Right-click empty space ▸ Simulate a fault* makes any
-  laser hop a mode, the cavity lock jump a peak, the master go multimode, or the error
-  signal's DC drift.
+  cavity is locked; its measured current is 0.42 mA below the set one (feedforward from the
+  piezo). Recovery is on: click **Relock** to have it watched. *Right-click empty space ▸
+  Simulate a fault* makes any laser hop a mode, the cavity lock jump a peak, the master go
+  multimode, or the error signal's DC drift.
 
 ## Troubleshooting
 
@@ -408,7 +451,9 @@ to the simulator) stays put while the wavemeter drifts and the reference hops,
 and moves when referencing is turned off. Mode-hop recovery runs against simulated
 external-cavity diode lasers, synchronously (a Monte Carlo over random lasers, checking the
 safety rules on every write) and end to end through fake controllers, for wavemeter-locked
-and cavity-locked lasers. The fake controllers also simulate a TA-SHG pro: its master's mode
+and cavity-locked lasers. The simulated lasers have hysteresis (up to 0.6 of the mode spacing,
+more one way than the other), follow every write of current and piezo as a real laser does,
+and run on two modes just before they hop. The fake controllers also simulate a TA-SHG pro: its master's mode
 content, the SHG cavity's sweep and lock, the reference cavity's transmission and PDH error
 signal with a DC level, the FALC pro's input offset, lockpoint candidates and selection; the
 synchronous tests drive them through the real client and protocol, without sockets.

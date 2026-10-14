@@ -11,21 +11,36 @@ as a lock would, leaves the laser at the very edge of its mode, where it hops ag
 cannot get back at all). Moving the current re-centers the filter on a mode that reaches the
 target, and a re-centered mode holds for a long time.
 
+Which way the current comes matters. A mode, once lasing, holds on past the point where it
+would not have started (hysteresis): sweeping up, the laser hops onto a mode later than it
+hops off it sweeping down. Where a mode lases sweeping up can be quite different from where it
+lases sweeping down, and the same current gives one mode or another depending on where the
+current came from. So the map keeps the two directions apart, and the laser is brought to its
+operating point the way the map found its mode there.
+
 The procedure (Recenter.run, a generator: see "Driving it" below)
   take over  (a laser locked by its DLC pro, or with an SHG stage) read how it is set up, turn
              its cavity lock off (and the SHG cavity's lock), and stop the scan if that starts
   near       if the laser is within reach of its target, tune the piezo onto it and check the
              margins (below). Fine: done; the cavity lock had just jumped to another peak, say.
-  map        sweep the current over its allowed window at fixed piezo, down, up and down
-             again, one reading per step. The readings fall into straight segments, one per
-             mode, separated by hops. A mode's stable range is where it lases in both sweep
-             directions (outside it, hysteresis decides which of two modes you get). With an
-             SHG stage its cavity is scanned meanwhile, and wherever the intra-cavity sweep
-             shows a second mode (cavity.py) is cut out of the stable ranges.
-  choose     a stable range that is wide (up to twice the margin either side counts) and
-             needs little piezo to reach the target from its middle (an edge that is only the
-             window's is taken to go on a little); go to that middle, or as near as lets the
-             piezo reach. The piezo tuning is measured on the way.
+  map        at fixed piezo, ramp the current to the top of its window and down to the bottom
+             (so the laser starts on the mode a down-sweep leaves it on), then sweep it up to
+             the top and back down, one reading per step. The readings fall into straight
+             segments, one per mode, separated by hops; for each mode, where it lases sweeping
+             up and where sweeping down. With an SHG stage its cavity is scanned meanwhile, and
+             wherever the intra-cavity sweep shows the mode with a second one (cavity.py) is
+             cut out of its ranges.
+  choose     for each mode and direction, a range where it lases sweeping that way (found in
+             either direction: that is enough). Where to operate in it: the middle of where the
+             mode holds once lasing, between where it hops off sweeping up and where sweeping
+             down (seen one way only: between where it hops on and off), but at least a little
+             past where it hops on and short of where it hops off (an edge that is only the
+             window's is taken to go on a little). The best is wide that way and needs little
+             piezo to reach the target.
+  park       go round by the far end of the window to the end the map's sweep that way started
+             from, then sweep the current that way, a reading a step, and stop at the operating
+             point: on the mode the map found there, else map again. The piezo tuning is
+             measured there (the first time).
   tune       piezo onto the target, at fixed current, watching for hops.
   check      step the current by +-margin around the operating point: the frequency must
              stay on one straight line and come back, i.e. no hop within the margin (and with
@@ -42,6 +57,10 @@ never changes by more than STEP_MAX per write, and the piezo stays within its li
 also refuses any other write but the few named in WRITABLE. On failure, current, offset and
 everything else it changed go back to where they were, except that a cavity lock it turned off
 stays off.
+
+Currents. The procedure writes, and works in, the set current (dl:cc:current-set); the nominal
+current and everything shown are the measured one (current-act), which differs from it by a
+fixed amount here (act_offset, measured when the recovery starts).
 
 Driving it. run() yields requests: Move(current, offset) (then the next fresh reading is
 sent in), Read(), Get(names) (their values come back), Set(name, value, restore),
@@ -239,9 +258,10 @@ class Result:
 class Point:
     i: float   # mA
     e: float   # MHz from the target, NaN: no valid reading
-    leg: int   # sweep leg
+    leg: int   # sweep leg: 1 up, 2 down (3: parking)
     up: bool   # the current was rising
-    bad: bool = False  # the SHG sweep there showed a second mode
+    bad: bool = False    # the SHG sweep there showed a second mode
+    rough: bool = False  # the reading is off its mode's line by far more than the noise
 
 
 def _merge(ranges, gap):
@@ -291,12 +311,17 @@ def _median(xs):
 
 @dataclass
 class Mode:
+    """One external-cavity mode in a map. Its current ranges (but `seen`) leave out wherever it
+    showed with a second mode: by the SHG sweep, or by readings scattered off its line."""
     e_ref: float   # MHz at i_ref
     slope: float   # MHz/mA, common to all modes
     i_ref: float
     up: list = field(default_factory=list)      # current ranges where it lased, sweeping up
     down: list = field(default_factory=list)    # ... and sweeping down
-    stable: list = field(default_factory=list)  # both: no other mode possible there
+    seen: list = field(default_factory=list)    # (up, lo, hi): where it lased, all of it
+    hold: list = field(default_factory=list)    # either way: once lasing, it holds there
+    stable: list = field(default_factory=list)  # both ways: no other mode possible there
+    bad: list = field(default_factory=list)     # where it showed with a second mode (SHG sweep, rough readings)
     n: int = 0
 
     def at(self, i: float) -> float:
@@ -304,6 +329,7 @@ class Mode:
 
 
 HOP_MIN = 150.0  # MHz: steps smaller than this are never taken for a hop
+ROUGH_MIN = 20.0  # MHz: a reading off its mode's line by less than this is never taken for two modes
 
 
 @dataclass
@@ -321,8 +347,10 @@ def analyse(points, step: float) -> MapResult:
     Within a leg, consecutive readings that differ by more than the threshold are on
     different modes; the threshold is well above the typical step-to-step change. Segments
     are grouped into modes by their frequency extrapolated to a common current with the
-    common slope. Wherever a point is bad (two modes at once, by the SHG sweep) is no mode's
-    stable range, whichever leg it was seen on."""
+    common slope. Wherever a point of a mode is bad (two modes at once, by the SHG sweep) is
+    cut out of that mode's ranges, whichever leg it was seen on; and so is a point rough, its
+    reading off the line through its neighbours by far more than the readings' noise: running on
+    two modes, the laser shows the wavemeter now one, now the other (or a mixture)."""
     legs = {}
     for p in points:
         legs.setdefault(p.leg, []).append(p)
@@ -354,6 +382,11 @@ def analyse(points, step: float) -> MapResult:
     # noise from second differences within segments (the straight line drops out): rms * sqrt(6)
     d2 = [abs(s[k + 1].e - 2 * s[k].e + s[k - 1].e) for s in segments for k in range(1, len(s) - 1)]
     noise = _median(d2) / 0.6745 / math.sqrt(6) if d2 else 0.0
+    rough = max(ROUGH_MIN, 5.0 * math.sqrt(6) * noise)
+    for s in segments:
+        for k in range(1, len(s) - 1):
+            if abs(s[k + 1].e - 2 * s[k].e + s[k - 1].e) > rough:
+                s[k].rough = True
     i_ref = _median([p.i for p in points])
     tagged = sorted(((sum(p.e - slope * (p.i - i_ref) for p in s) / len(s), s) for s in segments),
                     key=lambda x: x[0])
@@ -366,15 +399,17 @@ def analyse(points, step: float) -> MapResult:
             groups.append(([e_ref], [s]))
     modes = []
     gap = 1.5 * step + 1e-9
-    bad = _merge([(p.i - step / 2, p.i + step / 2) for p in points if p.bad], 1e-9)
     for refs, segs in groups:
         n = sum(len(s) for s in segs)
         m = Mode(sum(r * len(s) for r, s in zip(refs, segs)) / n, slope, i_ref, n=n)
+        up, down = [], []
         for s in segs:
-            rng = (min(p.i for p in s), max(p.i for p in s))
-            (m.up if s[0].up else m.down).append(rng)
-        m.up, m.down = _merge(m.up, gap), _merge(m.down, gap)
-        m.stable = _subtract(_intersect(m.up, m.down), bad)
+            (up if s[0].up else down).append((min(p.i for p in s), max(p.i for p in s)))
+        m.bad = _merge([(p.i - step / 2, p.i + step / 2) for s in segs for p in s if p.bad or p.rough], 1e-9)
+        m.seen = [(True, a, z) for a, z in _merge(up, gap)] + [(False, a, z) for a, z in _merge(down, gap)]
+        m.up, m.down = _subtract(_merge(up, gap), m.bad), _subtract(_merge(down, gap), m.bad)
+        m.hold = _subtract(_merge(up + down, gap), m.bad)
+        m.stable = _intersect(m.up, m.down)
         modes.append(m)
     gaps = [b.e_ref - a.e_ref for a, b in zip(modes, modes[1:])]
     return MapResult(modes, threshold, slope, _median(gaps) if gaps else 0.0, noise)
@@ -382,14 +417,16 @@ def analyse(points, step: float) -> MapResult:
 
 @dataclass
 class Band:
-    """A stable current range of a mode, and the operating current chosen in it."""
+    """A current range where a mode lases sweeping one way, and the operating current chosen in
+    it, to be approached sweeping that way."""
     mode: Mode
     lo: float         # mA, as mapped
     hi: float
     v: float          # scan offset it was mapped at
-    vlo: float = 0.0  # mA, the range's edges, an edge that is only the window's pushed out
-    vhi: float = 0.0
-    op: float = 0.0   # mA, where to operate: the middle, unless the piezo cannot reach from there
+    up: bool = True   # sweeping up (else down) it lases on lo..hi: park sweeping that way
+    hlo: float = 0.0  # mA, the edges of where it holds either way (an edge that is only the
+    hhi: float = 0.0  # window's pushed out a little): where it hops off, down and up
+    op: float = 0.0   # mA, where to operate
     score: float = 0.0
 
     @property
@@ -398,11 +435,21 @@ class Band:
 
     @property
     def center(self) -> float:
-        return 0.5 * (self.vlo + self.vhi)
+        return 0.5 * (self.hlo + self.hhi)
 
     @property
     def margin(self) -> float:
-        return min(self.op - self.vlo, self.vhi - self.op)
+        """mA from the operating point to where it hops off, the nearer way."""
+        return min(self.op - self.hlo, self.hhi - self.op)
+
+    @property
+    def entry(self) -> float:
+        """Where it hops on (or the window's edge it lased from), sweeping its way."""
+        return self.lo if self.up else self.hi
+
+    @property
+    def way(self) -> str:
+        return "up" if self.up else "down"
 
     @property
     def e(self) -> float:
@@ -428,11 +475,14 @@ class Recenter(CavitySteps):
     KV_PLAUSIBLE = (10.0, 5000.0)
     VERIFY_S = 10.0        # s for the cavity lock to show the right peak
     VERIFY_N = 5           # readings in a row on target that prove it
+    ARRIVE_S = 5.0         # s at most for the current to get where a quick ramp sent it
 
     def __init__(self, p: HopParams, current: float, offset: float, i_lo: float, i_hi: float,
                  v_lo: float, v_hi: float, kv: float = 0.0, cavity: bool = False, quick: bool = True,
-                 shg: bool | None = None):
-        """quick: if the laser is close to its target, first try the piezo alone (after a cavity
+                 shg: bool | None = None, act_offset: float = 0.0):
+        """Currents are set currents (what is written); act_offset is the measured current minus
+        the set current, for showing them as measured, and for the nominal current, which is.
+        quick: if the laser is close to its target, first try the piezo alone (after a cavity
         lock caught the wrong peak, say); else always map, which finds the best mode.
         cavity: its DLC pro has it locked to a cavity (take that over, relock it after).
         shg: it has an SHG stage (by default p.shg)."""
@@ -441,6 +491,13 @@ class Recenter(CavitySteps):
         self.I0, self.V0 = current, offset  # where the laser was when this began
         self.I, self.V = current, offset    # where it is now
         self.i_lo, self.i_hi, self.v_lo, self.v_hi = i_lo, i_hi, v_lo, v_hi
+        self.act_offset = act_offset
+        self.nominal = p.i_nom - act_offset if p.i_nom else current  # as a set current
+        self.edge = None                    # 'lo' or 'hi': swept there from the other end, not moved since
+        self.modes = []                     # of the last map
+        self.e0 = math.nan                  # MHz from the target when it began
+        self.home = None                    # sweeping up (True) or down to I0 gives the mode it began on
+        self.final_act = None               # mA measured at the end
         guess = kv or p.kv
         self.kv = guess or self.KV_GUESS    # MHz/V, sign included
         self.kv_known = bool(guess)
@@ -458,11 +515,14 @@ class Recenter(CavitySteps):
         self.readings = 0
         self.notes = []
         self.learned = {}                   # HopParams fields to keep, beyond kv and spacing
-        self.bad = []                       # current ranges where the SHG sweep showed two modes
         self.record = {"notes": [], "maps": [], "sweeps": []}
         CavitySteps.__init__(self, p.shg if shg is None else shg)
 
     # ---------------------------------------------------------------- helpers
+    def mA(self, i: float) -> float:
+        """A set current as measured."""
+        return i + self.act_offset
+
     def note(self, text: str):
         self.notes.append(text)
         self.record["notes"].append([round(self.t, 2) if math.isfinite(self.t) else None, text])
@@ -483,8 +543,35 @@ class Recenter(CavitySteps):
         if offset is not None:
             offset = min(max(offset, self.v_lo), self.v_hi)
             self.V = offset
+        self.edge = None
         reading = yield Move(current, offset, read)
         return self._got(reading) if read else None
+
+    def come_to(self, up: bool):
+        """To the bottom of the window by way of its top (up: ready to sweep up), or to the top by
+        way of the bottom: the laser is then on the mode a full sweep leaves it on there, as at
+        the start of the map's sweep that way. No readings: the ramps are quick."""
+        want, there, other = ("lo", self.i_lo, self.i_hi) if up else ("hi", self.i_hi, self.i_lo)
+        if self.edge == want:
+            return
+        if self.edge != ("hi" if up else "lo"):
+            yield from self.move(current=other, read=False)
+        yield from self.move(current=there, read=False)
+        yield from self.arrive()
+        self.edge = want
+
+    def arrive(self):
+        """After a quick ramp, until the measured current stops changing (if the controller limits
+        its slew rate, it lags behind what is set), at most ARRIVE_S."""
+        last = None
+        for _ in range(int(self.ARRIVE_S / 0.1)):
+            (act,) = yield Get(("dl:cc:current-act",))
+            if not isinstance(act, (int, float)) or isinstance(act, bool) or not math.isfinite(act):
+                return
+            if last is not None and abs(act - last) <= 0.005:
+                return
+            last = act
+            yield Wait(0.1)
 
     def ask(self, text: str):
         """Step by step: wait for the user before doing what `text` says."""
@@ -503,15 +590,21 @@ class Recenter(CavitySteps):
     def run(self):
         if self.cavity or self.shg:
             yield from self.take_over()
-        yield from self.read()
+        self.e0 = yield from self.read()
         for _ in range(self.RELOCK_TRIES):
             yield from self.find()
             if not self.cavity and not self.shg:
-                return self.result()
+                return (yield from self.finish())
             if (yield from self.hand_back()):
-                return self.result()
+                return (yield from self.finish())
             yield from self.take_back()
         raise Failed(f"relocking failed {self.RELOCK_TRIES} times, last: {self.relock_trouble}", keep=True)
+
+    def finish(self):
+        (act,) = yield Get(("dl:cc:current-act",))
+        if isinstance(act, (int, float)) and not isinstance(act, bool) and math.isfinite(act):
+            self.final_act = float(act)
+        return self.result()
 
     def find(self):
         """Put the laser on target, on a mode with margins: the quick way if it is near, else map."""
@@ -522,17 +615,25 @@ class Recenter(CavitySteps):
             if ((yield from self.tune()) == "ok" and (yield from self.check(self.p.margin))
                     and (yield from self.mode_ok())):
                 return
+        lo, hi = self.mA(self.i_lo), self.mA(self.i_hi)
         for _ in range(self.MAX_MAPS):
             bands = yield from self.map()
             if not bands:
-                raise Failed(f"no stable mode in {self.i_lo:.2f} … {self.i_hi:.2f} mA"
-                             + (" within reach of the piezo" if self.kv_known else ""))
-            for band in bands:
-                if not (yield from self.goto(band)):
+                yield from self.go_home()
+                raise Failed(f"no mode within {lo:.2f} … {hi:.2f} mA, sweeping up or down, "
+                             + ("that the piezo can bring onto the target" if self.kv_measured else "at all")
+                             + self.nearest())
+            while bands:
+                band = bands.pop(0)
+                if not (yield from self.park(band)):
                     break                 # not where the map said: map again
-                outcome = yield from self.tune(band)
+                if not self.kv_measured:
+                    yield from self.measure_kv()
+                    if self.kv_measured:  # the piezo's reach is known now: weigh the others again
+                        bands = self.weigh(bands)
+                outcome = yield from self.tune(band)  # (out of reach, the piezo goes as far as it may: map there)
                 if outcome == "limit":
-                    self.note(f"mode at {band.center:.2f} mA out of the piezo's reach")
+                    self.note(f"the mode at {self.mA(band.op):.2f} mA is out of the piezo's reach")
                     continue              # next candidate
                 if outcome != "ok":
                     break                 # it hopped while tuning: map again, here
@@ -542,27 +643,58 @@ class Recenter(CavitySteps):
                         and (yield from self.mode_ok())):
                     return
                 break                     # too close to a hop: map again, here
-        raise Failed(f"no mode that holds reaches the target within {self.i_lo:.2f} … {self.i_hi:.2f} mA")
+        yield from self.go_home()
+        raise Failed(f"no mode that holds reaches the target within {lo:.2f} … {hi:.2f} mA" + self.nearest())
+
+    def go_home(self):
+        """Before giving up: back to the current it began at, the way that gives the mode it was on
+        there, if the first map shows one (with hysteresis, setting the current back is not enough)."""
+        if self.home is None:
+            return
+        way = "up" if self.home else "down"
+        yield from self.ask(f"Give up: back to {self.mA(self.I0):.2f} mA sweeping {way}, onto the mode it was on")
+        self.stage = "putting it back on its mode"
+        if abs(self.V - self.V0) > 1e-6:
+            yield from self.move(offset=self.V0, read=False)
+        yield from self.come_to(self.home)
+        yield from self.move(current=self.I0, read=False)
+        e = yield from self.read()
+        self.note(f"back at {self.mA(self.I0):.2f} mA sweeping {way}: {e:+.0f} MHz from the target "
+                  f"(it began {self.e0:+.0f} MHz from it)")
+
+    def nearest(self) -> str:
+        """' (the nearest mode was ... from it)' for a failure message, after the last map ('' if none)."""
+        e = min((abs(m.at(i)) for m in self.modes for i in (self.i_lo, self.i_hi)), default=math.nan)
+        return f" (the nearest mode was {e / 1e3:.1f} GHz from it)" if math.isfinite(e) and e >= 1e3 else ""
 
     def map(self):
+        """Sweep the current up over the window, then down, at fixed piezo: the modes, and where
+        each lases sweeping up and sweeping down. Returns the candidate bands, best first."""
         self.maps += 1
-        start, v = self.I, self.V
-        n = sum(len(_steps(a, b, self.p.step)) for a, b in ((start, self.i_lo), (self.i_lo, self.i_hi),
-                                                              (self.i_hi, start)))
-        yield from self.ask(f"Map the modes: sweep the current {self.i_lo:.2f} … {self.i_hi:.2f} mA "
-                            f"in {self.p.step:g} mA steps ({n} readings) at {v:.2f} V"
-                            + (", scanning the SHG cavity" if self.shg_ok else ""))
+        v, lo, hi, step = self.V, self.i_lo, self.i_hi, self.p.step
+        n = 1 + 2 * len(_steps(lo, hi, step))
+        yield from self.ask(f"Map the modes: by way of {self.mA(hi):.2f} mA go to {self.mA(lo):.2f} mA, then sweep "
+                            f"the current up to {self.mA(hi):.2f} mA and back down in {step:g} mA steps "
+                            f"({n} readings) at {v:.2f} V" + (", scanning the SHG cavity" if self.shg_ok else ""))
         self.stage = f"mapping modes ({self.maps})"
-        points = [Point(start, self.e, 0, False)]
-        sweeps, traces = [None], [None]
-        legs = [(start, self.i_lo, False), (self.i_lo, self.i_hi, True), (self.i_hi, start, False)]
-        for leg, (a, b, up) in enumerate(legs):
-            for i in _steps(a, b, self.p.step):
-                e = yield from self.move(current=i)
-                points.append(Point(i, e, leg, up))
-                s = (yield from self.shg_sweep()) if self.shg_ok else None
-                sweeps.append(s)
-                traces.append(cavity.decimate(self._last_trace, 300) if s is not None else None)
+        yield from self.come_to(True)  # the up-sweep starts as the down-sweep will leave it
+        points, sweeps, traces = [], [], []
+
+        def at(i, e, leg, up):
+            points.append(Point(i, e, leg, up))
+            s = (yield from self.shg_sweep()) if self.shg_ok else None
+            sweeps.append(s)
+            traces.append(cavity.decimate(self._last_trace, 300) if s is not None else None)
+
+        yield from at(lo, (yield from self.read()), 1, True)
+        for leg, (a, b, up) in enumerate(((lo, hi, True), (hi, lo, False)), start=1):
+            if leg == 2:  # the top reading starts the sweep down as well: the same laser, the same place
+                points.append(Point(hi, points[-1].e, 2, False))
+                sweeps.append(sweeps[-1])
+                traces.append(traces[-1])
+            for i in _steps(a, b, step):
+                yield from at(i, (yield from self.move(current=i)), leg, up)
+        self.edge = "lo"
         if any(s is not None for s in sweeps):
             ref = cavity.reference_from([s for s in sweeps if s is not None])
             if ref is not None:
@@ -576,54 +708,78 @@ class Recenter(CavitySteps):
             examples = ([max(good, key=lambda j: j[2].area)] if good else []) + (
                 [min(bad, key=lambda j: j[2].area)] if bad else [])  # for a look afterwards
             for (ok, text), pt, _, y in examples:
-                self.record["sweeps"].append({"why": f"map {self.maps}", "i": round(pt.i, 3), "ok": ok,
+                self.record["sweeps"].append({"why": f"map {self.maps}", "i": round(self.mA(pt.i), 3), "ok": ok,
                                               "text": text, "y": y})
-        self.bad = _merge([(pt.i - self.p.step / 2, pt.i + self.p.step / 2) for pt in points if pt.bad], 1e-9)
-        res = analyse(points, self.p.step)
+        res = analyse(points, step)
         modes, self.threshold, self.slope = res.modes, res.threshold, res.slope
+        self.modes = modes
+        if self.maps == 1 and abs(v - self.V0) < 1e-6 and math.isfinite(self.e0):
+            self.home = self.homeward(modes)
         if res.spacing:
             self.spacing = res.spacing
         if res.noise:
             self.noise = res.noise
-        if not self.kv_measured and modes:
-            yield from self.measure_kv(modes, v)
-        bands = []
-        for mode in modes:
-            for lo, hi in mode.stable:
-                band = self.operating_point(mode, lo, hi, v)
-                if band is not None:
-                    bands.append(band)
-        bands.sort(key=lambda b: -b.score)
-        bad = sum(pt.bad for pt in points)
+        bands = self.weigh([Band(mode, a, b, v, up) for mode in modes
+                            for up, ranges in ((True, mode.up), (False, mode.down)) for a, b in ranges])
+        bad, rough = sum(pt.bad for pt in points), sum(pt.rough and not pt.bad for pt in points)
         self.note(f"map {self.maps} at {v:.2f} V: {len(modes)} modes"
                   + (f", {bad} points multimode in the SHG cavity" if bad else "")
+                  + (f", {rough} readings scattered (two modes?)" if rough else "")
                   + (": " if bands else "")
-                  + ", ".join(f"{b.lo:.2f}–{b.hi:.2f} mA ({b.e:+.0f} MHz)" for b in bands[:3]))
+                  + ", ".join(f"{self.mA(b.lo):.2f}–{self.mA(b.hi):.2f} mA sweeping {b.way} ({b.e:+.0f} MHz)"
+                              for b in bands[:3]))
         self.record["maps"].append({
-            "v": round(v, 4), "points": [[round(pt.i, 4), round(pt.e, 1) if math.isfinite(pt.e) else None,
-                                          pt.leg, pt.bad] for pt in points],
-            "bands": [[round(b.lo, 3), round(b.hi, 3), round(b.op, 3), round(b.e, 1)] for b in bands[:5]]})
+            "v": round(v, 4), "points": [[round(self.mA(pt.i), 4), round(pt.e, 1) if math.isfinite(pt.e) else None,
+                                          pt.leg, pt.bad or pt.rough] for pt in points],
+            "bands": [[round(self.mA(b.lo), 3), round(self.mA(b.hi), 3), round(self.mA(b.op), 3), round(b.e, 1),
+                       b.way] for b in bands[:5]]})
         return bands
 
-    def operating_point(self, mode: Mode, lo: float, hi: float, v: float):
-        """Where to operate in a stable range: its middle, or as near as the piezo allows (once the
-        tuning is measured); None if the piezo cannot reach the target from anywhere in it.
+    def homeward(self, modes):
+        """Which way the current must come to I0 for the mode the laser began on: True (up), False
+        (down), or None if the map did not see that mode there."""
+        tol = max(0.5 * self.threshold, 50.0)
+        for m in modes:
+            if abs(m.at(self.I0) - self.e0) <= tol:
+                ways = [up for up, a, z in m.seen if a - 1e-9 <= self.I0 <= z + 1e-9]
+                return ways[0] if ways else None
+        return None
+
+    def weigh(self, bands):
+        """The bands with their operating points (those the piezo can reach the target from, once
+        its tuning is measured), best first."""
+        out = [self.operating_point(b.mode, b.lo, b.hi, b.v, b.up) for b in bands]
+        return sorted((b for b in out if b is not None), key=lambda b: -b.score)
+
+    def operating_point(self, mode: Mode, lo: float, hi: float, v: float, up: bool = True):
+        """Where to operate in lo..hi, where the mode lases sweeping up (or down): the middle of
+        where it holds either way, but two steps (MIN_MARGIN at least) past where it hops on and
+        MIN_MARGIN short of where it hops off sweeping that way, inside where it lases sweeping
+        both ways if it does anywhere there, and as near as lets the piezo reach the target (once
+        the tuning is measured); None if the piezo cannot reach it from anywhere there, or it is
+        too close to a hop wherever in it. Seen one way only, where it holds is lo..hi itself: the
+        middle of that.
 
         An edge at the window's edge is not a hop: the mode goes on beyond, by how much the map
         cannot tell; it is counted on for another margin's worth (unless it is where the SHG sweep
         showed a second mode)."""
-        edge = 1.5 * self.p.step
+        step, edge = self.p.step, 1e-6  # the map reads at both ends of the window, sweeping either way
 
         def cut(x):
-            return any(a - self.p.step <= x <= b + self.p.step for a, b in self.bad)
+            return any(a - step <= x <= b + step for a, b in mode.bad)
 
-        b = Band(mode, lo, hi, v,
-                 vlo=lo - self.p.margin if lo <= self.i_lo + edge and not cut(lo) else lo,
-                 vhi=hi + self.p.margin if hi >= self.i_hi - edge and not cut(hi) else hi)
-        lo2 = max(b.vlo + self.MIN_MARGIN, self.i_lo)
-        hi2 = min(b.vhi - self.MIN_MARGIN, self.i_hi)
-        if lo2 > hi2:
-            lo2 = hi2 = min(max(b.center, self.i_lo), self.i_hi)
+        a, z = next(((a, z) for a, z in mode.hold if a - 1e-9 <= lo and hi <= z + 1e-9), (lo, hi))
+        b = Band(mode, lo, hi, v, up,
+                 hlo=a - self.p.margin if a <= self.i_lo + edge and not cut(a) else a,
+                 hhi=z + self.p.margin if z >= self.i_hi - edge and not cut(z) else z)
+        join = max(2 * step, self.MIN_MARGIN)  # past where it hops on; short of where it hops off: MIN_MARGIN
+        on = any(w == up and abs((a if up else z) - (lo if up else hi)) < 1e-9 for w, a, z in mode.seen)
+        low = 0.0 if lo <= self.i_lo + edge else (join if up and on else self.MIN_MARGIN)  # (at the window's
+        high = 0.0 if hi >= self.i_hi - edge else (join if on and not up else self.MIN_MARGIN)  # edge: no hop)
+        lo2 = max(lo + low, b.hlo + self.MIN_MARGIN, self.i_lo)
+        hi2 = min(hi - high, b.hhi - self.MIN_MARGIN, self.i_hi)
+        if lo2 > hi2 + 1e-9:  # narrow: its middle
+            lo2 = hi2 = min(max(0.5 * (lo + hi), self.i_lo), self.i_hi)
         if self.kv_measured:  # mode.at(i) + kv * dv = 0 with v + dv within the piezo's limits
             e1, e2 = sorted((self.kv * (v - self.v_hi), self.kv * (v - self.v_lo)))
             if abs(mode.slope) > 1e-9:
@@ -632,39 +788,67 @@ class Recenter(CavitySteps):
                 lo2, hi2 = max(lo2, a), min(hi2, z)
             elif not e1 <= mode.e_ref <= e2:
                 return None
-            if lo2 > hi2:
+            if lo2 > hi2 + 1e-9:
                 return None
+        both = [(a, z) for a, z in mode.stable if a <= hi2 and z >= lo2 and z - a >= 2 * self.MIN_MARGIN]
+        if both:  # where it lases sweeping either way: no other mode possible there, the safest; if it may
+            a, z = max(both, key=lambda r: r[1] - r[0])
+            a = max(lo2, a + (0.0 if a <= self.i_lo + edge else self.MIN_MARGIN))
+            z = min(hi2, self.i_hi if z >= self.i_hi - edge else z - self.MIN_MARGIN)
+            if a <= z + 1e-9:
+                lo2, hi2 = a, z
         b.op = min(max(b.center, lo2), hi2)
-        nominal = self.p.i_nom or self.I0
+        if b.margin < self.MIN_MARGIN - 1e-6:
+            return None  # too close to a hop wherever in it
         b.score = (min(b.margin, 2 * self.p.margin) - self.SHIFT * abs(b.e / self.kv)
-                   - 0.1 * abs(b.op - nominal) / max(self.p.i_window, 0.1))
+                   - 0.1 * abs(b.op - self.nominal) / max(self.p.i_window, 0.1)
+                   + 0.05 * min(abs(b.op - b.entry), 2 * self.p.margin))  # well past where it hops on
         return b
 
-    def measure_kv(self, modes, v: float):
-        """Piezo +0.5 V and back in the middle of the widest stable range, where it cannot hop:
-        how many MHz per volt, to choose between modes with."""
-        widest = max(((hi - lo, mode, 0.5 * (lo + hi)) for mode in modes for lo, hi in mode.stable),
-                     default=None, key=lambda x: x[0])
-        if widest is None or widest[0] < 2 * self.MIN_MARGIN:
-            return
+    def measure_kv(self):
+        """Piezo +0.5 V and back, here, in the middle of a mode where it cannot hop: how many MHz
+        per volt, to choose between modes with."""
         self.stage = "measuring the piezo tuning"
-        e0 = yield from self.move(current=widest[2])
-        e1 = yield from self.move(offset=v + 0.5)
+        v, e0 = self.V, self.e
+        dv = 0.5 if v + 0.5 <= self.v_hi else -0.5
+        e1 = yield from self.move(offset=v + dv)
         e2 = yield from self.move(offset=v)
-        a, b = 2 * (e1 - e0), 2 * (e1 - e2)
+        a, b = (e1 - e0) / dv, (e1 - e2) / dv
         lo, hi = self.KV_PLAUSIBLE
         if all(math.isfinite(x) for x in (a, b)) and lo <= abs(a) <= hi and 0.7 < b / a < 1.4:
             self.kv, self.kv_known, self.kv_measured = 0.5 * (a + b), True, True
             self.note(f"piezo tuning {self.kv:+.0f} MHz/V")
 
-    def goto(self, band: Band):
-        yield from self.ask(f"Go to {band.op:.2f} mA ({band.lo:.2f}–{band.hi:.2f} mA, {band.e:+.0f} MHz "
-                            f"from the target there), then tune the piezo onto the target")
-        self.stage = "moving to the best mode"
+    def park(self, band: Band):
+        """To the band's operating point the way the map found its mode there: from the end of the
+        window the map's sweep that way started from (come round to it by way of the other end),
+        sweeping that way, a reading a step. True if it is on that mode there."""
+        start = self.i_lo if band.up else self.i_hi
+        yield from self.ask(f"Park at {self.mA(band.op):.2f} mA, sweeping {band.way} from {self.mA(start):.2f} mA "
+                            f"as the map found the mode there ({self.mA(band.lo):.2f}–{self.mA(band.hi):.2f} mA "
+                            f"sweeping {band.way}, {band.e:+.0f} MHz from the target), then tune the piezo onto it")
+        self.stage = f"parking: sweeping {band.way} to {self.mA(band.op):.2f} mA"
         if abs(self.V - band.v) > 1e-6:
             yield from self.move(offset=band.v, read=False)
-        e = yield from self.move(current=band.op)
-        return math.isfinite(e) and abs(e - band.e) <= max(0.5 * self.threshold, 50.0)
+        yield from self.come_to(band.up)
+        e, pts = math.nan, []
+        for i in _steps(start, band.op, self.p.step):
+            e = yield from self.move(current=i)
+            pts.append([round(self.mA(i), 4), round(e, 1) if math.isfinite(e) else None, 3, False])
+        if self.record["maps"]:
+            self.record["maps"][-1]["points"] += pts
+        es = [e]
+        for _ in range(2):  # the middle of three: not fooled by one odd reading
+            es.append((yield from self.read()))
+        es = sorted(x for x in es if math.isfinite(x))
+        e, want = es[len(es) // 2] if es else math.nan, band.e
+        if math.isfinite(e) and abs(e - want) <= max(0.5 * self.threshold, 50.0):
+            self.note(f"parked at {self.mA(band.op):.2f} mA sweeping {band.way}: {e:+.0f} MHz from the target, "
+                      f"on the mode the map found there")
+            return True
+        self.note(f"parked at {self.mA(band.op):.2f} mA sweeping {band.way}, but {e:+.0f} MHz from the target, not "
+                  f"the map's {want:+.0f} MHz: it did not come back the same way")
+        return False
 
     def tune(self, band: Band | None = None):
         """Piezo onto the target at fixed current -> 'ok', 'limit', 'hop', 'lost' or 'slow'.
@@ -736,10 +920,10 @@ class Recenter(CavitySteps):
         b = sum((x - mx) * (y - me) for x, y in zip(xs, es)) / sxx if sxx > 0 else 0.0
         worst = max(abs(y - me - b * (x - mx)) for x, y in zip(xs, es))
         if worst > max(25.0, 6.0 * self.noise, 0.15 * abs(b) * m):
-            self.note(f"hop within {m:.2f} mA of {ic:.2f} mA (off the line by {worst:.0f} MHz)")
+            self.note(f"hop within {m:.2f} mA of {self.mA(ic):.2f} mA (off the line by {worst:.0f} MHz)")
             return False
         if modes:
-            self.note(f"two modes within {m:.2f} mA of {ic:.2f} mA ({'; '.join(modes)})")
+            self.note(f"two modes within {m:.2f} mA of {self.mA(ic):.2f} mA ({'; '.join(modes)})")
             return False
         if abs(self.e) > self.tol():
             return (yield from self.tune()) == "ok"
@@ -760,7 +944,8 @@ class Recenter(CavitySteps):
 
     def result(self) -> Result:
         if self.maps:
-            summary = (f"recentered {self.I0:.2f} → {self.I:.2f} mA, {self.V0:.2f} → {self.V:.2f} V"
+            now = self.final_act if self.final_act is not None else self.mA(self.I)
+            summary = (f"recentered {self.mA(self.I0):.2f} → {now:.2f} mA measured, {self.V0:.2f} → {self.V:.2f} V"
                        f" ({self.maps} map{'s' if self.maps != 1 else ''}, {self.readings} readings)")
         else:
             summary = f"the laser itself was fine; piezo {self.V0:.2f} → {self.V:.2f} V"
@@ -770,7 +955,9 @@ class Recenter(CavitySteps):
             summary += f"; {self.mode_text}"
         if self.falc_text:
             summary += f"; {self.falc_text}"
-        self.record.update({"i0": self.I0, "v0": self.V0, "i": self.I, "v": self.V, "summary": summary})
+        self.record.update({"i0": round(self.mA(self.I0), 4), "v0": self.V0, "i": round(self.mA(self.I), 4),
+                            "v": self.V, "act": self.final_act, "act_offset": round(self.act_offset, 4),
+                            "summary": summary})
         return Result(self.I, self.V, self.kv if self.kv_measured else 0.0,
                       self.spacing if self.maps else 0.0, self.maps, self.readings, summary,
                       dict(self.learned), self.record)
@@ -799,7 +986,7 @@ class Runner:
     READ_TIMEOUT = 10.0  # s
     CONFIRM_TIMEOUT = 900.0  # s: step by step, nobody answering for this long stops it
 
-    def __init__(self, rec: Recenter, io, now: float, timeout: float = 300.0, finished=None):
+    def __init__(self, rec: Recenter, io, now: float, timeout: float = 600.0, finished=None):
         self.rec, self.io, self.finished = rec, io, finished
         self.gen = rec.run()
         self.started = now

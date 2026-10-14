@@ -189,6 +189,7 @@ class ChannelRow(QtWidgets.QFrame):
         self._sp = None
         self._menu = None
         self._is_ref = False
+        self._relock = None  # the button arms the relock of a cavity-locked laser (else: the wavemeter lock)
         self._prompt = ""
 
         self.num = Text(str(n), "dim", win.bold_font)
@@ -255,6 +256,7 @@ class ChannelRow(QtWidgets.QFrame):
             self.anchor_text.setVisible(is_ref)
             self.sp_label.paint("ref" if is_ref else "set", "dim")
         if is_ref:
+            self._set_relock(False)
             self._refresh_reference(ch, ref, now)
             if ch.state == "recovering":
                 self._show_recovery(ch, now)
@@ -292,6 +294,7 @@ class ChannelRow(QtWidgets.QFrame):
             self.info.paint("right-click to link a laser", "dim")
         if state == "recovering" and ch.hop_prompt:
             state = "asking"
+        self._set_relock(ch.relock)
         self._set_state(state if state != "off" else ("error" if ch.message else "off"))
         self.name.paint(ch.name, "dim")
 
@@ -352,6 +355,21 @@ class ChannelRow(QtWidgets.QFrame):
             text += f"   ⟲ {fmt_duration(now - ch.note_t)} ago"
         return text
 
+    RELOCK_TIP = ("Its DLC pro locks it to a cavity; this does not lock it to the wavemeter.\n"
+                  "Relock: watch it, and after a mode hop take it over and relock it (if it is not\n"
+                  "locked on target now, relock it now). It does nothing else: the piezo is its lock's.\n"
+                  "Watching: click to stop watching.")
+    LOCK_TIP = "Lock to the wavemeter: the scan offset follows the reading onto the setpoint."
+
+    def _set_relock(self, relock: bool):
+        if relock == self._relock:
+            return
+        self._relock = relock
+        self.btn.setToolTip(self.RELOCK_TIP if relock else self.LOCK_TIP)
+        state, self._state = self._state, None
+        if state is not None:
+            self._set_state(state)  # the label
+
     def _set_state(self, state: str):
         if state == self._state:
             return
@@ -360,8 +378,13 @@ class ChannelRow(QtWidgets.QFrame):
             w.setProperty("state", state)
             w.style().unpolish(w)
             w.style().polish(w)
-        label = "Ref" if state.startswith("ref") else {
-            "on": "Locked", "engaging": "Locking", "recovering": "Recentering", "asking": "Continue"}.get(state, "Lock")
+        if state.startswith("ref"):
+            label = "Ref"
+        elif self._relock:
+            label = {"on": "Watching", "recovering": "Recentering", "asking": "Continue"}.get(state, "Relock")
+        else:
+            label = {"on": "Locked", "engaging": "Locking", "recovering": "Recentering",
+                     "asking": "Continue"}.get(state, "Lock")
         self.btn.setText(label)
 
     def _clicked(self):
@@ -388,7 +411,7 @@ class ChannelRow(QtWidgets.QFrame):
             tip += f"\nreference laser: {ref.state}" + (f", {ref.message}" if ref.message else "")
         if ch.hop.enabled:
             hop = ch.hop
-            tip += (f"\nmode-hop recovery on: {hop.i_nom:.2f} ± {hop.i_window:g} mA"
+            tip += (f"\nmode-hop recovery on: {hop.i_nom:.2f} ± {hop.i_window:g} mA (measured)"
                     + (", takes over the DLC pro's cavity lock" if hop.cavity else "")
                     + (", checks the mode in the SHG cavity" if hop.shg else "")
                     + (", step by step" if hop.confirm else ""))
@@ -643,7 +666,7 @@ class HopDialog(QtWidgets.QDialog):
         use.setEnabled(ch.current is not None)
         use.clicked.connect(lambda: self.i_nom.setValue(ch.current or 0.0))
         now = f"now {ch.current:.3f} mA" if ch.current is not None else "read when enabled"
-        form.addRow("Nominal current", row(self.i_nom, "mA", use, now))
+        form.addRow("Nominal current", row(self.i_nom, "mA measured (current-act)", use, now))
         self.i_window = number(p.i_window, 0.1, 50, 2, 0.1)
         form.addRow("Current stays within", row(self.i_window, "mA of nominal, and below the controller's limit"))
         self.v_window = number(p.v_window, 0.5, 100, 1, 0.5)
@@ -664,7 +687,7 @@ class HopDialog(QtWidgets.QDialog):
         self.relock = QtWidgets.QComboBox()
         self.relock.addItems([label for _, label in self.RELOCK])
         self.relock.setCurrentIndex(next((k for k, (key, _) in enumerate(self.RELOCK) if key == p.relock), 0))
-        form.addRow("Relock", self.relock)
+        form.addRow("Relock by", self.relock)
         self.window = number(p.window, 10, 100000, 0, 10)
         form.addRow("The right peak is", row("within ±", self.window, "MHz of where the wavemeter puts the setpoint"))
         self.falc = QtWidgets.QCheckBox("Null the error signal's DC level with the FALC pro's input offset, by at most")
@@ -742,7 +765,7 @@ class Plot(QtWidgets.QWidget):
     def __init__(self, xlabel: str = "", ylabel: str = "", height: int = 160, ylim=None):
         super().__init__()
         self.xlabel, self.ylabel, self.ylim = xlabel, ylabel, ylim
-        self.series = []  # (xs, ys, color, 'line' | 'dots' | 'cross', width)
+        self.series = []  # (xs, ys, color, 'line' | 'dots' | 'ring' | 'cross', width)
         self.vlines = []  # (x, color)
         self.spans = []   # (x0, x1, color)
         self.hlines = []  # (y, color)
@@ -803,11 +826,13 @@ class Plot(QtWidgets.QWidget):
                 p.setPen(QtGui.QPen(col, width))
                 p.drawPolyline(QtGui.QPolygonF([QtCore.QPointF(X(x), Y(y)) for x, y in zip(sx, sy)]))
             else:
-                p.setPen(QtGui.QPen(col, width))
-                p.setBrush(col)
+                p.setPen(QtGui.QPen(col, 1.2 if style == "ring" else width))
+                p.setBrush(Qt.BrushStyle.NoBrush if style == "ring" else col)
                 for x, y in zip(sx, sy):
                     c = QtCore.QPointF(X(x), Y(y))
-                    if style == "cross":
+                    if style == "ring":
+                        p.drawEllipse(c, width + 2.0, width + 2.0)
+                    elif style == "cross":
                         p.drawLine(c + QtCore.QPointF(-3, -3), c + QtCore.QPointF(3, 3))
                         p.drawLine(c + QtCore.QPointF(-3, 3), c + QtCore.QPointF(3, -3))
                     else:
@@ -882,20 +907,21 @@ class RecoveryDialog(QtWidgets.QDialog):
         return w
 
     def _map(self, m, rec):
-        plot = Plot("current (mA)", "GHz", 200)
-        for leg, color in ((0, "dim"), (1, "accent"), (2, "ok")):
+        plot = Plot("current (mA, measured)", "GHz", 200)
+        for leg, color, style in ((0, "dim", "dots"), (1, "accent", "dots"), (2, "ok", "dots"), (3, "warn", "ring")):
             pts = [pt for pt in m["points"] if pt[2] == leg and pt[1] is not None]
-            plot.add([pt[0] for pt in pts], [pt[1] / 1e3 for pt in pts], color, "dots", 2)
+            plot.add([pt[0] for pt in pts], [pt[1] / 1e3 for pt in pts], color, style, 2)
         bad = [pt for pt in m["points"] if pt[3] and pt[1] is not None]
         plot.add([pt[0] for pt in bad], [pt[1] / 1e3 for pt in bad], "err", "cross", 1.5)
-        for lo, hi, *_ in m.get("bands", [])[:3]:
-            plot.spans.append((lo, hi, "ok"))
-        if m.get("bands"):
-            plot.vlines.append((m["bands"][0][2], "warn"))
+        bands = m.get("bands", [])
+        if bands:  # the best candidate: where its mode lases sweeping its way, and the operating point
+            plot.spans.append((bands[0][0], bands[0][1], "ok"))
+            plot.vlines.append((bands[0][2], "warn"))
         plot.hlines.append((0.0, "dim"))
-        title = (f"map at {m['v']:.2f} V: frequency from the target against current, sweeping down (grey), up "
-                 f"(blue), down (green); stable ranges shaded, the best's operating point dashed"
-                 + ("; × where the SHG sweep showed two modes" if bad else ""))
+        best = (f"; the best: {bands[0][0]:.2f}–{bands[0][1]:.2f} mA sweeping {bands[0][4]} (shaded), its operating "
+                f"point dashed" if bands and len(bands[0]) > 4 else "")
+        title = (f"map at {m['v']:.2f} V: frequency from the target against current, sweeping up (blue dots), then "
+                 f"down (green), and parking (amber rings){best}" + ("; × where it showed two modes" if bad else ""))
         return self._box(title, plot)
 
     def _sweep(self, s):

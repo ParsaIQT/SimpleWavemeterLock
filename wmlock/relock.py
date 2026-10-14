@@ -225,7 +225,7 @@ class CavitySteps:
         """Keep the last sweep for a look afterwards (the latest few, and the maps' examples)."""
         ok, text = cavity.judge(m, self.shg_ref)
         sweeps = self.record["sweeps"]
-        sweeps.append({"why": why, "i": round(self.I, 3), "ok": ok, "text": text,
+        sweeps.append({"why": why, "i": round(self.mA(self.I), 3), "ok": ok, "text": text,
                        "y": cavity.decimate(self._last_trace, 300)})
         late = [s for s in sweeps if not s["why"].startswith("map")]
         if len(late) > 6:
@@ -245,7 +245,7 @@ class CavitySteps:
             self.note(f"SHG cavity: {text}: carrying on without")
             return True
         if not ok:
-            self.note(f"at {self.I:.2f} mA, SHG cavity: {text}")
+            self.note(f"at {self.mA(self.I):.2f} mA, SHG cavity: {text}")
             return False
         self.mode_text = text
         learned = cavity.updated(self.p.shg_ref if self.p.shg_ref.known else None, s)
@@ -557,22 +557,36 @@ def setup_report(client, laser: int, hop, lp) -> list:
     except ValueError:
         fw = None
 
-    g = get("dl:cc:current-set", "dl:cc:current-act", "dl:cc:current-clip", "dl:cc:current-clip-limit")
+    g = get("dl:cc:current-set", "dl:cc:current-act", "dl:cc:current-clip", "dl:cc:current-offset",
+            "dl:cc:feedforward-enabled", "dl:cc:feedforward-factor", "dl:cc:output-filter:slew-rate-enabled",
+            "dl:cc:output-filter:slew-rate")
     add("head", "Current")
-    i, clip = g["dl:cc:current-set"], g["dl:cc:current-clip"]
-    add("ok" if _num(i) else "error", f"set {fmt(i, ' mA')}, actual {fmt(g['dl:cc:current-act'], ' mA')}, "
-                                       f"limit (current-clip) {fmt(clip, ' mA')}")
+    i, act, clip = g["dl:cc:current-set"], g["dl:cc:current-act"], g["dl:cc:current-clip"]
+    off = act - i if _num(i) and _num(act) else None
+    add("ok" if _num(i) and _num(act) else "error",
+        f"measured {fmt(act, ' mA')}, set {fmt(i, ' mA')}" + (f" ({off:+.3f} mA apart)" if off is not None else "")
+        + f", limit (current-clip, on the set current) {fmt(clip, ' mA')}")
+    ff, factor = g["dl:cc:feedforward-enabled"], g["dl:cc:feedforward-factor"]
+    add("info", f"current offset {fmt(g['dl:cc:current-offset'], ' mA')}; feedforward from the piezo "
+                + (f"on, {factor:+.4f} mA/V" if ff and _num(factor) else fmt(ff)))
+    if ff and _num(factor) and abs(factor) * hop.v_window >= 0.05:
+        add("info", f"with the feedforward, a recovery's piezo moves (at most ±{hop.v_window:g} V) move the measured "
+                    f"current too, by up to ±{abs(factor) * hop.v_window:.2f} mA, besides what it sets")
+    if g["dl:cc:output-filter:slew-rate-enabled"]:
+        add("warn", f"the current's slew rate is limited ({fmt(g['dl:cc:output-filter:slew-rate'])}): a recovery "
+                    "steps it 0.2 mA at a time and expects each step to take effect at once")
     if hop.i_nom:
         lo, hi = hop.i_nom - hop.i_window, hop.i_nom + hop.i_window
-        if _num(clip) and hi > clip:
-            add("info", f"the window's top, {hi:.2f} mA, is above current-clip: {clip:.2f} mA is the limit")
-            hi = clip
-        inside = _num(i) and lo <= i <= hi
-        add("ok" if inside else "error", f"recoveries keep it within {lo:.2f} … {hi:.2f} mA "
-                                         f"({hop.i_nom:.2f} ± {hop.i_window:g}), changing it ≤ 0.2 mA a step; "
+        if _num(clip) and off is not None and hi - off > clip:
+            add("info", f"the window's top, {hi:.2f} mA, is above current-clip: {clip + off:.2f} mA measured is "
+                        "the limit")
+            hi = clip + off
+        inside = _num(act) and lo <= act <= hi
+        add("ok" if inside else "error", f"recoveries keep the measured current within {lo:.2f} … {hi:.2f} mA "
+                                         f"({hop.i_nom:.2f} ± {hop.i_window:g}), setting it ≤ 0.2 mA a step; "
                                          + ("it is inside now" if inside else "it is OUTSIDE now: no recovery"))
     else:
-        add("info", "the nominal current is read when recovery is enabled")
+        add("info", "the nominal current is read, as measured, when recovery is enabled")
 
     g = get("scan:offset", "scan:enabled", "scan:amplitude", "scan:frequency", "scan:unit")
     add("head", "Piezo and scan")
@@ -597,6 +611,9 @@ def setup_report(client, laser: int, hop, lp) -> list:
         add("ok" if g["dl:lock:lock-enabled"] is not None else "error",
             f"lock {fmt(g['dl:lock:lock-enabled'])}, state {g['dl:lock:state']} “{g['dl:lock:state-txt'] or '?'}”; "
             f"ReLock {fmt(g['dl:lock:relock:enabled'])}, window {fmt(g['dl:lock:window:enabled'])}")
+        add("info", "this program does not lock it to the wavemeter: its row's button is Relock, which has it "
+                    "watched and relocked after a mode hop (and relocks it then and there if it is not locked on "
+                    "target)")
         wo = g["dl:lock:lock-without-lockpoint"]
         mode = hop.relock if hop.relock in ("lockpoint", "plain") else ("plain" if wo else "lockpoint")
         blob = g["dl:lock:candidates"]

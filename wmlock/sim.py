@@ -43,7 +43,11 @@ class FakeDLCPro:
     binary data, tuples; a callable is asked for the value on every read) and commands.
 
     on_set[param](value) is called after a write; commands[name](*args) runs (exec 'name ...)
-    and returns its output, or raises CommandError."""
+    and returns its output, or raises CommandError.
+
+    A laser's measured current (current-act) is its set current plus current-offset, plus the
+    feedforward from the piezo (feedforward-factor mA/V times the scan offset, when enabled), plus
+    a fixed bias (its config's "act_offset", mA): set and measured current differ, as they do."""
 
     _REF = re.compile(r"\(param-ref '([\w:-]+)\)$")
     _SET = re.compile(r"\(param-set! '([\w:-]+) (\S+)\)$")
@@ -66,11 +70,15 @@ class FakeDLCPro:
                 p + "scan:amplitude": float(d.get("amplitude", 2.5)), p + "scan:frequency": 20.0,
                 p + "emission": True,
                 p + "dl:cc:current-set": float(d.get("current", 150.0)),
-                p + "dl:cc:current-act": float(d.get("current", 150.0)),
+                p + "dl:cc:current-act": lambda n=n: self.current_act(n),
+                p + "dl:cc:current-offset": 0.0,
+                p + "dl:cc:feedforward-enabled": bool(d.get("feedforward", 0.0)),
+                p + "dl:cc:feedforward-factor": float(d.get("feedforward", 0.0)),
                 p + "dl:cc:current-clip": float(d.get("clip", 200.0)),
                 p + "dl:lock:lock-enabled": bool(d.get("locked", False)),
                 p + "dl:lock:state-txt": '"off"',
             })
+        self.bias = {n: float(d.get("act_offset", 0.0)) for n, d in lasers.items()}
         self.sets = 0
         self.log = []  # every accepted write: (parameter, value); every command: (name, args)
         self.on_set = {}
@@ -94,6 +102,14 @@ class FakeDLCPro:
 
     def current(self, n: int) -> float:
         return self.params[f"laser{n}:dl:cc:current-set"]
+
+    def current_act(self, n: int) -> float:
+        """The diode current, as measured: what the laser runs at."""
+        p, d = f"laser{n}:", self.params
+        i = d[p + "dl:cc:current-set"] + d[p + "dl:cc:current-offset"] + self.bias.get(n, 0.0)
+        if d[p + "dl:cc:feedforward-enabled"]:
+            i += d[p + "dl:cc:feedforward-factor"] * d[p + "scan:offset"]
+        return i
 
     def written(self, param: str) -> list:
         """Values written to `param`, oldest first."""
@@ -295,20 +311,23 @@ class ECDL:
         selection   f_sel =         ksv*(V - v0) + ksi*(I - i0) + kst*T + shift
     The selection filter is the grating together with the diode chip's own modes; the current
     moves it fast (chip modes) and the mode slowly, the piezo the other way round. The lasing
-    mode keeps lasing while its misalignment |f_m - f_sel| < fsr/2 + hysteresis, then the laser
-    hops to the best aligned mode. Near the edge (`multimode`) it runs on two modes at once and
-    the wavemeter reads noise, sometimes nonsense. With the defaults a mode is stable over
-    2.7 mA of current (3.4 mA counting hysteresis) and 70 V of piezo, and starts out centered.
+    mode keeps lasing while its misalignment f_m - f_sel stays within fsr/2 + hysteresis either
+    way (more one way than the other with `skew`), then the laser hops to the best aligned mode:
+    sweeping up, it hops onto a mode later than it hops off it sweeping down, and in between
+    either mode can lase, whichever it was on. Shortly before it hops off (`multimode`, and no
+    more than 0.15 fsr more) it runs on two modes at once and the wavemeter reads noise,
+    sometimes nonsense. With the defaults a mode is alone over 2.7 mA of current (it holds over
+    3.4 mA) and 70 V of piezo, and starts out centered.
     """
 
     def __init__(self, f0, fsr=6.0, kv=0.4, ki=-0.25, ksv=None, ksi=-2.0, kt=-4.0, kst=-1.0,
-                 hysteresis=0.6, multimode=0.3, v0=70.0, i0=150.0, seed=None, mm_noise=0.03):
+                 hysteresis=0.6, multimode=0.3, v0=70.0, i0=150.0, seed=None, mm_noise=0.03, skew=0.0):
         self.f0, self.fsr = f0, fsr
         self.mm_noise = mm_noise  # GHz rms the wavemeter reads where it runs on two modes
         self.kv, self.ki = kv, ki
         self.ksv = 0.8 * kv if ksv is None else ksv
         self.ksi, self.kt, self.kst = ksi, kt, kst
-        self.hysteresis, self.multimode = hysteresis, multimode
+        self.hysteresis, self.multimode, self.skew = hysteresis, multimode, skew
         self.v0, self.i0 = v0, i0
         self.T = 0.0       # K
         self.shift = 0.0   # GHz: the selection filter moved by itself (e.g. the diode chip warmed)
@@ -319,10 +338,30 @@ class ECDL:
         return (m * self.fsr + (self.kv - self.ksv) * (v - self.v0) + (self.ki - self.ksi) * (i - self.i0)
                 + (self.kt - self.kst) * self.T - self.shift)
 
+    def limits(self):
+        """The misalignments (GHz) at which the lasing mode hops off: below, above."""
+        return (-(self.fsr / 2 + self.hysteresis * (1 - self.skew)),
+                self.fsr / 2 + self.hysteresis * (1 + self.skew))
+
+    def zone(self, a: float):
+        """(|a| where a neighbouring mode starts to lase too, |a| where this one hops off), on a's side."""
+        lo, hi = self.limits()
+        full = hi if a >= 0 else -lo
+        return max(self.fsr / 2 - self.multimode, full - self.multimode - 0.15 * self.fsr), full
+
+    def margins(self, v: float, i: float):
+        """mA from (v, i) to where another mode could lase as well, and to where this one hops off,
+        the nearer way each (negative: past it). Call lase() first."""
+        a = self.misalignment(self.m, v, i)
+        lo, hi = self.limits()
+        c = abs(self.ki - self.ksi)
+        return min(a - (hi - self.fsr), (lo + self.fsr) - a) / c, min(a - lo, hi - a) / c
+
     def lase(self, v: float, i: float) -> float:
         """Settle which mode lases at (v, i), with hysteresis; returns its misalignment (GHz)."""
         a = self.misalignment(self.m, v, i)
-        if abs(a) > self.fsr / 2 + self.hysteresis:
+        lo, hi = self.limits()
+        if not lo < a < hi:
             self.m -= round(a / self.fsr)
             a = self.misalignment(self.m, v, i)
         return a
@@ -335,18 +374,18 @@ class ECDL:
         """What the laser emits at (v, i), THz, as a wavemeter would see it."""
         a = self.lase(v, i)
         ghz = self.mode_ghz(v, i) + extra_mhz * 1e-3
-        if abs(a) > self.fsr / 2 - self.multimode and self.mm_noise:  # two modes: noisy, now and then nonsense
+        if abs(a) > self.zone(a)[0] and self.mm_noise:  # two modes: noisy, now and then nonsense
             ghz += self.rng.gauss(0.0, self.mm_noise)
             if self.rng.random() < 0.05:
                 ghz -= math.copysign(self.rng.uniform(0.2, 0.8) * self.fsr, a)
         return self.f0 + ghz * 1e-3
 
     def components(self, v: float, i: float):
-        """The modes it emits at (v, i): [(power fraction, GHz from f0)] (call lase() first). Within
-        `multimode` of the edge of its range the neighbouring mode takes up to half the power."""
+        """The modes it emits at (v, i): [(power fraction, GHz from f0)] (call lase() first). Shortly
+        before it hops off (zone) the neighbouring mode takes up to half the power."""
         a = self.misalignment(self.m, v, i)
         f = self.mode_ghz(v, i)
-        edge, full = self.fsr / 2 - self.multimode, self.fsr / 2 + self.hysteresis
+        edge, full = self.zone(a)
         p2 = 0.5 * min(max((abs(a) - edge) / max(full - edge, 1e-9), 0.0), 1.0)
         if p2 <= 0.0:
             return [(1.0, f)]
@@ -454,7 +493,7 @@ class SimLocked:
         return self.dlc.params[self.p + name]
 
     def _vi(self):
-        return self._get("scan:offset"), self._get("dl:cc:current-set")
+        return self._get("scan:offset"), self.dlc.current_act(self.n)
 
     def dc(self) -> float:
         """The error signal's DC level as the FALC sees it: its own offset plus the input offset."""
@@ -769,14 +808,23 @@ class SimLaser:
         self._hop_until = math.inf
         self._unlocked_until = self._dark_until = 0.0
         self.ecdl = None
-        if dlc is not None:
-            self.ecdl = ECDL(self.f0, kv=tuning, v0=offset0, i0=dlc.current(n), seed=seed)
         self.lock = lock          # SimLocked: its DLC pro locks it to a cavity
         self._mutex = threading.Lock()
+        if dlc is not None:
+            self.ecdl = ECDL(self.f0, kv=tuning, v0=offset0, i0=dlc.current_act(n), seed=seed)
+            for name in ("dl:cc:current-set", "scan:offset"):
+                dlc.on_set[f"laser{n}:{name}"] = self._settle
+
+    def _settle(self, _value):
+        """At every change of its current or offset, as it is made: the laser follows it, hopping on
+        the way as it would (else it would only see where a quick ramp ends up)."""
+        with self._mutex:
+            if self.lock is None or not self.lock.locked():  # (locked, its lock follows it)
+                self.ecdl.lase(*self._vi())
 
     def lock_it(self, **kwargs) -> "SimLocked":
         """Let its DLC pro lock it to a reference cavity with a resonance where it is now; see SimLocked."""
-        self.lock = SimLocked(self.dlc, self.n, self.ecdl, self.ecdl.freq(self.offset0, self.dlc.current(self.n)),
+        self.lock = SimLocked(self.dlc, self.n, self.ecdl, self.ecdl.freq(self.offset0, self.dlc.current_act(self.n)),
                               **kwargs)
         return self.lock
 
@@ -801,8 +849,7 @@ class SimLaser:
             if self.ecdl is None:
                 return self.f0 + wobble * 1e-6
             p, params = f"laser{self.n}:", self.dlc.params
-            v, i = params[p + "scan:offset"], params[p + "dl:cc:current-set"]
-            params[p + "dl:cc:current-act"] = i
+            v, i = params[p + "scan:offset"], self.dlc.current_act(self.n)
             if self.lock is None:
                 return self.ecdl.freq(v, i, wobble)
             return self.lock.frequency(wobble)
@@ -812,20 +859,21 @@ class SimLaser:
         """The diode warms or cools a little: the laser hops one mode up (+1) or down (-1)."""
         with self._mutex:
             e = self.ecdl
-            e.nudge(direction * (e.fsr / 2 + e.hysteresis + 0.3) + e.misalignment(e.m, *self._vi()))
+            lo, hi = e.limits()
+            e.nudge(e.misalignment(e.m, *self._vi()) - ((lo - 0.3) if direction > 0 else (hi + 0.3)))
 
     def go_multimode(self, direction: int = 1):
         """The diode drifts to where a neighbouring mode takes a third of the power, without a hop."""
         with self._mutex:
             e = self.ecdl
             a = e.misalignment(e.m, *self._vi())
-            edge, full = e.fsr / 2 - e.multimode, e.fsr / 2 + e.hysteresis
+            edge, full = e.zone(direction)
             e.nudge(a - direction * (edge + 0.66 * (full - edge)))
 
     def _vi(self):
         p = f"laser{self.n}:"
         v = self.dlc.params[p + "scan:offset"] + (self.lock.dv if self.lock is not None else 0.0)
-        return v, self.dlc.params[p + "dl:cc:current-set"]
+        return v, self.dlc.current_act(self.n)
 
     # faults of the reference laser (cavity=True)
     def mode_hop(self, mhz: float, seconds: float | None = None):
@@ -870,7 +918,8 @@ class SimSource(Source):
 class Demo:
     """Three fake controllers: two with two DL pros each, wavemeter-locked; one with a TA-SHG pro
     whose DLC pro locks its master to a reference cavity (lockpoint selected by hand, PDH through
-    a FALC pro) and its SHG cavity to the master. Plus a channel without light, and a 729 nm
+    a FALC pro) and its SHG cavity to the master, and feeds its piezo forward to its current (the
+    measured current is 0.42 mA below the set one). Plus a channel without light, and a 729 nm
     laser locked to a cavity: the reference."""
 
     CHANNELS = [  # ch, vacuum wavelength (nm), tuning (GHz/V), controller, laser, name
@@ -889,7 +938,8 @@ class Demo:
         self.dlcs = [
             FakeDLCPro("SIM-000123", "Ca+ blue", {1: {"product": "DL pro 397"}, 2: {"product": "DL pro 866"}}),
             FakeDLCPro("SIM-000456", "Ca+ red", {1: {"product": "DL pro 854"}, 2: {"product": "DL pro 423"}}),
-            FakeDLCPro("SIM-000789", "Yb+ SHG", {1: {"product": "TA-SHG pro 739", "scan": True}}),
+            FakeDLCPro("SIM-000789", "Yb+ SHG", {1: {"product": "TA-SHG pro 739", "scan": True,
+                                                    "feedforward": -0.006}}),  # measured 0.42 mA below set
         ]
         try:
             self.responder = FakeDiscovery(self.dlcs, port=discovery_port)

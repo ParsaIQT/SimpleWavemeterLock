@@ -20,6 +20,14 @@ DLC pro to a cavity, and after a hop a Recenter procedure takes the laser over
 (current, piezo, its locks and scans, through the controller thread) and hands
 it back to its lock. What each recovery saw and did is kept (Channel.last) and
 appended to a log file.
+
+A laser its DLC pro locks to a cavity (HopParams.cavity) is never locked to the
+wavemeter: engaging it ('Relock') only arms the guard, which watches it and
+relocks it after a hop; and if it is not locked on target then, relocks it now.
+
+Currents are shown, and the nominal current given, as measured (current-act);
+the set current (current-set) is what a recovery writes, and is watched for
+changes by hand.
 """
 from __future__ import annotations
 
@@ -43,9 +51,10 @@ log = logging.getLogger(__name__)
 
 ACTUATOR = "scan:offset"  # the DLC pro parameter the lock writes, below laserN:
 CURRENT = "dl:cc:current-set"
+CURRENT_ACT = "dl:cc:current-act"
 CAVITY_LOCK = "dl:lock:lock-enabled"
 SHG_STATE = "nlo:shg:lock:state-txt"
-WATCHED = (ACTUATOR, CURRENT, CAVITY_LOCK, "dl:lock:state-txt", SHG_STATE)
+WATCHED = (ACTUATOR, CURRENT, CURRENT_ACT, CAVITY_LOCK, "dl:lock:state-txt", SHG_STATE)
 
 
 def round_sig(x: float, digits: int = 9) -> float:
@@ -75,7 +84,7 @@ class Channel:
         self.raw = NAN        # THz, as the wavemeter read it
         self.status = "no data"
         self.t = 0.0          # monotonic time of the last new reading
-        self.state = "off"    # off | engaging | on | recovering
+        self.state = "off"    # off | engaging | on (locked, or for a cavity-locked laser: watched) | recovering
         self.message = ""     # why the lock is off, or what to do
         self.offset = None    # last known scan offset
         self.unit = "V"
@@ -83,7 +92,8 @@ class Channel:
         # mode-hop recovery
         self.guard = Guard()
         self.runner = None    # the recovery in progress
-        self.current = None   # mA, last known current (polled while the recovery is enabled)
+        self.current = None   # mA, last known current as measured (polled while the recovery is enabled)
+        self.current_set = None  # mA, its set current (polled too: a change by hand)
         self.cavity_on = None  # the DLC pro's own lock enabled (polled for a cavity-locked laser)
         self.cavity_txt = ""
         self.note = ""        # what the last recovery did
@@ -119,6 +129,11 @@ class Channel:
         if self.hop != HopParams():
             d["hop"] = self.hop.to_dict()
         return d
+
+    @property
+    def relock(self) -> bool:
+        """Its DLC pro locks it to a cavity: engaging it arms the relock, the wavemeter lock never runs."""
+        return self.hop.cavity
 
     @property
     def hop_stage(self) -> str:
@@ -251,7 +266,7 @@ class _HopIO:
         def ok(result=None):
             with e.lock:
                 if op[0] == "set" and op[1] == CURRENT:
-                    ch.current = op[2]
+                    ch.current_set = op[2]
                 elif op[0] == "set" and op[1] == ACTUATOR:
                     ch.offset = op[2]
                 done(result)
@@ -350,7 +365,7 @@ class Engine:
                 ch.raw, ch.status, ch.t = r.freq, r.status, r.t
                 ch.freq = r.freq if ref is None or r.ch == ref.channel else ref.correct(r.freq)
                 withheld = self._hop_reading(ch, r.t) if ch.hop.enabled or ch.runner else False
-                if ch.state == "on" and ch.freq > 0 and not withheld:
+                if ch.state == "on" and ch.freq > 0 and not withheld and not ch.relock:
                     self._step(ch)
             for ch in self.channels.values():  # a recovery waiting for time to pass
                 if ch.runner is not None:
@@ -396,6 +411,9 @@ class Engine:
                     return
                 ch.set_setpoint(round_sig(C_NM_THZ / ch.freq))
                 self.dirty = True
+            if ch.relock:
+                self._arm(ch)
+                return
             ch.state, ch.message = "engaging", ""
             ch.token += 1
             ch.guard.reset()
@@ -426,6 +444,26 @@ class Engine:
 
             self._controller(ch.device).submit(job, failed)
 
+    def _arm(self, ch: Channel, check: bool = True):
+        """A laser its DLC pro locks to a cavity: watch it, and relock it after a hop. check: if it is
+        not locked on target now, relock it now."""
+        hop = ch.hop
+        if not hop.enabled:
+            ch.message = "mode-hop recovery is off: right-click › Mode-hop recovery…"
+            return
+        e = self._hop_error(ch)
+        if check and (ch.cavity_on is False or (math.isfinite(e) and abs(e) > hop.tolerance)):
+            if not math.isfinite(e):
+                ch.message = "relock: needs a valid reading"
+                return
+            why = "cavity lock off" if ch.cavity_on is False else (
+                f"off by {e / 1e3:+.3f} GHz" if abs(e) >= 1e3 else f"off by {e:+.0f} MHz")
+            self._start_recovery(ch, why, budget=False, relock=True)
+            return
+        ch.state, ch.message = "on", ""
+        ch.token += 1
+        ch.guard.reset()
+
     def disengage(self, n: int, message: str = ""):
         with self.lock:
             ch = self.channels[n]
@@ -441,6 +479,7 @@ class Engine:
         ch.state, ch.message = "off", message
         ch.token += 1
         ch.resume = False
+        ch.guard.reset()
         c = self.controllers.get(ch.device)
         if c is not None:
             c.cancel(ch.param)
@@ -517,7 +556,7 @@ class Engine:
             for param in WATCHED:
                 c.unwatch(f"laser{ch.laser}:{param}")
         ch.device, ch.offset, ch.message = None, None, ""
-        ch.current = ch.cavity_on = None
+        ch.current = ch.current_set = ch.cavity_on = None
         ch.cavity_txt = ch.shg_txt = ""
 
     def _watch(self, ch: Channel):
@@ -541,8 +580,8 @@ class Engine:
         self._watch_hop(ch)
 
     def _watch_hop(self, ch: Channel):
-        """While mode-hop recovery is enabled: poll the current, and the state of the DLC pro's own
-        lock for a laser it locks to a cavity."""
+        """While mode-hop recovery is enabled: poll the current (set and measured), and the state of
+        the DLC pro's own lock for a laser it locks to a cavity."""
         key, laser = ch.device, ch.laser
         c = self._controller(key)
         p = f"laser{laser}:"
@@ -550,11 +589,16 @@ class Engine:
         def mine():
             return ch.device == key and ch.laser == laser
 
-        def on_current(v):
+        def on_current_set(v):
             with self.lock:
                 if mine() and ch.state != "recovering":
-                    if ch.current is not None and abs(v - ch.current) > 0.005:
+                    if ch.current_set is not None and abs(v - ch.current_set) > 0.005:
                         ch.guard.reset()  # changed by hand: stand by until the laser is on target again
+                    ch.current_set = v
+
+        def on_current(v):
+            with self.lock:
+                if mine():
                     ch.current = v
 
         def on_cavity(v):
@@ -573,7 +617,8 @@ class Engine:
                     ch.shg_txt = v
 
         hop = ch.hop
-        for param, cb, kind, on in ((CURRENT, on_current, "float", hop.enabled),
+        for param, cb, kind, on in ((CURRENT, on_current_set, "float", hop.enabled),
+                                    (CURRENT_ACT, on_current, "float", hop.enabled),
                                     (CAVITY_LOCK, on_cavity, "bool", hop.enabled and hop.cavity),
                                     ("dl:lock:state-txt", on_txt, "str", hop.enabled and hop.cavity),
                                     (SHG_STATE, on_shg, "str", hop.enabled and hop.shg)):
@@ -641,7 +686,7 @@ class Engine:
         """How far the locked lasers would be moved if correct(raw THz) replaced the present correction."""
         with self.lock:
             return max((abs(correct(ch.raw) - ch.freq) * 1e6 for ch in self.channels.values()
-                        if ch.state == "on" and ch.raw > 0), default=0.0)
+                        if ch.state == "on" and ch.raw > 0 and not ch.relock), default=0.0)
 
     def tick(self):
         """Call now and then from the GUI: keeps the reference's state current when readings stop,
@@ -658,6 +703,8 @@ class Engine:
     def set_hop_params(self, n: int, params: HopParams):
         with self.lock:
             ch = self.channels[n]
+            if ch.state == "on" and (params.cavity != ch.hop.cavity or (params.cavity and not params.enabled)):
+                self._disengage(ch, "")  # locked to the wavemeter, or watched, as it no longer should be
             ch.hop = params
             ch.guard.reset()
             ch.guard.track = 0.0
@@ -668,11 +715,11 @@ class Engine:
             self.dirty = True
 
     def _read_nominal(self, ch: Channel):
-        """The present current becomes the nominal one, which the current stays near."""
+        """The present current, as measured, becomes the nominal one, which the current stays near."""
         key, laser = ch.device, ch.laser
 
         def job(client):
-            v = client.get_float(f"laser{laser}:{CURRENT}")
+            v = client.get_float(f"laser{laser}:{CURRENT_ACT}")
             with self.lock:
                 if ch.device == key and ch.laser == laser and not ch.hop.i_nom:
                     ch.hop.i_nom, ch.current = round(v, 3), v
@@ -691,7 +738,7 @@ class Engine:
             elif not math.isfinite(self._hop_error(ch)):
                 ch.message = "recenter: needs a setpoint and a valid reading"
             else:
-                self._start_recovery(ch, "", quick=False)
+                self._start_recovery(ch, "", quick=False, budget=False)
 
     def cancel_recovery(self, n: int):
         with self.lock:
@@ -718,11 +765,12 @@ class Engine:
         hop = ch.hop
         if not hop.enabled or not ch.device or ch.state == "recovering":
             return False
-        if hop.cavity:  # watch it while its DLC pro has it locked and this program does not
-            if ch.state != "off" or not ch.cavity_on:
+        if hop.cavity:  # watch it while its DLC pro has it locked, and it is armed (Relock)
+            ref = self._is_reference(ch)  # the reference laser has no button: always armed
+            if ch.state != ("off" if ref else "on") or not ch.cavity_on:
                 ch.guard.reset()
                 return False
-            track = not self._is_reference(ch)  # its target moves with the wavemeter's drift
+            track = not ref  # its target moves with the wavemeter's drift
         else:  # watch it while this program has it locked to the wavemeter
             if ch.state != "on":
                 ch.guard.reset()
@@ -734,10 +782,13 @@ class Engine:
             return True
         return ch.guard.armed and math.isfinite(e) and abs(e - ch.guard.track) > hop.tolerance
 
-    def _start_recovery(self, ch: Channel, why: str, quick: bool = True):
+    def _start_recovery(self, ch: Channel, why: str, quick: bool = True, budget: bool = True, relock: bool = False):
+        """quick: try the piezo alone first if the laser is near its target. budget: counts towards
+        max_per_hour (those the guard starts). relock: asked to relock a laser its DLC pro locks to a
+        cavity: take its lock over even if it is off now, and watch it afterwards."""
         hop = ch.hop
         now = time.monotonic()
-        if quick and not ch.guard.allow(now, hop.max_per_hour):
+        if budget and not ch.guard.allow(now, hop.max_per_hour):
             ch.guard.reset()
             msg = f"{why}: {hop.max_per_hour} recoveries within the hour already, not another"
             if ch.state == "on":
@@ -745,7 +796,7 @@ class Engine:
             else:
                 ch.message = msg
             return
-        ch.resume = ch.state == "on"
+        ch.resume = ch.state == "on" or relock
         ch.lock.disengage("")
         c = self._controller(ch.device)
         c.cancel(ch.param)
@@ -753,17 +804,18 @@ class Engine:
         ch.token += 1
         ch.hop_why, ch.hop_t = why, now
         tok, laser, cavity = ch.token, ch.laser, hop.cavity
-        log.info("channel %d: %s, recovering", ch.n, why)
+        log.info("channel %d: %s, recovering", ch.n, why or "recenter")
 
         def job(client):
             p = f"laser{laser}:"
             i0 = client.get_float(p + CURRENT)
+            a0 = client.get_float(p + CURRENT_ACT)
             clip = client.get_float(p + "dl:cc:current-clip")
             v0 = client.get_float(p + ACTUATOR)
-            locked = cavity and client.get_bool(p + CAVITY_LOCK)
+            locked = cavity and (relock or client.get_bool(p + CAVITY_LOCK))
             with self.lock:
                 if ch.token == tok:
-                    self._begin_recovery(ch, i0, clip, v0, locked, quick, c)
+                    self._begin_recovery(ch, i0, a0, clip, v0, locked, quick, c)
 
         def failed(exc):
             with self.lock:
@@ -772,22 +824,25 @@ class Engine:
 
         c.submit(job, failed)
 
-    def _begin_recovery(self, ch: Channel, i0, clip, v0, locked, quick, controller):
+    def _begin_recovery(self, ch: Channel, i0, a0, clip, v0, locked, quick, controller):
+        """i0, a0: the set and the measured current; the window is about the nominal current, which
+        is measured, and becomes one of set currents with their difference now."""
         hop, lp = ch.hop, ch.lock.p
         if not hop.i_nom:
-            hop.i_nom = round(i0, 3)  # the current before the first recovery is the nominal one
+            hop.i_nom = round(a0, 3)  # the current before the first recovery is the nominal one
             self.dirty = True
-        i_lo, i_hi = max(hop.i_nom - hop.i_window, 0.0), min(hop.i_nom + hop.i_window, clip)
+        off = a0 - i0
+        i_lo, i_hi = max(hop.i_nom - hop.i_window - off, 0.0), min(hop.i_nom + hop.i_window - off, clip)
         v_lo, v_hi = max(lp.v_min, v0 - hop.v_window), min(lp.v_max, v0 + hop.v_window)
-        ch.current, ch.offset = i0, v0
+        ch.current, ch.current_set, ch.offset = a0, i0, v0
         if not i_lo <= i0 <= i_hi:
-            self._recovery_failed(ch, f"the current, {i0:.2f} mA, is outside {i_lo:.2f} … {i_hi:.2f} mA: "
-                                      "set the nominal current in Mode-hop recovery…")
+            self._recovery_failed(ch, f"the current, {a0:.2f} mA measured, is outside {i_lo + off:.2f} … "
+                                      f"{i_hi + off:.2f} mA: set the nominal current in Mode-hop recovery…")
             return
         if not v_lo <= v0 <= v_hi:
             self._recovery_failed(ch, f"the offset, {v0:.2f} V, is outside {lp.v_min:g} … {lp.v_max:g} V")
             return
-        rec = Recenter(hop, i0, v0, i_lo, i_hi, v_lo, v_hi, cavity=locked, quick=quick, shg=hop.shg)
+        rec = Recenter(hop, i0, v0, i_lo, i_hi, v_lo, v_hi, cavity=locked, quick=quick, shg=hop.shg, act_offset=off)
         io = _HopIO(self, ch, controller)
         runner = Runner(rec, io, time.monotonic(), finished=lambda r: self._recovery_done(ch, r))
         if runner.busy:
@@ -817,21 +872,26 @@ class Engine:
                 if name in HopParams.LEARNED:
                     setattr(ch.hop, name, value)
             self.dirty = True
-            ch.current, ch.offset = res.current, res.offset
+            ch.current_set, ch.offset = res.current, res.offset
             ch.message = ""
             ch.note, ch.note_t = f"{why}{res.summary}, {took}", time.monotonic()
             log.info("channel %d: %s", ch.n, ch.note)
             self._keep_record(ch, r, ch.note)
             if ch.resume:
                 ch.resume = False
-                self.engage(ch.n)  # bumpless, at the new offset
+                if ch.relock and not self._is_reference(ch):
+                    if rec.cavity:
+                        ch.cavity_on = True  # it relocked it (the poll may not have seen it yet)
+                    self._arm(ch, check=False)  # watch it again
+                else:
+                    self.engage(ch.n)  # bumpless, at the new offset
             return
         ch.resume = False
-        ch.current = r.i_written
+        ch.current_set = r.i_written
         if r.restored:
             where = "current and offset put back"
         else:
-            where = f"left at {r.i_written:.2f} mA, {r.v_written:.2f} {ch.unit}"
+            where = f"left at {rec.mA(r.i_written):.2f} mA, {r.v_written:.2f} {ch.unit}"
         if "dl:lock:lock-enabled" in r.journal:
             where += ", cavity lock left off"
         for name in ("lp_code", "lp_kind", "peak_y", "falc_sign"):  # worth keeping, even so
@@ -849,7 +909,8 @@ class Engine:
         ch.last = {
             "time": time.strftime("%Y-%m-%d %H:%M:%S"), "channel": ch.n, "name": ch.name,
             "why": ch.hop_why or "recenter now", "ok": r.state == "done", "outcome": outcome,
-            "took_s": round(r.now - ch.hop_t, 1), "i_window": [rec.i_lo, rec.i_hi], "v_window": [rec.v_lo, rec.v_hi],
+            "took_s": round(r.now - ch.hop_t, 1), "i_window": [round(rec.mA(rec.i_lo), 4), round(rec.mA(rec.i_hi), 4)],
+            "v_window": [rec.v_lo, rec.v_hi],
             "kv": rec.kv, "unit": ch.unit, **rec.record,
             "notes": [[None if t is None else round(t - r.started, 1), text] for t, text in rec.record["notes"]],
         }
