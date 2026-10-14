@@ -318,10 +318,16 @@ class ECDL:
     more than 0.15 fsr more) it runs on two modes at once and the wavemeter reads noise,
     sometimes nonsense. With the defaults a mode is alone over 2.7 mA of current (it holds over
     3.4 mA) and 70 V of piezo, and starts out centered.
+
+    With i_stop set, it stops lasing altogether when the current drops below i_stop, and starts
+    again only once the current is above i_start (above where it normally runs): setting the
+    current back is not enough. Not lasing, it gives the wavemeter nothing to read and the TA
+    hardly any seed (power()).
     """
 
     def __init__(self, f0, fsr=6.0, kv=0.4, ki=-0.25, ksv=None, ksi=-2.0, kt=-4.0, kst=-1.0,
-                 hysteresis=0.6, multimode=0.3, v0=70.0, i0=150.0, seed=None, mm_noise=0.03, skew=0.0):
+                 hysteresis=0.6, multimode=0.3, v0=70.0, i0=150.0, seed=None, mm_noise=0.03, skew=0.0,
+                 i_stop=None, i_start=None):
         self.f0, self.fsr = f0, fsr
         self.mm_noise = mm_noise  # GHz rms the wavemeter reads where it runs on two modes
         self.kv, self.ki = kv, ki
@@ -333,6 +339,9 @@ class ECDL:
         self.shift = 0.0   # GHz: the selection filter moved by itself (e.g. the diode chip warmed)
         self.m = 0
         self.rng = random.Random(seed)
+        self.i_stop, self.i_start = i_stop, i_start  # mA (measured): stops lasing below, starts again above
+        self.lasing = True
+        self.slope_mw, self.i_th = 0.25, i0 - 80.0   # its power: mW per mA above threshold
 
     def misalignment(self, m: int, v: float, i: float) -> float:
         return (m * self.fsr + (self.kv - self.ksv) * (v - self.v0) + (self.ki - self.ksi) * (i - self.i0)
@@ -358,7 +367,15 @@ class ECDL:
         return min(a - (hi - self.fsr), (lo + self.fsr) - a) / c, min(a - lo, hi - a) / c
 
     def lase(self, v: float, i: float) -> float:
-        """Settle which mode lases at (v, i), with hysteresis; returns its misalignment (GHz)."""
+        """Settle whether it lases, and on which mode, at (v, i), with hysteresis; returns that
+        mode's misalignment (GHz)."""
+        start = self.i_start if self.i_start is not None else self.i_stop
+        if self.lasing:
+            if self.i_stop is not None and i < self.i_stop:
+                self.lasing = False
+        elif start is None or i > start:
+            self.lasing = True  # on whichever mode is best aligned now
+            self.m -= round(self.misalignment(self.m, v, i) / self.fsr)
         a = self.misalignment(self.m, v, i)
         lo, hi = self.limits()
         if not lo < a < hi:
@@ -370,9 +387,15 @@ class ECDL:
         """Frequency of the lasing mode, GHz from f0 (call lase() first)."""
         return self.m * self.fsr + self.kv * (v - self.v0) + self.ki * (i - self.i0) + self.kt * self.T
 
+    def power(self, i: float) -> float:
+        """mW it sends on (to a TA's seed photodiode, say): lasing, above threshold; else a trace."""
+        return max(self.slope_mw * (i - self.i_th), 0.0) if self.lasing else 0.3
+
     def freq(self, v: float, i: float, extra_mhz: float = 0.0) -> float:
-        """What the laser emits at (v, i), THz, as a wavemeter would see it."""
+        """What the laser emits at (v, i), THz, as a wavemeter would see it (NaN: not lasing)."""
         a = self.lase(v, i)
+        if not self.lasing:
+            return math.nan
         ghz = self.mode_ghz(v, i) + extra_mhz * 1e-3
         if abs(a) > self.zone(a)[0] and self.mm_noise:  # two modes: noisy, now and then nonsense
             ghz += self.rng.gauss(0.0, self.mm_noise)
@@ -382,7 +405,9 @@ class ECDL:
 
     def components(self, v: float, i: float):
         """The modes it emits at (v, i): [(power fraction, GHz from f0)] (call lase() first). Shortly
-        before it hops off (zone) the neighbouring mode takes up to half the power."""
+        before it hops off (zone) the neighbouring mode takes up to half the power. None, not lasing."""
+        if not self.lasing:
+            return []
         a = self.misalignment(self.m, v, i)
         f = self.mode_ghz(v, i)
         edge, full = self.zone(a)
@@ -395,6 +420,66 @@ class ECDL:
         """The selection filter moves by `ghz` (a temperature step of the diode, say): enough
         and the laser hops."""
         self.shift += ghz
+
+    def stop(self):
+        """It stops lasing (the current dipped for a moment, say): it starts again only above i_start."""
+        self.lasing = False
+
+
+class SimTA:
+    """The tapered amplifier of a TA pro or TA-SHG pro, seeded by the laser: its seed photodiode
+    (amp:pd:seed:power, and amp:seed-limits:power) and its protection: with the seed below
+    power-min for longer than power-min-shutdown-delay (seconds here) it switches itself off
+    (amp:cc:enabled), to be switched on again by hand. Time comes from `clock`; the protection is
+    looked at whenever anything of the TA is read. It only looks at whether the laser lases (as
+    whatever drives the laser last settled it): settling it here, in the controller's thread,
+    could race a lock that is following the laser."""
+
+    def __init__(self, dlc: "FakeDLCPro", n: int, ecdl: "ECDL", clock=time.monotonic, power_min: float = 8.0,
+                 delay: float = 2.0, noise: float = 0.05, seed=None):
+        self.dlc, self.n, self.ecdl, self.clock = dlc, n, ecdl, clock
+        self.p = p = f"laser{n}:amp:"
+        self.noise = noise
+        self.rng = random.Random(seed)
+        self._low_since = None
+        self.trips = 0
+        dlc.params.update({
+            p + "pd:seed:power": self.seed_power, p + "seed-limits:power": self.seed_power,
+            p + "seed-limits:power-min": float(power_min),
+            p + "seed-limits:power-min-shutdown-delay": float(delay),
+            p + "seed-limits:status": lambda: 0 if self.ok() else 2,
+            p + "seed-limits:status-txt": lambda: '"ok"' if self.ok() else '"seed power too low"',
+            p + "cc:enabled": True, p + "cc:emission": self.on,
+        })
+
+    def seed_power(self) -> float:
+        """mW: what the laser sends into the TA."""
+        self.watch()
+        return max(self.ecdl.power(self.dlc.current_act(self.n)) + self.rng.gauss(0.0, self.noise), 0.0)
+
+    def ok(self) -> bool:
+        return self.ecdl.power(self.dlc.current_act(self.n)) >= self.dlc.params[self.p + "seed-limits:power-min"]
+
+    def watch(self):
+        """Its protection: switch off once the seed has been too low for too long."""
+        if not self.dlc.params[self.p + "cc:enabled"]:
+            self._low_since = None
+            return
+        if self.ok():
+            self._low_since = None
+            return
+        now = self.clock()
+        if self._low_since is None:
+            self._low_since = now
+        elif now - self._low_since > self.dlc.params[self.p + "seed-limits:power-min-shutdown-delay"]:
+            self.dlc.params[self.p + "cc:enabled"] = False
+            self._low_since = None
+            self.trips += 1
+
+    def on(self) -> bool:
+        """Amplifying (else nothing reaches the SHG cavity)."""
+        self.watch()
+        return bool(self.dlc.params[self.p + "cc:enabled"])
 
 
 class SimLocked:
@@ -419,16 +504,21 @@ class SimLocked:
 
     SHG: the intra-cavity signal while its cavity is scanned has an Airy peak (plus small
     transverse modes) per FSR for each mode the master emits (ECDL.components); its lock locks to
-    the master's main mode when that has most of the power, and holds while the scan is off."""
+    the master's main mode when that has most of the power, and holds while the scan is off. The
+    master seeds a TA (SimTA, `ta`) on the way: with the TA off, nothing reaches the SHG cavity.
+    The master's light for the reference cavity and the wavemeter is picked off before the TA.
+    A master that stops lasing loses its cavity lock, and the wavemeter has nothing to read."""
 
     N = 1000  # samples in a scope trace
 
     def __init__(self, dlc: "FakeDLCPro", n: int, ecdl: "ECDL", f_res: float, shg: bool = True,
                  lockpoints: bool = True, fsr: float = 1.5, lw: float = 6.0, tem=((0.37, 0.18), (0.71, 0.08)),
                  t00: float = 0.8, pdh: float = 0.4, pdh_dc: float = 0.0, falc: int = 1, range_v: float = 30.0,
-                 falc_in_trace: bool = True, falc_sign: int = 1, seed=None):
+                 falc_in_trace: bool = True, falc_sign: int = 1, seed=None, ta: bool | None = None,
+                 clock=time.monotonic):
         """falc_in_trace: the error signal on the scope includes the FALC's input offset, which adds
-        to it (falc_sign 1) or subtracts (-1)."""
+        to it (falc_sign 1) or subtracts (-1). ta: a TA between master and SHG cavity (by default
+        with an SHG stage); clock: its time, for its protection."""
         self.dlc, self.n, self.ecdl = dlc, n, ecdl
         self.p = p = f"laser{n}:"
         self.f_res, self.fsr, self.lw, self.tem, self.t00 = f_res, fsr, lw, tuple(tem), t00
@@ -483,6 +573,9 @@ class SimLocked:
                 p + "nlo:shg:scope:timescale": 50.0, p + "nlo:shg:scope:data": self._shg_blob,
                 p + "nlo:pd:shg-int:photodiode": self._intra_now, p + "nlo:pd:shg:power": self._shg_power,
             })
+        self.ta = None
+        if shg if ta is None else ta:
+            self.ta = SimTA(dlc, n, ecdl, clock=clock, seed=seed)
         dlc.on_set[p + "dl:lock:lock-enabled"] = self._lock_enabled
         dlc.on_set[p + "scan:enabled"] = lambda on: self._lose_selection()
         dlc.commands[p + "dl:lock:select-lockpoint"] = self._select
@@ -543,6 +636,9 @@ class SimLocked:
         v, i = self._vi()
         m = self.ecdl.m
         target = self.peak + self._offset_mhz() * 1e-6
+        self.ecdl.lase(v + self.dv, i)
+        if not self.ecdl.lasing:
+            return False
         for _ in range(4):
             self.ecdl.lase(v + self.dv, i)
             if self.ecdl.m != m:
@@ -554,7 +650,8 @@ class SimLocked:
     def _engage(self, near: float | None = None):
         """Lock: to the resonance at `near` THz (a lockpoint) or else nearest the laser."""
         v, i = self._vi()
-        if abs(self.dc()) >= 0.5 * self.pdh:  # the error signal never crosses zero: no lock
+        self.ecdl.lase(v + self.dv, i)
+        if abs(self.dc()) >= 0.5 * self.pdh or not self.ecdl.lasing:  # no error signal crossing zero: no lock
             self.peak, self.dv = None, 0.0
             return
         f = near if near is not None else self._free(v + self.dv, i)
@@ -602,7 +699,7 @@ class SimLocked:
                     self._engage()  # ReLock: whatever resonance is nearest the laser now
                 if self.peak is not None:
                     return self.peak + self._offset_mhz() * 1e-6
-            if self._get("scan:enabled"):  # sweeping: the wavemeter catches it anywhere in the scan
+            if self._get("scan:enabled") and self.ecdl.lasing:  # sweeping: the wavemeter catches it anywhere
                 m = self.ecdl.m
                 x = v + self._get("scan:amplitude") * (self.rng.random() - 0.5)
                 f = self.ecdl.freq(x, i, wobble)
@@ -695,8 +792,8 @@ class SimLocked:
         with self.mutex:
             if not self._get("nlo:shg:lock:lock-enabled"):
                 return 0, "off"
-            v, i = self._vi()
-            if max(p for p, _ in self.ecdl.components(v + self.dv, i)) < 0.6:
+            comps = self._comps()
+            if not comps or max(p for p, _ in comps) < 0.6:
                 return 6, "relocking"
             return 5, "locked"
 
@@ -713,15 +810,20 @@ class SimLocked:
         return self.shg_floor + self.shg_h * out
 
     def _comps(self):
+        """The master's modes as they reach the SHG cavity: none with the TA off (or not lasing). Only
+        looked at: settling the laser here (a poll of the SHG lock's state, say) would take a hop
+        away from the cavity lock, which must see it."""
         v, i = self._vi()
-        self.ecdl.lase(v + self.dv, i)
+        if self.ta is not None and not self.ta.on():
+            return []
         return self.ecdl.components(v + self.dv, i)
 
     def _intra_now(self) -> float:
         with self.mutex:
             comps = self._comps()
             if self.shg_state()[0] == 5:
-                return self.shg_floor + self.shg_h * max(p for p, _ in comps) + self.rng.gauss(0.0, 0.003)
+                main = max((p for p, _ in comps), default=0.0)
+                return self.shg_floor + self.shg_h * main + self.rng.gauss(0.0, 0.003)
             s = self._get("nlo:shg:scan:offset")
             if self._get("nlo:shg:scan:enabled"):
                 s += self._get("nlo:shg:scan:amplitude") * (self.rng.random() - 0.5)
@@ -730,8 +832,8 @@ class SimLocked:
     def _shg_power(self) -> float:
         with self.mutex:
             if self.shg_state()[0] == 5:
-                return 25.0 * max(p for p, _ in self._comps()) ** 2
-            return 0.1
+                return 25.0 * max((p for p, _ in self._comps()), default=0.0) ** 2
+            return 0.1 if self._comps() else 0.0
 
     def _shg_blob(self) -> bytes:
         from .dlcpro import encode_blocks, float_block
@@ -850,9 +952,8 @@ class SimLaser:
                 return self.f0 + wobble * 1e-6
             p, params = f"laser{self.n}:", self.dlc.params
             v, i = params[p + "scan:offset"], self.dlc.current_act(self.n)
-            if self.lock is None:
-                return self.ecdl.freq(v, i, wobble)
-            return self.lock.frequency(wobble)
+            f = self.ecdl.freq(v, i, wobble) if self.lock is None else self.lock.frequency(wobble)
+            return f if math.isfinite(f) else None  # not lasing
 
     # faults of a laser with a controller
     def hop_mode(self, direction: int = 1):
@@ -861,6 +962,14 @@ class SimLaser:
             e = self.ecdl
             lo, hi = e.limits()
             e.nudge(e.misalignment(e.m, *self._vi()) - ((lo - 0.3) if direction > 0 else (hi + 0.3)))
+
+    def stop_lasing(self):
+        """The current dips for a moment and the laser stops lasing; at its current it does not start
+        again by itself (if it has a lasing threshold, ECDL.i_stop and i_start)."""
+        with self._mutex:
+            self.ecdl.stop()
+            if self.lock is not None and self.lock.locked():
+                self.lock.peak, self.lock.dv = None, 0.0
 
     def go_multimode(self, direction: int = 1):
         """The diode drifts to where a neighbouring mode takes a third of the power, without a hop."""
@@ -919,8 +1028,9 @@ class Demo:
     """Three fake controllers: two with two DL pros each, wavemeter-locked; one with a TA-SHG pro
     whose DLC pro locks its master to a reference cavity (lockpoint selected by hand, PDH through
     a FALC pro) and its SHG cavity to the master, and feeds its piezo forward to its current (the
-    measured current is 0.42 mA below the set one). Plus a channel without light, and a 729 nm
-    laser locked to a cavity: the reference."""
+    measured current is 0.42 mA below the set one); its master stops lasing 1.3 mA below its
+    current, and its TA switches itself off after 5 s without seed. Plus a channel without light,
+    and a 729 nm laser locked to a cavity: the reference."""
 
     CHANNELS = [  # ch, vacuum wavelength (nm), tuning (GHz/V), controller, laser, name
         (1, 396.959120, +0.35, 0, 1, "397"),
@@ -952,9 +1062,11 @@ class Demo:
             for ch, wl, k, c, n, _ in self.CHANNELS
         ]
         shg = self.laser(self.SHG)
-        e = shg.ecdl  # a master whose modes go multimode well before they hop, quietly for the wavemeter
-        e.multimode, e.hysteresis, e.mm_noise = 0.9, 0.4, 0.004
+        e = shg.ecdl  # a master whose modes go multimode well before they hop, quietly for the wavemeter,
+        e.multimode, e.hysteresis, e.mm_noise = 0.9, 0.4, 0.004  # and that stops lasing 1.3 mA below its
+        e.i_stop, e.i_start = e.i0 - 1.3, e.i0 + 2.4  # current, starting again only 2.4 mA above it
         shg.lock_it(shg=True, lockpoints=True, pdh_dc=0.009)
+        self.dlcs[2].params["laser1:amp:seed-limits:power-min-shutdown-delay"] = 5.0
         shg.lock.settle()
         self.wavemeter = wavemeter or SimWavemeter()
         self.exposure = exposure

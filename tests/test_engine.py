@@ -311,15 +311,15 @@ def test_shg_laser_put_back_on_the_right_peak(quiet_demo, tmp_path):
         assert wait_for(lambda: ch.guard.armed, 5)  # watching it again
         shg.hop_mode(-1)  # the master hops: its lock relocks 6 GHz away and calls that locked
         assert wait_for(lambda: ch.state == "recovering", 5)
-        assert wait_for(lambda: ch.state == "on" and not ch.message and "recentered" in ch.note, 60), ch.message
-        assert shg.lock.locked() and abs(ch.error_mhz) < 3 and shg.ecdl.m == 0
+        assert wait_for(lambda: ch.state == "on" and not ch.message and "walked" in ch.note, 60), ch.message
+        assert shg.lock.locked() and abs(ch.error_mhz) < 3  # (the mode it hopped to, walked onto the target)
         assert shg.lock.shg_state()[0] == 5 and "single mode" in ch.note
-        (lo, hi), off = ch.last["i_window"], ch.last["act_offset"]  # measured: 147.58 ... 151.58 mA
-        assert lo == pytest.approx(147.58) and hi == pytest.approx(151.58)
+        (lo, hi), off = ch.last["i_window"], ch.last["act_offset"]  # measured: 148.58 ... 151.58 mA
+        assert lo == pytest.approx(148.58) and hi == pytest.approx(151.58) and ch.last["i_top"] == pytest.approx(154.58)
         assert_gentle(currents_written(dlc, 1), lo - off - 1e-3, hi - off + 1e-3)  # set (off: as the piezo was)
-        assert ch.last["ok"] and ch.last["maps"] and ch.last["scan"]["x"]  # kept for a look...
+        assert ch.last["ok"] and ch.last["walk"] and ch.last["scan"]["x"]  # kept for a look...
         lines = (tmp_path / "log.jsonl").read_text().splitlines()
-        assert len(lines) == 2 and "relocked, recentered" in lines[1]  # ...and logged
+        assert len(lines) == 2 and "relocked, walked the piezo" in lines[1]  # ...and logged
     finally:
         e.stop()
 
@@ -337,8 +337,9 @@ def test_step_by_step_through_the_engine(quiet_demo):
         for _ in range(12):
             if not wait_for(lambda: ch.hop_prompt or ch.state != "recovering", 10) or ch.state != "recovering":
                 break
+            asked = ch.hop_prompt
             e.confirm_step(demo.SHG)
-            assert wait_for(lambda: not ch.hop_prompt or ch.state != "recovering", 2)
+            assert wait_for(lambda a=asked: ch.hop_prompt != a or ch.state != "recovering", 2)  # (or the next)
         assert wait_for(lambda: ch.state == "on", 10) and shg.lock.locked() and not ch.message, ch.message
     finally:
         e.stop()
@@ -473,9 +474,35 @@ def test_nominal_current_is_the_measured_one(quiet_demo):
         assert wait_for(lambda: ch.guard.armed, 5)
         shg.hop_mode(+1)
         assert wait_for(lambda: ch.state == "recovering", 5)
-        assert wait_for(lambda: ch.state == "on" and "recentered" in ch.note, 60), ch.message
-        assert_gentle(currents_written(dlc, 1), 148.0, 152.0)  # set: the measured 147.58 ... 151.58
-        assert "mA measured" in ch.note and ch.last["i_window"] == [147.58, 151.58]
+        assert wait_for(lambda: ch.state == "on" and "walked" in ch.note, 60), ch.message
+        assert_gentle(currents_written(dlc, 1), 149.0, 152.0)  # set: the measured 148.58 ... 151.58
+        assert "mA measured" in ch.note and ch.last["i_window"] == [148.58, 151.58]
         assert ch.last["act_offset"] == pytest.approx(-0.42, abs=0.01)
+    finally:
+        e.stop()
+
+
+def test_a_laser_that_stops_lasing_is_brought_back_at_once(quiet_demo):
+    """Its TA's seed power says it stopped lasing: recovered at once, whatever the hourly limit; the
+    current jumps up, then comes down slowly, and the laser is relocked as after a hop."""
+    import time
+
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, max_per_hour=1))
+    try:
+        e.engage(demo.SHG)
+        assert wait_for(lambda: ch.guard.armed and ch.seed_name == "amp:pd:seed:power" and ch.hop.seed_ok, 5)
+        assert ch.lasing is True and ch.hop.seed_ok == pytest.approx(20.0, abs=0.5)  # learned, lasing on target
+        ch.guard.recent.append(time.monotonic())  # this hour's one recovery: used up
+        shg.stop_lasing()
+        assert wait_for(lambda: ch.lasing is False, 3)
+        assert wait_for(lambda: ch.state == "recovering", 3) and ch.hop_why.startswith("stopped lasing (seed 0.")
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 90), ch.message
+        assert shg.ecdl.lasing and shg.lock.ta.on() and abs(ch.error_mhz) < 3 and ch.lasing is True
+        assert ch.note.startswith("stopped lasing (seed 0.") and "lasing again" in ch.note, ch.note
+        currents = currents_written(dlc, 1)
+        assert max(currents) >= 150.0 + 2.4 and max(currents) <= 150.0 + 5.0 + 1e-9  # (set: nominal 149.58 measured)
+        assert_gentle(currents, 149.0, 155.0)
     finally:
         e.stop()

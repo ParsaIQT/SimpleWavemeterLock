@@ -203,12 +203,14 @@ def test_recovery_and_setup_dialogs(app, demo):
            "scan": {"x_pred": 70.0, "window_v": 0.375, "cands": [[70.01, 0.8, "t"], [71.4, 0.15, "t"]],
                     "choice": [70.01, 0.8, "t", "peak at 70.010 V"], "x": [69.0, 70.0, 71.0], "y": [0.0, 0.8, 0.0]},
            "falc": {"name": "falc1:input:offset", "offset0": 0.0, "dc0": 0.009, "error": [0.009, 0.01, 0.008],
-                    "offset": -0.009, "dc": 0.0001}}
+                    "offset": -0.009, "dc": 0.0001},
+           "walk": [[70.0, 149.6, 6000.0, True], [69.5, 149.6, 5800.0, False], [69.5, 149.7, 5780.0, True],
+                    [55.0, 149.7, 1.0, None]]}
     d = gui.RecoveryDialog(None, rec)
     d.show()
     spin(app, 0.1)
     tabs = d.findChild(QtWidgets.QTabWidget)
-    assert [tabs.tabText(k) for k in range(tabs.count())] == ["Steps", "Map", "SHG sweeps", "Cavity peaks",
+    assert [tabs.tabText(k) for k in range(tabs.count())] == ["Steps", "Walk", "Map", "SHG sweeps", "Cavity peaks",
                                                               "Error signal"]
     for k in range(tabs.count()):
         tabs.setCurrentIndex(k)
@@ -308,12 +310,44 @@ def test_row_asks_before_each_step(app):
         assert any(t.startswith("Continue: Take the laser over") for t in items) and "Stop recentering" in items
         row._menu.close()
         row._clicked()  # Continue
-        assert wait_for(lambda: (app.processEvents(), ch.hop_prompt.startswith("The laser is"))[1], 5)
+        assert wait_for(lambda: (app.processEvents(), ch.hop_prompt.startswith(("Walk the piezo onto the target",
+                                                                               "On target at")))[1], 5)
         e.cancel_recovery(7)
         assert wait_for(lambda: (app.processEvents(), ch.state == "off")[1], 5)
         assert "recovery stopped" in ch.message and "cavity lock left off" in ch.message
         spin(app, 0.1)
         assert row.btn.text() == "Relock"  # click to relock it
+    finally:
+        win.close()
+        spin(app, 0.1)
+        demo.close()
+
+
+def test_row_says_when_it_does_not_lase(app):
+    """With recovery on, the TA's seed power is shown; too little, and the row says NOT LASING (not
+    armed, nothing is done about it)."""
+    from wmlock.modehop import HopParams
+    from wmlock.sim import Demo, SimWavemeter
+
+    demo = Demo(discovery_port=0, wavemeter=SimWavemeter(noise=0.3, amplitude=0.0, walk=0.0), exposure=0.004)
+    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"])
+    win = gui.MainWindow(e, lambda: None)
+    e.start()
+    win.show()
+    try:
+        assert wait_for(lambda: (app.processEvents(), 7 in win.rows and e.channels[7].freq > 0)[1], 5)
+        e.link(7, demo.dlcs[2].key, 1)
+        e.setpoint_to_current(7)
+        e.set_hop_params(7, HopParams(enabled=True, cavity=True, shg=True, seed_ok=20.0))
+        ch, row = e.channels[7], win.rows[7]
+        assert wait_for(lambda: (app.processEvents(), ch.seed is not None and ch.lasing is True)[1], 5)
+        spin(app, 0.1)
+        assert "seed 20." in row.info.text() and "NOT LASING" not in row.info.text()
+        demo.laser(7).stop_lasing()
+        assert wait_for(lambda: (app.processEvents(), ch.lasing is False)[1], 5)
+        spin(app, 0.1)
+        assert "NOT LASING: seed 0." in row.info.text() and row.info._color == "err"
+        assert ch.state == "off"  # not armed: left alone
     finally:
         win.close()
         spin(app, 0.1)

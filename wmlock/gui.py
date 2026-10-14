@@ -287,6 +287,8 @@ class ChannelRow(QtWidgets.QFrame):
             where = f"laser{ch.laser} @ {dev.name if dev else ch.device}"
             if ctrl is not None and ctrl.online is False:
                 self.info.paint(f"{where}   offline", "err")
+            elif ch.lasing is False and ch.hop.enabled:
+                self.info.paint(f"{where}   NOT LASING: seed {ch.seed:.2f} mW{self._hop_text(ch, now)}", "err")
             else:
                 off = "…" if ch.offset is None else f"{ch.offset:.3f} {ch.unit}"
                 self.info.paint(f"{where}   {off}{self._hop_text(ch, now)}", "dim")
@@ -347,6 +349,8 @@ class ChannelRow(QtWidgets.QFrame):
         if not ch.hop.enabled:
             return ""
         text = f"   {ch.current:.2f} mA" if ch.current is not None else ""
+        if ch.seed is not None:
+            text += f"   seed {ch.seed:.1f} mW"
         if ch.hop.cavity:
             text += f"   cavity {ch.cavity_txt or ('on' if ch.cavity_on else 'off')}"
         if ch.hop.shg and ch.shg_txt:
@@ -411,7 +415,8 @@ class ChannelRow(QtWidgets.QFrame):
             tip += f"\nreference laser: {ref.state}" + (f", {ref.message}" if ref.message else "")
         if ch.hop.enabled:
             hop = ch.hop
-            tip += (f"\nmode-hop recovery on: {hop.i_nom:.2f} ± {hop.i_window:g} mA (measured)"
+            tip += (f"\nmode-hop recovery on: {hop.i_nom - hop.i_below:.2f} … {hop.i_nom + hop.i_window:.2f} mA "
+                    f"(measured), by {hop.how()}"
                     + (", takes over the DLC pro's cavity lock" if hop.cavity else "")
                     + (", checks the mode in the SHG cavity" if hop.shg else "")
                     + (", step by step" if hop.confirm else ""))
@@ -619,6 +624,9 @@ class HopDialog(QtWidgets.QDialog):
     RELOCK = (("auto", "as its DLC pro is set: by lockpoint, unless it locks without one"),
               ("lockpoint", "pick the right peak and select it as the lockpoint, as by hand"),
               ("plain", "re-enable the lock and let it find its resonance"))
+    METHOD = (("auto", "walk with an SHG stage, else map"),
+              ("walk", "walk: single mode first, then the piezo slowly onto the target, as by hand"),
+              ("map", "map: sweep the current over the window, up and down, and pick the best mode"))
 
     def __init__(self, parent, ch):
         super().__init__(parent)
@@ -667,21 +675,46 @@ class HopDialog(QtWidgets.QDialog):
         use.clicked.connect(lambda: self.i_nom.setValue(ch.current or 0.0))
         now = f"now {ch.current:.3f} mA" if ch.current is not None else "read when enabled"
         form.addRow("Nominal current", row(self.i_nom, "mA measured (current-act)", use, now))
+        self.i_below = number(p.i_below, 0.0, 50, 2, 0.1)
         self.i_window = number(p.i_window, 0.1, 50, 2, 0.1)
-        form.addRow("Current stays within", row(self.i_window, "mA of nominal, and below the controller's limit"))
+        form.addRow("Current stays within", row(self.i_below, "mA below and", self.i_window,
+                                                "mA above nominal (and the controller's limit)"))
         self.v_window = number(p.v_window, 0.5, 100, 1, 0.5)
         form.addRow("Piezo moves at most", row(self.v_window, "V per recovery, inside the lock's offset limits"))
         self.tolerance = number(p.tolerance, 5, 100000, 0, 10)
         self.grace = number(p.grace, 0.2, 60, 1, 0.5)
         form.addRow("A hop is", row("off target by more than", self.tolerance, "MHz for", self.grace, "s"))
-        self.margin = number(p.margin, 0.05, 5, 2, 0.05)
-        form.addRow("Keep a hop at least", row(self.margin, "mA away, both ways"))
-        self.step = number(p.step, 0.01, 1, 2, 0.01)
-        form.addRow("Map in steps of", row(self.step, "mA"))
         self.per_hour = QtWidgets.QSpinBox()
         self.per_hour.setRange(1, 60)
         self.per_hour.setValue(p.max_per_hour)
-        form.addRow("At most", row(self.per_hour, "recoveries an hour"))
+        form.addRow("At most", row(self.per_hour, "recoveries an hour (not counting a laser that stopped lasing)"))
+
+        heading("Finding a mode on target")
+        self.method = QtWidgets.QComboBox()
+        self.method.addItems([label for _, label in self.METHOD])
+        self.method.setCurrentIndex(next((k for k, (key, _) in enumerate(self.METHOD) if key == p.method), 0))
+        form.addRow("Method", self.method)
+        self.reach = number(p.reach, 0.5, 100, 1, 0.5)
+        self.walk_step = number(p.walk_step, 0.05, 5, 2, 0.1)
+        form.addRow("Walk", row("from a single-mode mode within", self.reach, "GHz, in", self.walk_step,
+                                "V steps"))
+        self.margin = number(p.margin, 0.05, 5, 2, 0.05)
+        form.addRow("Keep a hop at least", row(self.margin, "mA away, both ways (multimode, walking)"))
+        self.step = number(p.step, 0.01, 1, 2, 0.01)
+        form.addRow("Trim and map in steps of", row(self.step, "mA"))
+
+        heading("Lasing")
+        self.seed = QtWidgets.QLineEdit(p.seed)
+        self.seed.setToolTip("The parameter (below laserN:) that shows the TA's seed power: auto tries "
+                             "amp:pd:seed:power, then amp:seed-limits:power; off: do not watch.")
+        usual = f"(usually {p.seed_ok:.1f} mW)" if p.seed_ok else "(its usual, learned)"
+        self.seed_min = number(p.seed_min, 0.05, 0.95, 2, 0.05)
+        form.addRow("Seed power", row(self.seed, "below", self.seed_min, "of usual", usual, "is not lasing"))
+        self.jump = number(p.jump, 0.5, 20, 1, 0.5)
+        self.jump_max = number(p.jump_max, 0.5, 20, 1, 0.5)
+        self.ramp = number(p.ramp, 0.05, 10, 2, 0.1)
+        form.addRow("Not lasing", row("current to nominal +", self.jump, "… +", self.jump_max, "mA at once, back at",
+                                      self.ramp, "mA/s"))
 
         heading("Relocking the cavity lock")
         self.relock = QtWidgets.QComboBox()
@@ -707,8 +740,9 @@ class HopDialog(QtWidgets.QDialog):
             forget = QtWidgets.QPushButton("Forget")
             forget.clicked.connect(self._forget)
             form.addRow("Learned", row(self.learned, forget))
-        form.addRow(Text("On failure everything goes back to where it was, except that the cavity lock stays off.\n"
-                         "Right-click the channel: Check setup… reads what a recovery would use; nothing is written.",
+        form.addRow(Text("On failure everything goes back to where it was (the current down slowly), except that "
+                         "the cavity lock stays off,\nand a laser that stopped lasing stays where it lases. "
+                         "Right-click the channel: Check setup… reads what a recovery\nwould use; nothing is written.",
                          "dim"))
         bb = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
@@ -733,6 +767,8 @@ class HopDialog(QtWidgets.QDialog):
             out.append(f"single-mode SHG sweep: side peak {p.shg_side * 100:.0f} %")
         if p.falc_sign:
             out.append("the FALC offset shows on the error signal")
+        if p.seed_ok:
+            out.append(f"seed {p.seed_ok:.1f} mW lasing")
         return ", ".join(out)
 
     def _who(self):
@@ -748,11 +784,15 @@ class HopDialog(QtWidgets.QDialog):
         p = self._p
         out = HopParams(
             enabled=self.enabled.isChecked(), cavity=self.who.currentIndex() == 1, shg=self.shg.isChecked(),
+            method=self.METHOD[self.method.currentIndex()][0],
             relock=self.RELOCK[self.relock.currentIndex()][0], falc=self.falc.isChecked(),
             falc_max=self.falc_max.value(), window=self.window.value(), confirm=self.confirm.isChecked(),
-            i_nom=round(self.i_nom.value(), 3), i_window=self.i_window.value(), v_window=self.v_window.value(),
+            i_nom=round(self.i_nom.value(), 3), i_window=self.i_window.value(), i_below=self.i_below.value(),
+            v_window=self.v_window.value(), reach=self.reach.value(), walk_step=self.walk_step.value(),
             step=self.step.value(), margin=self.margin.value(), tolerance=self.tolerance.value(),
-            grace=self.grace.value(), max_per_hour=self.per_hour.value())
+            grace=self.grace.value(), max_per_hour=self.per_hour.value(), seed=self.seed.text().strip() or "auto",
+            seed_min=self.seed_min.value(), jump=self.jump.value(), jump_max=self.jump_max.value(),
+            ramp=self.ramp.value())
         if not self.forget:
             for name in HopParams.LEARNED:
                 setattr(out, name, getattr(p, name))
@@ -871,6 +911,8 @@ class RecoveryDialog(QtWidgets.QDialog):
         steps.setPlainText("\n".join(f"{t:6.1f} s  {text}" if t is not None else f"{'':8s} {text}"
                                      for t, text in rec.get("notes", [])))
         tabs.addTab(steps, "Steps")
+        if rec.get("walk"):
+            tabs.addTab(self._scroll(self._walk(rec["walk"])), "Walk")
         if rec.get("maps"):
             tabs.addTab(self._scroll([self._map(m, rec) for m in rec["maps"]]), "Map")
         if rec.get("sweeps"):
@@ -923,6 +965,20 @@ class RecoveryDialog(QtWidgets.QDialog):
         title = (f"map at {m['v']:.2f} V: frequency from the target against current, sweeping up (blue dots), then "
                  f"down (green), and parking (amber rings){best}" + ("; × where it showed two modes" if bad else ""))
         return self._box(title, plot)
+
+    def _walk(self, pts):
+        """The walk: frequency from the target against the scan offset, the mode as the SHG sweep had
+        it at each reading; and the current, reading by reading."""
+        f = Plot("scan offset (V)", "GHz", 200)
+        for ok, color, style in ((True, "ok", "dots"), (False, "err", "cross"), (None, "dim", "dots")):
+            sel = [p for p in pts if p[3] is ok and p[2] is not None]
+            f.add([p[0] for p in sel], [p[2] / 1e3 for p in sel], color, style, 2)
+        f.hlines.append((0.0, "dim"))
+        i = Plot("reading", "mA", 140)
+        i.add(list(range(len(pts))), [p[1] for p in pts], "accent", "line")
+        return [self._box("the walk: frequency from the target against the scan offset; green where the SHG sweep "
+                          "showed one mode, × two, grey not looked at", f),
+                self._box("the current (measured) at each reading: trims, and the checks either side at the end", i)]
 
     def _sweep(self, s):
         plot = Plot("sample", "V", 120)
@@ -1238,6 +1294,8 @@ class MainWindow(QtWidgets.QWidget):
                 who = f"Channel {las.ch}" + (f" {name}" if name else "")
                 sim.addAction(f"{who}: mode hop up", functools.partial(las.hop_mode, 1))
                 sim.addAction(f"{who}: mode hop down", functools.partial(las.hop_mode, -1))
+                if las.ecdl.i_stop is not None:
+                    sim.addAction(f"{who}: stops lasing", las.stop_lasing)
                 if las.lock is not None:
                     sim.addAction(f"{who}: cavity lock jumps a peak", functools.partial(las.lock.jump, 1))
                     sim.addAction(f"{who}: goes multimode, without a hop", functools.partial(las.go_multimode, 1))

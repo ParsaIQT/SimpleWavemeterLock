@@ -25,6 +25,11 @@ A laser its DLC pro locks to a cavity (HopParams.cavity) is never locked to the
 wavemeter: engaging it ('Relock') only arms the guard, which watches it and
 relocks it after a hop; and if it is not locked on target then, relocks it now.
 
+Whether it lases: with a TA, its seed power is polled too (HopParams.seed), and
+an armed laser that stops lasing is recovered at once, the hourly limit
+notwithstanding: the recovery jumps its current up first (modehop.Recenter.panic).
+The seed power while it lases as usual is learned (HopParams.seed_ok).
+
 Currents are shown, and the nominal current given, as measured (current-act);
 the set current (current-set) is what a recovery writes, and is watched for
 changes by hand.
@@ -42,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .dlcpro import DLCPro, DecopError, Device, discover, probe
 from .lock import Lock, LockParams
-from .modehop import Guard, HopParams, Recenter, Runner, perform
+from .modehop import SEED_FLOOR, Guard, HopParams, Recenter, Runner, perform
 from .relock import setup_report
 from .reference import Reference, RefParams
 from .wavemeter import C_NM_THZ, NAN
@@ -55,6 +60,10 @@ CURRENT_ACT = "dl:cc:current-act"
 CAVITY_LOCK = "dl:lock:lock-enabled"
 SHG_STATE = "nlo:shg:lock:state-txt"
 WATCHED = (ACTUATOR, CURRENT, CURRENT_ACT, CAVITY_LOCK, "dl:lock:state-txt", SHG_STATE)
+
+
+def _num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
 def round_sig(x: float, digits: int = 9) -> float:
@@ -104,6 +113,11 @@ class Channel:
         self.shg_txt = ""     # the SHG cavity's lock state (polled for a laser with an SHG stage)
         self.last = None      # what the last recovery saw and did (a dict, as logged)
         self.setup = None     # the last setup check: [(level, text)], None while it runs
+        self.seed = None      # mW, its TA's seed power (polled while the recovery is enabled, if it has one)
+        self.seed_name = ""   # the parameter it is read from ('': none)
+        self.seed_floor = 0.0  # mW: the TA's own power-min
+        self.lasing = None    # by the seed power: True, False, None (no telling)
+        self.seed_low = 0     # polls in a row with too little seed
 
     @property
     def param(self) -> str:
@@ -323,10 +337,13 @@ class Engine:
             for ch in self.channels.values():
                 if ch.state != "off":
                     self._disengage(ch, "")
-        end = time.monotonic() + 3.0  # a recovery that was cut short puts current and offset back
+        end = time.monotonic() + 20.0  # a recovery that was cut short puts current and offset back (slowly down)
         while time.monotonic() < end:
             with self.lock:
-                if not any(ch.runner is not None for ch in self.channels.values()):
+                runners = [ch.runner for ch in self.channels.values() if ch.runner is not None]
+                for r in runners:
+                    r.tick(time.monotonic())
+                if not runners:
                     break
             time.sleep(0.02)
         with self.lock:
@@ -553,11 +570,11 @@ class Engine:
             self._disengage(ch, "")
         c = self.controllers.get(ch.device)
         if c is not None:
-            for param in WATCHED:
+            for param in WATCHED + ((ch.seed_name,) if ch.seed_name else ()):
                 c.unwatch(f"laser{ch.laser}:{param}")
         ch.device, ch.offset, ch.message = None, None, ""
-        ch.current = ch.current_set = ch.cavity_on = None
-        ch.cavity_txt = ch.shg_txt = ""
+        ch.current = ch.current_set = ch.cavity_on = ch.seed = ch.lasing = None
+        ch.cavity_txt = ch.shg_txt = ch.seed_name = ""
 
     def _watch(self, ch: Channel):
         """Poll the offset of the linked laser for display, and read its unit once."""
@@ -626,6 +643,71 @@ class Engine:
                 c.watch(p + param, cb, kind)
             else:
                 c.unwatch(p + param)
+        names = hop.seed_names if hop.enabled else ()
+        if ch.seed_name and ch.seed_name not in names:
+            c.unwatch(p + ch.seed_name)
+            ch.seed_name, ch.seed, ch.lasing = "", None, None
+        if names and not ch.seed_name:
+            self._find_seed(ch)
+
+    def _find_seed(self, ch: Channel):
+        """Which parameter shows its seed power (the first of HopParams.seed_names it has), and its TA's
+        own minimum; then poll it."""
+        key, laser, names = ch.device, ch.laser, ch.hop.seed_names
+        c = self._controller(key)
+
+        def job(client):
+            values = perform(client, laser, ("get", names + (SEED_FLOOR,)))
+            name = next((n for n, v in zip(names, values) if _num(v)), "")
+            with self.lock:
+                if ch.device != key or ch.laser != laser or not ch.hop.enabled or name not in ch.hop.seed_names:
+                    return
+                floor = values[-1]
+                ch.seed_floor = float(floor) if _num(floor) and floor > 0 else 0.0
+                ch.seed_name = name
+                c.watch(f"laser{laser}:{name}", lambda v: self._on_seed(ch, key, laser, name, v))
+
+        c.submit(job)
+
+    def _armed(self, ch: Channel) -> bool:
+        """Watched for hops (and for losing lasing): locked to the wavemeter by this program, or Relock
+        armed while its DLC pro has its cavity lock on (the reference laser: always, it has no button)."""
+        hop = ch.hop
+        if not hop.enabled or not ch.device:
+            return False
+        if hop.cavity:
+            return ch.state == ("off" if self._is_reference(ch) else "on") and bool(ch.cavity_on)
+        return ch.state == "on"
+
+    def _on_seed(self, ch: Channel, key: str, laser: int, name: str, v: float):
+        """A poll of its seed power. Too little twice in a row, armed: recover it at once (it begins by
+        jumping the current up), whatever the hourly limit. Lasing as usual and on target: learn how
+        much seed that is."""
+        with self.lock:
+            if ch.device != key or ch.laser != laser or ch.seed_name != name:
+                return
+            hop = ch.hop
+            ch.seed = v
+            least = hop.seed_least(hop.seed_ok, ch.seed_floor)
+            ch.lasing = None if least <= 0 else v >= least
+            if ch.state == "recovering" or not hop.enabled:
+                ch.seed_low = 0
+                return
+            if ch.lasing is False:
+                ch.seed_low += 1
+                if ch.seed_low >= 2 and self._armed(ch):
+                    ch.seed_low = 0
+                    log.warning("channel %d: not lasing, seed power %.2f mW", ch.n, v)
+                    self._start_recovery(ch, f"stopped lasing (seed {v:.2f} mW)", budget=False)
+                return
+            ch.seed_low = 0
+            e = self._hop_error(ch)
+            if self._armed(ch) and ch.guard.armed and math.isfinite(e) and abs(e) <= hop.tolerance and v > 0:
+                if not hop.seed_ok:
+                    hop.seed_ok = round(v, 3)  # lasing as usual: this much
+                    self.dirty = True
+                else:
+                    hop.seed_ok = round(0.98 * hop.seed_ok + 0.02 * v, 3)
 
     def _controller(self, key: str) -> Controller:
         c = self.controllers.get(key)
@@ -826,13 +908,15 @@ class Engine:
 
     def _begin_recovery(self, ch: Channel, i0, a0, clip, v0, locked, quick, controller):
         """i0, a0: the set and the measured current; the window is about the nominal current, which
-        is measured, and becomes one of set currents with their difference now."""
+        is measured, and becomes one of set currents with their difference now: i_below below it,
+        i_window above, and jump_max above for a laser that does not lase."""
         hop, lp = ch.hop, ch.lock.p
         if not hop.i_nom:
             hop.i_nom = round(a0, 3)  # the current before the first recovery is the nominal one
             self.dirty = True
         off = a0 - i0
-        i_lo, i_hi = max(hop.i_nom - hop.i_window - off, 0.0), min(hop.i_nom + hop.i_window - off, clip)
+        i_lo, i_hi = max(hop.i_nom - hop.i_below - off, 0.0), min(hop.i_nom + hop.i_window - off, clip)
+        i_top = min(hop.i_nom + max(hop.jump_max, hop.i_window) - off, clip)
         v_lo, v_hi = max(lp.v_min, v0 - hop.v_window), min(lp.v_max, v0 + hop.v_window)
         ch.current, ch.current_set, ch.offset = a0, i0, v0
         if not i_lo <= i0 <= i_hi:
@@ -842,7 +926,8 @@ class Engine:
         if not v_lo <= v0 <= v_hi:
             self._recovery_failed(ch, f"the offset, {v0:.2f} V, is outside {lp.v_min:g} … {lp.v_max:g} V")
             return
-        rec = Recenter(hop, i0, v0, i_lo, i_hi, v_lo, v_hi, cavity=locked, quick=quick, shg=hop.shg, act_offset=off)
+        rec = Recenter(hop, i0, v0, i_lo, i_hi, v_lo, v_hi, cavity=locked, quick=quick, shg=hop.shg, act_offset=off,
+                       i_top=i_top)
         io = _HopIO(self, ch, controller)
         runner = Runner(rec, io, time.monotonic(), finished=lambda r: self._recovery_done(ch, r))
         if runner.busy:
@@ -910,7 +995,7 @@ class Engine:
             "time": time.strftime("%Y-%m-%d %H:%M:%S"), "channel": ch.n, "name": ch.name,
             "why": ch.hop_why or "recenter now", "ok": r.state == "done", "outcome": outcome,
             "took_s": round(r.now - ch.hop_t, 1), "i_window": [round(rec.mA(rec.i_lo), 4), round(rec.mA(rec.i_hi), 4)],
-            "v_window": [rec.v_lo, rec.v_hi],
+            "i_top": round(rec.mA(rec.i_top), 4), "v_window": [rec.v_lo, rec.v_hi], "seed": ch.seed,
             "kv": rec.kv, "unit": ch.unit, **rec.record,
             "notes": [[None if t is None else round(t - r.started, 1), text] for t, text in rec.record["notes"]],
         }

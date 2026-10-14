@@ -16,7 +16,10 @@
 
 Peaks are characterised by their area (the sum of the samples above the floor) as well as their
 height: a resonance only a few samples wide can be sampled anywhere between its top and its
-flank, which changes its height a lot and its area little.
+flank, which changes its height a lot and its area little. Where the scan turns, a resonance
+can show cut short, or as two crossings run into one: such peaks are left out, where the scan
+voltage shows where it turns, and peaks that do not recur in the sweep are not taken for a
+second mode (each resonance is crossed sweeping up and again sweeping down, once per FSR).
 
 Pure functions on plain lists: no Qt, no I/O.
 """
@@ -129,27 +132,61 @@ class ModeCheck:
 
     def split(self, area: float = 0.0):
         """(side, n_main): main peaks have at least MAIN of `area` (by default the biggest one's);
-        side is the biggest of the others over the biggest main one (a second mode makes one
-        such peak per FSR, all alike; transverse-mode bumps stay small)."""
+        side is the biggest of the others that recurs, over the biggest main one that does (a
+        second mode makes one such peak per FSR, all alike; transverse-mode bumps stay small)."""
         cut = MAIN * (area or self.area)
         main = [w for _, _, w in self.peaks if w >= cut]
-        side = [w for _, _, w in self.peaks if w < cut]
+        side = recurring([w for _, _, w in self.peaks if w < cut])
         if not main:
             return math.inf, 0
-        return (max(side) / max(main) if side else 0.0), len(main)
+        return (max(side) / max(recurring(main) or main) if side else 0.0), len(main)
 
 
-MAIN = 0.6  # a peak with at least this fraction of a main peak's area is one too
+MAIN = 0.6   # a peak with at least this fraction of a main peak's area is one too
+RECUR = 1.5  # peaks within this factor of each other's area are alike
 
 
-def sweep(y) -> ModeCheck:
+def recurring(areas) -> list:
+    """The areas that recur: another one is alike (within RECUR)."""
+    return [w for k, w in enumerate(areas)
+            if w > 0 and any(1 / RECUR <= v / w <= RECUR for j, v in enumerate(areas) if j != k)]
+
+
+def turnarounds(scan) -> list:
+    """Where a scan voltage trace turns (indices): its extremes between rising and falling."""
+    n = len(scan)
+    if n < 20:
+        return []
+    span = max(scan) - min(scan)
+    if span <= 0:
+        return []
+    k = max(2, n // 200)
+    out, sign, last = [], 0, 0
+    for i in range(n):
+        d = scan[min(i + k, n - 1)] - scan[max(i - k, 0)]
+        s = 1 if d > 0.01 * span else (-1 if d < -0.01 * span else 0)
+        if s and sign and s != sign:  # turned between last and i: at the extreme there
+            seg = range(max(last - k, 0), min(i + k, n - 1) + 1)
+            out.append(max(seg, key=lambda j: scan[j]) if sign > 0 else min(seg, key=lambda j: scan[j]))
+        if s:
+            sign, last = s, i
+    return out
+
+
+def sweep(y, scan=None) -> ModeCheck:
     """Measure an SHG sweep (the intra-cavity signal, in acquisition order). Peaks cut off by
-    the ends of the trace are left out."""
+    the ends of the trace are left out, and with the scan voltage (scan: same samples) those
+    where it turns. The biggest peak is the biggest that recurs (if any does)."""
     peaks = find_peaks(y)
     whole = [p for p in peaks if p.lo > 0 and p.hi < len(y) - 1] or peaks
+    if scan is not None and len(scan) == len(y):
+        turns = turnarounds(scan)
+        whole = [p for p in whole if not any(p.lo - pad <= t <= p.hi + pad
+                                             for t in turns for pad in (max(p.hi - p.lo + 1, 3),))] or whole
     if not whole:
         return ModeCheck()
-    big = max(whole, key=lambda p: p.w)
+    alike = recurring([p.w for p in whole])
+    big = max((p for p in whole if p.w in alike), key=lambda p: p.w, default=None) or max(whole, key=lambda p: p.w)
     if big.w <= 0:
         return ModeCheck()
     return ModeCheck(True, big.w, big.h, floor_level(y), [(p.i, p.h, p.w) for p in whole])

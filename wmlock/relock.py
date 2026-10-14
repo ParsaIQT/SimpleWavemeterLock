@@ -33,6 +33,7 @@ SCAN = "scan:enabled"
 SHG_LOCK = "nlo:shg:lock:lock-enabled"
 SHG_SCAN = "nlo:shg:scan:enabled"
 SCAN_X = (34, 50, 101)  # signals that are the scan output / the piezo voltage
+SHG_PIEZO = (90, 91)    # the SHG cavity's piezo voltage: its scan
 
 
 def says_locked(text) -> bool:
@@ -54,6 +55,8 @@ class CavitySteps:
         self.shg_ok = shg          # its SHG sweep can be read
         ref = self.p.shg_ref
         self.shg_ref = ref if ref.known else None
+        self.best_area = 0.0       # the biggest main peak in an SHG sweep in this recovery (the second biggest)
+        self._areas = []
         self.shg_key = "y"         # the SHG scope's channel with the intra-cavity signal
         self.shg_scanning = False
         self.last_sweep = None
@@ -69,6 +72,7 @@ class CavitySteps:
         self.mode_text = ""        # how single-mode it was when handed back
         self.falc_text = ""
         self.relock_trouble = ""   # why the last relock did not work
+        self.unlocked = False      # its cavity lock is off, turned off by the recovery
         self._blobs = {}
 
     # ------------------------------------------------------------ taking over
@@ -107,6 +111,7 @@ class CavitySteps:
         self.stage = "taking over"
         if self.cavity:
             yield mh.Set(LOCK, False, restore=False)
+            self.unlocked = True
         if self.shg and o.get(SHG_LOCK):
             yield mh.Set(SHG_LOCK, False, restore=True)
         if self.cavity or o.get(SCAN):  # unlocked, a DLC pro may let its scan run: the wavemeter needs it still
@@ -157,6 +162,7 @@ class CavitySteps:
         """After a relock that did not work: unlock again, for another go."""
         if self.cavity:
             yield mh.Set(LOCK, False, restore=False)
+            self.unlocked = True
             (scan,) = yield mh.Get((SCAN,))
             if scan:
                 yield mh.Set(SCAN, False, restore=self.scan_after_unlock)
@@ -206,24 +212,43 @@ class CavitySteps:
         """The SHG cavity's intra-cavity sweep, measured: a cavity.ModeCheck, None if unreadable."""
         yield mh.Wait(self.settle("nlo:shg:scan:frequency"), after_write=True)  # a sweep since the last change
         blob = yield from self.fresh("nlo:shg:scope:data")
-        y = None
+        y = scan = None
         if blob is not None:
             try:
-                y = float_arrays(blob).get(self.shg_key)
+                arrays = float_arrays(blob)
             except DecopError:
-                y = None
+                arrays = {}
+            y = arrays.get(self.shg_key)
+            other = "Y" if self.shg_key == "y" else "y"  # the other channel, if it shows the scan: where it turns
+            if self.scope.get(f"nlo:shg:scope:channel{2 if other == 'Y' else 1}:signal") in SHG_PIEZO:
+                scan = arrays.get(other)
         if not y:
             self.shg_ok = False
             self.note("cannot read the SHG cavity's intra-cavity signal: no more SHG checks")
             return None
-        m = cavity.sweep(y)
+        m = cavity.sweep(y, scan)
         self.last_sweep = m
         self._last_trace = y
         return m
 
+    def judge(self, m):
+        """(ok, text) for an SHG sweep (cavity.judge): against the laser's single-mode look if that is
+        known; else by its side peaks, and its main peaks against the biggest seen in this recovery
+        (all the power in one mode, they are biggest; two modes of about equal power would
+        otherwise look like one clean mode)."""
+        if m.seen:
+            self._areas = sorted(self._areas + [m.area])[-2:]
+            self.best_area = self._areas[0]  # the second biggest: one odd sweep does not set it
+        if self.shg_ref is not None and self.shg_ref.known:
+            return cavity.judge(m, self.shg_ref)
+        ok, text = cavity.judge(m)
+        if ok and m.area < cavity.AREA_MIN * self.best_area:
+            return False, f"multimode: main peaks at {m.area / self.best_area:.2f} of the biggest seen"
+        return ok, text
+
     def keep_sweep(self, m, why: str):
         """Keep the last sweep for a look afterwards (the latest few, and the maps' examples)."""
-        ok, text = cavity.judge(m, self.shg_ref)
+        ok, text = self.judge(m)
         sweeps = self.record["sweeps"]
         sweeps.append({"why": why, "i": round(self.mA(self.I), 3), "ok": ok, "text": text,
                        "y": cavity.decimate(self._last_trace, 300)})
@@ -239,7 +264,7 @@ class CavitySteps:
         s = yield from self.shg_sweep()
         if s is None:
             return True
-        ok, text = cavity.judge(s, self.shg_ref)
+        ok, text = self.judge(s)
         self.keep_sweep(s, "operating point")
         if ok is None:
             self.note(f"SHG cavity: {text}: carrying on without")
@@ -295,6 +320,7 @@ class CavitySteps:
         if self.scan_after_unlock:
             yield mh.Set(SCAN, True, restore=True)
         yield mh.Set(LOCK, True, restore=False)
+        self.unlocked = False
         if (yield from self.verify()):
             return True
         self.relock_trouble = f"the cavity lock caught a peak {self.e:+.0f} MHz away"
@@ -334,6 +360,7 @@ class CavitySteps:
         yield from self.ask(f"Lock to the peak at {choice.x:.3f} V")
         self.stage = "locking the cavity"
         yield mh.Set(LOCK, True, restore=False)
+        self.unlocked = False
         if not (yield from self.wait_locked()):
             self.relock_trouble = "the cavity lock would not lock at the lockpoint"
             self.note(self.relock_trouble)
@@ -576,17 +603,55 @@ def setup_report(client, laser: int, hop, lp) -> list:
         add("warn", f"the current's slew rate is limited ({fmt(g['dl:cc:output-filter:slew-rate'])}): a recovery "
                     "steps it 0.2 mA at a time and expects each step to take effect at once")
     if hop.i_nom:
-        lo, hi = hop.i_nom - hop.i_window, hop.i_nom + hop.i_window
+        lo, hi = hop.i_nom - hop.i_below, hop.i_nom + hop.i_window
+        top = hop.i_nom + max(hop.jump_max, hop.i_window)
         if _num(clip) and off is not None and hi - off > clip:
             add("info", f"the window's top, {hi:.2f} mA, is above current-clip: {clip + off:.2f} mA measured is "
                         "the limit")
             hi = clip + off
+        if _num(clip) and off is not None and top - off > clip:
+            add("warn", f"current-clip keeps a laser that stopped lasing below {clip + off:.2f} mA measured, short "
+                        f"of the {top:.2f} mA it may jump to")
+            top = clip + off
         inside = _num(act) and lo <= act <= hi
         add("ok" if inside else "error", f"recoveries keep the measured current within {lo:.2f} … {hi:.2f} mA "
-                                         f"({hop.i_nom:.2f} ± {hop.i_window:g}), setting it ≤ 0.2 mA a step; "
-                                         + ("it is inside now" if inside else "it is OUTSIDE now: no recovery"))
+                                         f"({hop.i_nom:.2f} − {hop.i_below:g} / + {hop.i_window:g}), setting it "
+                                         f"≤ 0.2 mA a step; " + ("it is inside now" if inside
+                                                                 else "it is OUTSIDE now: no recovery"))
+        add("info", f"a laser that stopped lasing: the current to {hop.i_nom + hop.jump:.2f} mA at once, then up to "
+                    f"{top:.2f} mA until it lases, and back down at {hop.ramp:g} mA/s")
     else:
         add("info", "the nominal current is read, as measured, when recovery is enabled")
+
+    names = hop.seed_names
+    if names:
+        add("head", "Lasing (its TA's seed power)")
+        g = get(*names, mh.SEED_FLOOR, "amp:seed-limits:power-min-shutdown-delay", "amp:seed-limits:status-txt",
+                mh.TA_ON, "amp:cc:emission", "emission")
+        name = next((n for n in names if _num(g[n])), "")
+        if not name:
+            add("info" if hop.seed.strip().lower() == "auto" else "error",
+                f"no seed power to read ({', '.join(names)}): whether it lases is not watched"
+                + (" (it has no TA?)" if hop.seed.strip().lower() == "auto" else ""))
+        else:
+            seed, floor, delay = g[name], g[mh.SEED_FLOOR], g["amp:seed-limits:power-min-shutdown-delay"]
+            floor = floor if _num(floor) and floor > 0 else 0.0
+            least = hop.seed_least(hop.seed_ok, floor)
+            lasing = seed >= least if least else None
+            add("error" if lasing is False else "ok", f"seed power {seed:.2f} mW ({name})"
+                + (": NOT LASING" if lasing is False else ""))
+            add("info", (f"not lasing below {least:.2f} mW: " if least else "")
+                + (f"{hop.seed_min:g} of its usual {hop.seed_ok:.2f} mW" if hop.seed_ok else "its usual seed power is "
+                   "learned while it lases on target")
+                + (f", and no less than the TA's power-min, {floor:.2f} mW" if floor else ""))
+            if floor and _num(delay):
+                add("info",
+                    f"the TA switches itself off after {delay:g} (power-min-shutdown-delay) with less than "
+                    f"{floor:.2f} mW of seed: a laser that stops lasing has its current jumped within a second or "
+                    "two of the seed power showing it; if the TA is off by then, switch it on again by hand")
+            ta, em = g[mh.TA_ON], g["amp:cc:emission"]
+            add("ok" if ta is not False else "warn", f"TA {fmt(ta)}, emitting {fmt(em)}, seed limits "
+                f"“{g['amp:seed-limits:status-txt'] or '?'}”; laser emission {fmt(g['emission'])}")
 
     g = get("scan:offset", "scan:enabled", "scan:amplitude", "scan:frequency", "scan:unit")
     add("head", "Piezo and scan")
@@ -713,9 +778,23 @@ def setup_report(client, laser: int, hop, lp) -> list:
                 add("info", f"single-mode look learned: main peak area {hop.shg_area:.3g}, biggest side peak "
                             f"{hop.shg_side * 100:.0f} %")
 
+    add("head", "Finding a mode on target")
+    if hop.how() == "walk":
+        add("info", f"walk: single mode first by the SHG sweep, trimming the current; within {hop.reach:g} GHz (else "
+                    f"first hop to a nearer mode with the current), the piezo onto the target in {hop.walk_step:g} V "
+                    f"steps, the mode looked at after each and the current trimmed when it gets worse; then the "
+                    f"current centered, ±{hop.margin:g} mA single-mode")
+        if hop.kv and hop.reach * 1e3 > abs(hop.kv) * hop.v_window:
+            add("warn", f"walking {hop.reach:g} GHz takes {hop.reach * 1e3 / abs(hop.kv):.1f} V of piezo, more than "
+                        f"the ±{hop.v_window:g} V a recovery may move it")
+    else:
+        add("info", f"map: the current swept over its window both ways in {hop.step:g} mA steps, the best mode "
+                    f"parked on the way it lases, the piezo onto the target")
+
     add("head", "What a recovery may change")
-    add("info", "the current (within its window, ≤ 0.2 mA a step), the scan offset, the cavity lock and SHG lock "
-                "on/off, the scan and SHG scan on/off, a scope channel (given back), a FALC pro's input offset "
-                "(within its limit) and select-lockpoint; nothing else. On failure all goes back, "
-                "except that the cavity lock stays off.")
+    add("info", "the current (within its window, ≤ 0.2 mA a step; higher for a laser that stopped lasing), the scan "
+                "offset, the cavity lock and SHG lock on/off, the scan and SHG scan on/off, a scope channel (given "
+                "back), a FALC pro's input offset (within its limit) and select-lockpoint; nothing else. On failure "
+                "all goes back (the current down slowly), except that the cavity lock stays off, and a laser that "
+                "stopped lasing stays where it lases.")
     return out
