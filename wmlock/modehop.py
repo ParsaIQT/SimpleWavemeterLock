@@ -27,9 +27,11 @@ Two ways to a mode on target (HopParams.method):
         no worse, until it is single-mode. Within `reach` of the target (else hop to a mode that
         is, with the current, the way that brings it nearer), walk the piezo onto the target in
         walk_step steps, looking at the frequency (a hop: afresh), whether it lases and the SHG
-        sweep after each, and trimming the current as soon as the mode gets worse than it was.
-        On target, center the current: a margin up and down, still single-mode and on the same
-        mode? If not one way, move the other way, the piezo back onto the target.
+        sweep after each, and trimming the current as soon as the mode gets worse than it was
+        (after a hop, a few steps on the way it was going, out of the new mode's edge).
+        On target and single-mode there: done. A laser that is fine is left as it is: nothing
+        moves but the piezo onto the target (not at all if it is on target), never the current,
+        and the piezo tuning, once known, is not measured again.
   map   sweep the current over the window (below), and choose.
 
 Which way the current comes matters (the map). A mode, once lasing, holds on past the point
@@ -69,7 +71,9 @@ The procedure (Recenter.run, a generator: see "Driving it" below)
              stay on one straight line and come back, i.e. no hop within the margin (and with
              an SHG stage, single mode at both ends and in the middle). Otherwise, or after a
              big piezo move (the piezo moves the modes too), map again here, up to three maps.
-  hand back  lock the SHG cavity (its intra-cavity signal must come up); then the cavity lock
+  hand back  lock the SHG cavity (its intra-cavity signal must come up, as high as usual: if not,
+             the master is not single-mode, however its sweep looked, and the walk trims the
+             current to where the sweep's main peaks are biggest); then the cavity lock
              (relock.py): with lockpoints, start the scan, pick the TEM00 peak where the
              wavemeter puts the target among the DLC pro's lockpoint candidates, null the
              error signal's DC level with the FALC pro's input offset, select the peak, lock,
@@ -124,6 +128,8 @@ class HopParams:
     falc: bool = True         # null the error signal's DC with the FALC pro's input offset first
     falc_max: float = 0.05    # V: the most the input offset may move from where it was
     window: float = 150.0     # MHz: the right cavity peak is within this of where the wavemeter puts it
+    peak_tol: float = 50.0    # MHz: locked to its cavity, but further than this from the target: the wrong peak
+    lock_min: float = 0.5     # its cavity transmission averaging below this fraction of usual: the lock keeps losing it
     confirm: bool = False     # step by step: ask before each step
     i_nom: float = 0.0        # mA, the laser's normal current (0: read it when enabled)
     i_window: float = 2.0     # mA: the current stays below i_nom + this, always...
@@ -132,8 +138,8 @@ class HopParams:
     reach: float = 8.0        # GHz: a single-mode mode this near the target is walked onto it with the piezo
     walk_step: float = 0.5    # V: the piezo's steps while walking, the mode looked at after each
     step: float = 0.1         # mA between readings while mapping, and of a trim
-    margin: float = 0.5       # mA: wanted distance from a hop, both ways
-    tolerance: float = 100.0  # MHz: further than this from the target is off target...
+    margin: float = 0.5       # mA: wanted distance from a hop, both ways (the map checks it)
+    tolerance: float = 100.0  # MHz: further than this from the target is off target (locked to a cavity: peak_tol)...
     grace: float = 2.0        # s: ...for this long (and two readings) means a hop
     max_per_hour: int = 4     # recoveries; more than that and something else is wrong
     seed: str = "auto"        # what tells it lases: auto (its TA's seed photodiode, if any) | a parameter | off
@@ -152,9 +158,11 @@ class HopParams:
     shg_n: int = 0
     falc_sign: int = 0        # +-1: how the input offset shows in the error signal (0: not known)
     seed_ok: float = 0.0      # mW: its seed power, lasing as usual
+    lock_ok: float = 0.0      # V: the cavity transmission (lock input), locked as usual
+    shg_lock: float = 0.0     # V: the SHG cavity's intra-cavity signal, locked, the master single-mode
 
     LEARNED = ("kv", "spacing", "peak_y", "lp_kind", "lp_code", "shg_area", "shg_side", "shg_n", "falc_sign",
-               "seed_ok")
+               "seed_ok", "lock_ok", "shg_lock")
 
     @classmethod
     def from_dict(cls, d) -> "HopParams":
@@ -180,6 +188,11 @@ class HopParams:
     @property
     def shg_ref(self) -> cavity.ModeRef:
         return cavity.ModeRef(self.shg_area, self.shg_side, self.shg_n)
+
+    def off_target(self) -> float:
+        """MHz: further than this from the target is off target (locked to a cavity: on the wrong peak; the
+        wavemeter is never that far off)."""
+        return self.peak_tol if self.cavity else self.tolerance
 
     def how(self, shg: bool | None = None) -> str:
         """The method it uses: 'walk' or 'map'."""
@@ -556,7 +569,6 @@ class Recenter(CavitySteps):
     HEAL_STEPS = 25        # current trims each way, at most
     HEAL_EXTRA = 2         # trims on, once single-mode, for good measure
     WORSE = 0.05           # an SHG sweep this much worse (badness) than the best is getting worse
-    CENTER_TRIES = 3
 
     def __init__(self, p: HopParams, current: float, offset: float, i_lo: float, i_hi: float,
                  v_lo: float, v_hi: float, kv: float = 0.0, cavity: bool = False, quick: bool = True,
@@ -616,6 +628,7 @@ class Recenter(CavitySteps):
         self.healed_hop = False             # it hopped while being trimmed single-mode
         self._hop = False                   # the last trim was a hop
         self.last_look = (None, "")         # the last SHG sweep's verdict
+        self._looked = None                 # (current, offset) it was taken at
         self._slopes = deque(maxlen=9)
         CavitySteps.__init__(self, p.shg if shg is None else shg)
 
@@ -1201,13 +1214,17 @@ class Recenter(CavitySteps):
         """As by hand (method 'walk'): make the mode single-mode first, by the SHG sweep, trimming the
         current if it is not; if it is then within reach of the target (else hop to a mode that is,
         with the current), walk the piezo slowly onto the target, looking at the mode after every
-        step and trimming the current whenever it gets worse; then center the current between where
-        the mode goes multimode either way. A hop on the way: start afresh from where it is."""
+        step and trimming the current whenever it gets worse. On target and single-mode (looked at
+        there): done. A laser that is fine is left as it is but for the piezo onto the target: the
+        current is not moved, nor the piezo to measure its tuning if that is known. A hop on the
+        way: start afresh from where it is."""
         if self.shg_ok:
             yield from self.shg_scan(True)
-        reach, sought, before = self.p.reach * 1e3, False, None
+        reach, sought, before, hops = self.p.reach * 1e3, False, None, 0
         for _ in range(self.WALK_ROUNDS):
-            if not (yield from self.heal()):
+            explore, self.doubt = self.doubt, False  # its SHG cavity would not lock as it should
+            self.explored += explore
+            if not (yield from self.heal(explore=explore)):
                 if before is not None:  # the mode it hopped to, to be nearer: the one before after all
                     yield from self.back(before, "the mode it hopped to does not go single-mode")
                     before = None
@@ -1216,16 +1233,21 @@ class Recenter(CavitySteps):
                              f"(SHG sweep: {self.last_look[1]})")
             if not math.isfinite(self.e) and not math.isfinite((yield from self.read())):
                 raise Failed("no valid readings")
+            if abs(self.e) <= self.tol():  # on target
+                if (yield from self.single_here()):
+                    return
+                continue  # not single-mode here after all: trim
             if abs(self.e) > reach and not sought:
                 sought, here = True, (self.V, self.I)
                 if (yield from self.seek(reach)):
                     before = here
                 continue  # on another mode, or back where it began: single-mode? (else walked from there)
-            for _ in range(2):
+            if not self.kv_known:  # (known from an earlier recovery: not measured again)
+                for _ in range(2):
+                    if not self.kv_measured:
+                        yield from self.measure_kv()
                 if not self.kv_measured:
-                    yield from self.measure_kv()
-            if not self.kv_measured:
-                raise Failed("cannot measure the piezo tuning (it hops, or the readings are too noisy)")
+                    raise Failed("cannot measure the piezo tuning (it hops, or the readings are too noisy)")
             need = -self.e / self.kv
             if not self.v_lo - 1e-6 <= self.V + need <= self.v_hi + 1e-6:
                 raise Failed(f"the target is {self.e / 1e3:+.2f} GHz away"
@@ -1236,7 +1258,10 @@ class Recenter(CavitySteps):
             if abs(self.e) > reach:
                 self.note(f"no mode nearer: walking the piezo {self.e / 1e3:+.2f} GHz")
             outcome = yield from self.walk_piezo()
-            if outcome in ("hop", "retune"):
+            if outcome in ("ok", "retune"):
+                continue  # on target: the mode looked at there (above); or the tuning to be measured
+            if outcome == "hop":
+                hops += 1
                 continue
             if outcome == "sick" and before is not None:
                 yield from self.back(before, f"no current keeps the mode it hopped to single-mode at {self.V:.2f} V")
@@ -1245,11 +1270,19 @@ class Recenter(CavitySteps):
             if outcome == "sick":
                 raise Failed(f"multimode at {self.V:.2f} V, and no current within {self.mA(self.i_lo):.2f} … "
                              f"{self.mA(self.i_hi):.2f} mA makes it single-mode (SHG sweep: {self.last_look[1]})")
-            if outcome != "ok":
-                raise Failed(f"the piezo did not bring it onto the target ({outcome}, {self.e:+.0f} MHz from it)")
-            if (yield from self.center()):
-                return
-        raise Failed(f"it hopped {self.WALK_ROUNDS} times on the way to the target")
+            raise Failed(f"the piezo did not bring it onto the target ({outcome}, {self.e:+.0f} MHz from it)")
+        raise Failed(f"it did not settle on the target, single-mode, in {self.WALK_ROUNDS} goes"
+                     + (f" (it hopped {hops} times on the way)" if hops else ""))
+
+    def single_here(self):
+        """On target: single-mode here by the SHG sweep (the last one, if it was taken right here)? Its
+        look is kept, and learned. True if there is no telling."""
+        if not self.shg_ok:
+            return True
+        if self.last_look[0] and self._looked == (self.I, self.V) and self.last_sweep is not None:
+            self.adopt(self.last_sweep, self.last_look[1])
+            return True
+        return (yield from self.mode_ok())
 
     def back(self, where, why: str):
         """Piezo, then current, back to where = (V, I): to the mode it was on there, if it comes back."""
@@ -1298,7 +1331,7 @@ class Recenter(CavitySteps):
             self.last_look = (None, "no SHG sweep")
             return None, 0.0
         ok, text = self.judge(m)
-        self.last_look = (ok, text)
+        self.last_look, self._looked = (ok, text), (self.I, self.V)
         self.keep_sweep(m, why)
         walk = self.record.get("walk")
         if walk and ok is not None:
@@ -1319,29 +1352,45 @@ class Recenter(CavitySteps):
             self.learn_slope(self.I - i0, self.e - e0)
         return True
 
-    def heal(self, want: float | None = None, again: bool = True):
+    def heal(self, want: float | None = None, again: bool = True, explore: bool = False):
         """Single-mode by the SHG sweep, and with want, its badness no more than that (on the walk: as
         good as it was): at once if it is so, or if there is no telling. Else trim the current a step
         at a time, the way that worked last (up, to begin with: down, it may stop lasing), while the
-        sweep gets no worse, then the other way; once there, HEAL_EXTRA trims on for good measure
-        while it stays so. Short of want, the best single-mode current found on the way will do.
-        False if there is none. self.healed_hop: it hopped meanwhile (look again where it is)."""
+        sweep gets no worse, then the other way; once there, on while its main peaks grow, and
+        HEAL_EXTRA trims more for good measure while it stays so. Short of want, the single-mode
+        current found on the way with the biggest main peaks will do. explore: it looks single-mode,
+        but is not (its SHG cavity would not lock as it should): what is wanted is main peaks
+        clearly bigger than where it began (by 1/AREA_MIN), or else where they are biggest. False
+        if there is no single-mode current. self.healed_hop: it hopped meanwhile (look again where
+        it is)."""
         self.healed_hop = False
         if not self.shg_ok:
             return True
 
+        def area():
+            return self.last_sweep.area if self.last_sweep is not None else 0.0
+
         def good(ok, bad):
+            if explore:  # single-mode, its main peaks clearly bigger than where it began
+                return ok is True and area() * cavity.AREA_MIN >= a_start
             return ok is not False and (want is None or bad <= want + 1e-9)
 
+        a_start = math.inf
         ok, bad = yield from self.look("the mode")
         if good(ok, bad):
             return True
-        yield from self.ask(f"The mode is {'not single' if ok is False else 'getting worse'} (SHG sweep: "
-                            f"{self.last_look[1]}): trim the current, {'up' if self.trim_way > 0 else 'down'} "
-                            f"first, a step at a time, until it is {'single-mode' if ok is False else 'as it was'}")
+        way = "up" if self.trim_way > 0 else "down"
+        if explore:
+            yield from self.ask(f"The SHG cavity would not lock as it should ({self.relock_trouble}), though its sweep "
+                                f"looks single-mode: trim the current either way, {way} first, to where the sweep's "
+                                f"main peaks are biggest")
+        else:
+            yield from self.ask(f"The mode is {'not single' if ok is False else 'getting worse'} (SHG sweep: "
+                                f"{self.last_look[1]}): trim the current, {way} first, a step at a time, until it is "
+                                f"{'single-mode' if ok is False else 'as it was'}")
         self.stage = "trimming the current: single mode?"
-        start, e_start, first = self.I, self.e, self.last_look[1]
-        fine = (bad, self.I, self.e) if ok is not False else None  # the best single-mode point on this mode
+        start, e_start, first, a_start = self.I, self.e, self.last_look[1], area() or math.inf
+        fine = (area(), self.I, self.e) if ok is not False else None  # the best single-mode point on this mode
         for way in (self.trim_way, -self.trim_way):
             if abs(self.I - start) > 1e-9:  # back to where it began, and the other way from there
                 yield from self.move(current=start)
@@ -1350,18 +1399,21 @@ class Recenter(CavitySteps):
                 ok, bad = yield from self.look("the mode")
                 if good(ok, bad):
                     return True
-            best, worse, healthy = bad, 0, 0
+            best, worse, healthy, top = bad, 0, 0, 0.0
             for _ in range(self.HEAL_STEPS + self.HEAL_EXTRA):
                 if not (yield from self.trim(way)):
                     break
                 if self._hop:
                     self.healed_hop, fine = True, None
                 ok, bad = yield from self.look("trimming")
-                if ok is not False and (fine is None or bad < fine[0]):
-                    fine = (bad, self.I, self.e)
+                if ok is not False and (fine is None or area() > fine[0]):
+                    fine = (area(), self.I, self.e)
                 if good(ok, bad):
                     self.trim_way = way
-                    healthy += 1
+                    if area() > (1 + self.WORSE / 2) * top:  # its main peaks still growing: on, and HEAL_EXTRA
+                        top, healthy = area(), 1               # trims past where they stop
+                    else:
+                        healthy += 1
                     if healthy > self.HEAL_EXTRA:
                         break
                     continue
@@ -1378,14 +1430,21 @@ class Recenter(CavitySteps):
                     if worse >= 2:
                         break
             if healthy:
-                self.note(f"{'single mode' if want is None else 'the mode as it was'} at {self.mA(self.I):.2f} mA, "
-                          f"trimming {'up' if way > 0 else 'down'} from {self.mA(start):.2f} mA (it was {first})")
+                self.note((f"the SHG sweep's main peaks {area() / a_start:.2f} times as big" if explore else
+                           'single mode' if want is None else 'the mode as it was')
+                          + f" at {self.mA(self.I):.2f} mA, trimming {'up' if way > 0 else 'down'} from "
+                          f"{self.mA(start):.2f} mA (it was {first})")
                 return True
         if fine is not None:  # not as good as wanted, but single-mode there
             yield from self.move(current=fine[1])
             if not self.jumped(fine[2], self.e):
-                self.note(f"single mode at {self.mA(self.I):.2f} mA, the best trimming either way from "
-                          f"{self.mA(start):.2f} mA (it was {first})")
+                if explore:
+                    self.note(f"the SHG sweep's main peaks are biggest at {self.mA(self.I):.2f} mA, trimming "
+                              f"either way from {self.mA(start):.2f} mA (where they were "
+                              f"{a_start / max(fine[0], 1e-12):.2f} of that)")
+                else:
+                    self.note(f"single mode at {self.mA(self.I):.2f} mA, the best trimming either way from "
+                              f"{self.mA(start):.2f} mA (it was {first})")
                 return True
             self.healed_hop = True
             if again:
@@ -1411,6 +1470,7 @@ class Recenter(CavitySteps):
             if self._hop and (yield from self.hopped(e_start, self.I - start)):
                 self.note(f"hopped at {self.mA(self.I):.2f} mA: {self.e / 1e3:+.2f} GHz from the target")
                 if math.isfinite(self.e) and abs(self.e) <= reach:
+                    yield from self.settle_in(way)
                     return True
         self.note(f"sweeping the current {'up' if way > 0 else 'down'} from {self.mA(start):.2f} to "
                   f"{self.mA(self.I):.2f} mA brought no mode within {reach / 1e3:g} GHz (it began "
@@ -1427,16 +1487,50 @@ class Recenter(CavitySteps):
         if all(math.isfinite(x) for x in (e0, e1, e2)) and abs(e2 - e0) < self.threshold:
             self.learn_slope(di, e1 - 0.5 * (e0 + e2))
 
+    def settle_in(self, way: int):
+        """It has just hopped onto a mode: it is at that mode's edge, where the one it came from still
+        lases a little. The current on, `way` (sweeping the current, the way it was going; after a hop to
+        a higher frequency, down: the current moves the selection filter faster than the mode), out of
+        the edge into the mode: HEAL_EXTRA steps, and on while the SHG sweep's main peaks grow, as long
+        as they do not shrink and it does not hop (then a step back)."""
+        if not self.shg_ok:
+            return
+        self.stage = "into the mode it hopped to"
+        ok, _ = yield from self.look("hopped onto")
+        top = self.last_sweep.area if ok is not None and self.last_sweep is not None else 0.0
+        start = self.I
+        for k in range(self.HEAL_STEPS):
+            if not top or not (yield from self.trim(way)):
+                break
+            if self._hop:
+                yield from self.trim(-way)
+                break
+            ok, _ = yield from self.look("into the mode")
+            area = self.last_sweep.area if self.last_sweep is not None else 0.0
+            if ok is False or area < (1 - self.WORSE) * top:
+                yield from self.trim(-way)
+                break
+            if area > (1 + self.WORSE / 2) * top:
+                top = area  # still growing: on
+            elif k + 1 >= self.HEAL_EXTRA:
+                break
+        if abs(self.I - start) > 1e-9:
+            self.note(f"into the mode it hopped to: {self.mA(start):.2f} → {self.mA(self.I):.2f} mA")
+
     def walk_piezo(self):
         """The piezo onto the target in steps of walk_step V. After each: the frequency (a hop?),
         whether it lases (move does that), and the mode by the SHG sweep: worse than single-mode,
-        trim the current (heal). 'ok' on target, 'hop', 'limit' (the piezo may go no further), or
-        'sick' (no single-mode current here)."""
+        trim the current (heal). 'ok' on target, 'hop', 'retune' (the piezo did not tune it as its
+        tuning says, or the wrong way: to be measured), 'limit' (the piezo may go no further), 'sick'
+        (no single-mode current here), or 'slow'."""
         step = self.p.walk_step
         e = self.e
         if abs(e) > self.tol():
-            yield from self.ask(f"Walk the piezo onto the target: {e / 1e3:+.2f} GHz away, about {-e / self.kv:+.1f} V "
-                                f"in {step:g} V steps, looking at the mode after each")
+            away = f"{e / 1e3:+.2f} GHz" if abs(e) >= 1e3 else f"{e:+.0f} MHz"
+            dv = -e / self.kv
+            yield from self.ask(f"Walk the piezo onto the target: {away} away, about "
+                                f"{dv:+.{1 if abs(dv) >= 1 else 2}f} V in {step:g} V steps, looking at the mode "
+                                f"after each")
         self.stage = "walking the piezo onto the target"
         v_start = self.V
         start = self.badness_now() if self.shg_ok else 0.0  # how good the mode is: it should stay so
@@ -1460,17 +1554,21 @@ class Recenter(CavitySteps):
             e1 = yield from self.move(offset=v)
             if self.jumped(e, e1, dv=dv) and (yield from self.hopped(e, dv=dv)):
                 if math.isfinite(self.e) and abs(self.e - e) <= self.threshold:  # it moved, but not as it should
-                    self.note(f"the piezo tuned it {(self.e - e) / dv:+.0f} MHz/V, not {self.kv:+.0f}: measured again")
-                    self.kv_measured = False
-                    return "retune"
+                    return self.retune((self.e - e) / dv)
                 self.note(f"hopped at {self.V:.2f} V: {self.e / 1e3:+.2f} GHz from the target"
                           if math.isfinite(self.e) else f"lost it at {self.V:.2f} V")
+                if math.isfinite(self.e):
+                    yield from self.settle_in(-1 if self.e > e else 1)
                 return "hop"
             e1 = self.e
             if abs(e1 - e) > max(10 * self.noise, 20.0):
                 kv = (e1 - e) / dv
                 if 0.5 < kv / self.kv < 2:
                     self.kv = 0.8 * self.kv + 0.2 * kv
+                elif kv / self.kv < 0:  # away from the target: is the tuning what it was?
+                    e2 = yield from self.steady()
+                    if abs(e2 - e) > max(10 * self.noise, 20.0) and (e2 - e) / dv / self.kv < 0:
+                        return self.retune((e2 - e) / dv)
             if self.shg_ok and abs(e1) > self.tol():
                 ok, bad = yield from self.look("walking")
                 if ok is False or bad > start + 2 * self.WORSE:  # it lost quality: trim the current
@@ -1482,79 +1580,21 @@ class Recenter(CavitySteps):
                     self.stage = "walking the piezo onto the target"
         return "slow"
 
-    def probe(self, m: float):
-        """(up, down): still single-mode (by the SHG sweep) and on the same mode with the current m
-        higher, and m lower (as far as the window lets it, if that is half of m at least: else
-        None, not looked at); None if it came back on another mode. Ends back here."""
-        ic, ec = self.I, self.e
-        out = []
-        for way in (1, -1):
-            i = min(max(ic + way * m, self.i_lo), self.i_hi)
-            if abs(i - ic) < 0.5 * m:
-                out.append(None)
-                continue
-            e = yield from self.move(current=i)
-            hop = self.jumped(ec, e, i - ic)
-            ok = None
-            if self.shg_ok and not hop:
-                ok, _ = yield from self.look(f"{'+' if way > 0 else '-'}{abs(i - ic):.2f} mA")
-            e2 = yield from self.move(current=ic)
-            if self.jumped(ec, e2):
-                self.note(f"came back from {self.mA(i):.2f} mA on another mode")
-                return None
-            if not hop:
-                self.learn_slope(i - ic, e - 0.5 * (ec + e2))
-            out.append(not hop and ok is not False)
-        return tuple(out)
-
-    def center(self):
-        """On target, single-mode: a margin's worth of current up and down, is it still so, and on
-        the same mode? If not one way, the current half a margin the other way, and the piezo back
-        onto the target; up to CENTER_TRIES times. Then the mode at the operating point. True when
-        done; False if it hopped (start afresh)."""
-        m = self.p.margin
-        yield from self.ask(f"On target at {self.mA(self.I):.2f} mA: look at the mode {m:g} mA either way, and "
-                            f"center the current if it goes multimode one way")
-        self.stage = "centering the current"
-        for _ in range(self.CENTER_TRIES):
-            sides = yield from self.probe(m)
-            if sides is None:
-                return False
-            up, down = sides
-            if up is not False and down is not False:
-                self.note(f"single mode {m:g} mA " + ("either way of" if up and down else "above" if up else "below")
-                          + f" {self.mA(self.I):.2f} mA" + ("" if up and down else " (the window ends "
-                                                             + ("below)" if up else "above)")))
-                break
-            if up is False and down is False:
-                self.note(f"multimode (or another mode) {m:g} mA either way of {self.mA(self.I):.2f} mA: "
-                          f"left in the middle")
-                break
-            i = min(max(self.I + (0.5 if down is False else -0.5) * m, self.i_lo), self.i_hi)
-            side = "below" if down is False else "above"
-            if abs(i - self.I) < 1e-6:
-                self.note(f"multimode {m:g} mA {side} {self.mA(self.I):.2f} mA, and the window ends "
-                          f"{'above' if side == 'below' else 'below'}: left here")
-                break
-            self.note(f"multimode {m:g} mA {side} {self.mA(self.I):.2f} mA: to {self.mA(i):.2f} mA")
-            e0, i0 = self.e, self.I
-            yield from self.move(current=i)
-            if self.jumped(e0, self.e, self.I - i0):
-                return False
-            if (yield from self.tune()) != "ok":
-                return False
-        if abs(self.e) > self.tol() and (yield from self.tune()) != "ok":
-            return False
-        return (yield from self.mode_ok())
+    def retune(self, kv: float) -> str:
+        """The piezo tuned it kv MHz/V, not as thought: its tuning to be measured again."""
+        self.note(f"the piezo tuned it {kv:+.0f} MHz/V, not {self.kv:+.0f}: measured again")
+        self.kv_known = self.kv_measured = False
+        return "retune"
 
     def verify(self):
-        """After relocking the cavity: VERIFY_N readings in a row within tolerance/2."""
+        """After relocking the cavity: VERIFY_N readings in a row within peak_tol (further, it is on the
+        wrong peak)."""
         self.stage = "waiting for the cavity lock"
         t0, good = None, 0
         while True:
             e = yield from self.read()
             t0 = self.t if t0 is None else t0
-            good = good + 1 if math.isfinite(e) and abs(e) <= self.p.tolerance / 2 else 0
+            good = good + 1 if math.isfinite(e) and abs(e) <= self.p.peak_tol else 0
             if good >= self.VERIFY_N:
                 return True
             if self.t - t0 > self.VERIFY_S:
@@ -1580,6 +1620,8 @@ class Recenter(CavitySteps):
             summary = "relocked, " + summary
         if self.mode_text:
             summary += f"; {self.mode_text}"
+        if self.shg_text:
+            summary += f"; {self.shg_text}"
         if self.falc_text:
             summary += f"; {self.falc_text}"
         self.record.update({"i0": round(self.mA(self.I_start), 4), "v0": self.V0, "i": round(self.mA(self.I), 4),

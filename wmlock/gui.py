@@ -289,6 +289,8 @@ class ChannelRow(QtWidgets.QFrame):
                 self.info.paint(f"{where}   offline", "err")
             elif ch.lasing is False and ch.hop.enabled:
                 self.info.paint(f"{where}   NOT LASING: seed {ch.seed:.2f} mW{self._hop_text(ch, now)}", "err")
+            elif self._slipping(ch):
+                self.info.paint(f"{where}   CAVITY LOCK SLIPPING{self._hop_text(ch, now)}", "warn")
             else:
                 off = "…" if ch.offset is None else f"{ch.offset:.3f} {ch.unit}"
                 self.info.paint(f"{where}   {off}{self._hop_text(ch, now)}", "dim")
@@ -353,16 +355,28 @@ class ChannelRow(QtWidgets.QFrame):
             text += f"   seed {ch.seed:.1f} mW"
         if ch.hop.cavity:
             text += f"   cavity {ch.cavity_txt or ('on' if ch.cavity_on else 'off')}"
+            frac = Engine.transmission(ch)
+            if frac is not None:
+                text += f" · transmission {frac:.0%}"
         if ch.hop.shg and ch.shg_txt:
             text += f"   SHG {ch.shg_txt}"
         if ch.note and now - ch.note_t < NOTE_S:
             text += f"   ⟲ {fmt_duration(now - ch.note_t)} ago"
         return text
 
+    @staticmethod
+    def _slipping(ch) -> bool:
+        """Its cavity lock looks as if it keeps losing it (armed, it would be relocked)."""
+        frac = Engine.transmission(ch)
+        return bool(ch.hop.enabled and ch.hop.cavity and ch.cavity_on and frac is not None and len(ch.trans_hist) >= 5
+                    and frac < ch.hop.lock_min)
+
     RELOCK_TIP = ("Its DLC pro locks it to a cavity; this does not lock it to the wavemeter.\n"
-                  "Relock: watch it, and after a mode hop take it over and relock it (if it is not\n"
-                  "locked on target now, relock it now). It does nothing else: the piezo is its lock's.\n"
-                  "Watching: click to stop watching.")
+                  "Relock: watch it, and take it over and relock it after a mode hop, when it is\n"
+                  "locked on the wrong peak (further from the target than the wavemeter could be\n"
+                  "wrong), or when its lock keeps losing it (its transmission far below usual);\n"
+                  "if it is not locked on target now, relock it now. It does nothing else: the piezo\n"
+                  "is its lock's. Watching: click to stop watching.")
     LOCK_TIP = "Lock to the wavemeter: the scan offset follows the reading onto the setpoint."
 
     def _set_relock(self, relock: bool):
@@ -684,6 +698,8 @@ class HopDialog(QtWidgets.QDialog):
         self.tolerance = number(p.tolerance, 5, 100000, 0, 10)
         self.grace = number(p.grace, 0.2, 60, 1, 0.5)
         form.addRow("A hop is", row("off target by more than", self.tolerance, "MHz for", self.grace, "s"))
+        self.tolerance.setToolTip("For a laser locked to the wavemeter. One its DLC pro locks to a cavity is off "
+                                  "target further than Wrong peak, below.")
         self.per_hour = QtWidgets.QSpinBox()
         self.per_hour.setRange(1, 60)
         self.per_hour.setValue(p.max_per_hour)
@@ -699,7 +715,7 @@ class HopDialog(QtWidgets.QDialog):
         form.addRow("Walk", row("from a single-mode mode within", self.reach, "GHz, in", self.walk_step,
                                 "V steps"))
         self.margin = number(p.margin, 0.05, 5, 2, 0.05)
-        form.addRow("Keep a hop at least", row(self.margin, "mA away, both ways (multimode, walking)"))
+        form.addRow("Keep a hop at least", row(self.margin, "mA away, both ways (the map checks it)"))
         self.step = number(p.step, 0.01, 1, 2, 0.01)
         form.addRow("Trim and map in steps of", row(self.step, "mA"))
 
@@ -723,6 +739,16 @@ class HopDialog(QtWidgets.QDialog):
         form.addRow("Relock by", self.relock)
         self.window = number(p.window, 10, 100000, 0, 10)
         form.addRow("The right peak is", row("within ±", self.window, "MHz of where the wavemeter puts the setpoint"))
+        self.peak_tol = number(p.peak_tol, 5, 10000, 0, 5)
+        form.addRow("Wrong peak", row("locked, but more than", self.peak_tol, "MHz from the target (the wavemeter is "
+                                      "never that far off): relock"))
+        self.lock_min = number(p.lock_min, 0.05, 0.95, 2, 0.05)
+        usual = f"(usually {p.lock_ok:.3f} V)" if p.lock_ok else "(its usual, learned)"
+        form.addRow("Lock slipping", row("transmission below", self.lock_min, "of usual", usual,
+                                         "on average over 10 s: relock"))
+        self.lock_min.setToolTip("The lock input (Fine In 1, as a rule: the cavity transmission, its lock detection "
+                                 "signal too). A lock that keeps losing the laser and relocking (ReLock) lets it "
+                                 "through only now and then.")
         self.falc = QtWidgets.QCheckBox("Null the error signal's DC level with the FALC pro's input offset, by at most")
         self.falc.setChecked(p.falc)
         self.falc_max = number(p.falc_max, 0.001, 1.0, 3, 0.005)
@@ -769,12 +795,17 @@ class HopDialog(QtWidgets.QDialog):
             out.append("the FALC offset shows on the error signal")
         if p.seed_ok:
             out.append(f"seed {p.seed_ok:.1f} mW lasing")
+        if p.lock_ok:
+            out.append(f"transmission {p.lock_ok:.3f} V locked")
+        if p.shg_lock:
+            out.append(f"SHG signal {p.shg_lock:.3f} V locked")
         return ", ".join(out)
 
     def _who(self):
         cavity = self.who.currentIndex() == 1
-        for w in (self.relock, self.window, self.falc, self.falc_max):
+        for w in (self.relock, self.window, self.falc, self.falc_max, self.peak_tol, self.lock_min):
             w.setEnabled(cavity)
+        self.tolerance.setEnabled(not cavity)
 
     def _forget(self):
         self.forget = True
@@ -786,7 +817,8 @@ class HopDialog(QtWidgets.QDialog):
             enabled=self.enabled.isChecked(), cavity=self.who.currentIndex() == 1, shg=self.shg.isChecked(),
             method=self.METHOD[self.method.currentIndex()][0],
             relock=self.RELOCK[self.relock.currentIndex()][0], falc=self.falc.isChecked(),
-            falc_max=self.falc_max.value(), window=self.window.value(), confirm=self.confirm.isChecked(),
+            falc_max=self.falc_max.value(), window=self.window.value(), peak_tol=self.peak_tol.value(),
+            lock_min=self.lock_min.value(), confirm=self.confirm.isChecked(),
             i_nom=round(self.i_nom.value(), 3), i_window=self.i_window.value(), i_below=self.i_below.value(),
             v_window=self.v_window.value(), reach=self.reach.value(), walk_step=self.walk_step.value(),
             step=self.step.value(), margin=self.margin.value(), tolerance=self.tolerance.value(),
@@ -978,7 +1010,7 @@ class RecoveryDialog(QtWidgets.QDialog):
         i.add(list(range(len(pts))), [p[1] for p in pts], "accent", "line")
         return [self._box("the walk: frequency from the target against the scan offset; green where the SHG sweep "
                           "showed one mode, × two, grey not looked at", f),
-                self._box("the current (measured) at each reading: trims, and the checks either side at the end", i)]
+                self._box("the current (measured) at each reading: the trims (a laser that was fine: none)", i)]
 
     def _sweep(self, s):
         plot = Plot("sample", "V", 120)
@@ -1298,7 +1330,9 @@ class MainWindow(QtWidgets.QWidget):
                     sim.addAction(f"{who}: stops lasing", las.stop_lasing)
                 if las.lock is not None:
                     sim.addAction(f"{who}: cavity lock jumps a peak", functools.partial(las.lock.jump, 1))
-                    sim.addAction(f"{who}: goes multimode, without a hop", functools.partial(las.go_multimode, 1))
+                    sim.addAction(f"{who}: cavity lock jumps 60 MHz", functools.partial(las.lock.jump, 0.04))
+                    sim.addAction(f"{who}: goes multimode, without a hop (its cavity lock keeps losing it)",
+                                  functools.partial(las.go_multimode, 1))
                     sim.addAction(f"{who}: error signal DC drifts +20 mV",
                                   functools.partial(setattr, las.lock, "pdh_dc", las.lock.pdh_dc + 0.02))
         self._menu = m

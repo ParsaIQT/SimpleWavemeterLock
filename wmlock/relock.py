@@ -10,8 +10,10 @@ By hand, for a TA-SHG pro whose master is locked to a reference cavity (PDH thro
   5  null the error signal's DC level with the FALC pro's input offset (some 0.01 V)
   6  lock the master
 Here 1 is take_over; 2 happens throughout the recentering (Recenter.map, check and mode_ok);
-3 is lock_shg; 4-6 relock_lockpoint, which also makes sure the wavemeter and the transmission
-agree that it locked to the right peak. relock_plain is for a lock that finds its resonance by
+3 is lock_shg, which also makes sure the intra-cavity signal comes up as high as usual (two
+modes of about equal power can look like one clean mode in a sweep, but not there); 4-6
+relock_lockpoint, which also makes sure the wavemeter and the transmission agree that it
+locked to the right peak. relock_plain is for a lock that finds its resonance by
 itself (lock without lockpoint, or ReLock): it re-enables it and lets the wavemeter judge.
 
 Every write goes through Runner, which refuses anything but WRITABLE (modehop.py) and puts it
@@ -73,6 +75,9 @@ class CavitySteps:
         self.falc_text = ""
         self.relock_trouble = ""   # why the last relock did not work
         self.unlocked = False      # its cavity lock is off, turned off by the recovery
+        self.doubt = False         # its SHG cavity would not lock as it should: not single-mode after all
+        self.explored = 0          # times the walk has trimmed the current for that
+        self.shg_text = ""         # its SHG signal short of usual, handed back all the same
         self._blobs = {}
 
     # ------------------------------------------------------------ taking over
@@ -272,12 +277,21 @@ class CavitySteps:
         if not ok:
             self.note(f"at {self.mA(self.I):.2f} mA, SHG cavity: {text}")
             return False
+        self.adopt(s, text)
+        return True
+
+    def adopt(self, s, text: str):
+        """The laser is single-mode where it is to be handed back, by SHG sweep s: how it looks is kept
+        (and learned, for telling single-mode next time)."""
         self.mode_text = text
         learned = cavity.updated(self.p.shg_ref if self.p.shg_ref.known else None, s)
         self.learned.update(shg_area=round(learned.area, 5), shg_side=round(learned.side, 4), shg_n=learned.n_main)
-        return True
 
     def lock_shg(self):
+        """Lock the SHG cavity: its intra-cavity signal must come up, and as high as usual (as learned
+        while it ran, else where it was locked when the recovery began): if not, the master is not
+        single-mode, whatever its sweep looked like (self.doubt), unless trimming the current for
+        that has not brought it up already (then it is handed back all the same, and says so)."""
         s = self.last_sweep
         yield from self.ask(f"Lock the SHG cavity ({self.mode_text or 'its mode was not checked'})")
         self.stage = "locking the SHG cavity"
@@ -288,19 +302,38 @@ class CavitySteps:
             level = 0.5 * self.shg_level
         else:  # or half way up the main peak of the sweep (the scope may scale it differently, though)
             level = s.floor + 0.5 * s.height if s is not None and s.seen else None
-        good, text, intra = 0, None, None
+        usual = self.p.shg_lock or self.shg_level or 0.0  # its intra-cavity signal, locked single-mode
+        good, text, intra, top = 0, None, None, 0.0
         for _ in range(int(self.SHG_LOCK_S / 0.5)):
             yield mh.Wait(0.5)
             text, intra = yield mh.Get(("nlo:shg:lock:state-txt", "nlo:pd:shg-int:photodiode"))
             up = _num(intra) and intra >= level if level is not None else says_locked(text)
             good = good + 1 if up else 0
+            top = max(top, intra) if up and _num(intra) else top
             if good >= 2:
-                self.note("SHG cavity locked" + (f", intra-cavity signal {intra:.3f} V" if _num(intra) else ""))
-                return True
-        self.relock_trouble = (f"the SHG cavity does not lock ({text or '?'}"
-                               + (f", intra-cavity signal {intra:.3f} V" if _num(intra) else "") + ")")
-        self.note(self.relock_trouble)
-        return False
+                break
+        else:
+            self.relock_trouble = (f"the SHG cavity does not lock ({text or '?'}"
+                                   + (f", intra-cavity signal {intra:.3f} V" if _num(intra) else "") + ")")
+            self.note(self.relock_trouble)
+            self.doubt = True
+            return False
+        if usual > 0 and top and top < cavity.AREA_MIN * usual:
+            if not self.explored:
+                self.relock_trouble = (f"the SHG cavity locked, but its intra-cavity signal is {top:.3f} V, "
+                                       f"{top / usual:.2f} of usual: the master is not single-mode")
+                self.note(self.relock_trouble)
+                self.doubt = True
+                return False
+            # (a second mode whose peaks the sweep cannot tell from the main ones, or a weaker TA, say)
+            self.shg_text = f"SHG signal only {top / usual:.2f} of usual"
+            self.note(f"SHG cavity locked, its intra-cavity signal {top:.3f} V, {top / usual:.2f} of usual, and "
+                      f"trimming the current did not bring it up: handed back all the same")
+            return True
+        self.note("SHG cavity locked" + (f", intra-cavity signal {top:.3f} V" if top else ""))
+        if top:
+            self.learned["shg_lock"] = round(top if not self.p.shg_lock else 0.7 * self.p.shg_lock + 0.3 * top, 4)
+        return True
 
     # ----------------------------------------------------------- handing back
     def hand_back(self):
@@ -375,6 +408,8 @@ class CavitySteps:
             self.note(self.relock_trouble)
             return False
         self.learned.update(peak_y=round(choice.y, 4), lp_kind=choice.kind)
+        if level is not None and level > 0:
+            self.learned["lock_ok"] = round(level, 4)  # locked where it belongs: its transmission as it should be
         self.note("locked to the right peak" + (f", transmission {level:.3f} V" if level is not None else ""))
         return True
 
@@ -672,13 +707,13 @@ def setup_report(client, laser: int, hop, lp) -> list:
         g = get("dl:lock:lock-enabled", "dl:lock:state", "dl:lock:state-txt", "dl:lock:lock-without-lockpoint",
                 "dl:lock:lockpoint:position", "dl:lock:lockpoint:type", "dl:lock:candidates",
                 "dl:lock:spectrum-input-channel", "dl:lock:error-channel", "dl:lock:falc-selection",
-                "dl:lock:relock:enabled", "dl:lock:window:enabled")
+                "dl:lock:relock:enabled", "dl:lock:window:enabled", "dl:lock:window:input-channel")
         add("ok" if g["dl:lock:lock-enabled"] is not None else "error",
             f"lock {fmt(g['dl:lock:lock-enabled'])}, state {g['dl:lock:state']} “{g['dl:lock:state-txt'] or '?'}”; "
             f"ReLock {fmt(g['dl:lock:relock:enabled'])}, window {fmt(g['dl:lock:window:enabled'])}")
         add("info", "this program does not lock it to the wavemeter: its row's button is Relock, which has it "
-                    "watched and relocked after a mode hop (and relocks it then and there if it is not locked on "
-                    "target)")
+                    "watched and relocked after a mode hop, on the wrong peak, or when its lock keeps losing it (see "
+                    "below; and relocks it then and there if it needs it when you click)")
         wo = g["dl:lock:lock-without-lockpoint"]
         mode = hop.relock if hop.relock in ("lockpoint", "plain") else ("plain" if wo else "lockpoint")
         blob = g["dl:lock:candidates"]
@@ -713,6 +748,18 @@ def setup_report(client, laser: int, hop, lp) -> list:
         add("ok" if isinstance(spec, int) else "warn",
             f"lock input (the XY display's y, the peaks): {signal_name(spec) if spec is not None else '—'}"
             + (f", now {level:.3f} V" if _num(level) else ""))
+        usual = hop.lock_ok or hop.peak_y
+        add("info", f"watched, armed: locked more than {hop.peak_tol:g} MHz from the target is the wrong peak; the "
+                    f"lock input averaging below {hop.lock_min:g} of its usual"
+                    + (f" ({usual:.3f} V{'' if hop.lock_ok else ', the right peak in the scan'})" if usual
+                       else " (learned while it runs locked)")
+                    + " over 10 s means the lock keeps losing it: either way it is relocked")
+        if not IO_VALUE.get(spec):
+            add("warn", "the lock input's present value cannot be read: a lock that keeps losing it is not noticed")
+        win = g["dl:lock:window:input-channel"]
+        if isinstance(win, int) and isinstance(spec, int) and win != spec:
+            add("info", f"lock detection (window {fmt(g['dl:lock:window:enabled'])}) on {signal_name(win)}, not the "
+                        f"lock input: the transmission watched is the lock input's")
         add("ok" if isinstance(err, int) else "warn",
             f"error signal: {signal_name(err) if err is not None else '— (firmware before 2.1?)'}")
         if hop.peak_y:
@@ -777,13 +824,17 @@ def setup_report(client, laser: int, hop, lp) -> list:
             if hop.shg_area:
                 add("info", f"single-mode look learned: main peak area {hop.shg_area:.3g}, biggest side peak "
                             f"{hop.shg_side * 100:.0f} %")
+            add("info", (f"intra-cavity signal locked, usually {hop.shg_lock:.3f} V: " if hop.shg_lock else
+                         "its usual intra-cavity signal locked is learned while it runs: ")
+                + f"a recovery's SHG lock must come up to {cavity.AREA_MIN:g} of that, else the master is not "
+                  "single-mode (two modes alike look like one in a sweep) and the current is trimmed")
 
     add("head", "Finding a mode on target")
     if hop.how() == "walk":
         add("info", f"walk: single mode first by the SHG sweep, trimming the current; within {hop.reach:g} GHz (else "
                     f"first hop to a nearer mode with the current), the piezo onto the target in {hop.walk_step:g} V "
-                    f"steps, the mode looked at after each and the current trimmed when it gets worse; then the "
-                    f"current centered, ±{hop.margin:g} mA single-mode")
+                    f"steps, the mode looked at after each and the current trimmed when it gets worse. A laser that "
+                    f"is fine is only relocked: its current is not touched")
         if hop.kv and hop.reach * 1e3 > abs(hop.kv) * hop.v_window:
             add("warn", f"walking {hop.reach:g} GHz takes {hop.reach * 1e3 / abs(hop.kv):.1f} V of piezo, more than "
                         f"the ±{hop.v_window:g} V a recovery may move it")

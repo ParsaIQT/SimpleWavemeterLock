@@ -1,3 +1,4 @@
+import re
 import time
 
 import pytest
@@ -177,20 +178,25 @@ def test_hop_dialog_round_trip(app):
     from wmlock.modehop import HopParams
 
     ch = Channel(7, {"hop": {"enabled": True, "cavity": True, "shg": True, "i_nom": 151.25, "kv": 402.0,
-                             "spacing": 6010.0, "lp_kind": "t", "lp_code": 116, "peak_y": 0.8, "relock": "lockpoint"}})
+                             "spacing": 6010.0, "lp_kind": "t", "lp_code": 116, "peak_y": 0.8, "relock": "lockpoint",
+                             "lock_ok": 0.79, "shg_lock": 1.21}})
     ch.current = 151.4
     d = gui.HopDialog(None, ch)
     assert d.params() == ch.hop
-    assert "lockpoint type 't' = 116" in d.learned.toolTip()
+    assert "lockpoint type 't' = 116" in d.learned.toolTip() and "transmission 0.790 V locked" in d.learned.toolTip()
+    assert not d.tolerance.isEnabled() and d.peak_tol.isEnabled()  # locked to a cavity: off target is the wrong peak
     d.i_window.setValue(1.5)
     d.confirm.setChecked(True)
     d.falc_max.setValue(0.02)
+    d.peak_tol.setValue(40.0)
+    d.lock_min.setValue(0.3)
     d.who.setCurrentIndex(0)
-    assert not d.relock.isEnabled() and not d.falc.isEnabled()  # only for a cavity lock
+    assert not d.relock.isEnabled() and not d.falc.isEnabled() and not d.lock_min.isEnabled()  # only for a cavity lock
+    assert d.tolerance.isEnabled()
     d._forget()
     p = d.params()
     assert p == HopParams(enabled=True, cavity=False, shg=True, relock="lockpoint", i_nom=151.25, i_window=1.5,
-                          confirm=True, falc_max=0.02)  # measured values forgotten
+                          confirm=True, falc_max=0.02, peak_tol=40.0, lock_min=0.3)  # measured values forgotten
 
 
 def test_recovery_and_setup_dialogs(app, demo):
@@ -311,7 +317,7 @@ def test_row_asks_before_each_step(app):
         row._menu.close()
         row._clicked()  # Continue
         assert wait_for(lambda: (app.processEvents(), ch.hop_prompt.startswith(("Walk the piezo onto the target",
-                                                                               "On target at")))[1], 5)
+                                                                               "Lock the SHG cavity")))[1], 5)
         e.cancel_recovery(7)
         assert wait_for(lambda: (app.processEvents(), ch.state == "off")[1], 5)
         assert "recovery stopped" in ch.message and "cavity lock left off" in ch.message
@@ -342,12 +348,42 @@ def test_row_says_when_it_does_not_lase(app):
         ch, row = e.channels[7], win.rows[7]
         assert wait_for(lambda: (app.processEvents(), ch.seed is not None and ch.lasing is True)[1], 5)
         spin(app, 0.1)
-        assert "seed 20." in row.info.text() and "NOT LASING" not in row.info.text()
+        assert re.search(r"seed (19\.9|20\.[01]) mW", row.info.text()) and "NOT LASING" not in row.info.text()
         demo.laser(7).stop_lasing()
         assert wait_for(lambda: (app.processEvents(), ch.lasing is False)[1], 5)
         spin(app, 0.1)
         assert "NOT LASING: seed 0." in row.info.text() and row.info._color == "err"
         assert ch.state == "off"  # not armed: left alone
+    finally:
+        win.close()
+        spin(app, 0.1)
+        demo.close()
+
+
+def test_row_says_when_its_cavity_lock_keeps_losing_it(app):
+    """A cavity-locked laser's transmission is shown against its usual; far below on average (its lock keeps
+    losing a master on two modes), the row says so (not armed, nothing is done about it)."""
+    from wmlock.modehop import HopParams
+    from wmlock.sim import Demo, SimWavemeter
+
+    demo = Demo(discovery_port=0, wavemeter=SimWavemeter(noise=0.3, amplitude=0.0, walk=0.0), exposure=0.004)
+    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"])
+    e.LEVEL_S = 3.0
+    win = gui.MainWindow(e, lambda: None)
+    e.start()
+    win.show()
+    try:
+        assert wait_for(lambda: (app.processEvents(), 7 in win.rows and e.channels[7].freq > 0)[1], 5)
+        e.link(7, demo.dlcs[2].key, 1)
+        e.setpoint_to_current(7)
+        e.set_hop_params(7, HopParams(enabled=True, cavity=True, shg=True, lock_ok=0.8))
+        ch, row = e.channels[7], win.rows[7]
+        assert wait_for(lambda: (app.processEvents(), len(ch.trans_hist) >= 5 and ch.cavity_on is True)[1], 5)
+        spin(app, 0.1)
+        assert "transmission 10" in row.info.text() or "transmission 9" in row.info.text(), row.info.text()
+        demo.laser(7).go_multimode(1)
+        assert wait_for(lambda: (app.processEvents(), "CAVITY LOCK SLIPPING" in row.info.text())[1], 10)
+        assert row.info._color == "warn" and ch.state == "off"  # not armed: left alone
     finally:
         win.close()
         spin(app, 0.1)

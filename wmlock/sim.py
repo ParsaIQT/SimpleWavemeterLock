@@ -499,8 +499,11 @@ class SimLocked:
     and follows it with the piezo while the laser stays on its mode; the error signal's DC level
     puts it off the resonance center (less transmission), and if it is more than half the PDH
     amplitude it cannot lock at all. If the laser hops, the lock relocks to the resonance nearest
-    it then: locked, but on another peak. Disabling the lock while scan:enabled is on lets the
-    scan run, as a DLC pro does.
+    it then: locked, but on another peak. A master running on two modes (the second with more
+    than SLIP of the power) cannot hold the lock for long: it loses it every HOLD_S or so, and
+    ReLock searches for SEARCH_S before it catches it again (meanwhile the transmission is low,
+    the wavemeter sees the laser near where it was). Disabling the lock while scan:enabled is on
+    lets the scan run, as a DLC pro does.
 
     SHG: the intra-cavity signal while its cavity is scanned has an Airy peak (plus small
     transverse modes) per FSR for each mode the master emits (ECDL.components); its lock locks to
@@ -510,6 +513,10 @@ class SimLocked:
     A master that stops lasing loses its cavity lock, and the wavemeter has nothing to read."""
 
     N = 1000  # samples in a scope trace
+    SLIP = 0.2        # a second mode with more of the master's power than this: the lock keeps losing it,
+    HOLD_S = 1.0      # holding it about this long (s, on average),
+    SEARCH_S = 1.5    # then ReLock searching this long,
+    SEARCH_MHZ = 60.0  # sweeping the laser this far either way
 
     def __init__(self, dlc: "FakeDLCPro", n: int, ecdl: "ECDL", f_res: float, shg: bool = True,
                  lockpoints: bool = True, fsr: float = 1.5, lw: float = 6.0, tem=((0.37, 0.18), (0.71, 0.08)),
@@ -533,6 +540,9 @@ class SimLocked:
         self.lockpoint = None   # (x, y, type)
         self.cands = []         # lockpoint candidates found in the last scan
         self.relocks = 0
+        self.clock = clock
+        self._slip_at = None    # when the lock will lose a master on two modes
+        self._search_until = -math.inf
         # GHz (incommensurate with the master's mode spacing, or a second mode would hide under the first),
         # V of SHG piezo per FSR, finesse
         self.shg_fsr, self.shg_vfsr, self.shg_finesse = 1.37, 9.0, 150.0
@@ -660,9 +670,32 @@ class SimLocked:
         if not self._hold():
             self.peak, self.dv = None, 0.0
 
+    def _slips(self) -> bool:
+        """The master runs on two modes, the second with more than SLIP of the power: no lock holds it."""
+        v, i = self._vi()
+        comps = self.ecdl.components(v + self.dv, i)
+        return len(comps) > 1 and min(p for p, _ in comps) > self.SLIP
+
+    def _searching(self) -> bool:
+        return self.clock() < self._search_until
+
+    def _tick(self):
+        """Locked to a master on two modes: lose it now and then, and search before locking again."""
+        if self.peak is None or not self._slips():
+            self._slip_at = None
+            return
+        now = self.clock()
+        if self._slip_at is None:
+            self._slip_at = now + self.rng.expovariate(1.0 / self.HOLD_S)
+        elif now >= self._slip_at:
+            self.peak, self.dv, self._slip_at = None, 0.0, None
+            self.relocks += 1
+            self._search_until = now + self.SEARCH_S
+
     def _lock_enabled(self, on: bool):
         with self.mutex:
             self.peak, self.dv = None, 0.0
+            self._slip_at, self._search_until = None, -math.inf
             if not on:
                 return
             if self.lockpoints:
@@ -683,6 +716,7 @@ class SimLocked:
     def state(self):
         with self.mutex:
             if self._get("dl:lock:lock-enabled"):
+                self._tick()
                 return (5, "locked") if self.peak is not None else (6, "relocking")
             return (3, "lockpoint selected") if self.lockpoint else (1, "scope")
 
@@ -692,10 +726,11 @@ class SimLocked:
             self.wobble = wobble
             v, i = self._vi()
             if self._get("dl:lock:lock-enabled"):
+                self._tick()
                 if self.peak is not None and not self._hold():
                     self.peak, self.dv = None, 0.0
                     self.relocks += 1
-                if self.peak is None and (not self.lockpoints or self.lockpoint is not None):
+                if self.peak is None and not self._searching() and (not self.lockpoints or self.lockpoint is not None):
                     self._engage()  # ReLock: whatever resonance is nearest the laser now
                 if self.peak is not None:
                     return self.peak + self._offset_mhz() * 1e-6
@@ -712,7 +747,11 @@ class SimLocked:
         """The present value of an input: Fine In 1 (transmission) or Fast In 3 (error signal)."""
         with self.mutex:
             v, i = self._vi()
+            if self._get("dl:lock:lock-enabled"):
+                self._tick()
             f = self.peak + self._offset_mhz() * 1e-6 if self.locked() else self._free(v + self.dv, i)
+            if self._get("dl:lock:lock-enabled") and not self.locked() and self._searching():
+                f += self.rng.uniform(-1.0, 1.0) * self.SEARCH_MHZ * 1e-6  # ReLock sweeping it
             t, e = 0.0, 0.0
             for power, ghz in self.ecdl.components(v + self.dv, i):
                 ti, ei = self._airy(f + (ghz - self.ecdl.mode_ghz(v + self.dv, i)) * 1e-3)
@@ -972,7 +1011,8 @@ class SimLaser:
                 self.lock.peak, self.lock.dv = None, 0.0
 
     def go_multimode(self, direction: int = 1):
-        """The diode drifts to where a neighbouring mode takes a third of the power, without a hop."""
+        """The diode drifts to where a neighbouring mode takes a third of the power, without a hop (its
+        cavity lock, if any, then keeps losing it: SimLocked.SLIP)."""
         with self._mutex:
             e = self.ecdl
             a = e.misalignment(e.m, *self._vi())

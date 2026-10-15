@@ -1,4 +1,5 @@
 import math
+import re
 
 import pytest
 
@@ -504,5 +505,60 @@ def test_a_laser_that_stops_lasing_is_brought_back_at_once(quiet_demo):
         currents = currents_written(dlc, 1)
         assert max(currents) >= 150.0 + 2.4 and max(currents) <= 150.0 + 5.0 + 1e-9  # (set: nominal 149.58 measured)
         assert_gentle(currents, 149.0, 155.0)
+    finally:
+        e.stop()
+
+
+def test_relock_takes_over_a_laser_locked_on_the_wrong_peak(quiet_demo):
+    """Locked, but 60 MHz from its target: the wavemeter is never that far off, so it is on another peak
+    (further than peak_tol, 50 MHz, though well inside the 100 MHz a hop of a wavemeter-locked laser takes):
+    relocked at once when Relock is pressed, and when it jumps there while watched."""
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    try:
+        assert ch.hop.tolerance == 100.0 and ch.hop.peak_tol == 50.0
+        with shg.lock.mutex:
+            shg.lock.peak += 60e-6  # held 60 MHz off
+        assert wait_for(lambda: abs(ch.error_mhz - 60) < 5, 3)
+        e.engage(demo.SHG)  # Relock
+        assert ch.state == "recovering" and ch.hop_why.startswith("off by +6"), ch.hop_why
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 60), ch.message
+        assert abs(ch.error_mhz) < 3 and shg.lock.peak == pytest.approx(shg.lock.f_res, abs=1e-12)
+        assert wait_for(lambda: ch.guard.armed, 5)
+        with shg.lock.mutex:
+            shg.lock.peak -= 60e-6
+        assert wait_for(lambda: ch.state == "recovering", 6), ch.message
+        assert re.fullmatch(r"locked -[56]\d MHz off: the wrong peak", ch.hop_why), ch.hop_why
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 60), ch.message
+        assert abs(ch.error_mhz) < 3
+    finally:
+        e.stop()
+
+
+def test_a_cavity_lock_that_keeps_losing_it_is_taken_over(quiet_demo):
+    """The master goes multimode (a third of its power in the next mode), quietly for the wavemeter: its cavity
+    lock keeps losing it and relocking, its transmission (Fine In 1) far below usual on average: taken over,
+    the mode made single, relocked; the usual transmission and SHG signal were learned while it ran."""
+    import time
+
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    e.LEVEL_S = 4.0
+    try:
+        e.engage(demo.SHG)
+        assert wait_for(lambda: ch.guard.armed and ch.trans_name == "io:fine-1:value-act" and ch.hop.lock_ok
+                        and ch.hop.shg_lock, 10)
+        assert ch.hop.lock_ok == pytest.approx(0.8, abs=0.02) and ch.hop.shg_lock == pytest.approx(1.23, abs=0.02)
+        assert wait_for(lambda: (e.transmission(ch) or 0) > 0.9, 5)
+        shg.go_multimode(1)
+        assert wait_for(lambda: ch.state == "recovering", 15), ch.message
+        assert ch.hop_why.startswith("the cavity lock keeps losing it (transmission "), ch.hop_why  # (not a hop:
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 90), ch.message  # the wavemeter saw it close)
+        relocks = shg.lock.relocks
+        time.sleep(3)
+        assert shg.lock.relocks == relocks and shg.lock.locked() and e.transmission(ch) > 0.9  # it holds
+        assert "single mode" in ch.note and not shg.lock._slips()
     finally:
         e.stop()
