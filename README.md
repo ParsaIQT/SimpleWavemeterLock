@@ -210,9 +210,12 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   `amp:seed-limits:power`; *off*: not watched), what fraction of its usual power is not lasing
   (half), and how far the current jumps up when it does not lase (2 to 5 mA, back down at
   0.5 mA/s). See *Lasing* below.
-* **Relock by** (cavity only): *by lockpoint*, as you would by hand, or *re-enable the lock*
-  for a lock that finds its resonance by itself (*lock without lockpoint*). The default
-  follows the DLC pro's `lock-without-lockpoint` setting.
+* **Relock by** (cavity only): *by lockpoint*, as you would by hand (the DLC pro is asked to find
+  its lock points first, `find-candidates`: it shows none otherwise), or *re-enable the lock* and
+  let it find its resonance (*lock without lockpoint* is ticked first: without it, it locks only at
+  a selected lockpoint). The default follows the DLC pro's `lock-without-lockpoint` setting. After
+  a relock, the setpoint is moved to where the wavemeter puts the laser locked: the lockpoint is the
+  target, in the wavemeter's numbers.
 * **The right peak is within ± 150 MHz** of where the wavemeter puts the setpoint.
 * **Wrong peak**: locked, but more than **50 MHz** from the target: the wavemeter is never that
   far off, so the lock holds the laser on another peak of the cavity (a transverse mode, say),
@@ -221,37 +224,54 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   detection's signal too) averaging below **half** its usual over 10 s: the lock keeps losing the
   laser and relocking (ReLock), and it is taken over, its mode looked at, and relocked; the
   wavelength may well look fine meanwhile. Its usual level is learned while the laser runs locked
-  on target (and is the right peak's height in the scan until then).
+  on target (and is the right peak's height in the scan until then). The same goes for an SHG
+  laser's intra-cavity signal (locked): below half its usual over 10 s, it is recovered (the SHG
+  cavity lost it, or the laser stopped lasing).
 * **Null the error signal's DC level with the FALC pro's input offset, by at most 0.05 V.**
 * **Step by step**: before each step, the recovery waits for you (see *Before the first run*).
 
 ### Lasing
 
 A laser can stop lasing altogether when its current drops too far, and setting the current
-back does not start it again: it needs a good deal more current first. With a TA (TA pro,
-TA-SHG pro), its seed power tells: below half of what it is while the laser lases on target
-(learned as it is watched), and below the TA's own `power-min` in any case, it is not lasing.
-Then, at once, without asking (the TA switches itself off after its `power-min-shutdown-delay`
-with too little seed):
+back does not start it again: it needs a good deal more current first. What tells:
+
+* **its SHG sweep** (with an SHG stage): a laser that lases shows its resonances; one that does not
+  sends broadband light (an AR-coated chip without its feedback), and the sweep **flat-lines**. A
+  flat sweep where there should be resonances (they have been seen in this recovery, it was locked
+  when the recovery began, or its usual look or signal is known) means it does not lase, unless its
+  TA is off (then the row says so). The wavemeter has nothing to read then either: whenever it has
+  no valid reading of the laser after a move, the SHG sweep is asked.
+* **its TA's seed power** (TA pro, TA-SHG pro): below half of what it is while the laser lases on
+  target (learned as it is watched), and below the TA's own `power-min` in any case, it is not
+  lasing. The broadband light of a laser that does not lase can keep the seed power well up,
+  though, so with an SHG stage the sweep has the last word.
+
+Not lasing, at once, without asking (the TA switches itself off after its
+`power-min-shutdown-delay` with too little seed):
 
 1. the cavity lock goes off (it would fight), and the current goes up to **2 mA above
-   nominal**, then 3, 4, **5 mA**, until the seed power says it lases: 0.2 mA a write, no
-   reading in between, half a second at each mA, so a second or two;
-2. it comes back down to nominal **slowly**, 0.5 mA/s, the seed power read every 0.2 mA;
-3. if it stops lasing again on the way down, it is never let that low again in this recovery
-   (half a mA above where it stopped): up once more, and down only that far.
+   nominal**, then 3, 4, **5 mA**, until it lases again (the SHG sweep shows resonances, or the seed
+   power is back): 0.2 mA a write, no reading in between, half a second at each mA (and an SHG
+   sweep), so a few seconds;
+2. it comes back down to nominal **slowly**, 0.5 mA/s or as fast as an SHG sweep a step allows,
+   asked every 0.2 mA whether it still lases;
+3. if it stopped lasing on the way somewhere it had been seen lasing, it is never let that low again
+   in this recovery (half a mA above where it stopped): up once more, and down only that far.
 
 Then the recovery goes on as after a hop. This happens whenever a watched laser (*Locked*,
-*Watching*) stops lasing: it is recovered straight away, the hourly limit notwithstanding.
-It also happens at the start of any recovery, and after any step of one that moves the
-current or the piezo; a move down is checked every 0.2 mA. The row shows the seed power, and
-**NOT LASING** in red when there is too little.
+*Watching*) stops lasing: by its seed power it is recovered straight away; if the seed power is
+fooled, its SHG signal (and cavity transmission) gone on average for a few seconds start the
+recovery, and since the wavemeter then has nothing to read either, the hourly limit does not
+count. It also happens at the start of any recovery, at every SHG sweep, and after any step that
+moves the current or the piezo; a move down is checked every 0.2 mA by the seed power. The row
+shows the seed power and the SHG signal (against its usual), **NOT LASING** in red when the seed
+power is too low, and **SHG SIGNAL GONE** when that is.
 
 If it does not lase even 5 mA up, the current goes back down to where it was (slowly), and the
 row says to look at the laser. If its TA switched itself off meanwhile, the laser is left
 lasing where it is, and the row says to switch the TA on again: this program never switches a
-TA on. Without a TA nothing tells whether it lases, and nothing is watched: such a laser gives
-the wavemeter no valid reading, which is not taken for a hop.
+TA on. Without a TA or an SHG stage nothing tells whether it lases, and nothing is watched: such a
+laser gives the wavemeter no valid reading, which is not taken for a hop.
 
 ### What happens after a hop
 
@@ -267,7 +287,8 @@ wavemeter reads it less often.
 3. **Hand back.** The wavemeter lock is re-engaged at the setpoint (a cavity-locked laser is
    watched again). For a cavity lock, see below; the wavemeter must show the right peak
    (within *Wrong peak*, 50 MHz) for 5 readings in a row, or it unlocks and tries again, up to
-   three times.
+   three times. Relocked, the setpoint is moved to where the wavemeter puts it (the middle of
+   those readings), and the note says by how much.
 
 **The walk**, as you would by hand (the default with an SHG stage):
 
@@ -354,7 +375,7 @@ recovery does what you would do by hand:
 | Unlock the master and the SHG, stop the master's scan | *Take over* |
 | Make sure the master is single-mode-ish before moving the scan offset, then move it slowly towards the target, watching the SHG sweep; trim the current when the mode loses quality | *the walk*: the SHG sweep after every trim and every 0.5 V of piezo, and at the operating point (the map: every map point, both ends of the margin check, and the operating point) |
 | Lock the SHG cavity | SHG scan off, `nlo:shg:lock:lock-enabled` on; the intra-cavity signal (`nlo:pd:shg-int:photodiode`) must come up, to at least 80 % of its usual locked (learned while the laser runs, else what it was when the recovery began): if not, the master is not single-mode, and the current is trimmed (once; then it is handed back all the same, and says so) |
-| Start the master's scan, bring the right cavity peak into it, pick it in the XY display (scan output against Fine In 1) | the scan runs; from the DLC pro's lockpoint candidates (`dl:lock:candidates`), the tall peak where the wavemeter puts the target (scan offset − deviation / piezo tuning), within ± 150 MHz, and the only one there; it must stand at least half as tall as the right peak did last time (from the lockpoint you selected), so a transverse mode is never taken for it |
+| Start the master's scan, bring the right cavity peak into it, show the lock points, pick it in the XY display (scan output against Fine In 1) | the scan runs; the DLC pro is asked to find its lock points (`dl:lock:find-candidates`) before each look at them; from those candidates (`dl:lock:candidates`), the tall peak where the wavemeter puts the target (scan offset − deviation / piezo tuning), within ± 150 MHz, and the only one there; it must stand at least half as tall as the right peak did last time (from the lockpoint you selected), so a transverse mode is never taken for it |
 | Correct the FALC's input offset (~0.01 V) so the error signal has no DC | the error signal's level away from the resonances, from the scope; the input offset steps against it, checking on the trace after each step that it does what it should |
 | Lock | `dl:lock:select-lockpoint` on that candidate, then `lock-enabled`; the lock must report locked, the wavemeter must agree it is the right peak, and the transmission must reach half the peak's height |
 
@@ -417,8 +438,10 @@ Safety:
 * The piezo moves at most ± 25 V per recovery (*Piezo moves at most*), inside the lock's
   offset limits: a walk of 8 GHz takes some 20 V.
 * Besides current and offset, a recovery writes only: the cavity lock and SHG lock on/off, the
-  scan and SHG scan on/off, a scope channel's signal (given back), a FALC pro's input offset
-  (within its limit of where it was), and runs `select-lockpoint`. Anything else is refused.
+  cavity lock's *lock without lockpoint* (relocking by re-enabling it), the scan and SHG scan
+  on/off, a scope channel's signal (given back), a FALC pro's input offset (within its limit of
+  where it was), and runs `find-candidates` and `select-lockpoint`. Anything else is refused. (And
+  in this program, a relock moves the setpoint onto the lock.)
 * If nothing works, or after 10 minutes, everything it changed goes back where it was and
   the cavity lock stays off, with the reason on the row. Stopping it does the same. A laser
   that had stopped lasing is put back where it lases again, not where it stopped; stopped while
@@ -464,7 +487,10 @@ Things to know:
   current and start again only 1.5 to 4.5 mA above it, a third of them not lasing when the
   recovery began: 220 of 231 fixed, 107 jumps of the current in 103 recoveries, none left
   without lasing, no TA switched off; one was handed back with its SHG signal at 0.65 of usual,
-  a second mode whose peaks fell on the main ones in the sweep.
+  a second mode whose peaks fell on the main ones in the sweep. The same 300 again, but sending
+  their TA 70 % of their power as broadband light when they do not lase, so that the seed power
+  never tells: 220 of 231 fixed all the same, every one of the 103 that stopped lasing caught by
+  its SHG sweep (or the wavemeter losing it) and brought back, none left without lasing.
 * The map (with the current ±2 mA and the piezo ±10 V): a Monte Carlo over 3000 random lasers
   (modes 3 to 10 GHz apart, chip modes shifting by 1 to 4 GHz/mA, hysteresis up to 0.15 of the
   mode spacing, noisy readings near a hop) fixed 99.4 % of the hops that could be fixed within
@@ -488,7 +514,11 @@ Things to know:
   * The candidates move with every scan as the free-running laser drifts, so coordinates read
     a moment earlier may no longer name one ("lockpoint not found"). Each try uses candidates
     read just before it, and a "not found" is tried once more with fresh ones.
-  * Lockpoint candidates are read while the scan runs, after 3 scan periods.
+  * Lockpoint candidates are read while the scan runs, after 3 scan periods, each time after
+    `find-candidates` (with its lock points not shown, a DLC pro offers none; the SDK has it as a
+    command without arguments, so it is taken to find them once, in the scan running then).
+  * Re-enabling a lock that should find its resonance by itself needs `lock-without-lockpoint`;
+    it is ticked first, put back if relocking fails, and left ticked once it locked.
   * "Locked" is the lock state 5, or a state text starting with "locked".
   * The FALC pro's input offset moves the error signal straight up and down, so the first
     recovery learns which way it moves, and later ones null the DC in one step. If the trace
@@ -511,7 +541,9 @@ Things to know:
   it; its TA switches itself off after 5 s with less than 8 mW of seed. Recovery is on: click
   **Relock** to have it watched. *Right-click empty space ▸ Simulate a fault* makes any laser
   hop a mode, the cavity lock jump a peak (or 60 MHz), the master go multimode (its cavity lock
-  then keeps losing it) or stop lasing, or the error signal's DC drift.
+  then keeps losing it) or stop lasing (also with its seed power hardly dropping: broadband light
+  still reaching the TA), or the error signal's DC drift. Like a real DLC pro with its lock points
+  not shown, the simulated one offers lockpoint candidates only after `find-candidates`.
 
 ## Troubleshooting
 

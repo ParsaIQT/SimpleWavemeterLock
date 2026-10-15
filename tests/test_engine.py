@@ -522,7 +522,7 @@ def test_relock_takes_over_a_laser_locked_on_the_wrong_peak(quiet_demo):
             shg.lock.peak += 60e-6  # held 60 MHz off
         assert wait_for(lambda: abs(ch.error_mhz - 60) < 5, 3)
         e.engage(demo.SHG)  # Relock
-        assert ch.state == "recovering" and ch.hop_why.startswith("off by +6"), ch.hop_why
+        assert ch.state == "recovering" and re.fullmatch(r"off by \+(5[5-9]|6[0-5]) MHz", ch.hop_why), ch.hop_why
         assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 60), ch.message
         assert abs(ch.error_mhz) < 3 and shg.lock.peak == pytest.approx(shg.lock.f_res, abs=1e-12)
         assert wait_for(lambda: ch.guard.armed, 5)
@@ -560,5 +560,53 @@ def test_a_cavity_lock_that_keeps_losing_it_is_taken_over(quiet_demo):
         time.sleep(3)
         assert shg.lock.relocks == relocks and shg.lock.locked() and e.transmission(ch) > 0.9  # it holds
         assert "single mode" in ch.note and not shg.lock._slips()
+    finally:
+        e.stop()
+
+
+def test_relock_recenters_the_target_on_the_lock(quiet_demo):
+    """The setpoint is 20 MHz off where the wavemeter reads the laser locked on the right peak (it has drifted, say):
+    after a relock the target is moved onto the lock, in the wavemeter's numbers."""
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    try:
+        e.set_setpoint(demo.SHG, C_NM_THZ / (ch.freq + 20e-6))  # 20 MHz above the lock: inside the 50 MHz
+        assert wait_for(lambda: abs(ch.error_mhz + 20) < 3, 3)
+        e.engage(demo.SHG)  # Relock: watched (20 MHz is not the wrong peak)
+        assert ch.state == "on" and wait_for(lambda: ch.guard.armed, 5)
+        shg.lock.jump(1)
+        assert wait_for(lambda: ch.state == "recovering", 5)
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked() and bool(ch.note), 60), ch.message
+        assert shg.lock.peak == pytest.approx(shg.lock.f_res, abs=1e-12)  # the right peak...
+        assert abs(ch.error_mhz) < 3 and ch.guard.track == 0.0  # ...and the target moved onto it
+        assert re.search(r"target re-centered on the lock, -(19|20|21)\.\d MHz", ch.note), ch.note
+        assert e.to_config()["channels"][str(demo.SHG)]["setpoint_nm"] == pytest.approx(ch.setpoint_nm)
+    finally:
+        e.stop()
+
+
+def test_a_laser_that_stops_lasing_unseen_by_its_seed_is_brought_back(quiet_demo):
+    """It stops lasing but still sends its TA most of its power, broadband: the seed power cannot tell. Its SHG
+    signal (and cavity transmission) is gone, though: recovered at once, the hourly limit notwithstanding (the
+    wavemeter has nothing to read either); the SHG sweep is flat, so the current jumps up until it shows
+    resonances again, comes down slowly, and the laser is relocked."""
+    import time
+
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, max_per_hour=1))
+    e.LEVEL_S = 3.0
+    try:
+        e.engage(demo.SHG)
+        assert wait_for(lambda: ch.guard.armed and ch.hop.seed_ok and ch.hop.shg_lock and ch.hop.lock_ok, 10)
+        ch.guard.recent.append(time.monotonic())  # this hour's one recovery: used up
+        shg.stop_lasing(ase=0.7)
+        assert wait_for(lambda: ch.state == "recovering", 10), ch.message
+        assert ch.lasing is not False  # (its seed power says it lases)
+        assert ch.hop_why.startswith(("the SHG signal is gone", "the cavity lock keeps losing it")), ch.hop_why
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 90), ch.message
+        assert shg.ecdl.lasing and shg.lock.ta.on() and abs(ch.error_mhz) < 3
+        assert "lasing again" in ch.note and max(currents_written(dlc, 1)) >= 150.0 + 2.0, ch.note
     finally:
         e.stop()

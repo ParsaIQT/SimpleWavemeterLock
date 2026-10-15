@@ -34,9 +34,13 @@ A laser its DLC pro locks to a cavity is relocked, besides after a hop, when it
 is locked more than HopParams.peak_tol from its target (the wrong peak: the
 wavemeter is never that far off), and when the lock keeps losing it and
 relocking: its transmission (the lock input, polled) averages below lock_min of
-usual over LEVEL_S. The usual transmission, and with an SHG stage the usual
-intra-cavity signal locked, are learned while it runs as it should
-(HopParams.lock_ok, shg_lock): a recovery's SHG lock must come up to that.
+usual over LEVEL_S. After a relock, its target (the setpoint) is moved to where
+the wavemeter puts it, locked. With an SHG stage, its intra-cavity signal
+averaging below lock_min of usual over LEVEL_S (the SHG cavity lost, or the
+laser not lasing: a broadband glow fools a seed photodiode, not a cavity) starts
+a recovery too, with the hourly limit if the wavemeter still reads the laser.
+The usual transmission and the usual intra-cavity signal locked are learned
+while it runs as it should (HopParams.lock_ok, shg_lock).
 
 Currents are shown, and the nominal current given, as measured (current-act);
 the set current (current-set) is what a recovery writes, and is watched for
@@ -132,6 +136,7 @@ class Channel:
         self.trans = None     # V, as last polled
         self.trans_hist = deque()  # (t, V) over the last Engine.LEVEL_S
         self.shg_level = None  # V: its SHG cavity's intra-cavity signal, as last polled
+        self.shg_hist = deque()  # (t, V) of that over the last Engine.LEVEL_S
 
     @property
     def param(self) -> str:
@@ -594,6 +599,7 @@ class Engine:
         ch.device, ch.offset, ch.message = None, None, ""
         ch.current = ch.current_set = ch.cavity_on = ch.seed = ch.lasing = ch.shg_level = None
         ch.cavity_txt = ch.shg_txt = ch.seed_name = ""
+        ch.shg_hist.clear()
 
     def _watch(self, ch: Channel):
         """Poll the offset of the linked laser for display, and read its unit once."""
@@ -655,10 +661,7 @@ class Engine:
         def on_shg_level(v):
             with self.lock:
                 if mine():
-                    ch.shg_level = v
-                    hop = ch.hop  # its usual, single-mode as it runs (not a moment it lost its lock)
-                    if self._running_fine(ch) and v > 0 and (not hop.shg_lock or v >= hop.lock_min * hop.shg_lock):
-                        self._learn(ch, "shg_lock", v)
+                    self._shg(ch, v)
 
         hop = ch.hop
         for param, cb, kind, on in ((CURRENT, on_current_set, "float", hop.enabled),
@@ -755,15 +758,41 @@ class Engine:
             log.warning("channel %d: %s", ch.n, self._slip_text(*slip))
             self._start_recovery(ch, self._slip_text(*slip), relock=True)
 
+    def _shg(self, ch: Channel, v: float):
+        """Its SHG intra-cavity signal: kept over LEVEL_S; running as it should, its usual learned (not a moment
+        it lost its lock); armed, far below usual on average: recover it (the hourly limit only if the wavemeter
+        still reads it: without, it most likely stopped lasing)."""
+        hop = ch.hop
+        ch.shg_level = v
+        if ch.state == "recovering" or not hop.enabled or not hop.shg:
+            ch.shg_hist.clear()
+            return
+        now = time.monotonic()
+        ch.shg_hist.append((now, v))
+        while ch.shg_hist and now - ch.shg_hist[0][0] > self.LEVEL_S:
+            ch.shg_hist.popleft()
+        if self._running_fine(ch) and v > 0 and (not hop.shg_lock or v >= hop.lock_min * hop.shg_lock):
+            self._learn(ch, "shg_lock", v)
+        gone = self._fallen(ch.shg_hist, hop.shg_lock, hop.lock_min) if self._armed(ch) else None
+        if gone:
+            ch.shg_hist.clear()
+            why = f"the SHG signal is gone ({gone[0] / gone[1]:.0%} of usual on average)"
+            log.warning("channel %d: %s", ch.n, why)
+            self._start_recovery(ch, why, budget=math.isfinite(self._hop_error(ch)), relock=hop.cavity)
+
+    def _fallen(self, hist, usual: float, frac: float):
+        """(average, usual) if the levels in hist (over at least most of LEVEL_S) average below frac of usual,
+        else None (and if there is no telling)."""
+        if usual <= 0 or len(hist) < 5 or hist[-1][0] - hist[0][0] < 0.8 * self.LEVEL_S:
+            return None
+        mean = sum(v for _, v in hist) / len(hist)
+        return (mean, usual) if mean < frac * usual else None
+
     def _slipping(self, ch: Channel):
         """(average, usual) if its transmission has averaged below lock_min of usual over the last LEVEL_S,
         else None (and if there is no telling)."""
-        hist, hop = ch.trans_hist, ch.hop
-        usual = hop.lock_ok or hop.peak_y
-        if not hop.cavity or usual <= 0 or len(hist) < 5 or hist[-1][0] - hist[0][0] < 0.8 * self.LEVEL_S:
-            return None
-        mean = sum(v for _, v in hist) / len(hist)
-        return (mean, usual) if mean < hop.lock_min * usual else None
+        hop = ch.hop
+        return self._fallen(ch.trans_hist, hop.lock_ok or hop.peak_y, hop.lock_min) if hop.cavity else None
 
     @staticmethod
     def _slip_text(mean: float, usual: float) -> str:
@@ -775,6 +804,12 @@ class Engine:
         usual = ch.hop.lock_ok or ch.hop.peak_y
         hist = list(ch.trans_hist)
         return sum(v for _, v in hist) / len(hist) / usual if hist and usual > 0 else None
+
+    @staticmethod
+    def shg_signal(ch: Channel):
+        """Its SHG intra-cavity signal over the last LEVEL_S, as a fraction of usual (None: no telling)."""
+        hist = list(ch.shg_hist)
+        return sum(v for _, v in hist) / len(hist) / ch.hop.shg_lock if hist and ch.hop.shg_lock > 0 else None
 
     def _running_fine(self, ch: Channel) -> bool:
         """As it should be, as far as can be told: armed, on target for a while, and its locks (the DLC pro's,
@@ -1011,6 +1046,7 @@ class Engine:
         ch.token += 1
         ch.hop_why, ch.hop_t = why, now
         ch.trans_hist.clear()
+        ch.shg_hist.clear()
         tok, laser, cavity = ch.token, ch.laser, hop.cavity
         log.info("channel %d: %s, recovering", ch.n, why or "recenter")
 
@@ -1085,7 +1121,7 @@ class Engine:
             self.dirty = True
             ch.current_set, ch.offset = res.current, res.offset
             ch.message = ""
-            ch.note, ch.note_t = f"{why}{res.summary}, {took}", time.monotonic()
+            ch.note, ch.note_t = f"{why}{res.summary}{self._recenter_target(ch, res.lock_e)}, {took}", time.monotonic()
             log.info("channel %d: %s", ch.n, ch.note)
             self._keep_record(ch, r, ch.note)
             if ch.resume:
@@ -1113,6 +1149,17 @@ class Engine:
         ch.message = f"{head} ({where})"
         log.warning("channel %d: %s", ch.n, ch.message)
         self._keep_record(ch, r, ch.message)
+
+    def _recenter_target(self, ch: Channel, lock_e: float) -> str:
+        """Relocked to its cavity, lock_e MHz from its target as the wavemeter reads it: the target (its setpoint)
+        moved there, so that the lockpoint is the target in the wavemeter's numbers. Returns a note."""
+        if not math.isfinite(lock_e) or self._is_reference(ch) or not ch.f_set > 0:
+            return ""
+        shift = lock_e + ch.guard.track  # MHz from the setpoint (the readings had the drift followed taken off)
+        ch.set_setpoint(round_sig(C_NM_THZ / (ch.f_set + shift * 1e-6)))
+        ch.guard.track = 0.0
+        self.dirty = True
+        return f"; target re-centered on the lock, {shift:+.1f} MHz"
 
     def _keep_record(self, ch: Channel, r: Runner, outcome: str):
         """What the recovery saw and did: kept for a look (Channel.last), and logged."""

@@ -270,13 +270,13 @@ class Confirm:
 
 # what a recovery may write besides current and offset, and how
 WRITABLE = {
-    "dl:lock:lock-enabled": bool, "scan:enabled": bool,
+    "dl:lock:lock-enabled": bool, "dl:lock:lock-without-lockpoint": bool, "scan:enabled": bool,
     "nlo:shg:lock:lock-enabled": bool, "nlo:shg:scan:enabled": bool,
     "scope:channel1:signal": int, "scope:channel2:signal": int,
     "nlo:shg:scope:channel1:signal": int, "nlo:shg:scope:channel2:signal": int,
 }
 FALC_OFFSET = re.compile(r"falc[1-4]:input:offset$")  # within falc_max of where it was
-COMMANDS = {"dl:lock:select-lockpoint": 3}  # name: number of arguments
+COMMANDS = {"dl:lock:select-lockpoint": 3, "dl:lock:find-candidates": 0}  # name: number of arguments
 ABSOLUTE = ("falc", "io:", "pdh", "system", "fw-ver", "serial-number")  # names not below laserN:
 
 
@@ -313,10 +313,11 @@ class Failed(Exception):
 
 
 class NotLasing(Exception):
-    """The laser stopped lasing (its seed power says so), at this set current."""
+    """The laser stopped lasing (its seed power, or its SHG sweep, says so), at this set current (None: it
+    has not been seen lasing in this recovery, so where it stopped is not known)."""
 
-    def __init__(self, current: float):
-        super().__init__(f"not lasing at {current:.3f} mA")
+    def __init__(self, current: float | None):
+        super().__init__("not lasing" + (f" at {current:.3f} mA" if current is not None else ""))
         self.current = current
 
 
@@ -335,6 +336,7 @@ class Result:
     summary: str
     learned: dict = field(default_factory=dict)  # more HopParams fields learned
     record: dict = field(default_factory=dict)   # what it saw and did, for a look afterwards
+    lock_e: float = math.nan  # MHz from the target where the wavemeter puts its cavity lock, relocked (NaN: none)
 
 
 # ------------------------------------------------------------------- the map
@@ -620,6 +622,7 @@ class Recenter(CavitySteps):
         self.seed_usual = p.seed_ok         # mW, lasing as usual
         self.seed_floor = 0.0               # mW: its TA's power-min
         self.lasing = None                  # True, False, or None: no telling
+        self.seen_lasing = False            # it has been seen lasing in this recovery (a reading, an SHG sweep)
         self.ta_on = None                   # its TA was on when this began
         self.panics = 0
         # the walk
@@ -645,7 +648,13 @@ class Recenter(CavitySteps):
     def _got(self, reading):
         self.t, self.e = reading
         self.readings += 1
+        self.seen_lasing |= math.isfinite(self.e)
         return self.e
+
+    def stopped(self) -> NotLasing:
+        """It does not lase: where it stopped, if it has been seen lasing in this recovery."""
+        self.lasing = False
+        return NotLasing(self.I if self.seen_lasing else None)
 
     def read(self):
         return self._got((yield Read()))
@@ -653,7 +662,8 @@ class Recenter(CavitySteps):
     def move(self, current=None, offset=None, read=True, check=True, top=False):
         """Set current and/or offset (within their windows; top: the current up to i_top), then (read)
         a fresh reading. check: with the seed power watched, ask it first whether the laser still
-        lases (on the way down, every STEP_MAX); raises NotLasing if not."""
+        lases (on the way down, every STEP_MAX); and if the wavemeter has no valid reading of it, ask
+        the SHG sweep (alive). Raises NotLasing if it does not lase."""
         prev = self.I
         if current is not None:
             current = min(max(current, self.i_lo), self.i_top if top else self.i_hi)
@@ -676,6 +686,8 @@ class Recenter(CavitySteps):
         else:
             reading = yield Move(current, offset, read)
             e = self._got(reading) if read else None
+        if read and check and not math.isfinite(e) and (yield from self.alive()) is False:
+            raise self.stopped()  # the wavemeter lost it: it stopped lasing, by the SHG sweep (or seed)
         if read and self.method == "walk":
             self.record.setdefault("walk", []).append(
                 [round(self.V, 4), round(self.mA(self.I), 4), round(e, 1) if math.isfinite(e) else None, None])
@@ -753,6 +765,43 @@ class Recenter(CavitySteps):
         self.lasing = self.lases(self.seed)
         return self.lasing
 
+    def tells_lasing(self) -> bool:
+        """Can it tell whether the laser lases (by its seed power, or its SHG sweep)?"""
+        return bool(self.seed_name) or bool(self.shg_ok)
+
+    def alive(self):
+        """Does it lase? With its SHG cavity scanned (and its TA on), by the sweep: resonances, or flat
+        (not lasing, a laser sends broadband light, which a seed photodiode takes for lasing and no
+        cavity resonates with); else, or if a flat sweep may be its scan's doing, by the seed power.
+        True, False, or None (no telling)."""
+        if self.shg_ok and self.shg_scanning:
+            on, emits = yield Get((TA_ON, TA_EMISSION))
+            if on is not False and emits is not False:
+                m = yield from self.shg_sweep(check=False)
+                if m is not None and self.sweep_lases(m):
+                    self.lasing = True
+                    return True
+                if m is not None and self.flat_is_dark():
+                    self.lasing = False
+                    return False
+        return (yield from self.lasing_now())
+
+    def flat_is_dark(self) -> bool:
+        """Does a flat SHG sweep mean it does not lase (rather than a scan that misses the resonances)?
+        Yes if the sweep has shown resonances (in this recovery, or locked at the start, or as learned),
+        or if the wavemeter has no valid reading of it either."""
+        return self.sweep_tells or not math.isfinite(self.e)
+
+    def dark(self):
+        """The SHG sweep is flat where it should not be: no narrow-band light reaches the SHG cavity.
+        Its TA off: say so (Failed); else the laser does not lase: NotLasing."""
+        on, emits = yield Get((TA_ON, TA_EMISSION))
+        if on is False or emits is False:
+            raise Failed(f"its TA is off (no light reaches the SHG cavity): switch it on again (the laser was left at "
+                         f"{self.mA(self.I):.2f} mA)", keep=True)
+        self.note(f"at {self.mA(self.I):.2f} mA the SHG sweep is flat: it does not lase")
+        raise self.stopped()
+
     def panic(self, why: str, where: float | None = None):
         """It does not lase. At once (nobody is asked): the cavity lock off (it would fight), the
         current up to nominal + jump, then a mA at a time up to nominal + jump_max until it lases;
@@ -765,7 +814,8 @@ class Recenter(CavitySteps):
         three leave it lasing)."""
         p = self.p
         self.panics += 1
-        self.note(f"not lasing ({why}): seed power {self.seed:.2f} mW, current up at once")
+        self.note(f"not lasing ({why})" + (f": seed power {self.seed:.2f} mW" if self.seed_name else "")
+                  + ", current up at once")
         if self.cavity and not self.unlocked:  # its lock would fight the jump
             yield Set("dl:lock:lock-enabled", False, restore=False)
             self.unlocked = True
@@ -783,12 +833,14 @@ class Recenter(CavitySteps):
                 yield from self.move(current=max(min(self.nominal + up, top), self.I), read=False, check=False,
                                      top=True)
                 yield Wait(self.PANIC_WAIT)
-                if (yield from self.lasing_now()) is not False:
+                if (yield from self.alive()) is not False:  # (the SHG sweep shows resonances again, or the seed)
                     break
             else:
-                raise Failed(f"not lasing even at {self.mA(self.I):.2f} mA (seed power {self.seed:.2f} mW): "
-                             f"look at the laser")
-            self.note(f"lasing at {self.mA(self.I):.2f} mA, seed power {self.seed:.2f} mW")
+                raise Failed(f"not lasing even at {self.mA(self.I):.2f} mA ("
+                             + (f"seed power {self.seed:.2f} mW" if self.seed_name and self.lasing is False and not
+                                self.shg_scanning else "the SHG sweep flat") + "): look at the laser")
+            self.note(f"lasing at {self.mA(self.I):.2f} mA, " + ("the SHG sweep shows it again" if self.shg_scanning
+                                                                  else f"seed power {self.seed:.2f} mW"))
             if floor is not None:
                 self.raise_floor(floor)
             if rounds > self.PANICS:
@@ -800,7 +852,7 @@ class Recenter(CavitySteps):
             for i in _steps(self.I, back, STEP_MAX) if self.I > back + 1e-9 else []:
                 yield from self.move(current=i, read=False, check=False, top=True)
                 yield Wait(STEP_MAX / max(p.ramp, 0.01))
-                if (yield from self.lasing_now()) is False:
+                if (yield from self.alive()) is False:
                     stopped = i
                     break
             if stopped is None:
@@ -817,7 +869,8 @@ class Recenter(CavitySteps):
         if self.panics > self.PANICS:
             raise Failed(f"it stopped lasing {self.panics} times: left lasing at {self.mA(self.I):.2f} mA: "
                          f"look at the laser", keep=True)
-        self.note(f"lasing again at {self.mA(self.I):.2f} mA, seed power {self.seed:.2f} mW")
+        self.note(f"lasing again at {self.mA(self.I):.2f} mA" + ("" if self.shg_scanning else
+                                                                 f", seed power {self.seed:.2f} mW"))
         yield from self.read()
 
     def raise_floor(self, lo: float):
@@ -863,7 +916,8 @@ class Recenter(CavitySteps):
                                  keep=True)
                 yield from self.take_back()
             except NotLasing as stop:
-                yield from self.panic(f"at {self.mA(stop.current):.2f} mA, {self.stage}", stop.current)
+                yield from self.panic(f"at {self.mA(stop.current):.2f} mA, {self.stage}" if stop.current is not None
+                                      else f"{self.stage}: not seen lasing in this recovery", stop.current)
                 if self.cavity or self.shg:
                     yield from self.take_back()  # whatever it had locked again: off again
 
@@ -1218,6 +1272,7 @@ class Recenter(CavitySteps):
         there): done. A laser that is fine is left as it is but for the piezo onto the target: the
         current is not moved, nor the piezo to measure its tuning if that is known. A hop on the
         way: start afresh from where it is."""
+        self.stage = "looking at the mode"
         if self.shg_ok:
             yield from self.shg_scan(True)
         reach, sought, before, hops = self.p.reach * 1e3, False, None, 0
@@ -1588,14 +1643,16 @@ class Recenter(CavitySteps):
 
     def verify(self):
         """After relocking the cavity: VERIFY_N readings in a row within peak_tol (further, it is on the
-        wrong peak)."""
+        wrong peak). Their middle one is where the wavemeter puts the lockpoint (self.lock_e: the
+        target is re-centered on it)."""
         self.stage = "waiting for the cavity lock"
-        t0, good = None, 0
+        t0, run = None, []
         while True:
             e = yield from self.read()
             t0 = self.t if t0 is None else t0
-            good = good + 1 if math.isfinite(e) and abs(e) <= self.p.peak_tol else 0
-            if good >= self.VERIFY_N:
+            run = run + [e] if math.isfinite(e) and abs(e) <= self.p.peak_tol else []
+            if len(run) >= self.VERIFY_N:
+                self.lock_e = _median(run)
                 return True
             if self.t - t0 > self.VERIFY_S:
                 return False
@@ -1629,7 +1686,7 @@ class Recenter(CavitySteps):
                             "method": self.method, "panics": self.panics, "summary": summary})
         return Result(self.I, self.V, self.kv if self.kv_measured else 0.0,
                       self.spacing if self.maps else 0.0, self.maps, self.readings, summary,
-                      dict(self.learned), self.record)
+                      dict(self.learned), self.record, self.lock_e if self.cavity else math.nan)
 
 
 # --------------------------------------------------------------------- driver
@@ -1655,6 +1712,7 @@ class Runner:
     INVALID = 3          # invalid readings in a row passed over before one is handed on
     ACK_TIMEOUT = 5.0    # s
     READ_TIMEOUT = 10.0  # s
+    READ_GAP = 2.5       # s (at least) without anything new from the wavemeter: no valid reading, if it can tell why
     CONFIRM_TIMEOUT = 900.0  # s: step by step, nobody answering for this long stops it
 
     def __init__(self, rec: Recenter, io, now: float, timeout: float = 600.0, finished=None):
@@ -1678,6 +1736,8 @@ class Runner:
         self._since = now
         self._until = now
         self._skip = self._invalid = 0
+        self._heard = now         # when the last reading (valid or not) came
+        self._gaps = deque(maxlen=15)  # s between readings
         self._dirty = False       # written since the last reading
         self._written_at = now    # when the last write landed
         self._token = 0
@@ -1878,6 +1938,9 @@ class Runner:
     # ------------------------------------------------------------------ inputs
     def on_reading(self, t: float, e: float):
         self.now = max(self.now, t)
+        if t > self._heard:
+            self._gaps.append(t - self._heard)
+        self._heard = max(self._heard, t)
         if self._waiting == "read":
             if self._skip > 0:
                 self._skip -= 1
@@ -1902,6 +1965,12 @@ class Runner:
         elif self.state == "running" and self._waiting == "confirm":
             if now - self._since > self.CONFIRM_TIMEOUT:
                 self._fail("nobody said go on")
+        elif self.state == "running" and self._waiting == "read" and self.rec.tells_lasing() and \
+                now - max(self._since, self._heard) > self._quiet():
+            # nothing new from the wavemeter (a laser that does not lase gives it no signal, the same each time,
+            # which is not passed on): handed on as no valid reading, for the procedure to ask whether it lases
+            self._waiting, self._dirty = None, False
+            self._send((now, math.nan))
         elif self.state == "running" and self._waiting == "read" and now - self._since > self.READ_TIMEOUT:
             self._fail("no valid readings")
         elif self.state == "running" and now > self.deadline:
@@ -1909,6 +1978,11 @@ class Runner:
         elif self.state == "running" and self._waiting == "wait" and now >= self._until:
             self._waiting = None
             self._send(None)
+
+    def _quiet(self) -> float:
+        """s without anything new from the wavemeter that means it has nothing to say: READ_GAP, or four of its
+        usual intervals between readings of this laser."""
+        return max(self.READ_GAP, 4 * _median(self._gaps) if self._gaps else 0.0)
 
     def confirm(self):
         """Step by step: the user says go on."""

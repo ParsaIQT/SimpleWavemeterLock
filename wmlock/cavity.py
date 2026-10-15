@@ -69,7 +69,7 @@ def find_peaks(y, rel: float = 0.03) -> list:
     top = max(y)
     span = top - base
     sigma = noise(y)
-    if span <= 0 or span < 6 * sigma:
+    if span <= 0 or span < 10 * sigma:  # (noise alone: never that much, even over thousands of samples)
         return []
     need = max(rel * span, 4 * sigma)
     edge = max(0.02 * span, 3 * sigma)  # a peak's extent: down to this above the floor

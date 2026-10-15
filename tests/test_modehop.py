@@ -9,7 +9,7 @@ import re
 
 import pytest
 
-from wmlock.dlcpro import DecopError, DLCPro
+from wmlock.dlcpro import DecopError, DLCPro, lock_points
 from wmlock.modehop import (COMMANDS, FALC_OFFSET, STEP_MAX, WRITABLE, Failed, Guard, HopParams, Move, Point,
                             Read, Recenter, Runner, Set, _steps, analyse, perform)
 from wmlock.sim import ECDL, FakeDLCPro, SimLocked
@@ -644,11 +644,12 @@ def test_shg_laser_relocked_the_way_you_would_by_hand(p):
     assert b.single_mode() and b.margin() > 0.3 and lock.shg_state() == (5, "locked")
     assert abs(lock.dc()) < 0.002 and b.writes("falc1:input:offset")[-1] == pytest.approx(-0.009, abs=0.001)
     # in your order: both locks off, scan the SHG cavity and find a single-mode mode on target, lock the SHG cavity,
-    # scan, null, pick, lock
+    # scan (its lock points shown: found afresh before each look at them), null, pick, lock
     order = [n.replace("laser1:", "") for n, _ in b.dlc.log if "cc:current" not in n and "scan:offset" not in n]
     assert order == ["dl:lock:lock-enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "nlo:shg:scan:enabled",
-                     "nlo:shg:scan:enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "falc1:input:offset",
-                     "dl:lock:select-lockpoint", "dl:lock:lock-enabled"]
+                     "nlo:shg:scan:enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "dl:lock:find-candidates",
+                     "falc1:input:offset", "dl:lock:find-candidates", "dl:lock:select-lockpoint",
+                     "dl:lock:lock-enabled"]
     assert settings(b) == ORIGINAL and b.dlc.params["laser1:scan:enabled"] is True  # as it was
     learned = r.result.learned
     assert learned["lp_code"] == ord("t") and learned["lp_kind"] == "t"
@@ -934,6 +935,50 @@ def test_lockpoint_candidates_that_move_between_reads():
     assert [args[2] for n, args in b.dlc.log if n.endswith("select-lockpoint")] == [116]
 
 
+def test_lock_points_are_found_only_when_asked():
+    """Like a DLC pro with its lock points not shown: the scan runs, but no candidates until find-candidates; a
+    relock by lockpoint asks before every look at them."""
+    b, lock = shg_bench(seed=27)
+    lock.jump(1)
+    b.dlc.params["laser1:dl:lock:lock-enabled"] = False
+    lock._lock_enabled(False)
+    b.dlc.params["laser1:scan:enabled"] = True
+    assert lock_points(b.dlc.params["laser1:dl:lock:candidates"]()).get("c") == []  # nothing shown
+    b.dlc.execute("(exec 'laser1:dl:lock:find-candidates)")
+    assert len(lock_points(b.dlc.params["laser1:dl:lock:candidates"]())["c"]) >= 2
+    b.dlc.params["laser1:scan:enabled"] = False
+    b.dlc.params["laser1:dl:lock:lock-enabled"] = True
+    lock.settle()
+    lock.jump(1)
+    b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+    assert r.state == "done" and lock.peak == pytest.approx(b.target, abs=1e-12), r.error
+    finds = [k for k, (n, _) in enumerate(b.dlc.log) if n.endswith("find-candidates")]
+    picks = [k for k, (n, _) in enumerate(b.dlc.log) if n.endswith("select-lockpoint")]
+    assert finds and picks and all(any(f < k for f in finds) for k in picks)
+
+
+def test_plain_relock_ticks_lock_without_lockpoint():
+    """Relock by re-enabling the lock, on a DLC pro set to lock at a selected lockpoint: it would not find
+    its resonance by itself, so lock without lockpoint is ticked first (and stays ticked, locked so)."""
+    b, lock = shg_bench(seed=28)
+    lock.jump(1)
+    p = HopParams.from_dict({**SHG.to_dict(), "relock": "plain"})
+    b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "done", r.error
+    assert b.writes("dl:lock:lock-without-lockpoint") == [True] and not lock.lockpoints
+    assert lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12) and abs(r.result.lock_e) < 3
+
+
+def test_plain_relock_that_fails_unticks_it_again():
+    b, lock = shg_bench(seed=29)
+    lock.jump(1)
+    lock._nearest = lambda f: (lock.f_res + 1.5e-3, 1.0)  # this lock always goes for the next peak up
+    p = HopParams.from_dict({**SHG.to_dict(), "relock": "plain"})
+    b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "failed" and "caught a peak +1500 MHz away" in r.error
+    assert b.writes("dl:lock:lock-without-lockpoint") == [True, False] and lock.lockpoints  # as it was
+
+
 # ------------------------------------------------ not lasing: its seed power, and a panic
 def lasing_bench(i_stop=148.7, i_start=152.4, seed=11, **kwargs):
     """The SHG bench, its master stopping lasing below i_stop (mA) and starting again only above
@@ -1142,6 +1187,46 @@ def test_a_piezo_tuning_learned_wrong_is_measured_again():
     assert r.state == "done", r.error
     assert any(n.startswith("the piezo tuned it +") and n.endswith("not -400: measured again") for n in rec.notes)
     assert r.result.kv == pytest.approx(400, rel=0.1) and abs(b.off_mhz()) < 1 and lock.locked()
+
+
+def test_not_lasing_is_seen_by_the_shg_sweep_when_its_seed_cannot_tell():
+    """Its master stops lasing on the way (sweeping the current down for a nearer mode), but still sends
+    the TA 70 % of its power, broadband: the seed photodiode cannot tell. The wavemeter loses it, and the SHG
+    sweep flat-lines: up at once until the sweep shows it again, then slowly down, never that low again."""
+    laser = ECDL(400.0, seed=33, multimode=0.9, hysteresis=0.4, mm_noise=0.004, ksv=0.4)
+    b, lock = locked_bench(laser, seed=33, shg=True, lockpoints=True, pdh_dc=0.009)
+    laser.i_stop, laser.i_start, laser.ase = 149.5, 151.0, 0.7
+    laser.nudge(-4.5)
+    p = HopParams.from_dict({**SHG.to_dict(), "reach": 5.0})
+    b, rec, r = recover(laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "done", r.error
+    assert laser.lasing and lock.locked() and abs(b.off_mhz()) < 1 and rec.panics == 1 and lock.ta.trips == 0
+    assert any(n.startswith("not lasing (at 149.") and "seed power 13." in n for n in rec.notes)  # (above 8 mW)
+    assert any(n.endswith("the SHG sweep shows it again") for n in rec.notes) and 149.8 <= rec.i_lo <= 150.0
+
+
+def test_not_lasing_from_the_start_is_seen_by_the_shg_sweep():
+    """Not lasing when the recovery begins, its seed power fooled: the first SHG sweep is flat. The current
+    jumps up until the sweep shows resonances (+4 mA), and back down to nominal: where it stopped is not known,
+    so nothing is put out of bounds."""
+    b, lock = lasing_bench(i_start=153.0)
+    b.laser.ase = 0.7
+    b.laser.stop()
+    times = timed_currents(b)
+    b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+    assert r.state == "done", r.error
+    assert b.laser.lasing and lock.locked() and abs(b.off_mhz()) < 1 and rec.panics == 1
+    assert max(i for _, i in times) == pytest.approx(154.0) and rec.i_lo == pytest.approx(149.0)
+    assert rec.notes[2].startswith("at 150.00 mA the SHG sweep is flat: it does not lase"), rec.notes
+
+
+def test_a_flat_shg_sweep_with_its_ta_off_is_left_to_you():
+    b, lock = shg_bench(seed=30)
+    lock.jump(1)
+    b.dlc.params["laser1:amp:cc:enabled"] = False  # no light reaches the SHG cavity
+    b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+    assert r.state == "failed" and r.error.startswith("its TA is off (no light reaches the SHG cavity)"), r.error
+    assert rec.panics == 0 and b.writes("dl:cc:current-set") == []  # the current never jumped for it
 
 
 def test_monte_carlo_walks_with_lasers_that_stop_lasing():

@@ -59,6 +59,8 @@ class CavitySteps:
         self.shg_ref = ref if ref.known else None
         self.best_area = 0.0       # the biggest main peak in an SHG sweep in this recovery (the second biggest)
         self._areas = []
+        self.sweep_tells = bool(self.p.shg_area or self.p.shg_lock)  # its SHG sweep shows resonances when it lases
+        self.top_seen = 0.0        # V: the tallest resonance in an SHG sweep in this recovery
         self.shg_key = "y"         # the SHG scope's channel with the intra-cavity signal
         self.shg_scanning = False
         self.last_sweep = None
@@ -78,6 +80,8 @@ class CavitySteps:
         self.doubt = False         # its SHG cavity would not lock as it should: not single-mode after all
         self.explored = 0          # times the walk has trimmed the current for that
         self.shg_text = ""         # its SHG signal short of usual, handed back all the same
+        self._find_refused = False  # the DLC pro would not find-candidates
+        self.lock_e = math.nan     # MHz: where the wavemeter puts the laser, relocked (the target re-centered on it)
         self._blobs = {}
 
     # ------------------------------------------------------------ taking over
@@ -106,6 +110,7 @@ class CavitySteps:
         level = o.get("nlo:pd:shg-int:photodiode")
         if self.shg and o.get(SHG_LOCK) and says_locked(o.get("nlo:shg:lock:state-txt")) and _num(level) and level > 0:
             self.shg_level = level
+            self.sweep_tells = True
         what = []
         if self.cavity:
             what.append(f"turn its cavity lock off (now {o.get('dl:lock:state-txt') or '?'})")
@@ -213,8 +218,9 @@ class CavitySteps:
         self._blobs[name] = blob
         return blob
 
-    def shg_sweep(self):
-        """The SHG cavity's intra-cavity sweep, measured: a cavity.ModeCheck, None if unreadable."""
+    def shg_sweep(self, check: bool = True):
+        """The SHG cavity's intra-cavity sweep, measured: a cavity.ModeCheck, None if unreadable. check: a
+        flat one where there should be resonances means it does not lase (self.dark: NotLasing)."""
         yield mh.Wait(self.settle("nlo:shg:scan:frequency"), after_write=True)  # a sweep since the last change
         blob = yield from self.fresh("nlo:shg:scope:data")
         y = scan = None
@@ -234,7 +240,18 @@ class CavitySteps:
         m = cavity.sweep(y, scan)
         self.last_sweep = m
         self._last_trace = y
+        if self.sweep_lases(m):
+            self.sweep_tells = self.seen_lasing = True
+            self.top_seen = max(self.top_seen, m.height)
+        elif check and self.flat_is_dark():
+            yield from self.dark()
         return m
+
+    def sweep_lases(self, m) -> bool:
+        """Does SHG sweep m show the laser lasing: a resonance at least a tenth as tall as they are (the tallest
+        seen in this recovery, or its intra-cavity signal locked, as usual)? Not lasing, it is flat."""
+        ref = max(self.top_seen, self.p.shg_lock)
+        return bool(m.seen) and m.height >= 0.1 * ref
 
     def judge(self, m):
         """(ok, text) for an SHG sweep (cavity.judge): against the laser's single-mode look if that is
@@ -348,8 +365,14 @@ class CavitySteps:
         return True
 
     def relock_plain(self):
-        yield from self.ask("Relock: re-enable the cavity lock")
+        """Re-enable the lock, set to lock without a lockpoint (else it locks only at a selected one):
+        it finds the resonance by itself, the laser being at its target."""
+        free = self.orig.get("dl:lock:lock-without-lockpoint")
+        yield from self.ask("Relock: re-enable the cavity lock" + ("" if free else ", ticking lock without lockpoint"))
         self.stage = "relocking the cavity"
+        if free is False:
+            yield mh.Set("dl:lock:lock-without-lockpoint", True, restore=False)
+            self.orig["dl:lock:lock-without-lockpoint"] = True
         if self.scan_after_unlock:
             yield mh.Set(SCAN, True, restore=True)
         yield mh.Set(LOCK, True, restore=False)
@@ -414,6 +437,12 @@ class CavitySteps:
         return True
 
     def candidates(self):
+        """The lockpoint candidates in the scan running now: the DLC pro finds (and shows) them only when
+        asked (find-candidates; the Lock points of its display), so it is asked each time."""
+        r = yield mh.Exec("dl:lock:find-candidates", ())
+        if isinstance(r, Exception) and not self._find_refused:
+            self._find_refused = True
+            self.note(f"find-candidates: {r}: the candidates are as the DLC pro shows them")
         (blob,) = yield mh.Get(("dl:lock:candidates",))
         if not isinstance(blob, bytes):
             return []
@@ -687,6 +716,9 @@ def setup_report(client, laser: int, hop, lp) -> list:
             ta, em = g[mh.TA_ON], g["amp:cc:emission"]
             add("ok" if ta is not False else "warn", f"TA {fmt(ta)}, emitting {fmt(em)}, seed limits "
                 f"“{g['amp:seed-limits:status-txt'] or '?'}”; laser emission {fmt(g['emission'])}")
+            if hop.shg:
+                add("info", "a master that does not lase may still send its TA much of its power as broadband "
+                            "light: the SHG sweep has the last word (flat, it does not lase; see SHG below)")
 
     g = get("scan:offset", "scan:enabled", "scan:amplitude", "scan:frequency", "scan:unit")
     add("head", "Piezo and scan")
@@ -727,11 +759,15 @@ def setup_report(client, laser: int, hop, lp) -> list:
             add("error", "cannot read dl:lock:candidates: relocking would only re-enable the lock")
             mode = "plain"
         if mode == "lockpoint":
-            add("ok", f"relock by lockpoint (lock-without-lockpoint {fmt(wo)}): start the scan, pick the tall peak "
-                      f"within ±{hop.window:.0f} MHz of where the wavemeter puts the setpoint, select it, lock")
+            add("ok", f"relock by lockpoint (lock-without-lockpoint {fmt(wo)}): start the scan, have the DLC pro find "
+                      f"its lock points (find-candidates), pick the tall peak within ±{hop.window:.0f} MHz of where "
+                      f"the wavemeter puts the setpoint, select it, lock")
         else:
-            add("info", f"relock by re-enabling the lock (lock-without-lockpoint {fmt(wo)}): it must find the "
-                        f"right resonance by itself; the wavemeter checks it did")
+            add("info", f"relock by re-enabling the lock (lock-without-lockpoint {fmt(wo)}"
+                        + ("" if wo else ": ticked first") + "): it must find the right resonance by itself; the "
+                        "wavemeter checks it did")
+        add("info", "after a relock, the setpoint is moved to where the wavemeter puts the laser locked (the lockpoint "
+                    "in the wavemeter's numbers)")
         pos = g["dl:lock:lockpoint:position"]
         if pts.get("l"):
             x, y, kind = pts["l"][0]
@@ -740,7 +776,8 @@ def setup_report(client, laser: int, hop, lp) -> list:
         else:
             add("info", f"lockpoint: position {fmt(pos)}, type “{g['dl:lock:lockpoint:type'] or ''}”")
         if pts:
-            add("info", f"{len(pts.get('c', []))} lockpoint candidates now (they are found while the scan runs)")
+            add("info", f"{len(pts.get('c', []))} lockpoint candidates now (the DLC pro finds them when asked, its "
+                        f"Lock points shown: a recovery asks before each look at them)")
         spec, err = g["dl:lock:spectrum-input-channel"], g["dl:lock:error-channel"]
         level = None
         if IO_VALUE.get(spec):
@@ -827,7 +864,11 @@ def setup_report(client, laser: int, hop, lp) -> list:
             add("info", (f"intra-cavity signal locked, usually {hop.shg_lock:.3f} V: " if hop.shg_lock else
                          "its usual intra-cavity signal locked is learned while it runs: ")
                 + f"a recovery's SHG lock must come up to {cavity.AREA_MIN:g} of that, else the master is not "
-                  "single-mode (two modes alike look like one in a sweep) and the current is trimmed")
+                  "single-mode (two modes alike look like one in a sweep) and the current is trimmed; watched, its "
+                  f"average over 10 s below {hop.lock_min:g} of it starts a recovery")
+            add("info", "whether the master lases is told by the SHG sweep too: flat (no resonance), it does not, "
+                        "whatever its seed power says (a master that does not lase still sends its TA broadband "
+                        "light); then the current jumps up until the sweep shows resonances again")
 
     add("head", "Finding a mode on target")
     if hop.how() == "walk":
@@ -844,8 +885,9 @@ def setup_report(client, laser: int, hop, lp) -> list:
 
     add("head", "What a recovery may change")
     add("info", "the current (within its window, ≤ 0.2 mA a step; higher for a laser that stopped lasing), the scan "
-                "offset, the cavity lock and SHG lock on/off, the scan and SHG scan on/off, a scope channel (given "
-                "back), a FALC pro's input offset (within its limit) and select-lockpoint; nothing else. On failure "
-                "all goes back (the current down slowly), except that the cavity lock stays off, and a laser that "
-                "stopped lasing stays where it lases.")
+                "offset, the cavity lock and SHG lock on/off, the cavity lock's lock-without-lockpoint, the scan and "
+                "SHG scan on/off, a scope channel (given back), a FALC pro's input offset (within its limit), "
+                "find-candidates and select-lockpoint; nothing else. On failure all goes back (the current down "
+                "slowly), except that the cavity lock stays off, and a laser that stopped lasing stays where it "
+                "lases.")
     return out

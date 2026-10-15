@@ -321,8 +321,10 @@ class ECDL:
 
     With i_stop set, it stops lasing altogether when the current drops below i_stop, and starts
     again only once the current is above i_start (above where it normally runs): setting the
-    current back is not enough. Not lasing, it gives the wavemeter nothing to read and the TA
-    hardly any seed (power()).
+    current back is not enough. Not lasing, it gives the wavemeter nothing to read and a cavity
+    nothing to resonate with; the TA gets hardly any seed (power()), or with `ase` that fraction of
+    its lasing power as broadband light (an AR-coated chip without its feedback), which its seed
+    photodiode cannot tell from lasing.
     """
 
     def __init__(self, f0, fsr=6.0, kv=0.4, ki=-0.25, ksv=None, ksi=-2.0, kt=-4.0, kst=-1.0,
@@ -342,6 +344,7 @@ class ECDL:
         self.i_stop, self.i_start = i_stop, i_start  # mA (measured): stops lasing below, starts again above
         self.lasing = True
         self.slope_mw, self.i_th = 0.25, i0 - 80.0   # its power: mW per mA above threshold
+        self.ase = 0.0     # not lasing, this fraction of that power still goes on (broadband)
 
     def misalignment(self, m: int, v: float, i: float) -> float:
         return (m * self.fsr + (self.kv - self.ksv) * (v - self.v0) + (self.ki - self.ksi) * (i - self.i0)
@@ -388,8 +391,10 @@ class ECDL:
         return self.m * self.fsr + self.kv * (v - self.v0) + self.ki * (i - self.i0) + self.kt * self.T
 
     def power(self, i: float) -> float:
-        """mW it sends on (to a TA's seed photodiode, say): lasing, above threshold; else a trace."""
-        return max(self.slope_mw * (i - self.i_th), 0.0) if self.lasing else 0.3
+        """mW it sends on (to a TA's seed photodiode, say): lasing, above threshold; else a trace, or
+        broadband light (ase)."""
+        p = max(self.slope_mw * (i - self.i_th), 0.0)
+        return p if self.lasing else max(self.ase * p, 0.3)
 
     def freq(self, v: float, i: float, extra_mhz: float = 0.0) -> float:
         """What the laser emits at (v, i), THz, as a wavemeter would see it (NaN: not lasing)."""
@@ -492,10 +497,11 @@ class SimLocked:
     peak), the PDH error signal on Fast In 3 (amplitude `pdh` V, sidebands 20 MHz out), with a DC
     offset `pdh_dc` plus the FALC pro's input offset. The lock (lock-enabled):
       lockpoints=True   locks to the resonance at the selected lockpoint (select-lockpoint
-                        x y type, which must name one of the candidates the DLC pro found in
-                        the last scan, type = the candidate's type character as a number);
-                        no lockpoint, no lock
+                        x y type, which must name one of the candidates the DLC pro found
+                        when last asked, find-candidates, in the scan running then; type = the
+                        candidate's type character as a number); no lockpoint, no lock
       lockpoints=False  (lock without lockpoint) locks to the resonance nearest the laser
+    (lockpoints is lock-without-lockpoint, as written to it).
     and follows it with the piezo while the laser stays on its mode; the error signal's DC level
     puts it off the resonance center (less transmission), and if it is more than half the PDH
     amplitude it cannot lock at all. If the laser hops, the lock relocks to the resonance nearest
@@ -530,7 +536,7 @@ class SimLocked:
         self.p = p = f"laser{n}:"
         self.f_res, self.fsr, self.lw, self.tem, self.t00 = f_res, fsr, lw, tuple(tem), t00
         self.pdh, self.pdh_dc, self.sideband = pdh, pdh_dc, 20.0
-        self.has_shg, self.lockpoints, self.falc, self.range_v = shg, lockpoints, falc, range_v
+        self.has_shg, self.falc, self.range_v = shg, falc, range_v
         self.falc_in_trace, self.falc_sign = falc_in_trace, falc_sign
         self.rng = random.Random(seed)
         self.mutex = threading.RLock()
@@ -538,7 +544,8 @@ class SimLocked:
         self.peak = None        # THz: the resonance the lock holds
         self.dv = 0.0           # V: the lock's piezo correction
         self.lockpoint = None   # (x, y, type)
-        self.cands = []         # lockpoint candidates found in the last scan
+        self.cands = []         # lockpoint candidates found when last asked (find-candidates)
+        self.found = []         # ...and in the last scan
         self.relocks = 0
         self.clock = clock
         self._slip_at = None    # when the lock will lose a master on two modes
@@ -589,11 +596,16 @@ class SimLocked:
         dlc.on_set[p + "dl:lock:lock-enabled"] = self._lock_enabled
         dlc.on_set[p + "scan:enabled"] = lambda on: self._lose_selection()
         dlc.commands[p + "dl:lock:select-lockpoint"] = self._select
-        dlc.commands[p + "dl:lock:find-candidates"] = lambda: (self._master_scan(), "")[1]
+        dlc.commands[p + "dl:lock:find-candidates"] = self._find_candidates
 
     # ------------------------------------------------------------- helpers
     def _get(self, name):
         return self.dlc.params[self.p + name]
+
+    @property
+    def lockpoints(self) -> bool:
+        """It locks to a selected lockpoint (else to the resonance nearest the laser)."""
+        return not self._get("dl:lock:lock-without-lockpoint")
 
     def _vi(self):
         return self._get("scan:offset"), self.dlc.current_act(self.n)
@@ -760,7 +772,7 @@ class SimLocked:
             return (t if sig == 0 else e + self.shown_dc()) + noise
 
     def _master_scan(self):
-        """One scan period: [(x, transmission, error)]; finds the lockpoint candidates (tops)."""
+        """One scan period: [(x, transmission, error)]; self.found: the lockpoint candidates in it (tops)."""
         v, i = self._vi()
         amp = self._get("scan:amplitude")
         m0 = self.ecdl.m
@@ -782,8 +794,17 @@ class SimLocked:
             x, t, _ = up[k]
             if t > 0.05 * self.t00 and t > up[k - 1][1] and t >= up[k + 1][1]:
                 cands.append((x, t, "t"))
-        self.cands = cands
+        self.found = cands
         return rows
+
+    def _find_candidates(self):
+        """find-candidates: the lockpoint candidates in the scan running now (only then does the DLC pro
+        show any)."""
+        with self.mutex:
+            if self._get("scan:enabled") and not self.locked():
+                self._master_scan()
+                self.cands = self.found
+            return ""
 
     def _scope_rows(self):
         if self._get("scan:enabled") and not self.locked():
@@ -811,8 +832,6 @@ class SimLocked:
         from .dlcpro import encode_blocks, points_block
 
         with self.mutex:
-            if self._get("scan:enabled") and not self.locked():
-                self._master_scan()
             blocks = [points_block("c", self.cands)]
             if self.lockpoint:
                 blocks.append(points_block("l", [self.lockpoint]))
@@ -1002,10 +1021,13 @@ class SimLaser:
             lo, hi = e.limits()
             e.nudge(e.misalignment(e.m, *self._vi()) - ((lo - 0.3) if direction > 0 else (hi + 0.3)))
 
-    def stop_lasing(self):
+    def stop_lasing(self, ase: float | None = None):
         """The current dips for a moment and the laser stops lasing; at its current it does not start
-        again by itself (if it has a lasing threshold, ECDL.i_stop and i_start)."""
+        again by itself (if it has a lasing threshold, ECDL.i_stop and i_start). ase: from now on, not
+        lasing it still sends that fraction of its power to the TA (ECDL.ase)."""
         with self._mutex:
+            if ase is not None:
+                self.ecdl.ase = ase
             self.ecdl.stop()
             if self.lock is not None and self.lock.locked():
                 self.lock.peak, self.lock.dv = None, 0.0

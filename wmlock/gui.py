@@ -291,6 +291,8 @@ class ChannelRow(QtWidgets.QFrame):
                 self.info.paint(f"{where}   NOT LASING: seed {ch.seed:.2f} mW{self._hop_text(ch, now)}", "err")
             elif self._slipping(ch):
                 self.info.paint(f"{where}   CAVITY LOCK SLIPPING{self._hop_text(ch, now)}", "warn")
+            elif self._shg_gone(ch):
+                self.info.paint(f"{where}   SHG SIGNAL GONE{self._hop_text(ch, now)}", "warn")
             else:
                 off = "…" if ch.offset is None else f"{ch.offset:.3f} {ch.unit}"
                 self.info.paint(f"{where}   {off}{self._hop_text(ch, now)}", "dim")
@@ -360,9 +362,19 @@ class ChannelRow(QtWidgets.QFrame):
                 text += f" · transmission {frac:.0%}"
         if ch.hop.shg and ch.shg_txt:
             text += f"   SHG {ch.shg_txt}"
+            frac = Engine.shg_signal(ch)
+            if frac is not None:
+                text += f" · {frac:.0%}"
         if ch.note and now - ch.note_t < NOTE_S:
             text += f"   ⟲ {fmt_duration(now - ch.note_t)} ago"
         return text
+
+    @staticmethod
+    def _shg_gone(ch) -> bool:
+        """Its SHG signal far below usual (armed, it would be recovered: not lasing, or the SHG cavity lost)."""
+        frac = Engine.shg_signal(ch)
+        return bool(ch.hop.enabled and ch.hop.shg and frac is not None and len(ch.shg_hist) >= 5
+                    and frac < ch.hop.lock_min)
 
     @staticmethod
     def _slipping(ch) -> bool:
@@ -1327,7 +1339,9 @@ class MainWindow(QtWidgets.QWidget):
                 sim.addAction(f"{who}: mode hop up", functools.partial(las.hop_mode, 1))
                 sim.addAction(f"{who}: mode hop down", functools.partial(las.hop_mode, -1))
                 if las.ecdl.i_stop is not None:
-                    sim.addAction(f"{who}: stops lasing", las.stop_lasing)
+                    sim.addAction(f"{who}: stops lasing", functools.partial(las.stop_lasing, 0.0))
+                    sim.addAction(f"{who}: stops lasing, its seed power hardly drops (broadband)",
+                                  functools.partial(las.stop_lasing, 0.7))
                 if las.lock is not None:
                     sim.addAction(f"{who}: cavity lock jumps a peak", functools.partial(las.lock.jump, 1))
                     sim.addAction(f"{who}: cavity lock jumps 60 MHz", functools.partial(las.lock.jump, 0.04))
