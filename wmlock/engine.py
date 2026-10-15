@@ -33,14 +33,18 @@ The seed power while it lases as usual is learned (HopParams.seed_ok).
 A laser its DLC pro locks to a cavity is relocked, besides after a hop, when it
 is locked more than HopParams.peak_tol from its target (the wrong peak: the
 wavemeter is never that far off), and when the lock keeps losing it and
-relocking: its transmission (the lock input, polled) averages below lock_min of
-usual over LEVEL_S. After a relock, its target (the setpoint) is moved to where
-the wavemeter puts it, locked. With an SHG stage, its intra-cavity signal
-averaging below lock_min of usual over LEVEL_S (the SHG cavity lost, or the
-laser not lasing: a broadband glow fools a seed photodiode, not a cavity) starts
-a recovery too, with the hourly limit if the wavemeter still reads the laser.
-The usual transmission and the usual intra-cavity signal locked are learned
-while it runs as it should (HopParams.lock_ok, shg_lock).
+relocking: its transmission (the input its lock detection watches, polled while
+its lock is on) averages, over LEVEL_S, below lock_min of the way from its zero
+(off resonance, measured while the master scans in a relock) to its level locked
+(HopParams.trans_zero, trans_locked). After a relock, its target (the setpoint)
+is moved to where the wavemeter puts it, locked. With an SHG stage, its
+intra-cavity signal averaging below lock_min of usual over LEVEL_S (the SHG
+cavity lost, or the laser not lasing: a broadband glow fools a seed photodiode,
+not a cavity) starts a recovery too. Either counts towards the hourly limit only
+if the wavemeter still reads the laser (else it most likely stopped lasing). The
+levels locked, of the transmission and the intra-cavity signal, are the medians
+of what they were over the last few minutes while it ran as it should
+(HopParams.trans_locked, shg_lock), and what a relock measured until then.
 
 Currents are shown, and the nominal current given, as measured (current-act);
 the set current (current-set) is what a recovery writes, and is watched for
@@ -52,15 +56,16 @@ import dataclasses
 import json
 import logging
 import math
+import statistics
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-from .dlcpro import IO_VALUE, DLCPro, DecopError, Device, discover, probe
+from .dlcpro import DLCPro, DecopError, Device, discover, probe
 from .lock import Lock, LockParams
 from .modehop import SEED_FLOOR, Guard, HopParams, Recenter, Runner, perform
-from .relock import says_locked, setup_report
+from .relock import TRANS, says_locked, setup_report, transmission_input, usable_zero, volts
 from .reference import Reference, RefParams
 from .wavemeter import C_NM_THZ, NAN
 
@@ -73,7 +78,8 @@ CAVITY_LOCK = "dl:lock:lock-enabled"
 SHG_STATE = "nlo:shg:lock:state-txt"
 SHG_INTRA = "nlo:pd:shg-int:photodiode"
 WATCHED = (ACTUATOR, CURRENT, CURRENT_ACT, CAVITY_LOCK, "dl:lock:state-txt", SHG_STATE, SHG_INTRA)
-LEARN_S = 120.0  # s: how slowly the usual transmission and SHG signal follow what they are
+FINE_N = 600   # polls: a level locked as usual is the median of the last this many running as it should...
+FINE_MIN = 10  # ...once there are this many (until then, the one learned before)
 
 
 def _num(x) -> bool:
@@ -134,9 +140,11 @@ class Channel:
         self.seed_low = 0     # polls in a row with too little seed
         self.trans_name = ""  # its cavity transmission: the lock input's present value (absolute name)
         self.trans = None     # V, as last polled
-        self.trans_hist = deque()  # (t, V) over the last Engine.LEVEL_S
+        self.trans_hist = deque()  # (t, V) over the last Engine.LEVEL_S, while its lock is on
+        self.trans_fine = deque(maxlen=FINE_N)  # V, polled running as it should
         self.shg_level = None  # V: its SHG cavity's intra-cavity signal, as last polled
-        self.shg_hist = deque()  # (t, V) of that over the last Engine.LEVEL_S
+        self.shg_hist = deque()  # (t, V) of that over the last Engine.LEVEL_S, armed
+        self.shg_fine = deque(maxlen=FINE_N)  # V, polled running as it should
 
     @property
     def param(self) -> str:
@@ -316,7 +324,8 @@ class _HopIO:
 
 
 class Engine:
-    LEVEL_S = 10.0  # s: a cavity lock's transmission averaged over this long, to tell one that keeps losing it
+    LEVEL_S = 10.0  # s: a cavity lock's transmission (an SHG signal) averaged over this long, to tell one that keeps
+    #                 losing it
 
     def __init__(self, config: dict, make_source, discovery_targets=None, extra_devices=(), log_path=None):
         """log_path: a file every recovery is appended to, as a line of JSON."""
@@ -600,6 +609,7 @@ class Engine:
         ch.current = ch.current_set = ch.cavity_on = ch.seed = ch.lasing = ch.shg_level = None
         ch.cavity_txt = ch.shg_txt = ch.seed_name = ""
         ch.shg_hist.clear()
+        ch.shg_fine.clear()
 
     def _watch(self, ch: Channel):
         """Poll the offset of the linked laser for display, and read its unit once."""
@@ -706,14 +716,13 @@ class Engine:
         c.submit(job)
 
     def _find_trans(self, ch: Channel):
-        """Which input its cavity lock locks on (the transmission, its lock-detection signal too, as a
-        rule); then poll that input's present value."""
+        """Which input shows its cavity transmission (the one its lock detection watches, if on; else its lock
+        input); then poll that input's present value."""
         key, laser = ch.device, ch.laser
         c = self._controller(key)
 
         def job(client):
-            (spec,) = perform(client, laser, ("get", ("dl:lock:spectrum-input-channel",)))
-            name = IO_VALUE.get(spec, "") if isinstance(spec, int) else ""
+            name = transmission_input(*perform(client, laser, ("get", TRANS))) or ""
             with self.lock:
                 if ch.device != key or ch.laser != laser or not (ch.hop.enabled and ch.hop.cavity) or not name:
                     return
@@ -727,6 +736,7 @@ class Engine:
         name, key = ch.trans_name, ch.device
         ch.trans_name, ch.trans = "", None
         ch.trans_hist.clear()
+        ch.trans_fine.clear()
         c = self.controllers.get(key)
         if name and c is not None and not any(o.device == key and o.trans_name == name for o in self.channels.values()):
             c.unwatch(name)
@@ -739,94 +749,125 @@ class Engine:
                     self._trans(ch, v)
 
     def _trans(self, ch: Channel, v: float):
-        """Its transmission: kept over LEVEL_S; armed, its average far below usual means the lock keeps losing
-        it: relock it (an hour's recoveries permitting). Running as it should: learn the usual."""
+        """Its transmission, while its DLC pro's lock is on (a lock turned off, by hand say, is not one that keeps
+        losing it): kept over LEVEL_S; armed, its average below its limit means the lock keeps losing it: relock it
+        (the hourly limit only if the wavemeter still reads it: without, it most likely stopped lasing). Running as
+        it should: its level locked learned."""
         hop = ch.hop
         ch.trans = v
-        if ch.state == "recovering" or not hop.enabled or not hop.cavity:
+        if ch.state == "recovering" or not hop.enabled or not hop.cavity or not ch.cavity_on:
             ch.trans_hist.clear()
             return
+        if self._running_fine(ch):
+            self._usual(ch, ch.trans_fine, "trans_locked", v)
         now = time.monotonic()
         ch.trans_hist.append((now, v))
         while ch.trans_hist and now - ch.trans_hist[0][0] > self.LEVEL_S:
             ch.trans_hist.popleft()
-        if self._running_fine(ch) and v > 0 and (not hop.lock_ok or v >= hop.lock_min * hop.lock_ok):
-            self._learn(ch, "lock_ok", v)
         slip = self._slipping(ch) if self._armed(ch) else None
         if slip:
             ch.trans_hist.clear()
-            log.warning("channel %d: %s", ch.n, self._slip_text(*slip))
-            self._start_recovery(ch, self._slip_text(*slip), relock=True)
+            why = self._slip_text(*slip)
+            log.warning("channel %d: %s", ch.n, why)
+            self._start_recovery(ch, why, budget=math.isfinite(self._hop_error(ch)), relock=True)
 
     def _shg(self, ch: Channel, v: float):
-        """Its SHG intra-cavity signal: kept over LEVEL_S; running as it should, its usual learned (not a moment
-        it lost its lock); armed, far below usual on average: recover it (the hourly limit only if the wavemeter
-        still reads it: without, it most likely stopped lasing)."""
+        """Its SHG intra-cavity signal, while armed: kept over LEVEL_S; running as it should, its level locked
+        learned; far below that on average: recover it (the hourly limit only if the wavemeter still reads it:
+        without, it most likely stopped lasing)."""
         hop = ch.hop
         ch.shg_level = v
         if ch.state == "recovering" or not hop.enabled or not hop.shg:
+            ch.shg_hist.clear()
+            return
+        if self._running_fine(ch):
+            self._usual(ch, ch.shg_fine, "shg_lock", v)
+        if not self._armed(ch):
             ch.shg_hist.clear()
             return
         now = time.monotonic()
         ch.shg_hist.append((now, v))
         while ch.shg_hist and now - ch.shg_hist[0][0] > self.LEVEL_S:
             ch.shg_hist.popleft()
-        if self._running_fine(ch) and v > 0 and (not hop.shg_lock or v >= hop.lock_min * hop.shg_lock):
-            self._learn(ch, "shg_lock", v)
-        gone = self._fallen(ch.shg_hist, hop.shg_lock, hop.lock_min) if self._armed(ch) else None
+        gone = self._fallen(ch.shg_hist, hop.shg_lock, 0.0, hop.lock_min)
         if gone:
             ch.shg_hist.clear()
-            why = f"the SHG signal is gone ({gone[0] / gone[1]:.0%} of usual on average)"
+            mean, usual, _ = gone
+            why = (f"the SHG signal is gone: {volts(mean, usual)} V on average over {self.LEVEL_S:g} s (locked "
+                   f"{volts(usual, usual)} V)")
             log.warning("channel %d: %s", ch.n, why)
             self._start_recovery(ch, why, budget=math.isfinite(self._hop_error(ch)), relock=hop.cavity)
 
-    def _fallen(self, hist, usual: float, frac: float):
-        """(average, usual) if the levels in hist (over at least most of LEVEL_S) average below frac of usual,
-        else None (and if there is no telling)."""
-        if usual <= 0 or len(hist) < 5 or hist[-1][0] - hist[0][0] < 0.8 * self.LEVEL_S:
+    def _fallen(self, hist, usual: float, zero: float, frac: float):
+        """(average, usual, zero) if the levels in hist (over most of LEVEL_S at least) average below frac of the way
+        from zero to usual, else None (and if there is no telling)."""
+        if usual <= zero or len(hist) < 5 or hist[-1][0] - hist[0][0] < 0.8 * self.LEVEL_S:
             return None
         mean = sum(v for _, v in hist) / len(hist)
-        return (mean, usual) if mean < frac * usual else None
+        return (mean, usual, zero) if mean < zero + frac * (usual - zero) else None
 
     def _slipping(self, ch: Channel):
-        """(average, usual) if its transmission has averaged below lock_min of usual over the last LEVEL_S,
-        else None (and if there is no telling)."""
+        """(average, level locked, zero) if its transmission has averaged below lock_min of the way from its zero to
+        its level locked over the last LEVEL_S, else None (and if there is no telling)."""
         hop = ch.hop
-        return self._fallen(ch.trans_hist, hop.lock_ok or hop.peak_y, hop.lock_min) if hop.cavity else None
+        if not hop.cavity:
+            return None
+        return self._fallen(ch.trans_hist, hop.trans_locked, usable_zero(hop.trans_zero, hop.trans_locked),
+                            hop.lock_min)
+
+    def _slip_text(self, mean: float, usual: float, zero: float) -> str:
+        return (f"the cavity lock keeps losing it: transmission {volts(mean, usual)} V on average over "
+                f"{self.LEVEL_S:g} s (locked {volts(usual, usual)} V, zero {volts(zero, usual)} V)")
 
     @staticmethod
-    def _slip_text(mean: float, usual: float) -> str:
-        return f"the cavity lock keeps losing it (transmission {mean / usual:.0%} of usual on average)"
-
-    @staticmethod
-    def transmission(ch: Channel):
-        """Its cavity transmission over the last LEVEL_S, as a fraction of usual (None: no telling)."""
-        usual = ch.hop.lock_ok or ch.hop.peak_y
+    def trans_levels(ch: Channel):
+        """Its cavity transmission, V: (its average over the last LEVEL_S while its lock was on, else its last
+        poll; its level locked, 0 while not known; its zero; the limit its average must stay above, armed, None if
+        there is no telling); None if it is not watched."""
+        hop = ch.hop
         hist = list(ch.trans_hist)
-        return sum(v for _, v in hist) / len(hist) / usual if hist and usual > 0 else None
+        if not hist and ch.trans is None:
+            return None
+        now = sum(v for _, v in hist) / len(hist) if hist else ch.trans
+        usual = hop.trans_locked
+        zero = usable_zero(hop.trans_zero, usual)
+        return now, usual, zero, zero + hop.lock_min * (usual - zero) if usual > zero else None
 
     @staticmethod
-    def shg_signal(ch: Channel):
-        """Its SHG intra-cavity signal over the last LEVEL_S, as a fraction of usual (None: no telling)."""
+    def shg_levels(ch: Channel):
+        """Its SHG intra-cavity signal, V: (its average over the last LEVEL_S while armed, else its last poll; its
+        level locked, 0 while not known; the limit its average must stay above, armed, None if there is no
+        telling); None if it is not watched."""
         hist = list(ch.shg_hist)
-        return sum(v for _, v in hist) / len(hist) / ch.hop.shg_lock if hist and ch.hop.shg_lock > 0 else None
+        if not hist and ch.shg_level is None:
+            return None
+        usual = ch.hop.shg_lock
+        now = sum(v for _, v in hist) / len(hist) if hist else ch.shg_level
+        return now, usual, ch.hop.lock_min * usual if usual > 0 else None
 
     def _running_fine(self, ch: Channel) -> bool:
-        """As it should be, as far as can be told: armed, on target for a while, and its locks (the DLC pro's,
-        the SHG cavity's) saying locked."""
+        """As it should be, as far as can be told: on target, and its locks saying locked: its DLC pro's lock to a
+        cavity (watched or not: what it transmits locked is known when Relock is clicked), or this program's to the
+        wavemeter (on target for a while); and its SHG cavity's."""
         hop = ch.hop
-        if ch.state == "recovering" or not self._armed(ch) or not ch.guard.armed:
+        if ch.state == "recovering" or not hop.enabled or not ch.device:
+            return False
+        if hop.cavity:
+            if not (ch.cavity_on and says_locked(ch.cavity_txt)):
+                return False
+        elif not (self._armed(ch) and ch.guard.armed):
             return False
         e = self._hop_error(ch) - ch.guard.track
-        return (math.isfinite(e) and abs(e) <= hop.off_target() and (not hop.cavity or says_locked(ch.cavity_txt))
-                and (not hop.shg or says_locked(ch.shg_txt)))
+        return math.isfinite(e) and abs(e) <= hop.off_target() and (not hop.shg or says_locked(ch.shg_txt))
 
-    def _learn(self, ch: Channel, name: str, v: float):
-        """A usual level (HopParams.lock_ok, shg_lock), following what it is over LEARN_S."""
-        was = getattr(ch.hop, name)
-        if not was:
-            self.dirty = True
-        setattr(ch.hop, name, v if not was else was + (v - was) * min(Controller.POLL / LEARN_S, 1.0))
+    def _usual(self, ch: Channel, fine: deque, name: str, v: float):
+        """A level locked as usual (HopParams.trans_locked, shg_lock), polled running as it should: the median of
+        the last FINE_N such polls, once there are FINE_MIN (until then, as learned before: by a relock, say)."""
+        fine.append(v)
+        if len(fine) >= FINE_MIN:
+            if not getattr(ch.hop, name):
+                self.dirty = True
+            setattr(ch.hop, name, round(statistics.median(fine), 5))
 
     def _armed(self, ch: Channel) -> bool:
         """Watched for hops (and for losing lasing): locked to the wavemeter by this program, or Relock
@@ -949,6 +990,8 @@ class Engine:
             ch.hop = params
             ch.guard.reset()
             ch.guard.track = 0.0
+            ch.trans_fine.clear()  # (learned afresh if forgotten)
+            ch.shg_fine.clear()
             if ch.device:
                 self._watch_hop(ch)
                 if params.enabled and not params.i_nom:
@@ -1045,8 +1088,8 @@ class Engine:
         ch.state, ch.message = "recovering", ""
         ch.token += 1
         ch.hop_why, ch.hop_t = why, now
-        ch.trans_hist.clear()
-        ch.shg_hist.clear()
+        for d in (ch.trans_hist, ch.shg_hist, ch.trans_fine, ch.shg_fine):  # (what it relocked to is learned afresh)
+            d.clear()
         tok, laser, cavity = ch.token, ch.laser, hop.cavity
         log.info("channel %d: %s, recovering", ch.n, why or "recenter")
 
@@ -1141,7 +1184,7 @@ class Engine:
             where = f"left at {rec.mA(r.i_written):.2f} mA, {r.v_written:.2f} {ch.unit}"
         if "dl:lock:lock-enabled" in r.journal:
             where += ", cavity lock left off"
-        for name in ("lp_code", "lp_kind", "peak_y", "falc_sign"):  # worth keeping, even so
+        for name in ("lp_code", "lp_kind", "peak_y", "falc_sign", "trans_zero"):  # worth keeping, even so
             if name in rec.learned:
                 setattr(ch.hop, name, rec.learned[name])
                 self.dirty = True

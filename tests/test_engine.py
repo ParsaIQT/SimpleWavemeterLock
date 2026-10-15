@@ -538,8 +538,9 @@ def test_relock_takes_over_a_laser_locked_on_the_wrong_peak(quiet_demo):
 
 def test_a_cavity_lock_that_keeps_losing_it_is_taken_over(quiet_demo):
     """The master goes multimode (a third of its power in the next mode), quietly for the wavemeter: its cavity
-    lock keeps losing it and relocking, its transmission (Fine In 1) far below usual on average: taken over,
-    the mode made single, relocked; the usual transmission and SHG signal were learned while it ran."""
+    lock keeps losing it and relocking, its transmission (Fine In 1, its lock detection's input) far below its level
+    locked on average: taken over, the mode made single, relocked; the levels locked, of the transmission and the
+    SHG signal, were learned while it ran."""
     import time
 
     demo, dlc = quiet_demo, quiet_demo.dlcs[2]
@@ -548,18 +549,65 @@ def test_a_cavity_lock_that_keeps_losing_it_is_taken_over(quiet_demo):
     e.LEVEL_S = 4.0
     try:
         e.engage(demo.SHG)
-        assert wait_for(lambda: ch.guard.armed and ch.trans_name == "io:fine-1:value-act" and ch.hop.lock_ok
+        assert wait_for(lambda: ch.guard.armed and ch.trans_name == "io:fine-1:value-act" and ch.hop.trans_locked
                         and ch.hop.shg_lock, 10)
-        assert ch.hop.lock_ok == pytest.approx(0.8, abs=0.02) and ch.hop.shg_lock == pytest.approx(1.23, abs=0.02)
-        assert wait_for(lambda: (e.transmission(ch) or 0) > 0.9, 5)
+        assert ch.hop.trans_locked == pytest.approx(0.8, abs=0.02) and ch.hop.shg_lock == pytest.approx(1.23, abs=0.02)
+        assert wait_for(lambda: e.trans_levels(ch)[0] > 0.75 and len(ch.trans_hist) >= 5, 5)
         shg.go_multimode(1)
         assert wait_for(lambda: ch.state == "recovering", 15), ch.message
-        assert ch.hop_why.startswith("the cavity lock keeps losing it (transmission "), ch.hop_why  # (not a hop:
-        assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 90), ch.message  # the wavemeter saw it close)
+        assert re.fullmatch(r"the cavity lock keeps losing it: transmission 0\.[0-3]\d\d V on average over 4 s "
+                            r"\(locked 0\.[78]\d\d V, zero 0\.000 V\)", ch.hop_why), ch.hop_why  # (not a hop: the
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 90), ch.message  # wavemeter saw it close)
         relocks = shg.lock.relocks
         time.sleep(3)
-        assert shg.lock.relocks == relocks and shg.lock.locked() and e.transmission(ch) > 0.9  # it holds
+        assert shg.lock.relocks == relocks and shg.lock.locked() and e.trans_levels(ch)[0] > 0.75  # it holds
         assert "single mode" in ch.note and not shg.lock._slips()
+        assert ch.hop.trans_zero == pytest.approx(0.0, abs=0.003)  # measured while the master scanned
+    finally:
+        e.stop()
+
+
+def test_the_transmission_is_watched_from_its_zero_to_its_level_locked(quiet_demo):
+    """Its transmission as on a real one: 0.05 V locked, on a DC offset of 0.01 V, and its level locked learned
+    wrong before (four times too high). Relock is not fooled: the level locked is the median of what it reads locked
+    on target (whether watched or not); a lock turned off and on again by hand is no lock that keeps losing it;
+    one that does is relocked, its zero measured while the master scans, and watched against both, in volts."""
+    import time
+
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    with shg.lock.mutex:
+        shg.lock.t00, shg.lock.t_dc = 0.05, 0.01
+        x, _, kind = shg.lock.lockpoint
+        shg.lock.lockpoint = (x, 0.06, kind)  # (chosen by hand on that peak)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, trans_locked=0.24))
+    e.LEVEL_S = 4.0
+    try:
+        assert wait_for(lambda: ch.hop.trans_locked < 0.1, 10)  # learned afresh, not yet watched
+        assert ch.hop.trans_locked == pytest.approx(0.06, abs=0.003) and ch.trans_name == "io:fine-1:value-act"
+        assert wait_for(lambda: len(ch.trans_hist) >= 5 and ch.trans_hist[-1][0] - ch.trans_hist[0][0] > 3.5, 5)
+        e.engage(demo.SHG)  # Relock: watched, nothing to relock
+        assert ch.state == "on" and not ch.hop_why
+        now, usual, zero, limit = e.trans_levels(ch)
+        assert now == pytest.approx(0.06, abs=0.003) and zero == 0.0 and limit == pytest.approx(0.03, abs=0.002)
+        dlc.execute("(param-set! 'laser1:dl:lock:lock-enabled #f)")  # by hand, for a while (its transmission ~0.01 V)
+        time.sleep(5)
+        assert ch.state == "on" and not ch.trans_hist and not ch.guard.armed
+        dlc.execute("(param-set! 'laser1:dl:lock:lock-enabled #t)")  # and on again: locked at once
+        time.sleep(6)
+        assert ch.state == "on" and not ch.hop_why and shg.lock.locked()  # no relock
+        shg.go_multimode(1)
+        assert wait_for(lambda: ch.state == "recovering", 15), ch.message
+        assert re.fullmatch(r"the cavity lock keeps losing it: transmission 0\.0[1-3]\d\d V on average over 4 s "
+                            r"\(locked 0\.0[56]\d\d V, zero 0\.0000 V\)", ch.hop_why), ch.hop_why
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 90), ch.message
+        assert ch.hop.trans_zero == pytest.approx(0.01, abs=0.002)  # measured while the master scanned
+        assert wait_for(lambda: len(ch.trans_hist) >= 5, 5)
+        now, usual, zero, limit = e.trans_levels(ch)
+        assert zero == ch.hop.trans_zero and usual == pytest.approx(0.06, abs=0.003)
+        assert limit == pytest.approx(0.035, abs=0.002) and now > limit  # half way from 0.01 to 0.06 V
+        cfg = e.to_config()["channels"][str(demo.SHG)]["hop"]
+        assert cfg["trans_zero"] == ch.hop.trans_zero and cfg["trans_locked"] == ch.hop.trans_locked
     finally:
         e.stop()
 
@@ -599,7 +647,7 @@ def test_a_laser_that_stops_lasing_unseen_by_its_seed_is_brought_back(quiet_demo
     e.LEVEL_S = 3.0
     try:
         e.engage(demo.SHG)
-        assert wait_for(lambda: ch.guard.armed and ch.hop.seed_ok and ch.hop.shg_lock and ch.hop.lock_ok, 10)
+        assert wait_for(lambda: ch.guard.armed and ch.hop.seed_ok and ch.hop.shg_lock and ch.hop.trans_locked, 10)
         ch.guard.recent.append(time.monotonic())  # this hour's one recovery: used up
         shg.stop_lasing(ase=0.7)
         assert wait_for(lambda: ch.state == "recovering", 10), ch.message

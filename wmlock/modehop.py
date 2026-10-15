@@ -129,7 +129,8 @@ class HopParams:
     falc_max: float = 0.05    # V: the most the input offset may move from where it was
     window: float = 150.0     # MHz: the right cavity peak is within this of where the wavemeter puts it
     peak_tol: float = 50.0    # MHz: locked to its cavity, but further than this from the target: the wrong peak
-    lock_min: float = 0.5     # its cavity transmission averaging below this fraction of usual: the lock keeps losing it
+    lock_min: float = 0.5     # its cavity transmission averaging below this fraction of the way from its zero to its
+    #                           level locked (both learned): the lock keeps losing it
     confirm: bool = False     # step by step: ask before each step
     i_nom: float = 0.0        # mA, the laser's normal current (0: read it when enabled)
     i_window: float = 2.0     # mA: the current stays below i_nom + this, always...
@@ -158,11 +159,12 @@ class HopParams:
     shg_n: int = 0
     falc_sign: int = 0        # +-1: how the input offset shows in the error signal (0: not known)
     seed_ok: float = 0.0      # mW: its seed power, lasing as usual
-    lock_ok: float = 0.0      # V: the cavity transmission (lock input), locked as usual
+    trans_locked: float = 0.0  # V: the cavity transmission (its lock detection's input), locked as usual...
+    trans_zero: float = 0.0   # V: ...and off resonance (its DC offset), measured while the master scans
     shg_lock: float = 0.0     # V: the SHG cavity's intra-cavity signal, locked, the master single-mode
 
     LEARNED = ("kv", "spacing", "peak_y", "lp_kind", "lp_code", "shg_area", "shg_side", "shg_n", "falc_sign",
-               "seed_ok", "lock_ok", "shg_lock")
+               "seed_ok", "trans_locked", "trans_zero", "shg_lock")
 
     @classmethod
     def from_dict(cls, d) -> "HopParams":

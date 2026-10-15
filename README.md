@@ -70,7 +70,7 @@ channel as soon as the WLM has a new result, and shows the channels ticked
 |---|---|
 | Right-click a channel | Link laser ▸ controller ▸ laserN, Enter IP address…, Rescan LAN, Unlink, Setpoint = current reading, Lock settings…, Mode-hop recovery…, Recenter now, Check setup…, Last recovery…, Use as reference laser, Rename…, Hide channel |
 | **Lock** button | Engage or release. Without a setpoint it locks to the current reading. Green means locked; a red bar means it unlocked itself, and the reason is shown under the deviation. Amber *Recentering* means a mode-hop recovery is running: click to stop it (everything goes back). Blue *Continue*: step by step, it waits for you to allow the step shown on the row. |
-| **Relock** button | For a laser its DLC pro locks to a cavity (*Mode-hop recovery… ▸ Locked by its DLC pro*), in place of Lock: this program does not lock it to the wavemeter. Click it to have the laser watched (*Watching*, green) and relocked after a mode hop, when it is locked more than 50 MHz from its target (another peak: the wavemeter is never that far off), or when its lock keeps losing it and relocking (its transmission far below usual on average); if any of that is so when you click, it is relocked there and then. Normally it does nothing at all. Click *Watching* to stop. |
+| **Relock** button | For a laser its DLC pro locks to a cavity (*Mode-hop recovery… ▸ Locked by its DLC pro*), in place of Lock: this program does not lock it to the wavemeter. Click it to have the laser watched (*Watching*, green) and relocked after a mode hop, when it is locked more than 50 MHz from its target (another peak: the wavemeter is never that far off), or when its lock keeps losing it and relocking (its transmission, on average, far below its level locked); if any of that is so when you click, it is relocked there and then. Normally it does nothing at all. Click *Watching* to stop. |
 | `set` field | Setpoint as vacuum wavelength in nm. Type and press Enter, or put the cursor next to a digit and use ↑/↓ or the mouse wheel to step that digit. This works while locked, so you can walk the laser. |
 | Double-click the name | Rename |
 | Right-click empty space | Rescan LAN (F5), Show hidden channels, Always on top, Larger/smaller digits (Ctrl +/−); with `--sim`, Simulate a fault |
@@ -220,13 +220,23 @@ Right-click a channel ▸ **Mode-hop recovery…**:
 * **Wrong peak**: locked, but more than **50 MHz** from the target: the wavemeter is never that
   far off, so the lock holds the laser on another peak of the cavity (a transverse mode, say),
   and it is relocked. A wavemeter-locked laser keeps the 100 MHz above.
-* **Lock slipping**: the lock input (Fine In 1, as a rule: the cavity transmission, the lock
-  detection's signal too) averaging below **half** its usual over 10 s: the lock keeps losing the
-  laser and relocking (ReLock), and it is taken over, its mode looked at, and relocked; the
-  wavelength may well look fine meanwhile. Its usual level is learned while the laser runs locked
-  on target (and is the right peak's height in the scan until then). The same goes for an SHG
-  laser's intra-cavity signal (locked): below half its usual over 10 s, it is recovered (the SHG
-  cavity lost it, or the laser stopped lasing).
+* **Lock slipping**: the cavity transmission (the input the DLC pro's lock detection watches,
+  Fine In 1 as a rule; with lock detection off, the lock input) is read twice a second while the
+  DLC pro's lock is on, and goes by two levels, in volts:
+  * its **zero**: the transmission between the peaks (any DC offset), measured while the master
+    scans in a relock by lockpoint (the median of ten looks; 0 V until then);
+  * its **level locked**: the median of what it read over the last few minutes while the laser ran
+    locked on target (watched or not), and what a relock measured, until then.
+
+  Its average over 10 s below **half way** from zero to locked (0 V and 0.05 V: below 0.025 V)
+  means the lock keeps losing the laser and relocking (ReLock): it is taken over, its mode looked
+  at, and relocked; the wavelength may well look fine meanwhile. The row shows the transmission in
+  volts with its level locked (*transmission 0.0493 V (locked 0.0500)*), and **CAVITY LOCK
+  SLIPPING** with the limit when it falls below; *Check setup…* shows which input is watched, both
+  levels and the limit. A lock that is off is not watched for this: turning it off and on again by
+  hand is not taken for slipping. The same goes for an SHG laser's intra-cavity signal (locked):
+  below half its level locked over 10 s, it is recovered (the SHG cavity lost it, or the laser
+  stopped lasing).
 * **Null the error signal's DC level with the FALC pro's input offset, by at most 0.05 V.**
 * **Step by step**: before each step, the recovery waits for you (see *Before the first run*).
 
@@ -264,8 +274,8 @@ fooled, its SHG signal (and cavity transmission) gone on average for a few secon
 recovery, and since the wavemeter then has nothing to read either, the hourly limit does not
 count. It also happens at the start of any recovery, at every SHG sweep, and after any step that
 moves the current or the piezo; a move down is checked every 0.2 mA by the seed power. The row
-shows the seed power and the SHG signal (against its usual), **NOT LASING** in red when the seed
-power is too low, and **SHG SIGNAL GONE** when that is.
+shows the seed power and the SHG signal (in volts, with its level locked), **NOT LASING** in red
+when the seed power is too low, and **SHG SIGNAL GONE** when that is.
 
 If it does not lase even 5 mA up, the current goes back down to where it was (slowly), and the
 row says to look at the laser. If its TA switched itself off meanwhile, the laser is left
@@ -375,9 +385,9 @@ recovery does what you would do by hand:
 | Unlock the master and the SHG, stop the master's scan | *Take over* |
 | Make sure the master is single-mode-ish before moving the scan offset, then move it slowly towards the target, watching the SHG sweep; trim the current when the mode loses quality | *the walk*: the SHG sweep after every trim and every 0.5 V of piezo, and at the operating point (the map: every map point, both ends of the margin check, and the operating point) |
 | Lock the SHG cavity | SHG scan off, `nlo:shg:lock:lock-enabled` on; the intra-cavity signal (`nlo:pd:shg-int:photodiode`) must come up, to at least 80 % of its usual locked (learned while the laser runs, else what it was when the recovery began): if not, the master is not single-mode, and the current is trimmed (once; then it is handed back all the same, and says so) |
-| Start the master's scan, bring the right cavity peak into it, show the lock points, pick it in the XY display (scan output against Fine In 1) | the scan runs; the DLC pro is asked to find its lock points (`dl:lock:find-candidates`) before each look at them; from those candidates (`dl:lock:candidates`), the tall peak where the wavemeter puts the target (scan offset − deviation / piezo tuning), within ± 150 MHz, and the only one there; it must stand at least half as tall as the right peak did last time (from the lockpoint you selected), so a transverse mode is never taken for it |
+| Start the master's scan, bring the right cavity peak into it, show the lock points, pick it in the XY display (scan output against Fine In 1) | the scan runs; the transmission is looked at ten times, unevenly spaced: mostly between the peaks, their median is its zero; the DLC pro is asked to find its lock points (`dl:lock:find-candidates`) before each look at them; from those candidates (`dl:lock:candidates`), the tall peak where the wavemeter puts the target (scan offset − deviation / piezo tuning), within ± 150 MHz, and the only one there; it must stand at least half as tall as the right peak did last time (from the lockpoint you selected), so a transverse mode is never taken for it |
 | Correct the FALC's input offset (~0.01 V) so the error signal has no DC | the error signal's level away from the resonances, from the scope; the input offset steps against it, checking on the trace after each step that it does what it should |
-| Lock | `dl:lock:select-lockpoint` on that candidate, then `lock-enabled`; the lock must report locked, the wavemeter must agree it is the right peak, and the transmission must reach half the peak's height |
+| Lock | `dl:lock:select-lockpoint` on that candidate, then `lock-enabled`; the lock must report locked, the wavemeter must agree it is the right peak, and the transmission (the median of a few looks) must reach half the peak's height above zero; it is its level locked from then on |
 
 How a sweep is judged: a single-mode master gives one tall peak per free spectral range of
 the SHG cavity, plus small transverse-mode bumps (always the same); a second mode adds its
@@ -465,8 +475,9 @@ reading.
 
 Recoveries learn the laser's piezo tuning and mode spacing, the right peak's height, the
 lockpoint type and the number `select-lockpoint` wants for it, what single-mode looks like in
-the SHG cavity, how the FALC offset shows on the error signal; watching it, its usual seed
-power, cavity transmission and SHG intra-cavity signal (locked) are learned too. They are kept
+the SHG cavity, how the FALC offset shows on the error signal, the cavity transmission's zero;
+watching it, its usual seed power and the levels locked of its cavity transmission and SHG
+intra-cavity signal are learned too. They are kept
 (the dialog shows them, *Forget* clears them) and make later recoveries quicker and surer.
 
 Things to know:
@@ -480,8 +491,8 @@ Things to know:
   recoveries ended on the right peak with the SHG cavity locked and the DC nulled, 231 strictly
   single-mode and the rest with at most 11 % of the power in a second mode, a median 1.1 mA from
   the next hop; all 54 failures (mostly a target further than the ±25 V of piezo could reach)
-  were left unlocked with every setting put back. About 20 s at 10 readings a second, 31 s at
-  most for nine in ten. With nothing learned at all, the same but for at most 12.5 % in a second
+  were left unlocked with every setting put back. About 22 s at 10 readings a second (2 s of it
+  looking at the cavity transmission, scanning and locked), 33 s at most for nine in ten. With nothing learned at all, the same but for at most 12.5 % in a second
   mode. (The previous version, which looked 0.5 mA either side of the operating point: 234
   fixed, 239 strictly single-mode.) 300 more that also stop lasing 0.7 to 2 mA below their
   current and start again only 1.5 to 4.5 mA above it, a third of them not lasing when the

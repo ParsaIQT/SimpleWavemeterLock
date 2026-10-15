@@ -494,8 +494,10 @@ class SimLocked:
 
     Reference cavity: TEM00 resonances every `fsr` GHz (one at f_res), weaker transverse modes
     (`tem`: offset in FSR, relative height) between; transmission on Fine In 1 (t00 V at a TEM00
-    peak), the PDH error signal on Fast In 3 (amplitude `pdh` V, sidebands 20 MHz out), with a DC
-    offset `pdh_dc` plus the FALC pro's input offset. The lock (lock-enabled):
+    peak, on a DC offset `t_dc`; its lock detection, the window, watches it too; its present value
+    while the master scans, unlocked, is that somewhere in the scan), the PDH error signal on
+    Fast In 3 (amplitude `pdh` V, sidebands 20 MHz out), with a DC offset `pdh_dc` plus the FALC
+    pro's input offset. The lock (lock-enabled):
       lockpoints=True   locks to the resonance at the selected lockpoint (select-lockpoint
                         x y type, which must name one of the candidates the DLC pro found
                         when last asked, find-candidates, in the scan running then; type = the
@@ -528,13 +530,13 @@ class SimLocked:
                  lockpoints: bool = True, fsr: float = 1.5, lw: float = 6.0, tem=((0.37, 0.18), (0.71, 0.08)),
                  t00: float = 0.8, pdh: float = 0.4, pdh_dc: float = 0.0, falc: int = 1, range_v: float = 30.0,
                  falc_in_trace: bool = True, falc_sign: int = 1, seed=None, ta: bool | None = None,
-                 clock=time.monotonic):
+                 clock=time.monotonic, t_dc: float = 0.0):
         """falc_in_trace: the error signal on the scope includes the FALC's input offset, which adds
         to it (falc_sign 1) or subtracts (-1). ta: a TA between master and SHG cavity (by default
         with an SHG stage); clock: its time, for its protection."""
         self.dlc, self.n, self.ecdl = dlc, n, ecdl
         self.p = p = f"laser{n}:"
-        self.f_res, self.fsr, self.lw, self.tem, self.t00 = f_res, fsr, lw, tuple(tem), t00
+        self.f_res, self.fsr, self.lw, self.tem, self.t00, self.t_dc = f_res, fsr, lw, tuple(tem), t00, t_dc
         self.pdh, self.pdh_dc, self.sideband = pdh, pdh_dc, 20.0
         self.has_shg, self.falc, self.range_v = shg, falc, range_v
         self.falc_in_trace, self.falc_sign = falc_in_trace, falc_sign
@@ -563,6 +565,9 @@ class SimLocked:
             p + "dl:lock:state-txt": lambda: f'"{self.state()[1]}"',
             p + "dl:lock:spectrum-input-channel": 0, p + "dl:lock:error-channel": 2,
             p + "dl:lock:falc-selection": falc, p + "dl:lock:relock:enabled": True,
+            p + "dl:lock:window:enabled": True, p + "dl:lock:window:input-channel": 0,
+            p + "dl:lock:window:level-low": lambda: self.t_dc + 0.2 * self.t00,
+            p + "dl:lock:window:level-high": 10.0, p + "dl:lock:window:level-hysteresis": 0.01,
             p + "dl:lock:candidate-filter:top": True, p + "dl:lock:candidate-filter:bottom": False,
             p + "dl:lock:candidate-filter:positive-edge": False, p + "dl:lock:candidate-filter:negative-edge": False,
             p + "dl:lock:candidates": self._candidates_blob,
@@ -756,20 +761,29 @@ class SimLocked:
             return self.ecdl.freq(v + self.dv, i, wobble)
 
     def level(self, sig: int) -> float:
-        """The present value of an input: Fine In 1 (transmission) or Fast In 3 (error signal)."""
+        """The present value of an input: Fine In 1 (transmission) or Fast In 3 (error signal); unlocked and
+        scanning, somewhere in the scan."""
         with self.mutex:
             v, i = self._vi()
-            if self._get("dl:lock:lock-enabled"):
+            on = self._get("dl:lock:lock-enabled")
+            if on:
                 self._tick()
-            f = self.peak + self._offset_mhz() * 1e-6 if self.locked() else self._free(v + self.dv, i)
-            if self._get("dl:lock:lock-enabled") and not self.locked() and self._searching():
+            x, m0 = v + self.dv, self.ecdl.m
+            scanning = self._get("scan:enabled") and not on
+            if scanning:
+                x = v + self._get("scan:amplitude") * (self.rng.random() - 0.5)
+            f = self.peak + self._offset_mhz() * 1e-6 if self.locked() else self._free(x, i)
+            if on and not self.locked() and self._searching():
                 f += self.rng.uniform(-1.0, 1.0) * self.SEARCH_MHZ * 1e-6  # ReLock sweeping it
             t, e = 0.0, 0.0
-            for power, ghz in self.ecdl.components(v + self.dv, i):
-                ti, ei = self._airy(f + (ghz - self.ecdl.mode_ghz(v + self.dv, i)) * 1e-3)
+            for power, ghz in self.ecdl.components(x, i):
+                ti, ei = self._airy(f + (ghz - self.ecdl.mode_ghz(x, i)) * 1e-3)
                 t, e = t + power * ti, e + power * ei
+            if scanning:
+                self.ecdl.m = m0
+                self.ecdl.lase(v + self.dv, i)
             noise = self.rng.gauss(0.0, 0.002)
-            return (t if sig == 0 else e + self.shown_dc()) + noise
+            return (t + self.t_dc if sig == 0 else e + self.shown_dc()) + noise
 
     def _master_scan(self):
         """One scan period: [(x, transmission, error)]; self.found: the lockpoint candidates in it (tops)."""
@@ -785,14 +799,15 @@ class SimLocked:
             for power, ghz in self.ecdl.components(x, i):
                 ti, ei = self._airy(self.ecdl.f0 + ghz * 1e-3 + self.wobble * 1e-6)
                 tr, er = tr + power * ti, er + power * ei
-            rows.append((x, tr + self.rng.gauss(0.0, 0.002), er + self.shown_dc() + self.rng.gauss(0.0, 0.002)))
+            rows.append((x, tr + self.t_dc + self.rng.gauss(0.0, 0.002),
+                         er + self.shown_dc() + self.rng.gauss(0.0, 0.002)))
         self.ecdl.m = m0
         self.ecdl.lase(v + self.dv, i)
         up = rows[:self.N // 2]
         cands = []
         for k in range(1, len(up) - 1):
             x, t, _ = up[k]
-            if t > 0.05 * self.t00 and t > up[k - 1][1] and t >= up[k + 1][1]:
+            if t > self.t_dc + 0.05 * self.t00 and t > up[k - 1][1] and t >= up[k + 1][1]:
                 cands.append((x, t, "t"))
         self.found = cands
         return rows
@@ -938,7 +953,7 @@ class SimLocked:
             f = self._free(v, i)
             peak, h = self._nearest(f)
             if lockpoint and self.lockpoints:
-                self.lockpoint = (v + (peak - f) * 1e3 / self.ecdl.kv, h * self.t00, "t")
+                self.lockpoint = (v + (peak - f) * 1e3 / self.ecdl.kv, self.t_dc + h * self.t00, "t")
             self.dlc.params[self.p + "dl:lock:lock-enabled"] = True
             self.peak = peak
             if not self._hold():

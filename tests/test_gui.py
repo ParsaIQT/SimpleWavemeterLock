@@ -179,19 +179,23 @@ def test_hop_dialog_round_trip(app):
 
     ch = Channel(7, {"hop": {"enabled": True, "cavity": True, "shg": True, "i_nom": 151.25, "kv": 402.0,
                              "spacing": 6010.0, "lp_kind": "t", "lp_code": 116, "peak_y": 0.8, "relock": "lockpoint",
-                             "lock_ok": 0.79, "shg_lock": 1.21}})
+                             "trans_locked": 0.79, "trans_zero": 0.004, "shg_lock": 1.21}})
     ch.current = 151.4
     d = gui.HopDialog(None, ch)
     assert d.params() == ch.hop
     assert "lockpoint type 't' = 116" in d.learned.toolTip() and "transmission 0.790 V locked" in d.learned.toolTip()
+    assert "transmission zero 0.004 V" in d.learned.toolTip()
+    assert d.slip_levels.text() == "now: zero 0.004 V, locked 0.790 V: relock below 0.397 V on average"
     assert not d.tolerance.isEnabled() and d.peak_tol.isEnabled()  # locked to a cavity: off target is the wrong peak
     d.i_window.setValue(1.5)
     d.confirm.setChecked(True)
     d.falc_max.setValue(0.02)
     d.peak_tol.setValue(40.0)
     d.lock_min.setValue(0.3)
+    assert d.slip_levels.text() == "now: zero 0.004 V, locked 0.790 V: relock below 0.240 V on average"
     d.who.setCurrentIndex(0)
     assert not d.relock.isEnabled() and not d.falc.isEnabled() and not d.lock_min.isEnabled()  # only for a cavity lock
+    assert not d.slip_levels.isEnabled()
     assert d.tolerance.isEnabled()
     d._forget()
     p = d.params()
@@ -361,8 +365,9 @@ def test_row_says_when_it_does_not_lase(app):
 
 
 def test_row_says_when_its_cavity_lock_keeps_losing_it(app):
-    """A cavity-locked laser's transmission is shown against its usual; far below on average (its lock keeps
-    losing a master on two modes), the row says so (not armed, nothing is done about it)."""
+    """A cavity-locked laser's transmission is shown in volts, against its level locked; far below on average (its
+    lock keeps losing a master on two modes), the row says so, and where the limit is (not armed, nothing is done
+    about it)."""
     from wmlock.modehop import HopParams
     from wmlock.sim import Demo, SimWavemeter
 
@@ -376,13 +381,16 @@ def test_row_says_when_its_cavity_lock_keeps_losing_it(app):
         assert wait_for(lambda: (app.processEvents(), 7 in win.rows and e.channels[7].freq > 0)[1], 5)
         e.link(7, demo.dlcs[2].key, 1)
         e.setpoint_to_current(7)
-        e.set_hop_params(7, HopParams(enabled=True, cavity=True, shg=True, lock_ok=0.8))
+        e.set_hop_params(7, HopParams(enabled=True, cavity=True, shg=True, trans_locked=0.8))
         ch, row = e.channels[7], win.rows[7]
         assert wait_for(lambda: (app.processEvents(), len(ch.trans_hist) >= 5 and ch.cavity_on is True)[1], 5)
         spin(app, 0.1)
-        assert "transmission 10" in row.info.text() or "transmission 9" in row.info.text(), row.info.text()
+        assert re.search(r"cavity locked · transmission 0\.[78]\d\d V \(locked 0\.[78]\d\d\)", row.info.text()), \
+            row.info.text()
         demo.laser(7).go_multimode(1)
         assert wait_for(lambda: (app.processEvents(), "CAVITY LOCK SLIPPING" in row.info.text())[1], 10)
+        assert re.search(r"transmission 0\.[0-3]\d\d V \(locked 0\.[78]\d\d, relock below 0\.[34]\d\d\)",
+                         row.info.text()), row.info.text()
         assert row.info._color == "warn" and ch.state == "off"  # not armed: left alone
     finally:
         win.close()

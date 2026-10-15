@@ -16,6 +16,10 @@ relock_lockpoint, which also makes sure the wavemeter and the transmission agree
 locked to the right peak. relock_plain is for a lock that finds its resonance by
 itself (lock without lockpoint, or ReLock): it re-enables it and lets the wavemeter judge.
 
+The transmission (the input its lock detection watches, Fine In 1 as a rule): while the master
+scans in a relock by lockpoint, its level between the peaks is measured (the zero: any DC
+offset), and once locked, its level locked. The engine watches it against those two.
+
 Every write goes through Runner, which refuses anything but WRITABLE (modehop.py) and puts it
 back if the recovery fails; a cavity lock that was turned off stays off then. The scope
 channels are borrowed only when they do not already show what is needed, and given back.
@@ -25,6 +29,7 @@ These are generator methods of Recenter (modehop.py), which mixes this class in.
 from __future__ import annotations
 
 import math
+import statistics
 
 from . import cavity
 from . import modehop as mh
@@ -36,6 +41,7 @@ SHG_LOCK = "nlo:shg:lock:lock-enabled"
 SHG_SCAN = "nlo:shg:scan:enabled"
 SCAN_X = (34, 50, 101)  # signals that are the scan output / the piezo voltage
 SHG_PIEZO = (90, 91)    # the SHG cavity's piezo voltage: its scan
+TRANS = ("dl:lock:window:enabled", "dl:lock:window:input-channel", "dl:lock:spectrum-input-channel")
 
 
 def says_locked(text) -> bool:
@@ -46,11 +52,36 @@ def _num(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
+def transmission_input(window_on, window_in, spectrum_in):
+    """The parameter holding the present value of the cavity transmission, from TRANS: the input its lock
+    detection (the lock's window) watches if that is on, else the lock input (the XY display's y, the peaks),
+    else the window's; None if none of them can be read."""
+    order = (window_in, spectrum_in) if window_on else (spectrum_in, window_in)
+    return next((IO_VALUE[s] for s in order if isinstance(s, int) and not isinstance(s, bool) and s in IO_VALUE),
+                None)
+
+
+def usable_zero(zero: float, locked: float) -> float:
+    """The zero to go by, V: the one measured, unless it is not well below the level locked (a scan that spends
+    its time on the peak, say: then 0)."""
+    return zero if locked > 0 and zero < 0.5 * locked else 0.0
+
+
+def volts(x: float, scale: float = 0.0) -> str:
+    """x (V) with the decimals a level of about `scale` V needs (x's own, without): three at least."""
+    s = abs(scale or x)
+    d = 3 if not s or s >= 0.1 else min(2 - math.floor(math.log10(s)), 6)
+    return f"{x:.{d}f}"
+
+
 class CavitySteps:
     SHG_LOCK_S = 10.0   # s for the SHG cavity to lock
     LOCK_S = 10.0       # s for the cavity lock to report locked
     SETTLE_S = 0.5      # s after starting a scan or changing a scope channel, for fresh traces
     FALC_TOL = 0.002    # V: an error-signal DC level smaller than this is left alone
+    ZERO_WAITS = (0.05, 0.08, 0.13, 0.07, 0.11, 0.17, 0.06, 0.09, 0.14, 0.1)  # s between looks at the transmission
+    #                     while the master scans (uneven: never in step with the scan); their median is its zero
+    LEVEL_WAITS = (0.05, 0.08, 0.13, 0.07, 0.11, 0.06)  # ...and locked: their median is its level locked
 
     def __init__(self, shg: bool):
         self.shg = shg
@@ -82,6 +113,7 @@ class CavitySteps:
         self.shg_text = ""         # its SHG signal short of usual, handed back all the same
         self._find_refused = False  # the DLC pro would not find-candidates
         self.lock_e = math.nan     # MHz: where the wavemeter puts the laser, relocked (the target re-centered on it)
+        self.zero = None           # V: the transmission off resonance, measured while the master scans
         self._blobs = {}
 
     # ------------------------------------------------------------ taking over
@@ -89,9 +121,9 @@ class CavitySteps:
         names = [LOCK, "dl:lock:state-txt", SCAN, "scan:amplitude", "scan:frequency", "nlo:shg:scan:frequency"]
         if self.cavity:
             names += ["dl:lock:lock-without-lockpoint", "dl:lock:candidates", "dl:lock:lockpoint:position",
-                      "dl:lock:lockpoint:type", "dl:lock:spectrum-input-channel", "dl:lock:error-channel",
-                      "dl:lock:falc-selection", "scope:channel1:signal", "scope:channel2:signal",
-                      "scope:channelx:xy-signal"] + [f"falc{k}:input:offset" for k in range(1, 5)]
+                      "dl:lock:lockpoint:type", "dl:lock:error-channel", "dl:lock:falc-selection",
+                      "scope:channel1:signal", "scope:channel2:signal", "scope:channelx:xy-signal",
+                      *TRANS] + [f"falc{k}:input:offset" for k in range(1, 5)]
         if self.shg:
             names += [SHG_LOCK, SHG_SCAN, "nlo:shg:lock:state-txt", "nlo:shg:scope:channel1:signal",
                       "nlo:shg:scope:channel2:signal", "nlo:pd:shg-int:photodiode", "nlo:pd:shg:power"]
@@ -393,6 +425,7 @@ class CavitySteps:
         self.stage = "finding the cavity peak"
         yield mh.Set(SCAN, True, restore=self.scan_after_unlock)
         yield mh.Wait(settle)
+        zero = yield from self.sample_level(self.ZERO_WAITS)  # mostly between the peaks: its zero
         choice, cands = None, []
         for _ in range(3):
             cands = yield from self.candidates()
@@ -407,6 +440,13 @@ class CavitySteps:
             raise mh.Failed(f"cannot tell which cavity peak is right: {choice.text} "
                             f"(left at the target, unlocked, scanning)", keep=True)
         self.note(f"cavity peak: {choice.text}")
+        if zero is not None:
+            if choice.y > 0 and zero < 0.5 * choice.y:
+                self.zero = self.learned["trans_zero"] = round(zero, 5)
+                self.note(f"transmission off resonance, scanning: {volts(zero, choice.y)} V (its zero)")
+            else:
+                self.note(f"the transmission while scanning, {volts(zero, choice.y)} V, is no zero next to the "
+                          f"peak's {volts(choice.y)} V: not taken")
         if self.falc_name:
             yield from self.null_falc()
         choice = yield from self.select(x_pred, choice)
@@ -425,15 +465,19 @@ class CavitySteps:
             self.relock_trouble = f"the cavity lock caught a peak {self.e:+.0f} MHz away"
             self.note(self.relock_trouble)
             return False
-        level = yield from self.lock_level()
-        if level is not None and choice.y > 0 and level < 0.5 * choice.y:
-            self.relock_trouble = f"locked, but the transmission is only {level / choice.y:.2f} of the peak's"
+        level = yield from self.sample_level(self.LEVEL_WAITS)
+        z = self.zero if self.zero is not None else usable_zero(self.p.trans_zero, choice.y)
+        if level is not None and choice.y > z and level - z < 0.5 * (choice.y - z):
+            self.relock_trouble = (f"locked, but the transmission is {volts(level, choice.y)} V, "
+                                   f"{(level - z) / (choice.y - z):.2f} of the peak's {volts(choice.y)} V above zero "
+                                   f"({volts(z, choice.y)} V)")
             self.note(self.relock_trouble)
             return False
         self.learned.update(peak_y=round(choice.y, 4), lp_kind=choice.kind)
-        if level is not None and level > 0:
-            self.learned["lock_ok"] = round(level, 4)  # locked where it belongs: its transmission as it should be
-        self.note("locked to the right peak" + (f", transmission {level:.3f} V" if level is not None else ""))
+        if level is not None and level > z:
+            self.learned["trans_locked"] = round(level, 5)  # locked where it belongs: its transmission as it should be
+        self.note("locked to the right peak" + (f", transmission {volts(level, choice.y)} V" if level is not None
+                                                else ""))
         return True
 
     def candidates(self):
@@ -503,13 +547,20 @@ class CavitySteps:
                 return True  # it cannot say: the wavemeter will
         return False
 
-    def lock_level(self):
-        """The lock input's present value (the transmission, when locked), or None."""
-        name = IO_VALUE.get(self.orig.get("dl:lock:spectrum-input-channel"))
+    def sample_level(self, waits):
+        """The transmission's present value (the input its lock detection watches, as a rule), looked at after
+        each of `waits` (s): their median, or None if it cannot be read."""
+        o = self.orig
+        name = transmission_input(*(o.get(n) for n in TRANS))
         if name is None:
             return None
-        (v,) = yield mh.Get((name,))
-        return float(v) if _num(v) else None
+        got = []
+        for w in waits:
+            yield mh.Wait(w)
+            (v,) = yield mh.Get((name,))
+            if _num(v):
+                got.append(float(v))
+        return statistics.median(got) if got else None
 
     def keep_scan(self, x_pred, choice, cands):
         """Keep the cavity scan, its candidates and the choice, for a look afterwards."""
@@ -737,9 +788,9 @@ def setup_report(client, laser: int, hop, lp) -> list:
     if hop.cavity:
         add("head", "Cavity lock (DLC pro lock module)")
         g = get("dl:lock:lock-enabled", "dl:lock:state", "dl:lock:state-txt", "dl:lock:lock-without-lockpoint",
-                "dl:lock:lockpoint:position", "dl:lock:lockpoint:type", "dl:lock:candidates",
-                "dl:lock:spectrum-input-channel", "dl:lock:error-channel", "dl:lock:falc-selection",
-                "dl:lock:relock:enabled", "dl:lock:window:enabled", "dl:lock:window:input-channel")
+                "dl:lock:lockpoint:position", "dl:lock:lockpoint:type", "dl:lock:candidates", "dl:lock:error-channel",
+                "dl:lock:falc-selection", "dl:lock:relock:enabled", "dl:lock:window:level-low",
+                "dl:lock:window:level-high", *TRANS)
         add("ok" if g["dl:lock:lock-enabled"] is not None else "error",
             f"lock {fmt(g['dl:lock:lock-enabled'])}, state {g['dl:lock:state']} “{g['dl:lock:state-txt'] or '?'}”; "
             f"ReLock {fmt(g['dl:lock:relock:enabled'])}, window {fmt(g['dl:lock:window:enabled'])}")
@@ -779,24 +830,37 @@ def setup_report(client, laser: int, hop, lp) -> list:
             add("info", f"{len(pts.get('c', []))} lockpoint candidates now (the DLC pro finds them when asked, its "
                         f"Lock points shown: a recovery asks before each look at them)")
         spec, err = g["dl:lock:spectrum-input-channel"], g["dl:lock:error-channel"]
-        level = None
-        if IO_VALUE.get(spec):
-            level = get(IO_VALUE[spec])[IO_VALUE[spec]]
+        win_on, win = g["dl:lock:window:enabled"], g["dl:lock:window:input-channel"]
         add("ok" if isinstance(spec, int) else "warn",
-            f"lock input (the XY display's y, the peaks): {signal_name(spec) if spec is not None else '—'}"
-            + (f", now {level:.3f} V" if _num(level) else ""))
-        usual = hop.lock_ok or hop.peak_y
-        add("info", f"watched, armed: locked more than {hop.peak_tol:g} MHz from the target is the wrong peak; the "
-                    f"lock input averaging below {hop.lock_min:g} of its usual"
-                    + (f" ({usual:.3f} V{'' if hop.lock_ok else ', the right peak in the scan'})" if usual
-                       else " (learned while it runs locked)")
-                    + " over 10 s means the lock keeps losing it: either way it is relocked")
-        if not IO_VALUE.get(spec):
-            add("warn", "the lock input's present value cannot be read: a lock that keeps losing it is not noticed")
-        win = g["dl:lock:window:input-channel"]
-        if isinstance(win, int) and isinstance(spec, int) and win != spec:
-            add("info", f"lock detection (window {fmt(g['dl:lock:window:enabled'])}) on {signal_name(win)}, not the "
-                        f"lock input: the transmission watched is the lock input's")
+            f"lock input (the XY display's y, the peaks): {signal_name(spec) if spec is not None else '—'}")
+        lo, hi = g["dl:lock:window:level-low"], g["dl:lock:window:level-high"]
+        add("info", f"its lock detection (window) {fmt(win_on)}, on {signal_name(win) if win is not None else '—'}"
+                    + (f", locked between {fmt(lo, ' V', 4)} and {fmt(hi, ' V', 4)}" if _num(lo) and _num(hi) else ""))
+        add("info", f"watched, armed: locked more than {hop.peak_tol:g} MHz from the target, it is on the wrong peak: "
+                    "relocked")
+        name = transmission_input(*(g[n] for n in TRANS))
+        if name is None:
+            add("warn", "the transmission's present value cannot be read (neither input has one): a lock that keeps "
+                        "losing it is not noticed")
+        else:
+            now = get(name)[name]
+            usual, zero = hop.trans_locked, usable_zero(hop.trans_zero, hop.trans_locked)
+            scale = usual or (now if _num(now) else 0.0)
+            which = "its lock detection's input" if name == IO_VALUE.get(win) else "the lock input"
+            add("ok" if _num(now) else "warn",
+                f"transmission watched: {name} ({which}), now {volts(now, scale) + ' V' if _num(now) else '—'}")
+            if not hop.trans_zero:
+                zero_text = "0 V until measured (while the master scans, in a relock by lockpoint)"
+            elif zero != hop.trans_zero:
+                zero_text = f"{volts(hop.trans_zero, scale)} V measured, not well below its level locked: 0 V used"
+            else:
+                zero_text = f"{volts(zero, scale)} V, measured while the master scanned in a relock"
+            add("info", f"its zero (off resonance, any DC offset): {zero_text}")
+            add("info", "its level locked: " + (f"{volts(usual, scale)} V, " if usual else "not known yet, ")
+                + "learned while it runs locked on target (the median of the last few minutes) and by a relock")
+            limit = f"{volts(zero + hop.lock_min * (usual - zero), scale)} V" if usual > zero else "its limit"
+            add("info", f"watched, armed: averaging below {limit} over 10 s ({hop.lock_min:g} of the way from its zero "
+                        "to its level locked), the lock keeps losing it: relocked")
         add("ok" if isinstance(err, int) else "warn",
             f"error signal: {signal_name(err) if err is not None else '— (firmware before 2.1?)'}")
         if hop.peak_y:

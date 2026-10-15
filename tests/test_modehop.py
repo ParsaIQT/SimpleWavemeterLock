@@ -592,6 +592,22 @@ def test_params_round_trip():
     assert HopParams(seed=" dl:pd:seed:power ").seed_names == ("dl:pd:seed:power",)
     assert HopParams().seed_least(20.0, 8.0) == 10.0 and HopParams().seed_least(0.0, 8.0) == 8.0
     assert HopParams().seed_least(0.0) == 0.0  # no telling
+    old = HopParams.from_dict({"cavity": True, "lock_ok": 0.2})  # learned as an earlier version did, and wrong at that:
+    assert old.trans_locked == 0.0 and old.trans_zero == 0.0 and "lock_ok" not in old.to_dict()  # learned afresh
+
+
+def test_the_transmission_input_and_levels():
+    from wmlock.relock import transmission_input, usable_zero, volts
+
+    assert transmission_input(True, 0, 0) == "io:fine-1:value-act"  # Fine In 1, both
+    assert transmission_input(True, 1, 0) == "io:fine-2:value-act"  # its lock detection's, when that is on
+    assert transmission_input(False, 1, 0) == "io:fine-1:value-act"  # else the lock input
+    assert transmission_input(True, 42, 2) == "io:fast-3:value-act"  # (an input without a present value: the other)
+    assert transmission_input(None, None, None) is None
+    assert usable_zero(0.01, 0.06) == 0.01 and usable_zero(-0.004, 0.05) == -0.004
+    assert usable_zero(0.04, 0.06) == 0.0 and usable_zero(0.01, 0.0) == 0.0  # not well below locked; no telling
+    assert volts(0.0493, 0.05) == "0.0493" and volts(0.8) == "0.800" and volts(0.0012, 0.06) == "0.0012"
+    assert volts(1.23) == "1.230" and volts(0.0) == "0.000" and volts(0.005) == "0.00500"
 
 
 def test_cancel_with_a_write_on_its_way_waits_for_it():
@@ -707,9 +723,10 @@ def test_the_shg_sweep_sees_a_second_mode_the_wavemeter_does_not():
             las.nudge(direction * (0.5 * fsr + las.hysteresis + 0.3))
             p = HopParams(enabled=True, i_nom=I0, cavity=True, shg=shg)
             b, rec, r = recover(las, b.target, p, cavity=True, bench=b, seed=seed)
-            assert r.state == "done", (seed, shg, r.error)
-            assert lock.peak == pytest.approx(b.target, abs=1e-12)
-            seen[shg] += b.single_mode()
+            if shg:
+                assert r.state == "done", (seed, r.error)
+                assert lock.peak == pytest.approx(b.target, abs=1e-12)
+            seen[shg] += r.state == "done" and b.single_mode()  # (without, two modes may not even hold the lock)
     assert seen[True] == 12 and seen[False] < 12
 
 
@@ -1155,8 +1172,27 @@ def test_a_laser_that_is_fine_is_relocked_and_nothing_else():
              "Select the lockpoint", "Lock to the peak"]
     assert len(asked) == len(steps) and all(a.startswith(x) for a, x in zip(asked, steps)), asked
     assert "the laser itself was fine" in runner.result.summary and lock.locked() and b.single_mode()
-    assert runner.result.learned["lock_ok"] == pytest.approx(0.8, abs=0.02)  # its transmission, locked as it should
-    assert runner.result.learned["shg_lock"] == pytest.approx(b.shg_usual, abs=0.02)
+    learned = runner.result.learned
+    assert learned["trans_locked"] == pytest.approx(0.8, abs=0.02)  # its transmission, locked as it should...
+    assert learned["trans_zero"] == pytest.approx(0.0, abs=0.003)  # ...and between the peaks, scanning
+    assert learned["shg_lock"] == pytest.approx(b.shg_usual, abs=0.02)
+
+
+def test_the_transmission_zero_is_measured_while_the_master_scans():
+    """Its transmission on Fine In 1 as on a real one: 0.05 V locked on a DC offset of 0.01 V. While the master scans
+    for the peak, the level between the peaks is its zero; locked, the median of a few looks its level locked (the
+    engine watches it against both); and the relock's check, locked as high as the peak above zero, holds."""
+    b, lock = shg_bench(seed=22, t00=0.05, t_dc=0.01)
+    p = HopParams.from_dict({**SHG.to_dict(), "kv": 400.0})
+    b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "done", r.error
+    learned = r.result.learned
+    assert learned["trans_zero"] == pytest.approx(0.01, abs=0.002)
+    assert learned["trans_locked"] == pytest.approx(0.06, abs=0.003)
+    assert learned["peak_y"] == pytest.approx(0.06, abs=0.006)
+    notes = " | ".join(text for _, text in r.result.record["notes"])
+    assert re.search(r"transmission off resonance, scanning: 0\.0[01]\d\d V \(its zero\)", notes), notes
+    assert re.search(r"locked to the right peak, transmission 0\.0[56]\d\d V", notes), notes
 
 
 def test_two_modes_alike_are_found_out_by_the_shg_lock():

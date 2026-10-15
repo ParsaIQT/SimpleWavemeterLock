@@ -16,6 +16,7 @@ from .lock import LockParams
 from .modehop import HopParams
 from .qt import Qt, QtCore, QtGui, QtWidgets
 from .reference import ACQUIRING, HOLD, MOVED, TRACKING, RefParams, fmt_duration
+from .relock import usable_zero, volts
 from .wavemeter import C_NM_THZ
 
 REFRESH_MS = 33
@@ -357,36 +358,44 @@ class ChannelRow(QtWidgets.QFrame):
             text += f"   seed {ch.seed:.1f} mW"
         if ch.hop.cavity:
             text += f"   cavity {ch.cavity_txt or ('on' if ch.cavity_on else 'off')}"
-            frac = Engine.transmission(ch)
-            if frac is not None:
-                text += f" · transmission {frac:.0%}"
+            lv = Engine.trans_levels(ch)
+            if lv is not None:
+                now, usual, _, limit = lv
+                text += f" · transmission {volts(now, usual)} V"
+                if usual:
+                    text += f" (locked {volts(usual, usual)}" + (f", relock below {volts(limit, usual)}"
+                                                                 if ChannelRow._slipping(ch) else "") + ")"
         if ch.hop.shg and ch.shg_txt:
             text += f"   SHG {ch.shg_txt}"
-            frac = Engine.shg_signal(ch)
-            if frac is not None:
-                text += f" · {frac:.0%}"
+            lv = Engine.shg_levels(ch)
+            if lv is not None:
+                now, usual, _ = lv
+                text += f" · {volts(now, usual)} V" + (f" (locked {volts(usual, usual)})" if usual else "")
         if ch.note and now - ch.note_t < NOTE_S:
             text += f"   ⟲ {fmt_duration(now - ch.note_t)} ago"
         return text
 
     @staticmethod
     def _shg_gone(ch) -> bool:
-        """Its SHG signal far below usual (armed, it would be recovered: not lasing, or the SHG cavity lost)."""
-        frac = Engine.shg_signal(ch)
-        return bool(ch.hop.enabled and ch.hop.shg and frac is not None and len(ch.shg_hist) >= 5
-                    and frac < ch.hop.lock_min)
+        """Its SHG signal, armed, far below its level locked (it would be recovered: not lasing, or the SHG cavity
+        lost)."""
+        lv = Engine.shg_levels(ch)
+        return bool(ch.hop.enabled and ch.hop.shg and lv is not None and lv[2] is not None and len(ch.shg_hist) >= 5
+                    and lv[0] < lv[2])
 
     @staticmethod
     def _slipping(ch) -> bool:
-        """Its cavity lock looks as if it keeps losing it (armed, it would be relocked)."""
-        frac = Engine.transmission(ch)
-        return bool(ch.hop.enabled and ch.hop.cavity and ch.cavity_on and frac is not None and len(ch.trans_hist) >= 5
-                    and frac < ch.hop.lock_min)
+        """Its cavity lock on, but its transmission below its limit on average (armed, it would be relocked: the lock
+        keeps losing it)."""
+        lv = Engine.trans_levels(ch)
+        return bool(ch.hop.enabled and ch.hop.cavity and ch.cavity_on and lv is not None and lv[3] is not None
+                    and len(ch.trans_hist) >= 5 and lv[0] < lv[3])
 
     RELOCK_TIP = ("Its DLC pro locks it to a cavity; this does not lock it to the wavemeter.\n"
                   "Relock: watch it, and take it over and relock it after a mode hop, when it is\n"
                   "locked on the wrong peak (further from the target than the wavemeter could be\n"
-                  "wrong), or when its lock keeps losing it (its transmission far below usual);\n"
+                  "wrong), or when its lock keeps losing it (its transmission, on average, far\n"
+                  "below its level locked);\n"
                   "if it is not locked on target now, relock it now. It does nothing else: the piezo\n"
                   "is its lock's. Watching: click to stop watching.")
     LOCK_TIP = "Lock to the wavemeter: the scan offset follows the reading onto the setpoint."
@@ -755,12 +764,18 @@ class HopDialog(QtWidgets.QDialog):
         form.addRow("Wrong peak", row("locked, but more than", self.peak_tol, "MHz from the target (the wavemeter is "
                                       "never that far off): relock"))
         self.lock_min = number(p.lock_min, 0.05, 0.95, 2, 0.05)
-        usual = f"(usually {p.lock_ok:.3f} V)" if p.lock_ok else "(its usual, learned)"
-        form.addRow("Lock slipping", row("transmission below", self.lock_min, "of usual", usual,
-                                         "on average over 10 s: relock"))
-        self.lock_min.setToolTip("The lock input (Fine In 1, as a rule: the cavity transmission, its lock detection "
-                                 "signal too). A lock that keeps losing the laser and relocking (ReLock) lets it "
-                                 "through only now and then.")
+        form.addRow("Lock slipping", row("transmission below", self.lock_min, "of the way from its zero to its level "
+                                         "locked, on average over 10 s: relock"))
+        self.slip_levels = Text("", "dim")
+        form.addRow("", self.slip_levels)
+        self.lock_min.valueChanged.connect(self._slip_levels)
+        self._slip_levels()
+        self.lock_min.setToolTip("The transmission: the input the lock detection watches (Fine In 1, as a rule). Its "
+                                 "zero is its level\noff resonance (any DC offset), measured while the master scans in "
+                                 "a relock; its level locked,\nthe median of what it read locked on target over the "
+                                 "last few minutes. A lock that keeps\nlosing the laser and relocking (ReLock) lets it "
+                                 "through only now and then. A lock turned off\n(by hand, say) is not watched for "
+                                 "this.")
         self.falc = QtWidgets.QCheckBox("Null the error signal's DC level with the FALC pro's input offset, by at most")
         self.falc.setChecked(p.falc)
         self.falc_max = number(p.falc_max, 0.001, 1.0, 3, 0.005)
@@ -807,15 +822,28 @@ class HopDialog(QtWidgets.QDialog):
             out.append("the FALC offset shows on the error signal")
         if p.seed_ok:
             out.append(f"seed {p.seed_ok:.1f} mW lasing")
-        if p.lock_ok:
-            out.append(f"transmission {p.lock_ok:.3f} V locked")
+        if p.trans_locked:
+            out.append(f"transmission {volts(p.trans_locked, p.trans_locked)} V locked")
+        if p.trans_zero:
+            out.append(f"transmission zero {volts(p.trans_zero, p.trans_locked)} V")
         if p.shg_lock:
             out.append(f"SHG signal {p.shg_lock:.3f} V locked")
         return ", ".join(out)
 
+    def _slip_levels(self):
+        """Where the transmission's zero and level locked put the limit, with lock_min as set."""
+        p = self._p
+        zero, locked = usable_zero(p.trans_zero, p.trans_locked), p.trans_locked
+        if locked > zero:
+            limit = zero + self.lock_min.value() * (locked - zero)
+            self.slip_levels.paint(f"now: zero {volts(zero, locked)} V, locked {volts(locked, locked)} V: relock below "
+                                   f"{volts(limit, locked)} V on average", "dim")
+        else:
+            self.slip_levels.paint("its zero and its level locked are learned (the zero is 0 V until measured)", "dim")
+
     def _who(self):
         cavity = self.who.currentIndex() == 1
-        for w in (self.relock, self.window, self.falc, self.falc_max, self.peak_tol, self.lock_min):
+        for w in (self.relock, self.window, self.falc, self.falc_max, self.peak_tol, self.lock_min, self.slip_levels):
             w.setEnabled(cavity)
         self.tolerance.setEnabled(not cavity)
 
