@@ -395,13 +395,45 @@ def test_recoveries_are_rate_limited(quiet_demo):
         e.stop()
 
 
-def test_recovery_refuses_a_current_outside_its_window(quiet_demo):
+def test_a_recovery_brings_a_current_outside_its_window_into_it_first(quiet_demo):
+    """150 mA, its window 144 … 146 mA: rather than refusing, a recovery brings it into the window first, 0.2 mA a
+    step, and goes on from there (here it finds nothing on target there, and puts it back where it began)."""
     demo, dlc = quiet_demo, quiet_demo.dlcs[0]
-    e, ch = hop_engine(demo, 1, dlc.key, 1, dict(enabled=True, i_nom=145.0, i_window=1.0))
+    e, ch = hop_engine(demo, 1, dlc.key, 1, dict(enabled=True, i_nom=145.0, i_window=1.0, step=0.2))
     try:
         e.recenter(1)
-        assert wait_for(lambda: ch.state == "off" and ch.message, 5)
-        assert "outside 144.00 … 146.00 mA" in ch.message and dlc.written("laser1:dl:cc:current-set") == []
+        assert ch.state == "recovering"
+        assert wait_for(lambda: dlc.current(1) <= 146.0 + 1e-9, 20), ch.message
+        currents = [150.0] + dlc.written("laser1:dl:cc:current-set")
+        assert all(abs(a - b) <= 0.2 + 1e-9 for a, b in zip(currents, currents[1:]))
+        assert wait_for(lambda: ch.state != "recovering", 90)
+        first = "the current was 150.00 mA, above its window (144.00 … 146.00 mA): down into it"
+        assert ch.last["notes"][0][1] == first
+        if ch.message:  # (nothing on target within 144 … 146 mA: back where it began)
+            assert dlc.current(1) == pytest.approx(150.0)
+    finally:
+        e.stop()
+
+
+def test_relock_brings_a_laser_left_high_and_off_target_back(quiet_demo):
+    """The morning after: the SHG laser left 3 mA above nominal (where it lased again, say), its cavity lock off, off
+    target. Relock: down into its window slowly, watching that it lases, on down until single-mode, walked onto the
+    target, relocked."""
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    try:
+        assert wait_for(lambda: ch.hop.i_nom > 0 and ch.hop.shg_lock, 10)
+        dlc.execute("(param-set! 'laser1:dl:lock:lock-enabled #f)")
+        i0 = dlc.current(1)
+        for k in range(1, 16):
+            dlc.execute(f"(param-set! 'laser1:dl:cc:current-set {i0 + 0.2 * k:.3f})")
+        assert wait_for(lambda: abs(ch.error_mhz) > 1000 and ch.cavity_on is False, 5), ch.error_mhz
+        e.engage(demo.SHG)  # Relock
+        assert ch.state == "recovering" and ch.hop_why == "cavity lock off"
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 120), ch.message
+        assert abs(ch.error_mhz) < 3 and ch.current <= ch.hop.i_nom + ch.hop.i_window + 1e-6
+        assert any("above its window" in text for _, text in ch.last["notes"]), ch.last["notes"]
     finally:
         e.stop()
 

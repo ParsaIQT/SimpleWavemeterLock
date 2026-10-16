@@ -1113,26 +1113,29 @@ class Engine:
 
     def _begin_recovery(self, ch: Channel, i0, a0, clip, v0, locked, quick, controller):
         """i0, a0: the set and the measured current; the window is about the nominal current, which
-        is measured, and becomes one of set currents with their difference now: i_below below it,
-        i_window above, and jump_max above for a laser that does not lase."""
+        is measured, and becomes one of set currents with their difference now (with the piezo where it
+        is: the recovery has it follow the feedforward): i_below below it, i_window above, and jump_max
+        above for a laser that does not lase. A current outside the window (left high where a laser that
+        had stopped lasing lased again, say) is brought into it first."""
         hop, lp = ch.hop, ch.lock.p
         if not hop.i_nom:
             hop.i_nom = round(a0, 3)  # the current before the first recovery is the nominal one
             self.dirty = True
         off = a0 - i0
-        i_lo, i_hi = max(hop.i_nom - hop.i_below - off, 0.0), min(hop.i_nom + hop.i_window - off, clip)
-        i_top = min(hop.i_nom + max(hop.jump_max, hop.i_window) - off, clip)
+        i_lo, i_hi = max(hop.i_nom - hop.i_below - off, 0.0), hop.i_nom + hop.i_window - off
+        i_top = hop.i_nom + max(hop.jump_max, hop.i_window) - off
         v_lo, v_hi = max(lp.v_min, v0 - hop.v_window), min(lp.v_max, v0 + hop.v_window)
         ch.current, ch.current_set, ch.offset = a0, i0, v0
-        if not i_lo <= i0 <= i_hi:
-            self._recovery_failed(ch, f"the current, {a0:.2f} mA measured, is outside {i_lo + off:.2f} … "
-                                      f"{i_hi + off:.2f} mA: set the nominal current in Mode-hop recovery…")
+        if not i_lo <= min(i_hi, clip):
+            self._recovery_failed(ch, f"current-clip, {clip + off:.2f} mA measured, is below its window ("
+                                      f"{i_lo + off:.2f} … {i_hi + off:.2f} mA): set the nominal current in "
+                                      f"Mode-hop recovery…")
             return
         if not v_lo <= v0 <= v_hi:
             self._recovery_failed(ch, f"the offset, {v0:.2f} V, is outside {lp.v_min:g} … {lp.v_max:g} V")
             return
         rec = Recenter(hop, i0, v0, i_lo, i_hi, v_lo, v_hi, cavity=locked, quick=quick, shg=hop.shg, act_offset=off,
-                       i_top=i_top)
+                       i_top=i_top, i_clip=clip)
         io = _HopIO(self, ch, controller)
         runner = Runner(rec, io, time.monotonic(), finished=lambda r: self._recovery_done(ch, r))
         if runner.busy:
@@ -1212,7 +1215,7 @@ class Engine:
             "why": ch.hop_why or "recenter now", "ok": r.state == "done", "outcome": outcome,
             "took_s": round(r.now - ch.hop_t, 1), "i_window": [round(rec.mA(rec.i_lo), 4), round(rec.mA(rec.i_hi), 4)],
             "i_top": round(rec.mA(rec.i_top), 4), "v_window": [rec.v_lo, rec.v_hi], "seed": ch.seed,
-            "kv": rec.kv, "unit": ch.unit, **rec.record,
+            "kv": rec.kv, "ff": rec.ff, "unit": ch.unit, **rec.record,
             "notes": [[None if t is None else round(t - r.started, 1), text] for t, text in rec.record["notes"]],
         }
         if self.log_path:

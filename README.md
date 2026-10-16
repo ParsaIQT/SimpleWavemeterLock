@@ -193,7 +193,13 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   *Lasing*), and never above the controller's own `current-clip`. The set current usually
   differs from the measured one (a current offset, feedforward from the piezo, …): a recovery
   writes the set current, offset by the difference it finds when it starts, and every current
-  it shows is measured.
+  it shows is measured. With the DLC pro's **feedforward** on, the piezo moves the current too
+  (`feedforward-factor` mA/V): the window, and the floor kept above where the laser stopped
+  lasing, are on the measured current wherever the piezo goes (the set current follows), and
+  no piezo move changes the measured current by more than 0.2 mA at once. A current found
+  **outside** its window when a recovery starts (left high where a laser that had stopped
+  lasing lased again, say) is brought into it first: from above slowly, asking every 0.2 mA
+  whether it still lases, and on down, as by hand, until the SHG sweep is single-mode.
 * A **hop** is the laser off its target by more than 100 MHz for 2 s, after it has been on
   target (a cavity-locked laser: more than *Wrong peak*, 50 MHz, below). The target is the
   setpoint (`set`). For a cavity-locked laser, type the
@@ -318,6 +324,12 @@ wavemeter reads it less often.
    good again. A reading that says it hopped is confirmed by two more first: on two modes at once
    the wavemeter reads now one, now the other. A step that takes it the wrong way has its tuning
    measured again.
+
+   **Parked high first**, when the feedforward will take the current down on the way (as by
+   hand: walking the piezo, the current drops, towards where the laser stops lasing): the
+   current goes up 0.1 mA at a time while the SHG sweep stays as good, until it changes (main
+   peaks 5 % smaller, a second mode, or a hop), then two steps back, to where it showed no
+   change. Whenever the walk has taken it 0.3 mA down from there, it is parked high again.
 4. **On target**, single-mode by the SHG sweep there: handed back.
 
 **A laser that is fine is only relocked.** If it is on target and single-mode when it is taken
@@ -335,7 +347,8 @@ in the sweep, or a weaker TA).
 The walk does not need the current to go far from nominal, and the mode it ends on is the
 nearest one that reaches the target, not necessarily the one it was on before the hop. With
 the piezo's feedforward to the current set right, a mode stays centered as the piezo walks, and
-no trims are needed.
+no trims are needed; but the measured current still moves with the piezo, which is what parking
+high is for.
 
 **The map** (the default without an SHG stage). Which way the current comes matters here: a
 mode, once lasing, holds on past the point where it
@@ -440,11 +453,13 @@ before and after nulling its DC. Every recovery is also appended to
 
 Safety:
 
-* The current never leaves nominal − 1 mA … + 2 mA (*Current stays within*), except that a
-  laser that stopped lasing may be taken up to nominal + 5 mA; it never changes by more than
-  0.2 mA per write. Larger moves are ramped. Each write is checked once more just before it is
-  sent, whatever the procedure asked for. With a TA, the current comes down slowly (0.5 mA/s)
-  after a jump and when it is put back.
+* The current, as measured, never leaves nominal − 1 mA … + 2 mA (*Current stays within*),
+  except that a laser that stopped lasing may be taken up to nominal + 5 mA, and that a current
+  found outside the window only ever moves towards it (and back there on failure); it never
+  changes by more than 0.2 mA per write, nor does the feedforward move it more than that per
+  piezo write. Larger moves are ramped. Each write is checked once more just before it is sent,
+  whatever the procedure asked for. With a TA, the current comes down slowly (0.5 mA/s) after a
+  jump and when it is put back.
 * The piezo moves at most ± 25 V per recovery (*Piezo moves at most*), inside the lock's
   offset limits: a walk of 8 GHz takes some 20 V.
 * Besides current and offset, a recovery writes only: the cavity lock and SHG lock on/off, the
@@ -492,16 +507,26 @@ Things to know:
   single-mode and the rest with at most 11 % of the power in a second mode, a median 1.1 mA from
   the next hop; all 54 failures (mostly a target further than the ±25 V of piezo could reach)
   were left unlocked with every setting put back. About 22 s at 10 readings a second (2 s of it
-  looking at the cavity transmission, scanning and locked), 33 s at most for nine in ten. With nothing learned at all, the same but for at most 12.5 % in a second
-  mode. (The previous version, which looked 0.5 mA either side of the operating point: 234
-  fixed, 239 strictly single-mode.) 300 more that also stop lasing 0.7 to 2 mA below their
-  current and start again only 1.5 to 4.5 mA above it, a third of them not lasing when the
-  recovery began: 220 of 231 fixed, 107 jumps of the current in 103 recoveries, none left
-  without lasing, no TA switched off; one was handed back with its SHG signal at 0.65 of usual,
-  a second mode whose peaks fell on the main ones in the sweep. The same 300 again, but sending
-  their TA 70 % of their power as broadband light when they do not lase, so that the seed power
-  never tells: 220 of 231 fixed all the same, every one of the 103 that stopped lasing caught by
-  its SHG sweep (or the wavemeter losing it) and brought back, none left without lasing.
+  looking at the cavity transmission, scanning and locked), 33 s at most for nine in ten. With
+  nothing learned at all, the same but for at most 12.5 % in a second mode. (The previous
+  version, which looked 0.5 mA either side of the operating point: 234 fixed, 239 strictly
+  single-mode.) 300 more that also stop lasing 0.7 to 2 mA below their current and start again
+  only 1.5 to 4.5 mA above it, a third of them not lasing when the recovery began: 220 of 231
+  fixed, 107 jumps of the current in 103 recoveries, none left without lasing, no TA switched
+  off; one was handed back with its SHG signal at 0.65 of usual, a second mode whose peaks fell
+  on the main ones in the sweep (which its cavity lock then kept losing: watched, it would be
+  relocked again). The same 300 again, but sending their TA 70 % of their power as broadband
+  light when they do not lase, so that the seed power never tells: 220 of 231 fixed all the
+  same, every one of the 103 that stopped lasing caught by its SHG sweep (or the wavemeter
+  losing it) and brought back, none left without lasing.
+* With the DLC pro's feedforward on: 150 SHG masters as above, their feedforward 0.5 to 3 times
+  what keeps a mode aligned as the piezo moves, stopping lasing 0.2 to 1 mA below nominal (and
+  starting again only 1.5 to 4 mA above), hopping one mode: 121 fixed, the other 29 out of the
+  piezo's reach; 28 stopped lasing once on the way and were brought back, none was left without
+  lasing, and the measured current never left its window. Before the feedforward was taken
+  into account and the current parked high: 110 fixed, 96 times not lasing in 42 recoveries,
+  11 given up as "it stopped lasing 4 times" or "not lasing even at nominal + 5 mA", 2 left
+  without lasing.
 * The map (with the current ±2 mA and the piezo ±10 V): a Monte Carlo over 3000 random lasers
   (modes 3 to 10 GHz apart, chip modes shifting by 1 to 4 GHz/mA, hysteresis up to 0.15 of the
   mode spacing, noisy readings near a hop) fixed 99.4 % of the hops that could be fixed within

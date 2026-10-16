@@ -711,9 +711,13 @@ def setup_report(client, laser: int, hop, lp) -> list:
     ff, factor = g["dl:cc:feedforward-enabled"], g["dl:cc:feedforward-factor"]
     add("info", f"current offset {fmt(g['dl:cc:current-offset'], ' mA')}; feedforward from the piezo "
                 + (f"on, {factor:+.4f} mA/V" if ff and _num(factor) else fmt(ff)))
-    if ff and _num(factor) and abs(factor) * hop.v_window >= 0.05:
-        add("info", f"with the feedforward, a recovery's piezo moves (at most ±{hop.v_window:g} V) move the measured "
-                    f"current too, by up to ±{abs(factor) * hop.v_window:.2f} mA, besides what it sets")
+    if ff and _num(factor) and factor:
+        add("info", f"with the feedforward, the piezo moves the current too: up to ±{abs(factor) * hop.v_window:.2f} "
+                    f"mA over the ±{hop.v_window:g} V a recovery may move it. A recovery keeps the measured current "
+                    "within its window, and above where it stopped lasing, wherever the piezo goes (the current set "
+                    "follows), moves the piezo in steps that change it by 0.2 mA at most, and before walking the piezo "
+                    "the way that takes the current down, parks the current high (up while the SHG sweep stays as "
+                    "good, then back two steps), again whenever it has come down 0.3 mA")
     if g["dl:cc:output-filter:slew-rate-enabled"]:
         add("warn", f"the current's slew rate is limited ({fmt(g['dl:cc:output-filter:slew-rate'])}): a recovery "
                     "steps it 0.2 mA at a time and expects each step to take effect at once")
@@ -729,10 +733,12 @@ def setup_report(client, laser: int, hop, lp) -> list:
                         f"of the {top:.2f} mA it may jump to")
             top = clip + off
         inside = _num(act) and lo <= act <= hi
-        add("ok" if inside else "error", f"recoveries keep the measured current within {lo:.2f} … {hi:.2f} mA "
-                                         f"({hop.i_nom:.2f} − {hop.i_below:g} / + {hop.i_window:g}), setting it "
-                                         f"≤ 0.2 mA a step; " + ("it is inside now" if inside
-                                                                 else "it is OUTSIDE now: no recovery"))
+        add("ok" if inside else "warn", f"recoveries keep the measured current within {lo:.2f} … {hi:.2f} mA "
+                                        f"({hop.i_nom:.2f} − {hop.i_below:g} / + {hop.i_window:g}), setting it "
+                                        f"≤ 0.2 mA a step; " + ("it is inside now" if inside else
+                                                                "it is OUTSIDE now: a recovery brings it in first "
+                                                                "(from above slowly, watching that it lases, and on "
+                                                                "down until the SHG sweep is single-mode)"))
         add("info", f"a laser that stopped lasing: the current to {hop.i_nom + hop.jump:.2f} mA at once, then up to "
                     f"{top:.2f} mA until it lases, and back down at {hop.ramp:g} mA/s")
     else:

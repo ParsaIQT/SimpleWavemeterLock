@@ -34,6 +34,7 @@ class Bench:
 
     def __init__(self, laser, target, noise=0.5, dt=0.1, seed=0, current=I0, offset=V0, scan=False):
         self.laser, self.target = laser, target
+        self.start = (current, offset)
         self.dlc = FakeDLCPro("SN-B", "bench", {1: {"current": current, "offset": offset, "scan": scan}},
                               serve=False)
         self.client = Loopback(self.dlc)
@@ -129,9 +130,32 @@ class Bench:
 ALLOWED = {"laser1:dl:cc:current-set", "laser1:scan:offset"} | {"laser1:" + k for k in WRITABLE}
 
 
+def measured_currents(b):
+    """The current the laser ran at (measured: with the feedforward, the piezo moves it too) when the recovery
+    began and after each write of current or offset."""
+    d = b.dlc.params
+    ff = d["laser1:dl:cc:feedforward-factor"] if d["laser1:dl:cc:feedforward-enabled"] else 0.0
+    base = d["laser1:dl:cc:current-offset"] + b.dlc.bias.get(1, 0.0)
+    i, v = b.start
+    out = [i + base + ff * v]
+    for name, value in b.dlc.log:
+        if name == "laser1:dl:cc:current-set":
+            i = value
+        elif name == "laser1:scan:offset":
+            v = value
+        else:
+            continue
+        out.append(i + base + ff * v)
+    return out
+
+
 def check_safety(b, i_lo, i_hi, p):
-    currents = [I0] + b.writes("dl:cc:current-set")
-    assert all(i_lo - 1e-9 <= c <= i_hi + 1e-9 for c in currents), "current outside its window"
+    """i_lo, i_hi: the window as set currents with the piezo where it began; it is on the measured current."""
+    acts = measured_currents(b)
+    off = acts[0] - b.start[0]
+    assert all(i_lo + off - 1e-9 <= a <= i_hi + off + 1e-9 for a in acts), "current outside its window"
+    assert all(abs(x - y) <= STEP_MAX + 1e-9 for x, y in zip(acts, acts[1:])), "measured current jumped"
+    currents = [b.start[0]] + b.writes("dl:cc:current-set")
     assert all(abs(x - y) <= STEP_MAX + 1e-9 for x, y in zip(currents, currents[1:])), "current jumped"
     falc0 = {}
     for name, value in b.dlc.log:
@@ -1286,3 +1310,137 @@ def test_monte_carlo_walks_with_lasers_that_stop_lasing():
             assert lock.locked() and abs(b.off_mhz()) < 1 and b.second_mode() < 0.16, seed  # (what the SHG
             assert lock.ta.on(), seed                                                        # sweep can see)
     assert done >= 30, done
+
+
+# ------------------------------------------------------------ feedforward
+def ff_bench(ff=-0.15, seed=12, i_stop=None, i_start=None):
+    """The SHG bench, its DLC pro's feedforward on: the piezo moves the current, ff mA/V (as measured, which is the
+    set current with the piezo where it begins); its master stopping lasing below i_stop and starting again only
+    above i_start (measured)."""
+    laser = ECDL(400.0, seed=seed, multimode=0.9, hysteresis=0.4, mm_noise=0.004, i_stop=i_stop, i_start=i_start)
+    b = Bench(laser, laser.freq(V0, I0), seed=seed, scan=True)
+    d = b.dlc.params
+    d["laser1:dl:cc:feedforward-enabled"], d["laser1:dl:cc:feedforward-factor"] = True, ff
+    b.dlc.bias[1] = -ff * V0
+    lock = b.lock_it(seed=seed, shg=True, lockpoints=True, pdh_dc=0.009)
+    lock.settle()
+    assert lock.locked() and abs(b.off_mhz()) < 1 and b.act == pytest.approx(I0)
+    b.shg_usual = lock._intra_now()
+    return b, lock
+
+
+def test_the_feedforward_does_not_take_the_current_out_of_its_window_or_below_where_it_lases():
+    """The night it went wrong: walking the piezo 16 V onto the target after a hop, the feedforward (-0.15 mA/V)
+    takes the current 2.4 mA down, through where the laser stops lasing (149.8 mA, nominal 150). The window and the
+    floor are on the measured current, so the current set follows the piezo; and as by hand, the current is parked
+    high before the walk (as high as the SHG sweep stays as good), and again whenever it has come down 0.3 mA: it
+    never stops lasing, and is relocked on target."""
+    b, lock = ff_bench(-0.15, i_stop=149.8, i_start=152.5)
+    b.laser.nudge(-3.9)  # it hops: -6 GHz, 16 V of piezo away
+    b, rec, r = recover(b.laser, b.target, HopParams.from_dict({**SHG.to_dict(), "kv": 400.0}), cavity=True, bench=b)
+    assert r.state == "done", r.error
+    assert rec.panics == 0 and b.laser.lasing and lock.locked() and abs(b.off_mhz()) < 1 and b.single_mode()
+    assert rec.ff == -0.15 and rec.notes[0].startswith("feedforward -0.1500 mA/V: the piezo moves the current too")
+    acts = measured_currents(b)
+    assert min(acts) >= 149.8 and max(acts) <= 152.0 + 1e-9  # (check_safety: and never a jump)
+    assert b.I > 153.0 and b.act <= 152.0  # set high, for the measured current to stay put
+    parks = [n for n in rec.notes if n.startswith("parked the current high")]
+    assert len(parks) >= 3, rec.notes
+    assert re.match(r"relocked, walked the piezo 70\.00 → 8[56]\.\d\d V", r.result.summary), r.result.summary
+
+
+def test_the_floor_where_it_stopped_lasing_is_on_the_measured_current():
+    """Stopped lasing at 149.8 mA measured with the piezo moved 10 V, the feedforward -0.15 mA/V: the floor from then
+    on (150.3) is a measured current, a set current 1.5 mA higher there, 1.5 mA lower with the piezo back."""
+    rec = Recenter(HopParams(i_nom=I0), I0, V0, 149.0, 152.0, 45.0, 95.0, i_top=155.0)
+    rec.ff, rec.V = -0.15, V0 + 10.0
+    assert rec.window() == pytest.approx((150.5, 153.5, 156.5)) and rec.mA(151.5) == pytest.approx(150.0)
+    rec.raise_floor(151.3 + rec.STOP_MARGIN)  # (it stopped at 151.3 set: 149.8 measured)
+    assert rec.i_lo == pytest.approx(151.8) and rec.mA(rec.i_lo) == pytest.approx(150.3)
+    assert rec.window(V0)[0] == pytest.approx(150.3) and rec.nominal == pytest.approx(151.5)
+    assert rec.allowed(V0 + 10.0) == pytest.approx((151.5, 156.5))  # (as far down as where it began, 150 at V0)
+
+
+def test_a_current_left_above_its_window_is_brought_down_into_it():
+    """The morning after: left lasing 3.5 mA above nominal, on the next mode and multimode, off target. A recovery
+    starts from there (it used to refuse: outside the window): down into the window slowly, asking whether it
+    lases, then on down as by hand until the SHG sweep is single-mode, into the mode, and walked onto the target."""
+    b, lock = ff_bench(-0.15, i_stop=149.6, i_start=152.5)
+    b.dlc.execute("(param-set! 'laser1:dl:lock:lock-enabled #f)")
+    for k in range(1, 18):  # (by hand, as a panic would have)
+        b.dlc.execute(f"(param-set! 'laser1:dl:cc:current-set {I0 + 0.2 * k:.3f})")
+    b.dlc.execute(f"(param-set! 'laser1:dl:cc:current-set {I0 + 3.5:.3f})")
+    b.laser.lase(b.V, b.act)
+    assert abs(b.off_mhz()) > 6000
+    b.start, b.dlc.log = (b.I, b.V), []
+    p = HopParams.from_dict({**SHG.to_dict(), "kv": 400.0, "shg_lock": b.shg_usual})
+    rec = Recenter(p, b.I, b.V, I0 - 1.0, I0 + 2.0, V0 - 25.0, V0 + 25.0, cavity=True, i_top=I0 + 5.0)
+    r = b.run(rec)
+    assert r.state == "done", r.error
+    assert lock.locked() and abs(b.off_mhz()) < 1 and b.single_mode() and b.act <= I0 + 2.0
+    assert re.match(r"the current was 153\.50 mA, above its window \(149\.00 … 152\.00 mA\): down into it, and on "
+                    r"down to 15[01]\.\d0 mA: single mode", next(n for n in rec.notes if "above its window" in n))
+    check_safety(b, I0 - 1.0, I0 + 3.5, p)  # (within the window, or between it and where it began; never a jump)
+
+
+def test_a_current_left_below_its_window_is_brought_up_into_it():
+    laser, target = hopped_laser(1)
+    b = Bench(laser, target, current=147.5)
+    laser.lase(b.V, b.act)
+    rec = Recenter(HopParams(enabled=True, i_nom=I0, i_below=2.0), 147.5, V0, 148.0, 152.0, 60.0, 80.0)
+    r = b.run(rec)
+    assert r.state == "done", r.error
+    assert rec.notes[0] == "the current was 147.50 mA, below its window (148.00 … 152.00 mA): up into it"
+    check_safety(b, 147.5, 152.0, rec.p)
+
+
+def test_the_runner_keeps_the_measured_current_in_step_with_the_feedforward():
+    """Whatever the procedure asks, with the feedforward on: a current outside both the window and where it began is
+    refused, and an offset move is made in steps that move the measured current 0.2 mA at most; on failure, current
+    and offset go back together, in steps that do neither."""
+    class Rogue(Recenter):
+        def run(self):
+            self.ff = -0.15
+            yield Read()
+            yield Move(offset=80.0)  # 1.5 mA of feedforward: in steps
+            yield Move(current=150.6)
+            yield Read()
+            raise Failed("gave up")
+
+    b, lock = ff_bench(-0.15)
+    lock.dlc.execute("(param-set! 'laser1:dl:lock:lock-enabled #f)")
+    r = b.run(Rogue(HopParams(), I0, V0, 148.0, 152.0, 60.0, 90.0))
+    assert r.state == "failed" and r.error == "gave up" and r.restored and (b.I, b.V) == (I0, V0)
+    offsets = [V0] + b.writes("scan:offset")
+    assert all(abs(x - y) <= STEP_MAX / 0.15 + 1e-9 for x, y in zip(offsets, offsets[1:])) and 80.0 in offsets
+    acts = measured_currents(b)
+    assert all(abs(x - y) <= STEP_MAX + 1e-9 for x, y in zip(acts, acts[1:]))
+
+    class Greedy(Rogue):
+        def run(self):
+            self.ff = -0.15
+            yield Read()
+            self.I = 152.5  # (a bug: past the window, the set current moved by hand)
+            yield Move(current=152.6)
+
+    b, lock = ff_bench(-0.15)
+    r = b.run(Greedy(HopParams(), I0, V0, 148.0, 152.0, 60.0, 90.0))
+    assert max(b.writes("dl:cc:current-set")) <= 152.0 + 1e-9  # (move() keeps it inside: the Runner, at the edge)
+
+
+def test_cancelled_mid_walk_with_the_feedforward_everything_goes_back_in_small_steps():
+    b, lock = ff_bench(-0.15, i_stop=149.8, i_start=152.5)
+    b.laser.nudge(-3.9)
+    p = HopParams.from_dict({**SHG.to_dict(), "kv": 400.0, "shg_lock": b.shg_usual})
+    rec = Recenter(p, I0, V0, I0 - 1.0, I0 + 2.0, V0 - 25.0, V0 + 25.0, cavity=True, i_top=I0 + 5.0)
+    r = b.run(rec, until=lambda run: rec.V > V0 + 8.0)
+    assert r.busy and b.V > V0 + 7.0 and b.I > I0 + 1.0
+    r.cancel("stopped by the user")
+    while r.busy:
+        if b.pending:
+            b.pending.pop(0)()
+        else:
+            r.on_reading(*b.reading())
+    assert r.state == "failed" and r.restored and (b.I, b.V) == (I0, V0) and b.laser.lasing
+    acts = measured_currents(b)
+    assert min(acts) >= 149.8 and all(abs(x - y) <= STEP_MAX + 1e-9 for x, y in zip(acts, acts[1:]))
