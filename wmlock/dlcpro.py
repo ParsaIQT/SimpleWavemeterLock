@@ -196,6 +196,19 @@ class DLCPro:
             raise DecopError(f"{name}: {bad.strip()}")
         return r
 
+    def exec_bytes(self, name: str, *args) -> bytes:
+        """Run a command that returns binary data (the recorder's get-data): its last line, base64."""
+        r = self.exec(name, *args)
+        last = r.splitlines()[-1].strip() if r else ""
+        quoted = len(last) >= 2 and last[0] == last[-1] == '"'
+        text = last[1:] if last.startswith("&") else last[1:-1] if quoted else None
+        try:
+            if text is None:
+                raise ValueError
+            return base64.b64decode(text, validate=True)
+        except (ValueError, binascii.Error):
+            raise DecopError(f"{name}: not binary data {last[:40]!r}") from None
+
 
 BINARY = (":data", ":candidates", ":background-trace")  # parameters that are binary data
 

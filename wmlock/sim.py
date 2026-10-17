@@ -512,7 +512,9 @@ class SimLocked:
     ReLock searches for SEARCH_S before it catches it again (meanwhile the transmission is low,
     the wavemeter sees the laser near where it was). Disabling the lock while scan:enabled is on
     lets the scan run, as a DLC pro does. hop_search: s that ReLock searches after the lock lost the
-    laser (it hopped, say) before it catches the resonance nearest it (0: at once).
+    laser (it hopped, say) before it catches the resonance nearest it (0: at once). A blip (blip()) is
+    the lock losing the laser for a few milliseconds and having it again: only the transmission shows it.
+    recorder: the DLC pro's recorder (SimRecorder), recording the transmission.
 
     SHG: the intra-cavity signal while its cavity is scanned has an Airy peak (plus small
     transverse modes) per FSR for each mode the master emits (ECDL.components); its lock locks to
@@ -531,7 +533,7 @@ class SimLocked:
                  lockpoints: bool = True, fsr: float = 1.5, lw: float = 6.0, tem=((0.37, 0.18), (0.71, 0.08)),
                  t00: float = 0.8, pdh: float = 0.4, pdh_dc: float = 0.0, falc: int = 1, range_v: float = 30.0,
                  falc_in_trace: bool = True, falc_sign: int = 1, seed=None, ta: bool | None = None,
-                 clock=time.monotonic, t_dc: float = 0.0, hop_search: float = 0.0):
+                 clock=time.monotonic, t_dc: float = 0.0, hop_search: float = 0.0, recorder: bool = True):
         """falc_in_trace: the error signal on the scope includes the FALC's input offset, which adds
         to it (falc_sign 1) or subtracts (-1). ta: a TA between master and SHG cavity (by default
         with an SHG stage); clock: its time, for its protection."""
@@ -553,6 +555,7 @@ class SimLocked:
         self.relocks = 0
         self.clock = clock
         self._slip_at = None    # when the lock will lose a master on two modes
+        self.blips = []         # (start, end) of the lock's blips, in its clock
         self._search_until = -math.inf
         # GHz (incommensurate with the master's mode spacing, or a second mode would hide under the first),
         # V of SHG piezo per FSR, finesse
@@ -597,6 +600,7 @@ class SimLocked:
                 p + "nlo:shg:scope:timescale": 50.0, p + "nlo:shg:scope:data": self._shg_blob,
                 p + "nlo:pd:shg-int:photodiode": self._intra_now, p + "nlo:pd:shg:power": self._shg_power,
             })
+        self.recorder = SimRecorder(dlc, n, self.trans_at, clock=clock) if recorder else None
         self.ta = None
         if shg if ta is None else ta:
             self.ta = SimTA(dlc, n, ecdl, clock=clock, seed=seed)
@@ -786,8 +790,25 @@ class SimLocked:
             if scanning:
                 self.ecdl.m = m0
                 self.ecdl.lase(v + self.dv, i)
+            if self.locked() and self._blipped(self.clock()):
+                t = 0.0  # (for a moment, no transmission)
             noise = self.rng.gauss(0.0, 0.002)
             return (t + self.t_dc if sig == 0 else e + self.shown_dc()) + noise
+
+    def _blipped(self, t: float) -> bool:
+        return any(a <= t < b for a, b in self.blips)
+
+    def trans_at(self, times) -> list:
+        """The transmission (Fine In 1) at those times (of its clock), for the recorder: as it is now, but
+        where the lock had a blip."""
+        with self.mutex:
+            blips, self.blips = self.blips, []
+            try:
+                now = self.level(0)  # (its level without a blip now)
+            finally:
+                self.blips = blips
+            return [(self.t_dc if self.locked() and self._blipped(t) else now) + self.rng.gauss(0.0, 0.002)
+                    for t in times]
 
     def _master_scan(self):
         """One scan period: [(x, transmission, error)]; self.found: the lockpoint candidates in it (tops)."""
@@ -950,6 +971,13 @@ class SimLocked:
                 if not self._hold():
                     self.peak, self.dv = None, 0.0
 
+    def blip(self, seconds: float):
+        """The lock loses the laser for `seconds` (milliseconds, say) and has it again at once: only the
+        transmission shows it, meanwhile."""
+        with self.mutex:
+            now = self.clock()
+            self.blips = [b for b in self.blips if b[1] > now - 600.0] + [(now, now + seconds)]
+
     def knock(self, seconds: float = 1.5):
         """The lock loses the laser for a moment (a knock, say): ReLock searches `seconds`, then catches the
         resonance nearest the laser, the one it had."""
@@ -971,6 +999,83 @@ class SimLocked:
             self.peak = peak
             if not self._hold():
                 self.peak, self.dv = None, 0.0
+
+
+class SimRecorder:
+    """A DLC pro's recorder (laserN:recorder) on a FakeDLCPro: channel 1 recorded every recording-time /
+    sample-count-set s once it is enabled, until it has sample-count-set samples (then it disables itself;
+    the data stays until the next recording). Samples are made when they are read (get-data, binary blocks
+    'x' the time in s and 'y' channel 1): level_at(times), what the input showed then, as far as the
+    simulation knows it."""
+
+    LIMIT = 1 << 20
+
+    def __init__(self, dlc: "FakeDLCPro", n: int, level_at, clock=time.monotonic):
+        self.dlc, self.level_at, self.clock = dlc, level_at, clock
+        self.p = p = f"laser{n}:recorder:"
+        self.t0 = None     # when the recording going on began
+        self.t_data = 0.0  # ...the one whose data there is
+        self.done = 0      # samples of a recording that has stopped
+        self.reads = 0     # get-data calls
+        self.busy = False  # get-data refused while it records (as a real one might)
+        d = dlc.params
+        d.update({
+            p + "enabled": False, p + "state": lambda: self._state()[0],
+            p + "state-txt": lambda: f'"{self._state()[1]}"', p + "trigger-mode": 0, p + "recording-mode": 0,
+            p + "recording-time": 10.0, p + "sample-count-set": 10000, p + "sample-count-limit": self.LIMIT,
+            p + "sample-count": lambda: d[p + "sample-count-set"], p + "sampling-interval": lambda: self.dt(),
+            p + "sampling-rate": lambda: 1.0 / self.dt(), p + "memory-size": self.LIMIT,
+            p + "inputs:channel1:signal": 0, p + "inputs:channel2:signal": -3, p + "inputs:channelx:signal": -2,
+            p + "inputs:channel1:low-pass-filter:enabled": True,
+            p + "inputs:channel1:low-pass-filter:cut-off-frequency": 1000.0,
+            p + "data:recorded-sample-count": lambda: self.count(),
+            p + "data:last-recorded-sample": lambda: self.count() - 1,
+            p + "data:recorded-sampling-interval": lambda: self.dt(),
+        })
+        dlc.on_set[p + "enabled"] = self._enabled
+        dlc.commands[p + "data:get-data"] = self._get_data
+
+    def dt(self) -> float:
+        d = self.dlc.params
+        return d[self.p + "recording-time"] / max(d[self.p + "sample-count-set"], 1)
+
+    def _enabled(self, on: bool):
+        if on:
+            self.t0 = self.t_data = self.clock()
+            self.done = 0
+        elif self.t0 is not None:
+            self.done, self.t0 = self.count(), None
+
+    def count(self) -> int:
+        size = self.dlc.params[self.p + "sample-count-set"]
+        if self.t0 is None:
+            return self.done
+        n = min(int((self.clock() - self.t0) / self.dt()), size)
+        if n >= size:  # full: it stops
+            self.done, self.t0 = size, None
+            self.dlc.params[self.p + "enabled"] = False
+        return n
+
+    def _state(self):
+        if self.t0 is not None:
+            return 1, "recording"
+        return (2, "finished") if self.done else (0, "idle")
+
+    def _get_data(self, start, count):
+        from .dlcpro import encode_blocks, float_block
+
+        start, count = int(start), int(count)
+        n = self.count()
+        if self.busy and self.t0 is not None:
+            raise CommandError("-11 busy recording")
+        if start < 0 or count <= 0 or start >= max(n, 1):
+            raise CommandError("-3 no such samples")
+        ks = range(start, min(start + count, n))
+        dt = self.dt()
+        times = [self.t_data + k * dt for k in ks]
+        self.reads += 1
+        blob = encode_blocks([float_block("x", [k * dt for k in ks]), float_block("y", self.level_at(times))])
+        return "&" + base64.b64encode(blob).decode()
 
 
 class SimLaser:

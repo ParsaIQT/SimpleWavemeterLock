@@ -250,10 +250,10 @@ def quiet_demo():
     d.close()
 
 
-def hop_engine(demo, n, key, laser, params, log_path=None):
+def hop_engine(demo, n, key, laser, params, log_path=None, drop_path=None):
     from wmlock.modehop import HopParams
 
-    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"], log_path=log_path)
+    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"], log_path=log_path, drop_path=drop_path)
     e.start()
     assert wait_for(lambda: n in e.channels and e.channels[n].freq > 0, 5)
     e.link(n, key, laser)
@@ -356,7 +356,9 @@ def test_setup_check_reads_only(quiet_demo):
         text = "\n".join(t for _, t in ch.setup)
         assert "relock by lockpoint" in text and "falc1" in text and "SHG cavity lock on" in text
         assert not [lvl for lvl, _ in ch.setup if lvl == "error"], ch.setup
-        assert len(dlc.log) == before  # nothing written
+        assert "watched with the DLC pro's recorder" in text
+        assert [x for x in dlc.log[before:] if ":recorder:" not in x[0]] == []  # nothing written (by the check: its
+        #                                                                       dropout monitor uses the recorder)
     finally:
         e.stop()
 

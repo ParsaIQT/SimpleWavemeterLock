@@ -54,7 +54,9 @@ python -m wmlock --sim           # demo: simulated wavemeter, two fake DLC pros,
 ```
 
 The source you choose is remembered, so afterwards plain `python -m wmlock` or
-double-clicking `wmlock.pyw` (Windows, no console window) is enough. Other options:
+double-clicking `wmlock.pyw` (Windows, no console window) is enough. Started from a console
+(PowerShell, say), warnings go there with the time: unlocks, recoveries, and lock dropouts (see
+*Lock dropouts*). Other options:
 `--dll PATH` for a non-standard DLL location, `--channels 1,2,5` to override the
 switch's channel list, `--config FILE` for a different settings file (default
 `~/.simplewavemeterlock.json`).
@@ -254,6 +256,7 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   lockpoint, it is turned on for a moment for this), the error signal's level away from the
   resonances is read off the scope, and the input offset steps against it. *Check setup…* says
   which FALC pro and input it uses, or why it leaves it alone.
+* **Log its lock dropouts**: see *Lock dropouts* below.
 * **Step by step**: before each step, the recovery waits for you (see *Before the first run*).
 
 ### Lasing
@@ -334,6 +337,42 @@ Switching channels needs the GUI on the wavemeter PC (`wlmData.dll`, as by defau
 unticked channel as gone: its laser is unlocked as before, *channel no longer measured*). A
 channel that is not measured for another reason (the switch not cycling) unlocks its laser.
 A laser this program locks to the wavemeter is held meanwhile (see *The lock*).
+
+### Lock dropouts
+
+A lock that loses the laser for a few milliseconds and catches it again can spoil a measurement,
+or lose an ion, and nothing else notices. For each laser its DLC pro locks to a cavity (*Log its
+lock dropouts* in *Mode-hop recovery…*, on by default), a monitor on a connection of its own
+watches the cavity transmission (the input its lock detection watches) with the **DLC pro's
+recorder**: every 0.25 ms, recording after recording (30 s each, the next started at once), the
+samples read as they come in. A **dropout** is the transmission below the slipping limit (half way
+from its zero to its level locked) for 0.5 ms or more, while its cavity lock is on and no recovery
+runs (and 5 s after either). Each one goes to the console you started the program from, with the
+time, how long it lasted and how low the transmission went:
+
+```
+2026-10-17 23:41:07 WARNING wmlock.dropouts: channel 7 739 SHG: lock dropout 3.2 ms: transmission down
+to 0.002 V (counts below 0.026 V; locked 0.050 V); 2 in the last hour
+```
+
+and to `~/.simplewavemeterlock-dropouts.jsonl`, a line of JSON each (time to the millisecond,
+channel, duration, lowest level, limit, level locked), for counting in the morning, or for tuning
+the lock later. Once an hour the console says how many there were, the longest, and how the
+monitor watched (and how much of the time it saw). The row shows *N lock dropouts in the last
+hour*, its tooltip the last one.
+
+While the program runs, the recorder is the monitor's: its channel 1 (the transmission, no
+low-pass), sample count and recording time are set for this, and put back when the program
+closes. If the controller has no recorder, or it does not record as expected, the console says
+why, and the transmission's present value is polled instead, as fast as the controller answers
+(a few hundred times a second at best): a dropout shorter than the time between reads can be
+missed, and the hourly line says how often it reads. *Check setup…* says which it will be.
+
+Not tried on a real DLC pro yet: the recorder's parameters and `recorder:data:get-data` (its
+samples as TOPTICA's 'Scope, Lock, and Recorder Binary Data' blocks, channel 1 in block 'y') are
+as TOPTICA's SDK has them; how often it samples is measured, not taken from its settings. The
+first lines in the console say whether it works (*watching Fine In 1 with the DLC pro's recorder,
+0.25 ms samples*).
 
 ### What happens after a hop
 
@@ -629,8 +668,8 @@ Things to know:
   **Relock** to have it watched. *Right-click empty space ▸ Simulate a fault* makes any laser
   hop a mode, the cavity lock jump a peak (or 60 MHz), the master go multimode (its cavity lock
   then keeps losing it) or stop lasing (also with its seed power hardly dropping: broadband light
-  still reaching the TA), or the error signal's DC drift, and someone untick a laser's channel on
-  the wavemeter (and tick it again). Like a real DLC pro with its lock points not shown, the
+  still reaching the TA), or the error signal's DC drift, the cavity lock drop out for 3 ms, and
+  someone untick a laser's channel on the wavemeter (and tick it again). Like a real DLC pro with its lock points not shown, the
   simulated one offers lockpoint candidates only after `find-candidates`; after a hop its lock
   searches for 1.5 s before it catches a peak again.
 
@@ -673,6 +712,7 @@ wmlock/lock.py       the PI lock, pure maths
 wmlock/reference.py  wavemeter referencing to a cavity-locked laser, pure maths
 wmlock/modehop.py    mode-hop recovery: lasing watch and panic, the walk, the current map, driver; pure logic
 wmlock/relock.py     taking over and handing back a DLC pro's cavity and SHG locks; setup check
+wmlock/dropouts.py   lock dropouts: the DLC pro's recorder (or polling) read, dropouts found
 wmlock/cavity.py     reading SHG sweeps, cavity scans and error signals, pure maths
 wmlock/engine.py     threads and state: source → lock → per-controller workers
 wmlock/gui.py        Qt window

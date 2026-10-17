@@ -63,6 +63,15 @@ def transmission_input(window_on, window_in, spectrum_in):
                 None)
 
 
+def transmission_signal(window_on, window_in, spectrum_in):
+    """The signal id of the cavity transmission, from TRANS (as transmission_input chooses it, for the
+    recorder): the input its lock detection watches if that is on, else the lock input; None if neither is
+    known."""
+    order = (window_in, spectrum_in) if window_on else (spectrum_in, window_in)
+    ok = [s for s in order if isinstance(s, int) and not isinstance(s, bool) and s >= 0]
+    return next((s for s in ok if s in IO_VALUE), ok[0] if ok else None)
+
+
 def usable_zero(zero: float, locked: float) -> float:
     """The zero to go by, V: the one measured, unless it is not well below the level locked (a scan that spends
     its time on the peak, say: then 0)."""
@@ -937,6 +946,22 @@ def setup_report(client, laser: int, hop, lp) -> list:
                     add("warn", "the scan amplitude is 0: no DC level to see, the input offset is left alone")
             else:
                 add("warn", f"cannot tell which FALC pro the lock uses (falc-selection {sel}): left alone")
+
+        add("head", "Lock dropouts")
+        r = get("recorder:enabled", "recorder:state-txt", "recorder:sample-count-limit")
+        if not hop.dropouts:
+            add("info", "not watched (Mode-hop recovery…: Log its lock dropouts)")
+        elif r["recorder:enabled"] is None:
+            add("warn", f"this controller has no recorder (laser{laser}:recorder): dropouts are watched by polling "
+                        f"the transmission, which can miss those shorter than the time between reads (some ms)")
+        else:
+            add("ok", f"watched with the DLC pro's recorder (now “{r['recorder:state-txt'] or '?'}”), the transmission "
+                      f"every 0.25 ms: while this program runs the recorder is its own, and its settings are put back "
+                      f"when it closes")
+        if hop.dropouts:
+            add("info", "a dropout: the transmission below the slipping limit (above) for 0.5 ms or more, while its "
+                        "lock is on and no recovery runs; each one goes to the console and to "
+                        "~/.simplewavemeterlock-dropouts.jsonl, and how many, once an hour")
 
         add("head", "Scope (laser scope)")
         s = get("scope:channel1:signal", "scope:channel2:signal", "scope:channelx:xy-signal", "scope:variant")

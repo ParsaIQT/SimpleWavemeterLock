@@ -46,6 +46,11 @@ levels locked, of the transmission and the intra-cavity signal, are the medians
 of what they were over the last few minutes while it ran as it should
 (HopParams.trans_locked, shg_lock), and what a relock measured until then.
 
+Lock dropouts (dropouts.py): for each laser its DLC pro locks to a cavity, a monitor of its own watches the
+transmission for the lock losing the laser even for a fraction of a millisecond, while its lock is on and no
+recovery runs (and DROP_SETTLE_S after); each dropout is logged (the console, and a line of JSON in
+drop_path), and how many there were, once an hour.
+
 Currents are shown, and the nominal current given, as measured (current-act);
 the set current (current-set) is what a recovery writes, and is watched for
 changes by hand.
@@ -77,9 +82,11 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 from .dlcpro import DLCPro, DecopError, Device, discover, probe
+from .dropouts import Monitor as DropoutMonitor
+from .dropouts import log as drop_log
 from .lock import Lock, LockParams
 from .modehop import SEED_FLOOR, Guard, HopParams, Recenter, Runner, perform
-from .relock import TRANS, says_locked, setup_report, transmission_input, usable_zero, volts
+from .relock import TRANS, says_locked, setup_report, transmission_input, transmission_signal, usable_zero, volts
 from .reference import Reference, RefParams
 from .wavemeter import C_NM_THZ, NAN
 
@@ -172,6 +179,14 @@ class Channel:
         self.pending = None    # a recovery waiting for readings, its channel switched on for it: what it begins with
         self.wait_since = 0.0  # when the recovery began waiting for them
         self.wait_fail = ""    # why its channel could not be switched on for it
+        # lock dropouts (a laser its DLC pro locks)
+        self.trans_sig = None  # the signal id of its transmission input
+        self.drops = deque()   # (time.time(), s) of its dropouts over the last hour
+        self.drops_total = 0   # ...since the program started
+        self.drop_last = ""    # the last one, said
+        self.drop_said = 0.0   # monotonic: when the console last had one...
+        self.drop_unsaid = 0   # ...and how many since were not said there (at most one a second)
+        self.hold_since = None  # monotonic: since when its lock should hold (on, no recovery)
 
     @property
     def param(self) -> str:
@@ -362,10 +377,14 @@ class Engine:
     LOOK_N = 5       # readings in a row on target (its locks saying locked) end a look; off target, it is relocked
     WAIT_S = 10.0    # s a recovery waits for readings once its wavemeter channel is switched on for it
 
-    def __init__(self, config: dict, make_source, discovery_targets=None, extra_devices=(), log_path=None):
-        """log_path: a file every recovery is appended to, as a line of JSON."""
+    def __init__(self, config: dict, make_source, discovery_targets=None, extra_devices=(), log_path=None,
+                 drop_path=None):
+        """log_path: a file every recovery is appended to, as a line of JSON; drop_path: the same for every lock
+        dropout."""
         self.config = config
-        self.log_path = log_path
+        self.log_path, self.drop_path = log_path, drop_path
+        self.monitors = {}  # channel -> its DropoutMonitor
+        self.started = time.time()
         self.lock = threading.RLock()
         self.channels = {int(k): Channel(int(k), c) for k, c in (config.get("channels") or {}).items()}
         self.active = []         # channels measured by the wavemeter, in order
@@ -400,6 +419,10 @@ class Engine:
 
     def stop(self):
         with self.lock:
+            monitors, self.monitors = list(self.monitors.values()), {}
+        for m in monitors:
+            m.stop()  # (each puts its recorder's settings back)
+        with self.lock:
             for ch in self.channels.values():
                 if ch.state != "off":
                     self._disengage(ch, "")
@@ -419,6 +442,8 @@ class Engine:
         while getattr(self.source, "switching", False) and self.source.is_alive() and time.monotonic() < end:
             time.sleep(0.02)
         self.source.stop()
+        for m in monitors:
+            m.join(max(0.0, end + 5.0 - time.monotonic()))
         with self.lock:
             controllers = list(self.controllers.values())
         for c in controllers:
@@ -832,6 +857,9 @@ class Engine:
             for param in WATCHED + ((ch.seed_name,) if ch.seed_name else ()):
                 c.unwatch(f"laser{ch.laser}:{param}")
         self._unwatch_trans(ch)
+        m = self.monitors.pop(ch.n, None)
+        if m is not None:
+            m.stop()
         ch.device, ch.offset, ch.message = None, None, ""
         ch.current = ch.current_set = ch.cavity_on = ch.seed = ch.lasing = ch.shg_level = None
         ch.cavity_txt = ch.shg_txt = ch.seed_name = ""
@@ -926,6 +954,7 @@ class Engine:
             ch.seed_name, ch.seed, ch.lasing = "", None, None
         if names and not ch.seed_name:
             self._find_seed(ch)
+        self._watch_drops(ch)
 
     def _find_seed(self, ch: Channel):
         """Which parameter shows its seed power (the first of HopParams.seed_names it has), and its TA's
@@ -953,9 +982,13 @@ class Engine:
         c = self._controller(key)
 
         def job(client):
-            name = transmission_input(*perform(client, laser, ("get", TRANS))) or ""
+            got = perform(client, laser, ("get", TRANS))
+            name = transmission_input(*got) or ""
             with self.lock:
-                if ch.device != key or ch.laser != laser or not (ch.hop.enabled and ch.hop.cavity) or not name:
+                if ch.device != key or ch.laser != laser or not (ch.hop.enabled and ch.hop.cavity):
+                    return
+                ch.trans_sig = transmission_signal(*got)
+                if not name:
                     return
                 ch.trans_name = name
                 ch.trans_hist.clear()
@@ -965,7 +998,7 @@ class Engine:
 
     def _unwatch_trans(self, ch: Channel):
         name, key = ch.trans_name, ch.device
-        ch.trans_name, ch.trans = "", None
+        ch.trans_name, ch.trans, ch.trans_sig = "", None, None
         ch.trans_hist.clear()
         ch.trans_fine.clear()
         c = self.controllers.get(key)
@@ -1145,6 +1178,99 @@ class Engine:
                     self.dirty = True
                 else:
                     hop.seed_ok = round(0.98 * hop.seed_ok + 0.02 * v, 3)
+
+    # ---------------------------------------------------------- lock dropouts
+    DROP_SETTLE_S = 5.0  # s after its lock went on (or a recovery ended) before dropouts count
+
+    def _watch_drops(self, ch: Channel):
+        """A dropout monitor for a laser its DLC pro locks, while HopParams.dropouts says so."""
+        hop, key = ch.hop, (ch.device, ch.laser)
+        want = bool(ch.device) and hop.enabled and hop.cavity and hop.dropouts
+        m = self.monitors.get(ch.n)
+        if m is not None and (not want or m.key != key):
+            m.stop()
+            del self.monitors[ch.n]
+            m = None
+        if want and m is None:
+            d = Device.from_key(ch.device)
+            m = DropoutMonitor(d.ip, d.port, ch.laser, status=lambda: self._drop_status(ch, key),
+                               report=lambda drop: self._dropped(ch, key, drop),
+                               summary=lambda text: self._drop_summary(ch, key, text),
+                               name=f"channel {ch.n}" + (f" {ch.name}" if ch.name else ""))
+            m.key = key
+            self.monitors[ch.n] = m
+            m.start()
+
+    def _drop_status(self, ch: Channel, key) -> tuple:
+        """For its dropout monitor: (should its lock hold, the limit its transmission counts below (None: not
+        known yet), its transmission's signal id)."""
+        with self.lock:
+            if (ch.device, ch.laser) != key:
+                return False, None, None
+            if not ch.cavity_on or ch.state == "recovering":
+                ch.hold_since = None
+                return False, None, ch.trans_sig
+            now = time.monotonic()
+            if ch.hold_since is None:
+                ch.hold_since = now
+            lv = self.trans_levels(ch)
+            return now - ch.hold_since >= self.DROP_SETTLE_S, lv[3] if lv else None, ch.trans_sig
+
+    def _dropped(self, ch: Channel, key, d):
+        """A dropout, from its monitor: said in the console (at most one a second, and how many in between), and
+        appended to drop_path."""
+        with self.lock:
+            if (ch.device, ch.laser) != key:
+                return
+            ch.drops.append((d.t, d.duration))
+            while ch.drops and d.t - ch.drops[0][0] > 3600.0:
+                ch.drops.popleft()
+            ch.drops_total += 1
+            usual = ch.hop.trans_locked
+            how = f"{d.duration * 1e3:.1f} ms" if d.duration < 1.0 else f"{d.duration:.2f} s"
+            if d.method == "polling":
+                how += f" (polled every {d.resolution * 1e3:.0f} ms)"
+            ch.drop_last = (f"{time.strftime('%H:%M:%S', time.localtime(d.t))} {how}, transmission down to "
+                            f"{volts(d.low, usual)} V")
+            text = (f"lock dropout {how}: transmission down to {volts(d.low, usual)} V (counts below "
+                    f"{volts(d.limit, usual)} V; locked {volts(usual, usual)} V); {len(ch.drops)} in the last hour")
+            mono = time.monotonic()
+            say = mono - ch.drop_said >= 1.0
+            if say:
+                if ch.drop_unsaid:
+                    text += f" ({ch.drop_unsaid} more since the last one said here)"
+                ch.drop_said, ch.drop_unsaid = mono, 0
+            else:
+                ch.drop_unsaid += 1
+            who = f"channel {ch.n}" + (f" {ch.name}" if ch.name else "")
+            rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d.t)) + f".{int(d.t % 1 * 1000):03d}",
+                   "channel": ch.n, "name": ch.name, "duration_ms": round(d.duration * 1e3, 3),
+                   "low_v": round(d.low, 5), "limit_v": round(d.limit, 5), "locked_v": usual, "method": d.method,
+                   "resolution_ms": round(d.resolution * 1e3, 4)}
+        if say:
+            drop_log.warning("%s: %s", who, text)
+        if self.drop_path:
+            try:
+                with open(self.drop_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n")
+            except OSError as exc:
+                drop_log.warning("cannot log the dropout: %s", exc)
+
+    def _drop_summary(self, ch: Channel, key, figures: str):
+        """Once an hour, from its monitor: how many dropouts, and how it watches."""
+        with self.lock:
+            if (ch.device, ch.laser) != key:
+                return
+            now = time.time()
+            while ch.drops and now - ch.drops[0][0] > 3600.0:
+                ch.drops.popleft()
+            n, total = len(ch.drops), ch.drops_total
+            longest = max((s for _, s in ch.drops), default=0.0)
+            who = f"channel {ch.n}" + (f" {ch.name}" if ch.name else "")
+        since = time.strftime("%Y-%m-%d %H:%M", time.localtime(self.started))
+        most = f"{longest * 1e3:.1f} ms" if longest < 1.0 else f"{longest:.2f} s"
+        drop_log.info("%s: %d lock dropout%s in the last hour%s (%d since %s); watched by %s", who, n,
+                      "" if n == 1 else "s", f", the longest {most}" if n else "", total, since, figures)
 
     def _controller(self, key: str) -> Controller:
         c = self.controllers.get(key)

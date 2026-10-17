@@ -132,6 +132,7 @@ class HopParams:
     relock: str = "auto"      # the DLC pro's lock: auto | lockpoint (pick the peak) | plain (re-enable)
     falc: bool = True         # null the error signal's DC with the FALC pro's input offset first
     falc_max: float = 0.05    # V: the most the input offset may move from where it was
+    dropouts: bool = True     # watch its cavity lock for dropouts, from a fraction of a ms (dropouts.py), and log them
     window: float = 150.0     # MHz: the right cavity peak is within this of where the wavemeter puts it
     peak_tol: float = 50.0    # MHz: locked to its cavity, but further than this from the target: the wrong peak
     lock_min: float = 0.5     # its cavity transmission averaging below this fraction of the way from its zero to its

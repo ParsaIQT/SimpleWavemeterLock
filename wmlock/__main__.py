@@ -24,7 +24,9 @@ def main(argv=None) -> int:
                    help="with --dll: show these channels instead of asking the switch, e.g. 1,2,5")
     p.add_argument("--config", metavar="FILE", help="settings file (default: ~/.simplewavemeterlock.json)")
     args = p.parse_args(argv)
-    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S")
+    logging.getLogger("wmlock.dropouts").setLevel(logging.INFO)  # (its hourly summaries too)
 
     path = args.config or cfgfile.default_path(args.sim)
     config = cfgfile.load(path)
@@ -67,7 +69,9 @@ def main(argv=None) -> int:
     log_path = Path(path).with_name(Path(path).stem.lstrip(".") + "-recoveries.jsonl")
     if Path(path).name.startswith("."):
         log_path = log_path.with_name("." + log_path.name)
-    engine = Engine(config, make_source, discovery_targets=targets, extra_devices=extra, log_path=log_path)
+    drop_path = log_path.with_name(log_path.name.replace("-recoveries", "-dropouts"))
+    engine = Engine(config, make_source, discovery_targets=targets, extra_devices=extra, log_path=log_path,
+                    drop_path=drop_path)
     try:
         from .gui import run
 

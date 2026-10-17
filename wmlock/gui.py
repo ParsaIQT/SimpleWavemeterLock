@@ -387,6 +387,11 @@ class ChannelRow(QtWidgets.QFrame):
             text += f"   ⟲ {fmt_duration(now - ch.note_t)} ago"
         if ch.looked and now - ch.looked_t < NOTE_S and ch.looked_t > ch.note_t:
             text += f"   looked {fmt_duration(now - ch.looked_t)} ago"
+        if ch.drops:
+            wall = time.time()
+            n = sum(1 for t, _ in ch.drops if wall - t <= 3600.0)
+            if n:
+                text += f"   {n} lock dropout{'s' if n != 1 else ''} in the last hour"
         return text
 
     @staticmethod
@@ -475,6 +480,8 @@ class ChannelRow(QtWidgets.QFrame):
             tip += f"\nlast recovery: {ch.note}"
         if ch.looked:
             tip += f"\nlast look, its wavemeter channel switched on for it: {ch.looked}"
+        if ch.drops_total:
+            tip += f"\nlock dropouts: {ch.drops_total} since the program started; the last at {ch.drop_last}"
         self.wl.setToolTip(tip)
 
     def _show_setpoint(self, nm: float):
@@ -798,6 +805,15 @@ class HopDialog(QtWidgets.QDialog):
         self.falc.setChecked(p.falc)
         self.falc_max = number(p.falc_max, 0.001, 1.0, 3, 0.005)
         form.addRow(row(self.falc, self.falc_max, "V"))
+        self.dropouts = QtWidgets.QCheckBox("Log its lock dropouts, from half a millisecond (the transmission below "
+                                            "the slipping limit), with the DLC pro's recorder")
+        self.dropouts.setChecked(p.dropouts)
+        self.dropouts.setToolTip("Each one goes to the console (with the time, how long, how low) and to\n"
+                                 "~/.simplewavemeterlock-dropouts.jsonl; once an hour, how many there were.\n"
+                                 "While this program runs it uses the DLC pro's recorder (its settings are put\n"
+                                 "back when it closes); without one, it polls the transmission instead, which\n"
+                                 "can miss dropouts shorter than the time between reads.")
+        form.addRow(self.dropouts)
         self.confirm = QtWidgets.QCheckBox("Step by step: ask me before each step (for the first runs on a laser)")
         self.confirm.setChecked(p.confirm)
         form.addRow(self.confirm)
@@ -861,7 +877,8 @@ class HopDialog(QtWidgets.QDialog):
 
     def _who(self):
         cavity = self.who.currentIndex() == 1
-        for w in (self.relock, self.window, self.falc, self.falc_max, self.peak_tol, self.lock_min, self.slip_levels):
+        for w in (self.relock, self.window, self.falc, self.falc_max, self.dropouts, self.peak_tol, self.lock_min,
+                  self.slip_levels):
             w.setEnabled(cavity)
         self.tolerance.setEnabled(not cavity)
 
@@ -875,6 +892,7 @@ class HopDialog(QtWidgets.QDialog):
             enabled=self.enabled.isChecked(), cavity=self.who.currentIndex() == 1, shg=self.shg.isChecked(),
             method=self.METHOD[self.method.currentIndex()][0],
             relock=self.RELOCK[self.relock.currentIndex()][0], falc=self.falc.isChecked(),
+            dropouts=self.dropouts.isChecked(),
             falc_max=self.falc_max.value(), window=self.window.value(), peak_tol=self.peak_tol.value(),
             lock_min=self.lock_min.value(), confirm=self.confirm.isChecked(),
             i_nom=round(self.i_nom.value(), 3), i_window=self.i_window.value(), i_below=self.i_below.value(),
@@ -1401,6 +1419,7 @@ class MainWindow(QtWidgets.QWidget):
                     sim.addAction(f"{who}: cavity lock jumps 60 MHz", functools.partial(las.lock.jump, 0.04))
                     sim.addAction(f"{who}: cavity lock knocked out, ReLock catches the same peak",
                                   functools.partial(las.lock.knock, 1.5))
+                    sim.addAction(f"{who}: cavity lock drops out for 3 ms", functools.partial(las.lock.blip, 0.003))
                     sim.addAction(f"{who}: goes multimode, without a hop (its cavity lock keeps losing it)",
                                   functools.partial(las.go_multimode, 1))
                     sim.addAction(f"{who}: error signal DC drifts +20 mV",
