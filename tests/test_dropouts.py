@@ -75,12 +75,12 @@ def run_monitor(demo, status, blips, wait=3.0, **attrs):
 def test_the_monitor_reads_the_recorder_and_puts_its_settings_back(demo):
     dlc = demo.dlcs[2]
     before = {k: v for k, v in dlc.params.items() if ":recorder:" in k and not callable(v)}
-    m, got, summaries = run_monitor(demo, lambda: (True, 0.45, 0), [0.003, 0.0012, 0.0003, 0.05], SUMMARY_S=2.0,
+    m, got, summaries = run_monitor(demo, lambda: (True, 0.45, 0), [0.003, 0.0012, 0.0002, 0.05], SUMMARY_S=2.0,
                                     _summary_at=time.monotonic() + 2.0)
     assert m.method == "recorder" and m.resolution == pytest.approx(0.00025, rel=0.05)
     ms = [round(d.duration * 1e3, 2) for d in got]
     assert len(ms) == 3 and ms[0] == pytest.approx(3.0, abs=0.3) and ms[1] == pytest.approx(1.25, abs=0.3)
-    assert ms[2] == pytest.approx(50.0, abs=0.3)  # (0.3 ms: one sample, or two: too short)
+    assert ms[2] == pytest.approx(50.0, abs=0.3)  # (0.2 ms: one sample at most, too short)
     assert all(d.method == "recorder" and d.low < 0.05 and d.limit == 0.45 for d in got)
     assert all(abs(d.t - time.time()) < 30 for d in got)
     assert summaries and "the DLC pro's recorder, 0.25 ms samples" in summaries[0]

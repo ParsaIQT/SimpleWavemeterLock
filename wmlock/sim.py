@@ -556,6 +556,7 @@ class SimLocked:
         self.clock = clock
         self._slip_at = None    # when the lock will lose a master on two modes
         self.blips = []         # (start, end) of the lock's blips, in its clock
+        self._rec_rng = random.Random(None if seed is None else seed + 1)  # the recorder's noise
         self._search_until = -math.inf
         # GHz (incommensurate with the master's mode spacing, or a second mode would hide under the first),
         # V of SHG piezo per FSR, finesse
@@ -799,16 +800,20 @@ class SimLocked:
         return any(a <= t < b for a, b in self.blips)
 
     def trans_at(self, times) -> list:
-        """The transmission (Fine In 1) at those times (of its clock), for the recorder: as it is now, but
-        where the lock had a blip."""
+        """The transmission (Fine In 1) at those times (of its clock), for the recorder: as it is now, locked
+        (else its DC offset), but where the lock had a blip. Only looked at: nothing is moved along, and its
+        noise has a generator of its own (the recorder reads a lot, which must not change the rest)."""
         with self.mutex:
-            blips, self.blips = self.blips, []
-            try:
-                now = self.level(0)  # (its level without a blip now)
-            finally:
-                self.blips = blips
-            return [(self.t_dc if self.locked() and self._blipped(t) else now) + self.rng.gauss(0.0, 0.002)
-                    for t in times]
+            base = self.t_dc
+            if self.locked():
+                v, i = self._vi()
+                x = v + self.dv
+                f = self.peak + self._offset_mhz() * 1e-6
+                main = self.ecdl.mode_ghz(x, i)
+                base += sum(power * self._airy(f + (ghz - main) * 1e-3)[0]
+                            for power, ghz in self.ecdl.components(x, i))
+            rng = self._rec_rng
+            return [(self.t_dc if self._blipped(t) else base) + rng.gauss(0.0, 0.002) for t in times]
 
     def _master_scan(self):
         """One scan period: [(x, transmission, error)]; self.found: the lockpoint candidates in it (tops)."""
