@@ -267,8 +267,10 @@ class ChannelRow(QtWidgets.QFrame):
         valid = ch.freq > 0
         if valid:
             self.wl.paint(fmt_nm(C_NM_THZ / ch.freq, self.win.digits), "dim" if now - ch.t > STALE_S else "fg")
+        elif ch.off:
+            self.wl.paint("off", "dim")  # (its wavemeter channel: the info line says so)
         else:
-            self.wl.paint(ch.status or "—", "err")
+            self.wl.paint(ch.status or "—", "dim" if ch.borrowed else "err")
         state = ch.state
         if valid and ch.setpoint_nm:
             color = {"on": "ok", "engaging": "warn", "recovering": "warn"}.get(state, "fg")
@@ -294,6 +296,16 @@ class ChannelRow(QtWidgets.QFrame):
                 self.info.paint(f"{where}   CAVITY LOCK SLIPPING{self._hop_text(ch, now)}", "warn")
             elif self._shg_gone(ch):
                 self.info.paint(f"{where}   SHG SIGNAL GONE{self._hop_text(ch, now)}", "warn")
+            elif ch.look_why:
+                self.info.paint(f"{where}   looking, its wavemeter channel switched on for it: {ch.look_why}"
+                                f"{self._hop_text(ch, now)}", "warn")
+            elif ch.off and (state in ("on", "engaging") or ch.relock):
+                if ch.relock:
+                    what = "watched by what its DLC pro says" if state == "on" else \
+                        "Relock has it watched (and a look, the channel switched on for it)"
+                else:
+                    what = f"lock held at {ch.offset:.3f} {ch.unit}" if ch.offset is not None else "lock held"
+                self.info.paint(f"{where}   wavemeter channel off: {what}{self._hop_text(ch, now)}", "dim")
             else:
                 off = "…" if ch.offset is None else f"{ch.offset:.3f} {ch.unit}"
                 self.info.paint(f"{where}   {off}{self._hop_text(ch, now)}", "dim")
@@ -373,6 +385,8 @@ class ChannelRow(QtWidgets.QFrame):
                 text += f" · {volts(now, usual)} V" + (f" (locked {volts(usual, usual)})" if usual else "")
         if ch.note and now - ch.note_t < NOTE_S:
             text += f"   ⟲ {fmt_duration(now - ch.note_t)} ago"
+        if ch.looked and now - ch.looked_t < NOTE_S and ch.looked_t > ch.note_t:
+            text += f"   looked {fmt_duration(now - ch.looked_t)} ago"
         return text
 
     @staticmethod
@@ -455,8 +469,12 @@ class ChannelRow(QtWidgets.QFrame):
                     + (", takes over the DLC pro's cavity lock" if hop.cavity else "")
                     + (", checks the mode in the SHG cavity" if hop.shg else "")
                     + (", step by step" if hop.confirm else ""))
+        if ch.off:
+            tip += "\nits wavemeter channel is switched off ('Use' unticked in the WLM software)"
         if ch.note:
             tip += f"\nlast recovery: {ch.note}"
+        if ch.looked:
+            tip += f"\nlast look, its wavemeter channel switched on for it: {ch.looked}"
         self.wl.setToolTip(tip)
 
     def _show_setpoint(self, nm: float):
@@ -1282,6 +1300,8 @@ class MainWindow(QtWidgets.QWidget):
         e = self.engine
         e.update_rate()
         e.tick()
+        if e.rows() != [row.n for row in self.row_list]:  # (a channel switched off, watched no more)
+            self._rebuild()
         ref = e.reference
         if ref is None:
             self.st_ref.paint("", "dim")
@@ -1310,7 +1330,7 @@ class MainWindow(QtWidgets.QWidget):
         e = self.engine
         with e.lock:
             self._layout_version = e.layout_version
-            wanted = [n for n in e.active if not e.channels[n].hidden]
+            wanted = e.rows()
         for n in list(self.rows):
             if n not in wanted:
                 row = self.rows.pop(n)
@@ -1370,9 +1390,17 @@ class MainWindow(QtWidgets.QWidget):
                     sim.addAction(f"{who}: stops lasing", functools.partial(las.stop_lasing, 0.0))
                     sim.addAction(f"{who}: stops lasing, its seed power hardly drops (broadband)",
                                   functools.partial(las.stop_lasing, 0.7))
+                if e.source.use.get(las.ch, True):
+                    sim.addAction(f"{who}: someone unticks it on the wavemeter", functools.partial(e.source.untick,
+                                                                                                    las.ch))
+                else:
+                    sim.addAction(f"{who}: someone ticks it again on the wavemeter", functools.partial(e.source.tick,
+                                                                                                        las.ch))
                 if las.lock is not None:
                     sim.addAction(f"{who}: cavity lock jumps a peak", functools.partial(las.lock.jump, 1))
                     sim.addAction(f"{who}: cavity lock jumps 60 MHz", functools.partial(las.lock.jump, 0.04))
+                    sim.addAction(f"{who}: cavity lock knocked out, ReLock catches the same peak",
+                                  functools.partial(las.lock.knock, 1.5))
                     sim.addAction(f"{who}: goes multimode, without a hop (its cavity lock keeps losing it)",
                                   functools.partial(las.go_multimode, 1))
                     sim.addAction(f"{who}: error signal DC drifts +20 mV",

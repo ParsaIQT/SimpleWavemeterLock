@@ -60,9 +60,11 @@ switch's channel list, `--config FILE` for a different settings file (default
 `~/.simplewavemeterlock.json`).
 
 The WLM software must be running, with the multichannel switch cycling over the
-channels you want: the GUI never switches channels itself. It reads every
-channel as soon as the WLM has a new result, and shows the channels ticked
-"Use" in the switch settings.
+channels you want. It reads every channel as soon as the WLM has a new result,
+and shows the channels ticked "Use" in the switch settings. It switches no
+channel itself, except for one case: when someone unticks the channel of a laser it watches,
+it switches that channel back on when the laser needs relocking, then off again
+(see *Its wavemeter channel switched off*).
 
 ## Use
 
@@ -70,12 +72,13 @@ channel as soon as the WLM has a new result, and shows the channels ticked
 |---|---|
 | Right-click a channel | Link laser ▸ controller ▸ laserN, Enter IP address…, Rescan LAN, Unlink, Setpoint = current reading, Lock settings…, Mode-hop recovery…, Recenter now, Check setup…, Last recovery…, Use as reference laser, Rename…, Hide channel |
 | **Lock** button | Engage or release. Without a setpoint it locks to the current reading. Green means locked; a red bar means it unlocked itself, and the reason is shown under the deviation. Amber *Recentering* means a mode-hop recovery is running: click to stop it (everything goes back). Blue *Continue*: step by step, it waits for you to allow the step shown on the row. |
-| **Relock** button | For a laser its DLC pro locks to a cavity (*Mode-hop recovery… ▸ Locked by its DLC pro*), in place of Lock: this program does not lock it to the wavemeter. Click it to have the laser watched (*Watching*, green) and relocked after a mode hop, when it is locked more than 50 MHz from its target (another peak: the wavemeter is never that far off), or when its lock keeps losing it and relocking (its transmission, on average, far below its level locked); if any of that is so when you click, it is relocked there and then. Normally it does nothing at all. Click *Watching* to stop. |
+| **Relock** button | For a laser its DLC pro locks to a cavity (*Mode-hop recovery… ▸ Locked by its DLC pro*), in place of Lock: this program does not lock it to the wavemeter. Click it to have the laser watched (*Watching*, green) and relocked after a mode hop, when it is locked more than 50 MHz from its target (another peak: the wavemeter is never that far off), or when its lock keeps losing it and relocking (its transmission, on average, far below its level locked); if any of that is so when you click, it is relocked there and then. Normally it does nothing at all, also while someone has its wavemeter channel switched off (see *Its wavemeter channel switched off*). Click *Watching* to stop. |
 | `set` field | Setpoint as vacuum wavelength in nm. Type and press Enter, or put the cursor next to a digit and use ↑/↓ or the mouse wheel to step that digit. This works while locked, so you can walk the laser. |
 | Double-click the name | Rename |
 | Right-click empty space | Rescan LAN (F5), Show hidden channels, Always on top, Larger/smaller digits (Ctrl +/−); with `--sim`, Simulate a fault |
 
-Greyed digits mean the channel has had no new reading for 3 s.
+Greyed digits mean the channel has had no new reading for 3 s; a grey *off* in their place, that
+someone unticked the channel in the WLM software (see *Its wavemeter channel switched off*).
 
 ## The lock
 
@@ -103,6 +106,8 @@ offset = offset_at_engage − (P·e + I·Σe)
   * the controller stops answering.
 * Invalid readings (low signal, overexposed, …) are skipped and the laser is
   left alone. Locks always start released when the program starts.
+* If someone unticks the channel's "Use" in the WLM software, the lock is held where it is
+  (*lock held* on its row, still shown), and goes on when the channel is ticked again.
 
 ## Reference laser
 
@@ -219,9 +224,10 @@ Right-click a channel ▸ **Mode-hop recovery…**:
 * **Relock by** (cavity only): *by lockpoint*, as you would by hand (the DLC pro is asked to find
   its lock points first, `find-candidates`: it shows none otherwise), or *re-enable the lock* and
   let it find its resonance (*lock without lockpoint* is ticked first: without it, it locks only at
-  a selected lockpoint). The default follows the DLC pro's `lock-without-lockpoint` setting. After
-  a relock, the setpoint is moved to where the wavemeter puts the laser locked: the lockpoint is the
-  target, in the wavemeter's numbers.
+  a selected lockpoint). The default follows the DLC pro's `lock-without-lockpoint` setting. Either
+  way, with a FALC pro the error signal's DC level is nulled first (below). After a relock, the
+  setpoint is moved to where the wavemeter puts the laser locked: the lockpoint is the target, in
+  the wavemeter's numbers.
 * **The right peak is within ± 150 MHz** of where the wavemeter puts the setpoint.
 * **Wrong peak**: locked, but more than **50 MHz** from the target: the wavemeter is never that
   far off, so the lock holds the laser on another peak of the cavity (a transverse mode, say),
@@ -230,7 +236,7 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   Fine In 1 as a rule; with lock detection off, the lock input) is read twice a second while the
   DLC pro's lock is on, and goes by two levels, in volts:
   * its **zero**: the transmission between the peaks (any DC offset), measured while the master
-    scans in a relock by lockpoint (the median of ten looks; 0 V until then);
+    scans in a relock (the median of ten looks; 0 V until then);
   * its **level locked**: the median of what it read over the last few minutes while the laser ran
     locked on target (watched or not), and what a relock measured, until then.
 
@@ -243,7 +249,11 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   hand is not taken for slipping. The same goes for an SHG laser's intra-cavity signal (locked):
   below half its level locked over 10 s, it is recovered (the SHG cavity lost it, or the laser
   stopped lasing).
-* **Null the error signal's DC level with the FALC pro's input offset, by at most 0.05 V.**
+* **Null the error signal's DC level with the FALC pro's input offset, by at most 0.05 V**: before
+  every relock, by lockpoint or not, as you would by hand: the scan runs (relocking without a
+  lockpoint, it is turned on for a moment for this), the error signal's level away from the
+  resonances is read off the scope, and the input offset steps against it. *Check setup…* says
+  which FALC pro and input it uses, or why it leaves it alone.
 * **Step by step**: before each step, the recovery waits for you (see *Before the first run*).
 
 ### Lasing
@@ -262,7 +272,7 @@ back does not start it again: it needs a good deal more current first. What tell
   lasing. The broadband light of a laser that does not lase can keep the seed power well up,
   though, so with an SHG stage the sweep has the last word.
 
-Not lasing, at once, without asking (the TA switches itself off after its
+Not lasing, at once, without asking, even if its wavemeter channel is switched off (the TA switches itself off after its
 `power-min-shutdown-delay` with too little seed):
 
 1. the cavity lock goes off (it would fight), and the current goes up to **2 mA above
@@ -288,6 +298,42 @@ row says to look at the laser. If its TA switched itself off meanwhile, the lase
 lasing where it is, and the row says to switch the TA on again: this program never switches a
 TA on. Without a TA or an SHG stage nothing tells whether it lases, and nothing is watched: such a
 laser gives the wavemeter no valid reading, which is not taken for a hop.
+
+### Its wavemeter channel switched off
+
+Someone who wants a faster rate on their own laser may untick another laser's channel ("Use")
+in the WLM software. A laser **its DLC pro locks to a cavity** keeps its row (*wavemeter channel
+off*), and if it is watched (*Watching*) it stays watched, by what its DLC pro says, polled twice
+a second:
+
+* its lock's state not saying locked (the DLC pro relocking it, ReLock), its transmission below
+  its limit, its SHG cavity's lock not saying locked, or its SHG signal below half its usual: the
+  laser may now be locked on another peak, which only the wavemeter can tell. Its channel is
+  switched on for a **look** (15 s at most, at most once a minute; one asked for sooner is made
+  then). Readings count once its lock says locked again (its own ReLock is given the time to catch
+  the laser). If it is locked on target (5 readings in a row) it is left alone, and its channel is
+  switched off again. If it is off target, or its lock still is not locked, it is relocked.
+* its transmission or SHG signal low on average over 10 s, or its seed power gone: recovered, as
+  with its channel on.
+
+Any recovery switches the channel on first and waits for readings (10 s at most), then switches
+it off again when it is over, whatever the outcome. A laser that stopped lasing does not wait:
+its current jumps at once, and the readings come in meanwhile. If someone unticks the channel
+during a recovery, it is switched on again at once, and the recovery waits for it. Clicking
+**Relock** while the channel is off has a look too. If the channel is ticked again by someone,
+a watched laser is looked at, and relocked if it is off target. If the channel cannot be switched on,
+there is no recovery, and the row says why.
+
+What this cannot see: a DLC pro relock that is over between two polls (half a second apart),
+with the transmission and the SHG cavity's lock unmoved, leaves the laser on whatever peak it
+caught until something else is seen, or until the channel is ticked again (the look then relocks it
+if it is off target).
+
+Switching channels needs the GUI on the wavemeter PC (`wlmData.dll`, as by default), or
+`server/server.py` from this version on the wavemeter PC with `--http` (an older one reports an
+unticked channel as gone: its laser is unlocked as before, *channel no longer measured*). A
+channel that is not measured for another reason (the switch not cycling) unlocks its laser.
+A laser this program locks to the wavemeter is held meanwhile (see *The lock*).
 
 ### What happens after a hop
 
@@ -399,7 +445,7 @@ recovery does what you would do by hand:
 | Make sure the master is single-mode-ish before moving the scan offset, then move it slowly towards the target, watching the SHG sweep; trim the current when the mode loses quality | *the walk*: the SHG sweep after every trim and every 0.5 V of piezo, and at the operating point (the map: every map point, both ends of the margin check, and the operating point) |
 | Lock the SHG cavity | SHG scan off, `nlo:shg:lock:lock-enabled` on; the intra-cavity signal (`nlo:pd:shg-int:photodiode`) must come up, to at least 80 % of its usual locked (learned while the laser runs, else what it was when the recovery began): if not, the master is not single-mode, and the current is trimmed (once; then it is handed back all the same, and says so) |
 | Start the master's scan, bring the right cavity peak into it, show the lock points, pick it in the XY display (scan output against Fine In 1) | the scan runs; the transmission is looked at ten times, unevenly spaced: mostly between the peaks, their median is its zero; the DLC pro is asked to find its lock points (`dl:lock:find-candidates`) before each look at them; from those candidates (`dl:lock:candidates`), the tall peak where the wavemeter puts the target (scan offset − deviation / piezo tuning), within ± 150 MHz, and the only one there; it must stand at least half as tall as the right peak did last time (from the lockpoint you selected), so a transverse mode is never taken for it |
-| Correct the FALC's input offset (~0.01 V) so the error signal has no DC | the error signal's level away from the resonances, from the scope; the input offset steps against it, checking on the trace after each step that it does what it should |
+| Correct the FALC's input offset (~0.01 V) so the error signal has no DC | the error signal's level away from the resonances, from the scope; the input offset steps against it, checking on the trace after each step that it does what it should (relocking without a lockpoint, the same, the scan on for a moment for it) |
 | Lock | `dl:lock:select-lockpoint` on that candidate, then `lock-enabled`; the lock must report locked, the wavemeter must agree it is the right peak, and the transmission (the median of a few looks) must reach half the peak's height above zero; it is its level locked from then on |
 
 How a sweep is judged: a single-mode master gives one tall peak per free spectral range of
@@ -466,7 +512,8 @@ Safety:
   cavity lock's *lock without lockpoint* (relocking by re-enabling it), the scan and SHG scan
   on/off, a scope channel's signal (given back), a FALC pro's input offset (within its limit of
   where it was), and runs `find-candidates` and `select-lockpoint`. Anything else is refused. (And
-  in this program, a relock moves the setpoint onto the lock.)
+  in this program, a relock moves the setpoint onto the lock; and a laser whose wavemeter channel
+  someone switched off has the channel switched on for the recovery, and off again after.)
 * If nothing works, or after 10 minutes, everything it changed goes back where it was and
   the cavity lock stays off, with the reason on the row. Stopping it does the same. A laser
   that had stopped lasing is put back where it lases again, not where it stopped; stopped while
@@ -481,12 +528,12 @@ Safety:
 * At most 4 recoveries an hour; beyond that it stops and says so (a laser that stopped lasing
   is recovered all the same). It also does nothing until the laser has been on target again.
 * If the controller stops answering, it stops and says what the current was left at.
-* A recovery only starts from a current within the window. Set the nominal current again
-  after changing it by hand.
+* A recovery that finds the current outside its window brings it into it first (see *Nominal
+  current*). Set the nominal current again after changing it by hand on purpose.
 
 *Recenter now* runs a recovery at any time, without a hop (the map skips its quick check): it
 re-centers a laser you suspect sits near the edge of its mode. It needs a setpoint and a valid
-reading.
+reading (or its channel switched off: it is switched on for it).
 
 Recoveries learn the laser's piezo tuning and mode spacing, the right peak's height, the
 lockpoint type and the number `select-lockpoint` wants for it, what single-mode looks like in
@@ -527,6 +574,10 @@ Things to know:
   into account and the current parked high: 110 fixed, 96 times not lasing in 42 recoveries,
   11 given up as "it stopped lasing 4 times" or "not lasing even at nominal + 5 mA", 2 left
   without lasing.
+* Relocking without a lockpoint (*lock without lockpoint* ticked), the same 300 SHG masters as
+  above, their error signal's DC level up to ±30 mV: 235 of the 245 fixable fixed, as before;
+  all 246 relocks now end with the DC level under 3 mV (before the FALC pro was used there: 29),
+  some 2 s longer.
 * The map (with the current ±2 mA and the piezo ±10 V): a Monte Carlo over 3000 random lasers
   (modes 3 to 10 GHz apart, chip modes shifting by 1 to 4 GHz/mA, hysteresis up to 0.15 of the
   mode spacing, noisy readings near a hop) fixed 99.4 % of the hops that could be fixed within
@@ -578,8 +629,10 @@ Things to know:
   **Relock** to have it watched. *Right-click empty space ▸ Simulate a fault* makes any laser
   hop a mode, the cavity lock jump a peak (or 60 MHz), the master go multimode (its cavity lock
   then keeps losing it) or stop lasing (also with its seed power hardly dropping: broadband light
-  still reaching the TA), or the error signal's DC drift. Like a real DLC pro with its lock points
-  not shown, the simulated one offers lockpoint candidates only after `find-candidates`.
+  still reaching the TA), or the error signal's DC drift, and someone untick a laser's channel on
+  the wavemeter (and tick it again). Like a real DLC pro with its lock points not shown, the
+  simulated one offers lockpoint candidates only after `find-candidates`; after a hop its lock
+  searches for 1.5 s before it catches a peak again.
 
 ## Troubleshooting
 
@@ -598,9 +651,13 @@ Things to know:
 `server/server.py` is the FastAPI server you already had, with one fix: it
 called `GetUseChannel`, which wlmData does not have. That call always fell
 back to "enabled", so every channel was reported. It now reports a channel only
-when the switch actually uses it (`GetSwitcherSignalStates`). Same endpoint,
-same JSON, so other clients keep working. Run it on the wavemeter PC next to
-HighFinesse's `wlmData.py`/`wlmConst.py`:
+when the switch actually uses it (`GetSwitcherSignalStates`); one with "Use"
+unticked is reported `"Disabled"` with `"use": false`, and
+`POST /api/v1/channel/<n>/use` with `{"use": true}` ticks it (`false` unticks
+it), for a laser whose channel someone switched off (*Its wavemeter channel
+switched off*). Same endpoint, same JSON otherwise, so other clients keep
+working. Run it on the wavemeter PC next to HighFinesse's
+`wlmData.py`/`wlmConst.py`:
 
 ```
 pip install fastapi uvicorn
@@ -642,7 +699,7 @@ and moves when referencing is turned off. Mode-hop recovery runs against simulat
 external-cavity diode lasers, synchronously (a Monte Carlo over random lasers, checking the
 safety rules on every write) and end to end through fake controllers, for wavemeter-locked
 and cavity-locked lasers (relocked after a hop, on the wrong peak, or with a lock that keeps
-losing it). The simulated lasers have hysteresis (up to 0.6 of the mode spacing,
+losing it, also with their wavemeter channel switched off by someone). The simulated lasers have hysteresis (up to 0.6 of the mode spacing,
 more one way than the other), follow every write of current and piezo as a real laser does,
 and run on two modes just before they hop; they can stop lasing below a current and start again
 only well above it. The fake controllers also simulate a TA-SHG pro: its master's mode

@@ -8,9 +8,15 @@ Run on the wavemeter PC, next to HighFinesse's wlmData.py and wlmConst.py
 
 then on any PC:  python -m wmlock --http http://<wavemeter-pc>:8000
 
-Change from the original: wlmData has no GetUseChannel, so the old code always
+Changes from the original: wlmData has no GetUseChannel, so the old code always
 fell back to "enabled" and reported every channel. Whether the switch measures
-a channel is the 'Use' flag of GetSwitcherSignalStates.
+a channel is the 'Use' flag of GetSwitcherSignalStates: a channel with it
+unticked is reported "Disabled" with "use": false, and
+
+    POST /api/v1/channel/<n>/use   {"use": true}
+
+ticks it again (false unticks it), as SimpleWavemeterLock does to relock a
+laser whose channel someone switched off, before switching it off again.
 """
 import ctypes
 import sys
@@ -18,6 +24,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 # HighFinesse imports
 import wlmData
@@ -65,16 +72,23 @@ def channel_count():
     return min(n, MAX_CHANNELS) if n > 0 else 1
 
 
-def channel_in_use(ch, n):
-    """True if the switch measures this channel ('Use' ticked in the WLM software)."""
+def channel_use(ch, n):
+    """True if the switch measures this channel ('Use' ticked in the WLM software); False if it does not
+    because 'Use' is unticked (the switch cycling: ticking it would have it measured); None if it does not
+    for another reason (the switch not cycling)."""
     if n <= 1:
-        return ch == 1
+        return True if ch == 1 else None
     if wlmData.dll.GetSwitcherMode(0) == 0:  # switch not cycling: only the selected channel
-        return ch == max(wlmData.dll.GetSwitcherChannel(0), 1)
+        return True if ch == max(wlmData.dll.GetSwitcherChannel(0), 1) else None
     use, show = ctypes.c_long(), ctypes.c_long()
     if wlmData.dll.GetSwitcherSignalStates(ch, ctypes.byref(use), ctypes.byref(show)) < 0:
         return True  # not available: report the channel
     return bool(use.value)
+
+
+def channel_in_use(ch, n):
+    """True if the switch measures this channel ('Use' ticked in the WLM software)."""
+    return channel_use(ch, n) is True
 
 
 @app.get("/api/v1/wavelength", tags=["Metrics"])
@@ -99,13 +113,16 @@ def get_wavelength_data():
     channels_data = {}
     n = channel_count()
     for ch in range(1, n + 1):
-        if not channel_in_use(ch, n):
+        use = channel_use(ch, n)
+        if use is not True:
             channels_data[f"channel_{ch}"] = {
                 "status": "Disabled",
                 "is_valid": False,
                 "frequency_thz": None,
                 "wavelength_nm": None
             }
+            if use is False:  # 'Use' unticked: POST /api/v1/channel/<n>/use can tick it
+                channels_data[f"channel_{ch}"]["use"] = False
             continue  # Skip trying to read frequencies for this channel
 
         freq = wlmData.dll.GetFrequencyNum(ch, 0.0)
@@ -129,3 +146,26 @@ def get_wavelength_data():
         },
         "channels": channels_data
     }
+
+
+class Use(BaseModel):
+    use: bool
+
+
+@app.post("/api/v1/channel/{ch}/use", tags=["Control"])
+def set_channel_use(ch: int, body: Use):
+    """Tick (use: true) or untick a channel's 'Use' in the WLM software (its 'Show' left as it is)."""
+    if wlmData.dll.GetWLMCount(0) == 0:
+        return JSONResponse(status_code=503, content={"detail": "wlmServer is not running on the host machine."})
+    n = channel_count()
+    if not 1 <= ch <= n:
+        return JSONResponse(status_code=404, content={"detail": f"no channel {ch} (the switch has {n})"})
+    if n <= 1 or wlmData.dll.GetSwitcherMode(0) == 0:
+        return JSONResponse(status_code=409, content={"detail": "the switch is not cycling through its channels"})
+    use, show = ctypes.c_long(), ctypes.c_long()
+    if wlmData.dll.GetSwitcherSignalStates(ch, ctypes.byref(use), ctypes.byref(show)) < 0:
+        show.value = 1
+    r = wlmData.dll.SetSwitcherSignalStates(ch, int(body.use), show.value)
+    if r < 0:
+        return JSONResponse(status_code=500, content={"detail": f"SetSwitcherSignalStates: error {r}"})
+    return {"channel": ch, "use": body.use}

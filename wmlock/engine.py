@@ -49,6 +49,20 @@ of what they were over the last few minutes while it ran as it should
 Currents are shown, and the nominal current given, as measured (current-act);
 the set current (current-set) is what a recovery writes, and is watched for
 changes by hand.
+
+A wavemeter channel switched off ('Use' unticked in the WLM software, by someone
+who wants a faster rate on theirs) gives no readings; the source can switch it
+on again. A laser its DLC pro locks to a cavity stays watched meanwhile, by what
+its DLC pro says: its lock's state, its transmission, its SHG cavity's lock and
+signal, its seed power. When any of that says something happened, its channel
+is switched on for a look (Engine.LOOK_S at most, LOOK_GAP apart at least):
+locked on target, it is switched off again; else the laser is relocked. Any
+recovery switches the channel on first, waits for readings (WAIT_S at most; not
+for a laser that stopped lasing: its current jump does not wait), and switches
+it off again when it is over; switched off during one, it is switched on again
+at once. A laser this program locks to the wavemeter is held where it is (its
+lock goes on when readings do). A channel the switch stops measuring for
+another reason (not cycling) unlocks as before.
 """
 from __future__ import annotations
 
@@ -145,6 +159,19 @@ class Channel:
         self.shg_level = None  # V: its SHG cavity's intra-cavity signal, as last polled
         self.shg_hist = deque()  # (t, V) of that over the last Engine.LEVEL_S, armed
         self.shg_fine = deque(maxlen=FINE_N)  # V, polled running as it should
+        # its wavemeter channel switched off ('Use' unticked in the WLM software)
+        self.off = False       # switched off: no readings until it is switched on again
+        self.borrowed = False  # switched on by this program (for a look or a recovery): to be switched off again
+        self.look_why = ""     # what its DLC pro said that has it looked at now, its channel on ('': no look)
+        self.look_until = 0.0  # the look ends then at the latest
+        self.look_next = 0.0   # no look before then...
+        self.look_due = ""     # ...one asked for sooner is made then: why
+        self.look_n = (0, 0)   # readings in a row in the look: on target, off target
+        self.looked = ""       # what the last look found
+        self.looked_t = 0.0
+        self.pending = None    # a recovery waiting for readings, its channel switched on for it: what it begins with
+        self.wait_since = 0.0  # when the recovery began waiting for them
+        self.wait_fail = ""    # why its channel could not be switched on for it
 
     @property
     def param(self) -> str:
@@ -180,7 +207,11 @@ class Channel:
     def hop_stage(self) -> str:
         if self.state != "recovering":
             return ""
-        return self.runner.stage if self.runner is not None else "reading the laser's settings"
+        if self.runner is not None:
+            return self.runner.stage
+        if self.borrowed and (self.off or self.pending is not None):
+            return "its wavemeter channel switched on: waiting for readings"
+        return "reading the laser's settings"
 
     @property
     def hop_prompt(self) -> str:
@@ -326,6 +357,10 @@ class _HopIO:
 class Engine:
     LEVEL_S = 10.0  # s: a cavity lock's transmission (an SHG signal) averaged over this long, to tell one that keeps
     #                 losing it
+    LOOK_S = 15.0    # s: a look at a laser, its wavemeter channel switched on for it, lasts this long at most...
+    LOOK_GAP = 60.0  # s: ...and comes this long after the last at the soonest
+    LOOK_N = 5       # readings in a row on target (its locks saying locked) end a look; off target, it is relocked
+    WAIT_S = 10.0    # s a recovery waits for readings once its wavemeter channel is switched on for it
 
     def __init__(self, config: dict, make_source, discovery_targets=None, extra_devices=(), log_path=None):
         """log_path: a file every recovery is appended to, as a line of JSON."""
@@ -334,6 +369,8 @@ class Engine:
         self.lock = threading.RLock()
         self.channels = {int(k): Channel(int(k), c) for k, c in (config.get("channels") or {}).items()}
         self.active = []         # channels measured by the wavemeter, in order
+        self.off = []            # channels switched off on the wavemeter, which the source can switch on
+        self._timers_t = 0.0
         self.layout_version = 0  # bumped when the set of rows to show changes
         self.source_ok, self.source_msg = False, "starting"
         self.rate = 0.0          # new readings per second, all channels
@@ -362,7 +399,6 @@ class Engine:
         self.start_discovery()
 
     def stop(self):
-        self.source.stop()
         with self.lock:
             for ch in self.channels.values():
                 if ch.state != "off":
@@ -377,6 +413,13 @@ class Engine:
                     break
             time.sleep(0.02)
         with self.lock:
+            for ch in self.channels.values():
+                self._release(ch)  # a channel switched on for a look or a recovery: off again
+        end = time.monotonic() + 2.0
+        while getattr(self.source, "switching", False) and self.source.is_alive() and time.monotonic() < end:
+            time.sleep(0.02)
+        self.source.stop()
+        with self.lock:
             controllers = list(self.controllers.values())
         for c in controllers:
             c.stop()
@@ -385,16 +428,189 @@ class Engine:
     def on_state(self, ok: bool, msg: str):
         self.source_ok, self.source_msg = ok, msg
 
-    def on_active(self, chans):
+    def on_active(self, chans, off=()):
+        """chans: the channels the wavemeter measures; off: those switched off ('Use' unticked), which the source
+        can switch on again. One that is neither any more is no longer measured: unlocked (watched no more)."""
         with self.lock:
-            for n in chans:
+            chans = list(chans)
+            off = [n for n in off if n not in chans]
+            for n in chans + off:
                 if n not in self.channels:
                     self.channels[n] = Channel(n)
-            for n in set(self.active) - set(chans):
-                if self.channels[n].state != "off":
-                    self._disengage(self.channels[n], "unlocked: channel no longer measured")
-            self.active = list(chans)
+            for n in chans:
+                if self.channels[n].off:
+                    self._channel_on(self.channels[n])
+            for n in off:
+                if not self.channels[n].off:
+                    self._channel_off(self.channels[n])
+            for n in (set(self.active) | set(self.off)) - set(chans) - set(off):
+                ch = self.channels[n]
+                ch.off = ch.borrowed = False
+                if ch.state != "off":
+                    self._disengage(ch, "unlocked: channel no longer measured")
+            self.active, self.off = chans, off
             self.layout_version += 1
+
+    def on_switch_failed(self, n: int, on: bool, why: str):
+        """The source could not switch channel n on (or off)."""
+        with self.lock:
+            ch = self.channels.get(n)
+            if ch is None:
+                return
+            text = f"cannot switch channel {n} {'on' if on else 'off'} on the wavemeter: {why}"
+            log.warning(text)
+            if not on:
+                ch.looked, ch.looked_t = text, time.monotonic()
+                return
+            ch.borrowed = False  # (it is not on: nothing to switch off again)
+            if ch.runner is not None:
+                if ch.off:
+                    ch.runner.cancel(text)
+            elif ch.state == "recovering":  # (waiting for readings to begin, or for its settings first)
+                ch.wait_fail = text
+                if ch.pending is not None:
+                    self._wait_over(ch, text)
+            elif ch.look_why:
+                self._look_over(ch, text)
+
+    def rows(self) -> list:
+        """The channels to show: those measured, and those switched off that are locked, watched or being
+        recovered, or could be watched (Relock); not those hidden."""
+        with self.lock:
+            chs = self.channels
+            shown = set(self.active) | {n for n in self.off if chs[n].state != "off" or (
+                chs[n].relock and chs[n].hop.enabled and chs[n].device)}
+            return [n for n in sorted(shown) if not chs[n].hidden]
+
+    # ------------------------------------------------ its channel switched off
+    def _channel_off(self, ch: Channel):
+        """Its wavemeter channel was switched off: no readings until it is on again. A recovery or a look needs
+        them: switched on again at once. Else a laser its DLC pro locks stays watched by what its DLC pro says,
+        and one this program locks to the wavemeter is held (its lock goes on when readings do)."""
+        ch.off = True
+        ch.freq = ch.raw = NAN
+        ch.status = "channel off"
+        ch.guard.pause()
+        if ch.runner is not None:
+            ch.runner.blind(True)
+        if ch.state == "recovering" or ch.look_why:
+            if not ch.borrowed:
+                log.info("channel %d: switched off on the wavemeter during a %s: on again", ch.n,
+                         "look" if ch.look_why else "recovery")
+            ch.borrowed = True
+            self._switch(ch, True)
+        else:
+            ch.borrowed = False
+
+    def _channel_on(self, ch: Channel):
+        """Its wavemeter channel is measured again (switched on by this program, or by someone). A laser watched
+        meanwhile that this program did not switch it on for is looked at (and relocked if it is off target)."""
+        ch.off = False
+        ch.status = "waiting"  # (for its first reading)
+        if ch.runner is not None:
+            ch.runner.blind(False)
+        if not ch.borrowed and ch.state == "on" and ch.relock and not self._is_reference(ch):
+            self._look(ch, "its wavemeter channel was switched on again", switch=False)
+
+    def _switch(self, ch: Channel, on: bool):
+        if getattr(self.source, "switchable", False):
+            self.source.switch(ch.n, on)
+
+    def _release(self, ch: Channel):
+        """Its wavemeter channel switched off again, if this program switched it on."""
+        if ch.borrowed:
+            ch.borrowed = False
+            self._switch(ch, False)
+            log.info("channel %d: switched off again on the wavemeter", ch.n)
+
+    def _says_locked(self, ch: Channel) -> bool:
+        return bool(ch.cavity_on) and says_locked(ch.cavity_txt) and (not ch.hop.shg or says_locked(ch.shg_txt))
+
+    def _look(self, ch: Channel, why: str, switch: bool = True):
+        """What its DLC pro says (why) may mean it is not locked on target any more, and its wavemeter channel is
+        off: switched on for a look, LOOK_S at most; one asked for within LOOK_GAP of the last is made then.
+        switch False: its channel is on already."""
+        now = time.monotonic()
+        if ch.look_why or ch.state != "on" or not ch.relock:
+            return
+        if switch:
+            if not ch.off:
+                return  # (readings come: the guard sees it)
+            if now < ch.look_next:
+                ch.look_due = ch.look_due or why
+                return
+            ch.borrowed = True
+            self._switch(ch, True)
+        ch.look_why, ch.look_until, ch.look_n, ch.look_due = why, now + self.LOOK_S, (0, 0), ""
+        log.info("channel %d: %s: looked at with its wavemeter channel on", ch.n, why)
+
+    def _looking(self, ch: Channel):
+        """A reading in a look, its cavity lock saying locked (while its DLC pro relocks it, the laser is anywhere:
+        it is given the time to): LOOK_N in a row on target with its locks saying locked, it is fine (its channel
+        switched off again, if this program switched it on for the look); LOOK_N in a row off target, relocked."""
+        e = self._hop_error(ch) - ch.guard.track
+        if not math.isfinite(e):
+            return
+        if not (ch.cavity_on and says_locked(ch.cavity_txt)):
+            ch.look_n = (0, 0)
+            return
+        on, off = ch.look_n
+        on, off = (on + 1, 0) if abs(e) <= ch.hop.off_target() else (0, off + 1)
+        ch.look_n = (on, off)
+        if on >= self.LOOK_N and self._says_locked(ch):
+            self._look_over(ch, f"locked on target ({e:+.0f} MHz)")
+        elif off >= self.LOOK_N:
+            self._look_relock(ch, e)
+
+    def _look_relock(self, ch: Channel, e: float):
+        why, ch.look_why = ch.look_why, ""
+        ch.looked, ch.looked_t = f"{why}: {self._off_text(e)}", time.monotonic()
+        self._start_recovery(ch, f"{why}, then {self._off_text(e)}", relock=True)
+
+    @staticmethod
+    def _off_text(e: float) -> str:
+        if not math.isfinite(e):
+            return "no valid reading"
+        return f"jumped {e / 1e3:+.3f} GHz" if abs(e) >= 1e3 else f"locked {e:+.0f} MHz off: the wrong peak"
+
+    def _look_over(self, ch: Channel, found: str):
+        """The look is over: what it found; its channel switched off again if this program switched it on."""
+        now = time.monotonic()
+        why, ch.look_why, ch.look_next = ch.look_why, "", now + self.LOOK_GAP
+        ch.looked, ch.looked_t = f"{why}: {found}", now
+        log.info("channel %d: looked (%s): %s", ch.n, why, found)
+        self._release(ch)
+
+    def _look_timeout(self, ch: Channel):
+        """LOOK_S without LOOK_N readings in a row either way, its cavity lock saying locked: as the last of them
+        had it; with none, by its DLC pro (its lock still not saying locked: relocked)."""
+        on, off = ch.look_n
+        if off:
+            self._look_relock(ch, self._hop_error(ch) - ch.guard.track)
+        elif on:
+            self._look_over(ch, "on target, " + ("its locks saying locked" if self._says_locked(ch) else
+                                                 f"its SHG cavity's lock saying “{ch.shg_txt or '?'}”"))
+        elif ch.cavity_on and not says_locked(ch.cavity_txt):
+            why, ch.look_why = ch.look_why, ""
+            ch.looked, ch.looked_t = f"{why}: still “{ch.cavity_txt}” after {self.LOOK_S:g} s", time.monotonic()
+            self._start_recovery(ch, f"{why}, still after {self.LOOK_S:g} s", relock=True)
+        else:
+            self._look_over(ch, f"no valid reading in {self.LOOK_S:g} s; its DLC pro says it is locked: left as it is")
+
+    def _timers(self, now: float):
+        """Looks, and recoveries waiting for readings, that have run out of time; looks that are due."""
+        if now - self._timers_t < 0.1:
+            return
+        self._timers_t = now
+        for ch in list(self.channels.values()):
+            if ch.pending is not None and now - ch.wait_since >= self.WAIT_S:
+                self._wait_over(ch)
+            if ch.look_why and now >= ch.look_until:
+                self._look_timeout(ch)
+            elif ch.look_due and now >= ch.look_next:
+                why, ch.look_due = ch.look_due, ""
+                if ch.off and ch.state == "on":
+                    self._look(ch, why)
 
     def on_readings(self, readings):
         with self.lock:
@@ -414,9 +630,15 @@ class Engine:
                 withheld = self._hop_reading(ch, r.t) if ch.hop.enabled or ch.runner else False
                 if ch.state == "on" and ch.freq > 0 and not withheld and not ch.relock:
                     self._step(ch)
+                if ch.pending is not None and ch.freq > 0:  # the readings it waited for
+                    args, ch.pending = ch.pending, None
+                    self._begin_recovery(ch, *args)
+                elif ch.look_why and ch.state == "on":
+                    self._looking(ch)
             for ch in self.channels.values():  # a recovery waiting for time to pass
                 if ch.runner is not None:
                     ch.runner.tick(readings[-1].t)
+            self._timers(readings[-1].t)
 
     def _step(self, ch: Channel):
         u = ch.lock.update(ch.error_mhz)
@@ -501,7 +723,7 @@ class Engine:
         e = self._hop_error(ch) - ch.guard.track
         slip = self._slipping(ch)
         if check and (ch.cavity_on is False or (math.isfinite(e) and abs(e) > hop.off_target()) or slip):
-            if not math.isfinite(e):
+            if not math.isfinite(e) and not ch.off:  # (switched off, its channel is switched on for the relock)
                 ch.message = "relock: needs a valid reading"
                 return
             why = "cavity lock off" if ch.cavity_on is False else (
@@ -512,6 +734,9 @@ class Engine:
         ch.state, ch.message = "on", ""
         ch.token += 1
         ch.guard.reset()
+        if check and ch.off:  # is it locked on target? A look, its channel switched on for it
+            ch.look_next = 0.0
+            self._look(ch, "Relock clicked")
 
     def disengage(self, n: int, message: str = ""):
         with self.lock:
@@ -529,6 +754,8 @@ class Engine:
         ch.token += 1
         ch.resume = False
         ch.guard.reset()
+        ch.pending, ch.look_why, ch.look_due = None, "", ""
+        self._release(ch)
         c = self.controllers.get(ch.device)
         if c is not None:
             c.cancel(ch.param)
@@ -662,11 +889,15 @@ class Engine:
             with self.lock:
                 if mine():
                     ch.cavity_txt = v
+                    if ch.off and self._armed(ch) and isinstance(v, str) and not says_locked(v):
+                        self._look(ch, f"its cavity lock said “{v}”")  # (its wavemeter channel switched off)
 
         def on_shg(v):
             with self.lock:
                 if mine():
                     ch.shg_txt = v
+                    if ch.off and ch.hop.shg and self._armed(ch) and isinstance(v, str) and not says_locked(v):
+                        self._look(ch, f"its SHG cavity's lock said “{v}”")
 
         def on_shg_level(v):
             with self.lock:
@@ -769,7 +1000,11 @@ class Engine:
             ch.trans_hist.clear()
             why = self._slip_text(*slip)
             log.warning("channel %d: %s", ch.n, why)
-            self._start_recovery(ch, why, budget=math.isfinite(self._hop_error(ch)), relock=True)
+            self._start_recovery(ch, why, budget=math.isfinite(self._hop_error(ch)) or ch.off, relock=True)
+        elif ch.off and self._armed(ch):  # its wavemeter channel switched off: one poll that low is worth a look
+            _, usual, _, limit = self.trans_levels(ch)
+            if limit is not None and v < limit:
+                self._look(ch, f"its transmission fell to {volts(v, usual)} V (locked {volts(usual, usual)} V)")
 
     def _shg(self, ch: Channel, v: float):
         """Its SHG intra-cavity signal, while armed: kept over LEVEL_S; running as it should, its level locked
@@ -796,7 +1031,9 @@ class Engine:
             why = (f"the SHG signal is gone: {volts(mean, usual)} V on average over {self.LEVEL_S:g} s (locked "
                    f"{volts(usual, usual)} V)")
             log.warning("channel %d: %s", ch.n, why)
-            self._start_recovery(ch, why, budget=math.isfinite(self._hop_error(ch)), relock=hop.cavity)
+            self._start_recovery(ch, why, budget=math.isfinite(self._hop_error(ch)) or ch.off, relock=hop.cavity)
+        elif ch.off and hop.shg_lock > 0 and v < hop.lock_min * hop.shg_lock:  # (as the transmission)
+            self._look(ch, f"its SHG signal fell to {volts(v, hop.shg_lock)} V (locked {volts(hop.shg_lock)} V)")
 
     def _fallen(self, hist, usual: float, zero: float, frac: float):
         """(average, usual, zero) if the levels in hist (over most of LEVEL_S at least) average below frac of the way
@@ -898,7 +1135,7 @@ class Engine:
                 if ch.seed_low >= 2 and self._armed(ch):
                     ch.seed_low = 0
                     log.warning("channel %d: not lasing, seed power %.2f mW", ch.n, v)
-                    self._start_recovery(ch, f"stopped lasing (seed {v:.2f} mW)", budget=False)
+                    self._start_recovery(ch, f"stopped lasing (seed {v:.2f} mW)", budget=False, urgent=True)
                 return
             ch.seed_low = 0
             e = self._hop_error(ch)
@@ -980,6 +1217,7 @@ class Engine:
             for ch in list(self.channels.values()):
                 if ch.runner is not None:
                     ch.runner.tick(now)
+            self._timers(now)
 
     # ------------------------------------------------------- mode-hop recovery
     def set_hop_params(self, n: int, params: HopParams):
@@ -1019,7 +1257,7 @@ class Engine:
                 return
             if not ch.device:
                 ch.message = "right-click to link a laser first"
-            elif not math.isfinite(self._hop_error(ch)):
+            elif not (math.isfinite(self._hop_error(ch)) or (ch.off and ch.f_set > 0)):
                 ch.message = "recenter: needs a setpoint and a valid reading"
             else:
                 self._start_recovery(ch, "", quick=False, budget=False)
@@ -1067,10 +1305,13 @@ class Engine:
             return True
         return ch.guard.armed and math.isfinite(e) and abs(e - ch.guard.track) > hop.off_target()
 
-    def _start_recovery(self, ch: Channel, why: str, quick: bool = True, budget: bool = True, relock: bool = False):
+    def _start_recovery(self, ch: Channel, why: str, quick: bool = True, budget: bool = True, relock: bool = False,
+                        urgent: bool = False):
         """quick: try the piezo alone first if the laser is near its target. budget: counts towards
         max_per_hour (those the guard starts). relock: asked to relock a laser its DLC pro locks to a
-        cavity: take its lock over even if it is off now, and watch it afterwards."""
+        cavity: take its lock over even if it is off now, and watch it afterwards. Its wavemeter channel
+        switched off, it is switched on, and the recovery begins with readings (WAIT_S at most), unless
+        urgent (it does not lase: its current jump does not wait)."""
         hop = ch.hop
         now = time.monotonic()
         if budget and not ch.guard.allow(now, hop.max_per_hour):
@@ -1090,6 +1331,11 @@ class Engine:
         ch.hop_why, ch.hop_t = why, now
         for d in (ch.trans_hist, ch.shg_hist, ch.trans_fine, ch.shg_fine):  # (what it relocked to is learned afresh)
             d.clear()
+        ch.look_why = ch.look_due = ch.wait_fail = ""
+        ch.pending, ch.wait_since = None, now
+        if ch.off:  # no readings: its wavemeter channel on first
+            ch.borrowed = True
+            self._switch(ch, True)
         tok, laser, cavity = ch.token, ch.laser, hop.cavity
         log.info("channel %d: %s, recovering", ch.n, why or "recenter")
 
@@ -1102,7 +1348,7 @@ class Engine:
             locked = cavity and (relock or client.get_bool(p + CAVITY_LOCK))
             with self.lock:
                 if ch.token == tok:
-                    self._begin_recovery(ch, i0, a0, clip, v0, locked, quick, c)
+                    self._begin_when_read(ch, (i0, a0, clip, v0, locked, quick, c), urgent)
 
         def failed(exc):
             with self.lock:
@@ -1110,6 +1356,27 @@ class Engine:
                     self._recovery_failed(ch, f"cannot read the laser's settings: {exc}")
 
         c.submit(job, failed)
+
+    def _begin_when_read(self, ch: Channel, args, urgent: bool):
+        """Begin the recovery (args: _begin_recovery's), or if its wavemeter channel was switched on for it, once
+        that gives a valid reading (on_readings), WAIT_S at most (_wait_over); at once if urgent."""
+        if ch.wait_fail and not urgent:
+            self._recovery_failed(ch, ch.wait_fail)
+        elif urgent or not ch.borrowed or (not ch.off and ch.t > ch.wait_since and ch.freq > 0):
+            self._begin_recovery(ch, *args)
+        else:
+            ch.pending = args
+
+    def _wait_over(self, ch: Channel, why: str = ""):
+        """No valid reading within WAIT_S of switching its channel on for the recovery: it begins all the same
+        if the channel is measured (the laser may not lase: the recovery finds out); else (or why: switching
+        it on did not work) there is no recovery, nothing having been touched."""
+        args, ch.pending = ch.pending, None
+        if not why and not ch.off:
+            self._begin_recovery(ch, *args)
+            return
+        self._recovery_failed(ch, why or f"its wavemeter channel is switched off and did not come on in "
+                                         f"{self.WAIT_S:g} s")
 
     def _begin_recovery(self, ch: Channel, i0, a0, clip, v0, locked, quick, controller):
         """i0, a0: the set and the measured current; the window is about the nominal current, which
@@ -1140,18 +1407,23 @@ class Engine:
         runner = Runner(rec, io, time.monotonic(), finished=lambda r: self._recovery_done(ch, r))
         if runner.busy:
             ch.runner = runner
+            if ch.off:  # (begun at once, not lasing: its channel is being switched on)
+                runner.blind(True)
 
     def _recovery_failed(self, ch: Channel, why: str):
         """Before anything was touched."""
         ch.state, ch.resume = "off", False
         ch.message = f"{ch.hop_why + ': ' if ch.hop_why else ''}no recovery, {why}"
         ch.token += 1
+        ch.pending = None
+        self._release(ch)
 
     def _recovery_done(self, ch: Channel, r: Runner):
         ch.runner = None
         ch.guard.reset()
         ch.state = "off"
         ch.token += 1
+        self._release(ch)  # its wavemeter channel, if it was switched on for the recovery
         took = f"{r.now - ch.hop_t:.0f} s"
         why = f"{ch.hop_why}: " if ch.hop_why else ""
         rec = r.rec
@@ -1242,9 +1514,10 @@ class Engine:
                 return
             ch.setup = None
             key, laser, hop, lp = ch.device, ch.laser, ch.hop, ch.lock.p
+            wlm = self._channel_report(ch)
 
             def job(client):
-                report = setup_report(client, laser, hop, lp)
+                report = setup_report(client, laser, hop, lp) + wlm
                 with self.lock:
                     if ch.device == key:
                         ch.setup = report
@@ -1254,6 +1527,29 @@ class Engine:
                     ch.setup = [("error", f"cannot read the controller: {exc}")]
 
             self._controller(key).submit(job, failed)
+
+    def _channel_report(self, ch: Channel) -> list:
+        """For the setup check: its wavemeter channel, if someone switches it off."""
+        if not ch.hop.enabled:
+            return []
+        out = [("head", f"Wavemeter channel {ch.n}")]
+        if ch.off:
+            out.append(("warn", "switched off now ('Use' unticked in the WLM software)"))
+        if not getattr(self.source, "switchable", False):
+            out.append(("info", "this wavemeter source cannot switch channels: switched off, the laser is unlocked "
+                                "(watched no more)"))
+        elif ch.relock:
+            out.append(("info", "switched off by someone, the laser stays watched by what its DLC pro says (its "
+                                "lock's state, transmission, SHG lock and signal, seed power); when that says "
+                                "something happened, the channel is switched on for a look (and a relock if it is "
+                                "off target), then off again. This needs wlmData.dll, or with --http server.py from "
+                                "this version (an older one reports the channel as gone: unlocked)"))
+        else:
+            out.append(("info", "switched off by someone, its lock is held where it is, and goes on when the channel "
+                                "is ticked again; a recovery switches it on, and off again after"))
+        if ch.looked:
+            out.append(("info", f"last look, its channel switched on for it: {ch.looked}"))
+        return out
 
     # -------------------------------------------------------------- discovery
     def start_discovery(self):

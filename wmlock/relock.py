@@ -14,11 +14,13 @@ Here 1 is take_over; 2 happens throughout the recentering (Recenter.map, check a
 modes of about equal power can look like one clean mode in a sweep, but not there); 4-6
 relock_lockpoint, which also makes sure the wavemeter and the transmission agree that it
 locked to the right peak. relock_plain is for a lock that finds its resonance by
-itself (lock without lockpoint, or ReLock): it re-enables it and lets the wavemeter judge.
+itself (lock without lockpoint, or ReLock): it re-enables it and lets the wavemeter judge;
+with a FALC pro it has the scan on for a moment first, to null the error signal's DC level (5).
 
 The transmission (the input its lock detection watches, Fine In 1 as a rule): while the master
-scans in a relock by lockpoint, its level between the peaks is measured (the zero: any DC
-offset), and once locked, its level locked. The engine watches it against those two.
+scans in a relock (by lockpoint, or for the FALC pro before one without), its level between the
+peaks is measured (the zero: any DC offset), and once locked by lockpoint, its level locked. The
+engine watches it against those two.
 
 Every write goes through Runner, which refuses anything but WRITABLE (modehop.py) and puts it
 back if the recovery fails; a cavity lock that was turned off stays off then. The scope
@@ -192,7 +194,7 @@ class CavitySteps:
         boards = [k for k in range(1, 5) if _num(o.get(f"falc{k}:input:offset"))]
         sel = o.get("dl:lock:falc-selection")
         board = boards[0] if len(boards) == 1 else (sel if sel in boards else 0)
-        if p.falc and mode == "lockpoint" and boards:
+        if p.falc and boards:
             if board and isinstance(o.get("dl:lock:error-channel"), int):
                 self.falc_name = f"falc{board}:input:offset"
                 self.falc_orig = float(o[self.falc_name])
@@ -398,14 +400,16 @@ class CavitySteps:
 
     def relock_plain(self):
         """Re-enable the lock, set to lock without a lockpoint (else it locks only at a selected one):
-        it finds the resonance by itself, the laser being at its target."""
+        it finds the resonance by itself, the laser being at its target. With a FALC pro, the error
+        signal's DC level nulled first (scan_dc)."""
         free = self.orig.get("dl:lock:lock-without-lockpoint")
+        scanning = (yield from self.scan_dc()) if self.falc_name else False
         yield from self.ask("Relock: re-enable the cavity lock" + ("" if free else ", ticking lock without lockpoint"))
         self.stage = "relocking the cavity"
         if free is False:
             yield mh.Set("dl:lock:lock-without-lockpoint", True, restore=False)
             self.orig["dl:lock:lock-without-lockpoint"] = True
-        if self.scan_after_unlock:
+        if self.scan_after_unlock and not scanning:
             yield mh.Set(SCAN, True, restore=True)
         yield mh.Set(LOCK, True, restore=False)
         self.unlocked = False
@@ -414,6 +418,36 @@ class CavitySteps:
         self.relock_trouble = f"the cavity lock caught a peak {self.e:+.0f} MHz away"
         self.note(self.relock_trouble)
         return False
+
+    def scan_dc(self):
+        """What only the master's scan shows, before a relock without lockpoint: the error signal's DC level,
+        nulled with the FALC pro's input offset, and the transmission's zero. The scan runs about the laser,
+        which is at its target; then it is as the relock wants it (off, unless the DLC pro had it on when its
+        lock was turned off). True if it is left on."""
+        amp = self.orig.get("scan:amplitude")
+        if not (_num(amp) and amp > 0):
+            self.note("the scan amplitude is 0: the error signal's DC level cannot be seen, the FALC pro's input "
+                      "offset is left alone")
+            return False
+        yield from self.ask("Start the scan, to see the error signal's DC level and null it with the FALC pro's "
+                            "input offset")
+        self.stage = "scanning, for the error signal's DC level"
+        yield mh.Set(SCAN, True, restore=self.scan_after_unlock)
+        yield mh.Wait(self.settle("scan:frequency"))
+        zero = yield from self.sample_level(self.ZERO_WAITS)  # mostly between the peaks: its zero
+        top = max(self.peak_y, self.p.trans_locked)  # the peak's height, or the level locked, as known
+        if zero is not None and top > 0:
+            if zero < 0.5 * top:
+                self.zero = self.learned["trans_zero"] = round(zero, 5)
+                self.note(f"transmission off resonance, scanning: {volts(zero, top)} V (its zero)")
+            else:
+                self.note(f"the transmission while scanning, {volts(zero, top)} V, is no zero next to the "
+                          f"{volts(top)} V it has locked: not taken")
+        yield from self.null_falc()
+        if not self.scan_after_unlock:
+            yield mh.Set(SCAN, False)
+            yield mh.Wait(self.SETTLE_S)
+        return self.scan_after_unlock
 
     def relock_lockpoint(self):
         p = self.p
@@ -822,7 +856,8 @@ def setup_report(client, laser: int, hop, lp) -> list:
         else:
             add("info", f"relock by re-enabling the lock (lock-without-lockpoint {fmt(wo)}"
                         + ("" if wo else ": ticked first") + "): it must find the right resonance by itself; the "
-                        "wavemeter checks it did")
+                        "wavemeter checks it did (with a FALC pro, the scan is on for a moment first, to null the "
+                        "error signal's DC level)")
         add("info", "after a relock, the setpoint is moved to where the wavemeter puts the laser locked (the lockpoint "
                     "in the wavemeter's numbers)")
         pos = g["dl:lock:lockpoint:position"]
@@ -895,7 +930,11 @@ def setup_report(client, laser: int, hop, lp) -> list:
             use = next(iter(boards)) if len(boards) == 1 else (sel if sel in boards else 0)
             if use and isinstance(err, int):
                 add("ok", f"before relocking, the DC level of the error signal ({signal_name(err)}) is nulled with "
-                          f"falc{use}'s input offset, by at most ±{hop.falc_max:g} V from where it is")
+                          f"falc{use}'s input offset, by at most ±{hop.falc_max:g} V from where it is, as the scan "
+                          f"shows it" + (" (the scan on for a moment: it relocks without lockpoint)"
+                                         if mode == "plain" else ""))
+                if _num(amp) and amp <= 0:
+                    add("warn", "the scan amplitude is 0: no DC level to see, the input offset is left alone")
             else:
                 add("warn", f"cannot tell which FALC pro the lock uses (falc-selection {sel}): left alone")
 

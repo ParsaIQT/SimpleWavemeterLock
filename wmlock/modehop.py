@@ -1029,14 +1029,20 @@ class Recenter(CavitySteps):
         if self.shg_ok:
             ok, _ = yield from self.look("coming down")
             first = self.last_look[1]
-            while ok is False and (yield from self.trim(-1)):
-                ok, _ = yield from self.look("coming down")
-            if ok is not False:
+            for _ in range(3):  # (one look can pass two modes for one: settle_in's looks may say otherwise)
+                while ok is False and (yield from self.trim(-1)):
+                    ok, _ = yield from self.look("coming down")
+                if ok is False:
+                    break  # (the bottom of the window)
                 yield from self.settle_in(-1)
                 ok = self.last_look[0]
-            if self.mA(self.I) < self.mA(hi) - 1e-6:
-                text += (f", and on down to {self.mA(self.I):.2f} mA: " + (self.last_look[1] if ok is not False else
-                         f"still not single-mode ({self.last_look[1]})") + f" (it was {first})")
+                if ok is not False:
+                    break
+            below = self.mA(self.I) < self.mA(hi) - 1e-6
+            if below or ok is False:
+                text += ((f", and on down to {self.mA(self.I):.2f} mA" if below else "") + ": "
+                         + (self.last_look[1] if ok is not False else f"still not single-mode ({self.last_look[1]})")
+                         + f" (it was {first})")
         self.note(text)
 
     def finish(self):
@@ -1915,6 +1921,7 @@ class Runner:
         self._skip = self._invalid = 0
         self._heard = now         # when the last reading (valid or not) came
         self._gaps = deque(maxlen=15)  # s between readings
+        self._blind = False       # the wavemeter does not measure the laser for now (blind)
         self._dirty = False       # written since the last reading
         self._written_at = now    # when the last write landed
         self._token = 0
@@ -2182,6 +2189,8 @@ class Runner:
         elif self.state == "running" and self._waiting == "confirm":
             if now - self._since > self.CONFIRM_TIMEOUT:
                 self._fail("nobody said go on")
+        elif self.state == "running" and self._waiting == "read" and self._blind:
+            pass  # (no reading to be had for now: waited for until there is, see blind)
         elif self.state == "running" and self._waiting == "read" and self.rec.tells_lasing() and \
                 now - max(self._since, self._heard) > self._quiet():
             # nothing new from the wavemeter (a laser that does not lase gives it no signal, the same each time,
@@ -2200,6 +2209,14 @@ class Runner:
         """s without anything new from the wavemeter that means it has nothing to say: READ_GAP, or four of its
         usual intervals between readings of this laser."""
         return max(self.READ_GAP, 4 * _median(self._gaps) if self._gaps else 0.0)
+
+    def blind(self, on: bool):
+        """The wavemeter does not measure the laser for now (on: its channel was switched off, and is being
+        switched on again) or does again: a reading waited for meanwhile is waited for until it does, and its
+        silence until then means nothing (not that it stopped lasing)."""
+        if self._blind and not on:
+            self._since = self._heard = self.now
+        self._blind = on
 
     def confirm(self):
         """Step by step: the user says go on."""
@@ -2298,6 +2315,11 @@ class Guard:
             self.off_since = t
         self.off_count += 1
         return self.off_count >= 2 and t - self.off_since >= grace
+
+    def pause(self):
+        """No readings for a while (its channel switched off): the next is not taken for a long step in time.
+        Armed, it stays armed: a laser off target when they come back has hopped."""
+        self._t = None
 
     def allow(self, now: float, per_hour: int) -> bool:
         while self.recent and now - self.recent[0] > 3600.0:

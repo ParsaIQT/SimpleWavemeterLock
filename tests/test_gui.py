@@ -396,3 +396,41 @@ def test_row_says_when_its_cavity_lock_keeps_losing_it(app):
         win.close()
         spin(app, 0.1)
         demo.close()
+
+
+def test_row_of_a_channel_switched_off_stays_while_watched(app):
+    """Someone unticks the channel in the WLM software: the row of a laser that is watched stays, and says so; so
+    does one that Relock could watch; any other goes (the channel is not measured)."""
+    from wmlock.modehop import HopParams
+    from wmlock.sim import Demo, SimWavemeter
+
+    demo = Demo(discovery_port=0, wavemeter=SimWavemeter(noise=0.3, amplitude=0.0, walk=0.0), exposure=0.004)
+    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"])
+    win = gui.MainWindow(e, lambda: None)
+    e.start()
+    win.show()
+    try:
+        assert wait_for(lambda: (app.processEvents(), 7 in win.rows and e.channels[7].freq > 0)[1], 5)
+        e.link(7, demo.dlcs[2].key, 1)
+        e.setpoint_to_current(7)
+        e.set_hop_params(7, HopParams(enabled=True, cavity=True, shg=True))
+        ch, row = e.channels[7], win.rows[7]
+        row._clicked()  # Relock: watched
+        assert wait_for(lambda: (app.processEvents(), ch.guard.armed)[1], 5)
+        e.source.untick(7)
+        assert wait_for(lambda: (app.processEvents(), ch.off)[1], 2)
+        spin(app, 0.7)
+        assert 7 in win.rows and win.rows[7] is row and row.btn.text() == "Watching"
+        assert row.wl.text() == "off" and "wavemeter channel off: watched by what its DLC pro says" in \
+            row.info.text()
+        row._clicked()  # stop watching: still shown, for Relock
+        spin(app, 0.7)
+        assert win.rows.get(7) is row and row.btn.text() == "Relock" and "Relock has it watched" in row.info.text()
+        e.set_hop_params(7, HopParams(enabled=False, cavity=True, shg=True))  # nothing to watch it for: not shown
+        assert wait_for(lambda: (app.processEvents(), 7 not in win.rows)[1], 2)
+        e.source.tick(7)
+        assert wait_for(lambda: (app.processEvents(), 7 in win.rows)[1], 2)
+    finally:
+        win.close()
+        spin(app, 0.1)
+        demo.close()

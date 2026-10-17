@@ -511,7 +511,8 @@ class SimLocked:
     than SLIP of the power) cannot hold the lock for long: it loses it every HOLD_S or so, and
     ReLock searches for SEARCH_S before it catches it again (meanwhile the transmission is low,
     the wavemeter sees the laser near where it was). Disabling the lock while scan:enabled is on
-    lets the scan run, as a DLC pro does.
+    lets the scan run, as a DLC pro does. hop_search: s that ReLock searches after the lock lost the
+    laser (it hopped, say) before it catches the resonance nearest it (0: at once).
 
     SHG: the intra-cavity signal while its cavity is scanned has an Airy peak (plus small
     transverse modes) per FSR for each mode the master emits (ECDL.components); its lock locks to
@@ -530,7 +531,7 @@ class SimLocked:
                  lockpoints: bool = True, fsr: float = 1.5, lw: float = 6.0, tem=((0.37, 0.18), (0.71, 0.08)),
                  t00: float = 0.8, pdh: float = 0.4, pdh_dc: float = 0.0, falc: int = 1, range_v: float = 30.0,
                  falc_in_trace: bool = True, falc_sign: int = 1, seed=None, ta: bool | None = None,
-                 clock=time.monotonic, t_dc: float = 0.0):
+                 clock=time.monotonic, t_dc: float = 0.0, hop_search: float = 0.0):
         """falc_in_trace: the error signal on the scope includes the FALC's input offset, which adds
         to it (falc_sign 1) or subtracts (-1). ta: a TA between master and SHG cavity (by default
         with an SHG stage); clock: its time, for its protection."""
@@ -539,6 +540,7 @@ class SimLocked:
         self.f_res, self.fsr, self.lw, self.tem, self.t00, self.t_dc = f_res, fsr, lw, tuple(tem), t00, t_dc
         self.pdh, self.pdh_dc, self.sideband = pdh, pdh_dc, 20.0
         self.has_shg, self.falc, self.range_v = shg, falc, range_v
+        self.hop_search = hop_search
         self.falc_in_trace, self.falc_sign = falc_in_trace, falc_sign
         self.rng = random.Random(seed)
         self.mutex = threading.RLock()
@@ -747,6 +749,8 @@ class SimLocked:
                 if self.peak is not None and not self._hold():
                     self.peak, self.dv = None, 0.0
                     self.relocks += 1
+                    if self.hop_search > 0:
+                        self._search_until = self.clock() + self.hop_search
                 if self.peak is None and not self._searching() and (not self.lockpoints or self.lockpoint is not None):
                     self._engage()  # ReLock: whatever resonance is nearest the laser now
                 if self.peak is not None:
@@ -946,6 +950,15 @@ class SimLocked:
                 if not self._hold():
                     self.peak, self.dv = None, 0.0
 
+    def knock(self, seconds: float = 1.5):
+        """The lock loses the laser for a moment (a knock, say): ReLock searches `seconds`, then catches the
+        resonance nearest the laser, the one it had."""
+        with self.mutex:
+            if self.peak is not None:
+                self.peak, self.dv = None, 0.0
+                self.relocks += 1
+                self._search_until = self.clock() + seconds
+
     def settle(self, lockpoint: bool = True):
         """Start locked on the resonance at the laser, as if locked by hand (lockpoint selected)."""
         with self.mutex:
@@ -1074,14 +1087,22 @@ class SimLaser:
 
 
 class SimSource(Source):
-    """Cycles through the lasers like a fibre switch, one exposure per channel."""
+    """Cycles through the lasers like a fibre switch, one exposure per channel, skipping those whose 'Use' is
+    unticked (use: switch() ticks and unticks it as this program would, untick() and tick() as someone at the
+    WLM software would). A channel ticked again shows its old value until it is measured anew, as the WLM's
+    does."""
 
     label = "simulation"
+    switchable = True
 
     def __init__(self, sink, lasers, exposure=0.02, wavemeter=None):
         super().__init__(sink, exposure)
         self.lasers = lasers
         self.wavemeter = wavemeter or SimWavemeter()
+        self.use = {laser.ch: True for laser in lasers}
+        self.switched = []   # (ch, on): what switch() did, in order
+        self._shown = {}     # ch -> the value it shows (kept while it is not measured)
+        self._again = set()  # ticked again: shows its old value once more, then is measured
 
     def cavity_laser(self):
         return next((laser for laser in self.lasers if laser.cavity), None)
@@ -1089,16 +1110,48 @@ class SimSource(Source):
     def laser(self, ch: int):
         return next((laser for laser in self.lasers if laser.ch == ch), None)
 
+    def untick(self, ch: int):
+        """Someone unticks the channel's 'Use' in the WLM software (for a faster rate on theirs, say)."""
+        self.use[ch] = False
+
+    def tick(self, ch: int):
+        self._use(ch, True, record=False)
+
+    def _use(self, ch: int, on: bool, record: bool = True) -> str:
+        if ch not in self.use:
+            return "channel not available"
+        if on and not self.use[ch]:
+            self._again.add(ch)
+        self.use[ch] = on
+        if record:
+            self.switched.append((ch, on))
+        return ""
+
+    def _channels(self):
+        used = [laser for laser in self.lasers if self.use.get(laser.ch, True)]
+        self._set_active([laser.ch for laser in used], [laser.ch for laser in self.lasers if laser not in used])
+        return used
+
     def run(self):
-        self._set_active([laser.ch for laser in self.lasers])
+        self._channels()
         self._set_state(True)
         i = 0
         while not self._stop_ev.wait(self.interval):
-            laser = self.lasers[i % len(self.lasers)]
+            self._do_switches(self._use)
+            used = self._channels()
+            if not used:
+                continue
+            laser = used[i % len(used)]
             i += 1
             now = time.monotonic()
+            if laser.ch in self._again:
+                self._again.discard(laser.ch)
+                if laser.ch in self._shown:  # its old value, once more
+                    self._push({laser.ch: self._shown[laser.ch]}, now)
+                    continue
             f = laser.true_freq(now)
-            self._push({laser.ch: -1.0 if f is None else self.wavemeter.read(f, now)}, now)  # -1: no signal
+            value = self._shown[laser.ch] = -1.0 if f is None else self.wavemeter.read(f, now)  # -1: no signal
+            self._push({laser.ch: value}, now)
 
 
 class Demo:
@@ -1106,8 +1159,9 @@ class Demo:
     whose DLC pro locks its master to a reference cavity (lockpoint selected by hand, PDH through
     a FALC pro) and its SHG cavity to the master, and feeds its piezo forward to its current (the
     measured current is 0.42 mA below the set one); its master stops lasing 1.3 mA below its
-    current, and its TA switches itself off after 5 s without seed. Plus a channel without light,
-    and a 729 nm laser locked to a cavity: the reference."""
+    current, its TA switches itself off after 5 s without seed, and its lock searches a moment after
+    a hop before it catches a peak again. Plus a channel without light, and a 729 nm laser locked to
+    a cavity: the reference."""
 
     CHANNELS = [  # ch, vacuum wavelength (nm), tuning (GHz/V), controller, laser, name
         (1, 396.959120, +0.35, 0, 1, "397"),
@@ -1142,7 +1196,7 @@ class Demo:
         e = shg.ecdl  # a master whose modes go multimode well before they hop, quietly for the wavemeter,
         e.multimode, e.hysteresis, e.mm_noise = 0.9, 0.4, 0.004  # and that stops lasing 1.3 mA below its
         e.i_stop, e.i_start = e.i0 - 1.3, e.i0 + 2.4  # current, starting again only 2.4 mA above it
-        shg.lock_it(shg=True, lockpoints=True, pdh_dc=0.009)
+        shg.lock_it(shg=True, lockpoints=True, pdh_dc=0.009, hop_search=SimLocked.SEARCH_S)
         self.dlcs[2].params["laser1:amp:seed-limits:power-min-shutdown-delay"] = 5.0
         shg.lock.settle()
         self.wavemeter = wavemeter or SimWavemeter()

@@ -263,7 +263,8 @@ def test_cavity_lock_that_keeps_catching_the_wrong_peak_is_left_off():
     lock._nearest = lambda f: (lock.f_res + 1.5e-3, 1.0)  # this lock always goes for the next peak up
     b, rec, r = recover(b.laser, b.target, cavity=True, bench=b)
     assert r.state == "failed"
-    assert r.error == "relocking failed 3 times, last: the cavity lock caught a peak +1500 MHz away"
+    m = re.fullmatch(r"relocking failed 3 times, last: the cavity lock caught a peak \+(\d+) MHz away", r.error)
+    assert m and abs(int(m.group(1)) - 1500) <= 3, r.error  # (the wavemeter's noise aside)
     assert b.dlc.params["laser1:dl:lock:lock-enabled"] is False and not r.restored  # left where it was found best
 
 
@@ -823,6 +824,26 @@ def test_falc_offset_moves_no_further_than_allowed():
     b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
     assert r.state == "done", r.error
     assert min(b.writes("falc1:input:offset")) == pytest.approx(-0.05) and lock.locked()
+
+
+@pytest.mark.parametrize("scan", [True, False], ids=["scanning-before", "not-scanning-before"])
+def test_falc_offset_nulled_in_a_relock_without_lockpoint_too(scan):
+    """Locking without a lockpoint, it relocks by re-enabling the lock, but has the scan on for a moment first, as
+    you would: the error signal's DC level is nulled, and the transmission's zero measured."""
+    laser = ECDL(400.0, seed=11, multimode=0.9, hysteresis=0.4, mm_noise=0.004)
+    b, lock = locked_bench(laser, seed=11, shg=True, lockpoints=False, pdh_dc=0.009, t_dc=0.05, scan=scan)
+    lock.jump(1)
+    p = HopParams.from_dict({**SHG.to_dict(), "trans_locked": 0.85})  # (learned while it ran)
+    b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "done", r.error
+    assert rec.relock_mode == "plain" and lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12)
+    assert abs(lock.dc()) < 0.002 and b.writes("falc1:input:offset")[-1] == pytest.approx(-0.009, abs=0.001)
+    assert r.result.learned["trans_zero"] == pytest.approx(0.05, abs=0.01) and "FALC input offset" in r.result.summary
+    order = [n.replace("laser1:", "") for n, _ in b.dlc.log if "cc:current" not in n and "scan:offset" not in n]
+    tail = order[order.index("nlo:shg:lock:lock-enabled", 2) + 1:]  # after the SHG cavity is locked
+    assert tail == ["scan:enabled"] + ["falc1:input:offset"] * tail.count("falc1:input:offset") + (
+        [] if scan else ["scan:enabled"]) + ["dl:lock:lock-enabled"]
+    assert b.dlc.params["laser1:scan:enabled"] is scan  # as it was
 
 
 STEPS = {

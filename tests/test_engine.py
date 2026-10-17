@@ -690,3 +690,150 @@ def test_a_laser_that_stops_lasing_unseen_by_its_seed_is_brought_back(quiet_demo
         assert "lasing again" in ch.note and max(currents_written(dlc, 1)) >= 150.0 + 2.0, ch.note
     finally:
         e.stop()
+
+
+# ------------------------------------------- a wavemeter channel switched off
+def test_a_channel_switched_off_keeps_its_relock_watching_and_its_lock_held(quiet_demo):
+    """Someone unticks channels in the WLM software (for a faster rate on theirs): a laser its DLC pro locks stays
+    watched (by what its DLC pro says), one locked to the wavemeter is held, both still shown; nothing is touched
+    while all is well. Ticked again, the wavemeter lock goes on."""
+    import time
+
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    try:
+        e.link(1, demo.dlcs[0].key, 1)
+        e.setpoint_to_current(1)
+        e.engage(1)
+        e.engage(demo.SHG)
+        c1, src = e.channels[1], e.source
+        assert wait_for(lambda: c1.state == "on" and ch.guard.armed and ch.cavity_on and ch.shg_txt == "locked", 5)
+        src.untick(1)
+        src.untick(demo.SHG)
+        assert wait_for(lambda: ch.off and c1.off, 2)
+        assert ch.state == c1.state == "on" and not ch.message and not c1.message  # watched, and held
+        assert math.isnan(ch.freq) and ch.status == "channel off" and e.rows() == [1, 2, 3, 4, 5, 6, 7]
+        time.sleep(2)
+        assert src.switched == [] and ch.state == "on" and not ch.look_why  # all is well: left alone
+        src.tick(1)
+        assert wait_for(lambda: not c1.off and c1.freq > 0, 2) and c1.state == "on"
+        assert wait_for(lambda: abs(c1.error_mhz) < 5, 5) and c1.lock.active  # locked again
+        e.disengage(demo.SHG)
+        src.untick(2)
+        assert wait_for(lambda: e.channels[2].off, 2)
+        assert e.rows() == [1, 3, 4, 5, 6, 7]  # switched off: shown if locked, watched, or Relock could watch it
+    finally:
+        e.stop()
+
+
+def test_a_relock_with_its_channel_off_looks_when_its_dlc_pro_says_so_and_relocks(quiet_demo):
+    """Its channel switched off, the master hops: its DLC pro's lock searches, then catches a peak 6 GHz off and
+    says locked. That it searched was seen: its channel is switched on for a look, the laser relocked onto its
+    target, and the channel switched off again; switched off by someone meanwhile, it is switched on again."""
+    import time
+
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    shg.lock.hop_search = 1.5  # (the DLC pro's ReLock takes that long to catch a resonance again)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, step=0.2))
+    src = e.source
+    try:
+        e.engage(demo.SHG)
+        assert wait_for(lambda: ch.guard.armed and ch.cavity_on and ch.shg_txt == "locked", 5)
+        target = ch.f_set
+        src.untick(demo.SHG)
+        assert wait_for(lambda: ch.off, 2)
+        shg.hop_mode(-1)
+        assert wait_for(lambda: ch.state == "recovering", 15), ch.looked
+        assert re.fullmatch(r"its (cavity|SHG cavity's) lock said “relocking”, then jumped -[56]\.\d{3} GHz",
+                            ch.hop_why), ch.hop_why
+        assert src.switched == [(demo.SHG, True)] and src.use[demo.SHG]
+        assert wait_for(lambda: ch.runner is not None and ch.runner.stage.startswith(("walking", "the piezo")), 30)
+        src.untick(demo.SHG)  # someone unticks it again, mid-recovery
+        assert wait_for(lambda: src.use[demo.SHG] and len(src.switched) == 2, 3)  # on again at once
+        assert wait_for(lambda: ch.state != "recovering", 90)
+        assert ch.state == "on" and not ch.message and "relocked, walked the piezo" in ch.note, ch.message
+        time.sleep(0.3)
+        assert src.switched == [(demo.SHG, True), (demo.SHG, True), (demo.SHG, False)] and not src.use[demo.SHG]
+        assert ch.off and shg.lock.locked() and abs(shg.true_freq(time.monotonic()) - target) * 1e6 < 5
+    finally:
+        e.stop()
+
+
+def test_a_look_gives_its_dlc_pro_the_time_to_relock_by_itself(quiet_demo):
+    """Its channel off, its lock is knocked out: its DLC pro says relocking, a look. While its ReLock searches
+    (the laser anywhere) its readings do not count; it catches the same peak: locked on target, left alone."""
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    src = e.source
+    try:
+        e.engage(demo.SHG)
+        assert wait_for(lambda: ch.guard.armed and ch.cavity_on and ch.shg_txt == "locked", 5)
+        src.untick(demo.SHG)
+        assert wait_for(lambda: ch.off, 2)
+        shg.lock.knock(2.5)
+        assert wait_for(lambda: ch.look_why == "its cavity lock said “relocking”", 3), ch.looked
+        assert wait_for(lambda: not ch.look_why, 15)
+        assert ch.looked.startswith("its cavity lock said “relocking”: locked on target"), ch.looked
+        assert ch.state == "on" and not ch.note and wait_for(lambda: ch.off, 2)  # no recovery
+        assert src.switched == [(demo.SHG, True), (demo.SHG, False)]
+    finally:
+        e.stop()
+
+
+def test_relock_clicked_with_its_channel_off_has_a_look(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    src = e.source
+    try:
+        assert wait_for(lambda: ch.cavity_on and ch.shg_txt == "locked", 5)
+        src.untick(demo.SHG)
+        assert wait_for(lambda: ch.off, 2)
+        e.engage(demo.SHG)  # Relock: is it locked on target? A look, its channel switched on for it
+        assert ch.state == "on" and ch.look_why == "Relock clicked" and ch.borrowed
+        assert wait_for(lambda: not ch.look_why, 10)
+        assert ch.looked.startswith("Relock clicked: locked on target") and ch.state == "on", ch.looked
+        assert wait_for(lambda: ch.off, 2) and src.switched == [(demo.SHG, True), (demo.SHG, False)]
+    finally:
+        e.stop()
+
+
+def test_a_laser_that_stops_lasing_with_its_channel_off_is_jumped_at_once(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    src = e.source
+    try:
+        e.engage(demo.SHG)
+        assert wait_for(lambda: ch.guard.armed and ch.hop.seed_ok, 5)
+        src.untick(demo.SHG)
+        assert wait_for(lambda: ch.off, 2)
+        shg.stop_lasing(0.0)
+        assert wait_for(lambda: ch.state == "recovering", 5) and ch.hop_why.startswith("stopped lasing")
+        assert wait_for(lambda: ch.runner is not None, 2)  # at once: the current jump does not wait for readings
+        assert wait_for(lambda: ch.state != "recovering", 120)
+        assert ch.state == "on" and shg.ecdl.lasing and shg.lock.locked() and "lasing again" in ch.note, ch.message
+        assert wait_for(lambda: ch.off, 2) and src.switched == [(demo.SHG, True), (demo.SHG, False)]
+    finally:
+        e.stop()
+
+
+def test_no_relock_when_its_channel_cannot_be_switched_on(quiet_demo):
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    src = e.source
+    src._use = lambda n, on, record=True: "SetSwitcherSignalStates: WLM busy" if on else ""
+    try:
+        assert wait_for(lambda: ch.cavity_on, 5)
+        src.untick(demo.SHG)
+        dlc.params["laser1:dl:lock:lock-enabled"] = False  # its cavity lock off: Relock relocks it
+        assert wait_for(lambda: ch.off and ch.cavity_on is False, 2)
+        e.engage(demo.SHG)
+        assert ch.state == "recovering"
+        assert wait_for(lambda: ch.state == "off", 5)
+        assert ch.message == ("cavity lock off: no recovery, cannot switch channel 7 on on the wavemeter: "
+                              "SetSwitcherSignalStates: WLM busy")
+        assert dlc.written("laser1:dl:cc:current-set") == [] and not ch.borrowed  # nothing touched
+    finally:
+        e.stop()
