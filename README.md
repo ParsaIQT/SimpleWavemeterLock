@@ -239,7 +239,11 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   its lock points first, `find-candidates`: it shows none otherwise), or *re-enable the lock* and
   let it find its resonance (*lock without lockpoint* is ticked first: without it, it locks only at
   a selected lockpoint). The default follows the DLC pro's `lock-without-lockpoint` setting. Either
-  way, with a FALC pro the error signal's DC level is nulled first (below). After a relock, the
+  way, with a FALC pro the error signal's DC level is nulled first (below), and a relock counts only
+  if the lock reports *Locked* within 20 s, the wavemeter agrees, and its transmission is up at
+  least half way from its zero to its level locked (re-enabling it, the wavemeter alone would take
+  a laser parked on its target, its lock on hold, for one relocked: in your log, a relock that the
+  next ten seconds found at 46 % of its transmission). After a relock, the
   setpoint is moved to where the wavemeter puts the laser locked: the lockpoint is the target, in
   the wavemeter's numbers.
 * **The right peak is within ± 150 MHz** of where the wavemeter puts the setpoint.
@@ -387,6 +391,14 @@ seldom (about one request a second). Sampling every 0.25 ms and reading as fast 
 it made TOPAS say *acquisition busy* now and then; if it still does, sample less often (2 ms
 still sees a dropout of 4 ms), or untick *Log its lock dropouts* for that laser. TOPAS's own
 recorder view and this monitor cannot both use the recorder at once.
+
+The DLC pro's data acquisition is shared: while the recorder records, it refuses a scope trace,
+or its lock going on, now and then as busy (`-1032 data acquisition busy`; in your log, once it
+failed a recovery outright as it took the laser over, and once it cut a FALC nulling short). So
+**nothing is recorded while the lock should not hold**: off, not reporting *Locked* (on hold,
+relocking), being recovered, or within 5 s of either; the recorder is stopped then, the moment a
+recovery begins, and records again once the lock holds. And a recovery tries an operation the
+controller refuses as busy again, every 0.25 s for 3 s, before it gives up on it.
 
 Not tried on a real DLC pro yet: the recorder's parameters and `recorder:data:get-data` (its
 samples as TOPTICA's 'Scope, Lock, and Recorder Binary Data' blocks, channel 1 in block 'y') are
@@ -574,14 +586,17 @@ the DC is what is left. So:
 * each look is the **median of three traces**; a level within 2 mV (or three times the scatter
   of the three) is left alone.
 * **how much the offset moves the error signal** (the FALC's input stage may show it several
-  times over, or subtract it) is learned: until it is, the offset moves a tenth of the way (as
+  times over, or subtract it: on yours, from the log, about −10 times, so 0.01 V of offset is
+  0.1 V on the trace) is learned: until it is, the offset moves a tenth of the way (as
   if one to one), then more, until the trace shows clearly how much; then the rest of the way,
   and again from there until within half its tolerance; known, straight there. Before, it went
   the whole way as if one to one: with an offset that shows 8 times over, a 20 mV DC first went
   to −140 mV. Now the trace goes no further from zero than where it began (30 % further if the
   offset subtracts, the first time).
 * the **best offset seen is kept**; if that is no better than where it began, the offset is put
-  back.
+  back. If the scope stops giving traces part way (refused as busy, say), it goes back to the best
+  offset seen (before, it left the offset where the last step had put it, and said it had not
+  moved it: in your log, +50 mV, some half a volt on the trace).
 * a **relock that failed with the offset moved**: the next try puts it back where it was when
   the recovery began, with which it was locked before, as you would by hand (and the one after
   nulls again).
@@ -680,7 +695,9 @@ Safety:
   or an earlier relock's), as you would by hand, the wavemeter judging; only without one there is
   the laser left at its target, unlocked and scanning, for you to pick the peak. If the lock
   caught a wrong peak three times, the laser is left on its new, good operating point with
-  the lock off.
+  the lock off. A setting the controller refused (as busy, say: it is tried again for 3 s first)
+  is not "put back": it never changed. (Before, a refused *lock off* as the recovery took the
+  laser over was put back as *off*, which turned off a lock that had been on.)
 * At most 4 recoveries an hour; beyond that it stops and says so (a laser that stopped lasing
   is recovered all the same). It also does nothing until the laser has been on target again.
 * If the controller stops answering, it stops and says what the current was left at.
@@ -774,6 +791,10 @@ Things to know:
   * Re-enabling a lock that should find its resonance by itself needs `lock-without-lockpoint`;
     it is ticked first, put back if relocking fails, and left ticked once it locked.
   * "Locked" is the lock state 5, or a state text starting with "locked", within 20 s.
+  * While the recorder records, the DLC pro refuses a scope trace, its lock going on and finding
+    lock points as busy now and then (`-1032 data acquisition busy`, seen in the lab). The
+    simulated one does too, as often as asked (`SimRecorder.conflicts`): with it refusing every
+    time, a recovery failed as in your log until the recorder was stopped for recoveries.
   * The FALC pro's input offset moves the error signal straight up and down, by some factor
     (its input stage): the first recovery learns which way and how much, and later ones null
     the DC in one step. If the trace ever did not follow the offset (the scope showing some

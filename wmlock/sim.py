@@ -83,6 +83,7 @@ class FakeDLCPro:
         self.log = []  # every accepted write: (parameter, value); every command: (name, args)
         self.on_set = {}
         self.commands = {}
+        self.busy_checks = []  # (kind 'get' | 'set' | 'exec', name) -> True: refused now as busy (decop -1032)
         self.mutex = threading.RLock()  # held while a command line is executed
         self._conns = []
         self._closed = False
@@ -173,9 +174,14 @@ class FakeDLCPro:
         with self.mutex:
             return self._execute(cmd)
 
+    def _busy(self, kind: str, name: str) -> bool:
+        return any(check(kind, name) for check in self.busy_checks)
+
     def _execute(self, cmd: str) -> str:
         m = self._REF.match(cmd)
         if m:
+            if self._busy("get", m.group(1)):
+                return "Error: -1032 data acquisition busy"
             v = self.params.get(m.group(1))
             if v is None:
                 return f"Error: -14 unknown parameter '{m.group(1)}'"
@@ -186,6 +192,8 @@ class FakeDLCPro:
         m = self._SET.match(cmd)
         if m:
             name, value = m.groups()
+            if self._busy("set", name):
+                return "Error: -1032 data acquisition busy"
             old = self.params.get(name)
             if callable(old):
                 return f"Error: -14 cannot set '{name}'"
@@ -216,6 +224,8 @@ class FakeDLCPro:
         m = self._EXEC.match(cmd)
         if m:
             name, args = m.group(1), [_parse_arg(a) for a in m.group(2).split()]
+            if self._busy("exec", name):
+                return "Error: -1032 data acquisition busy"
             fn = self.commands.get(name)
             if fn is None:
                 return f"Error: -1 unknown command '{name}'"
@@ -617,7 +627,7 @@ class SimLocked:
                 p + "nlo:shg:scope:timescale": 50.0, p + "nlo:shg:scope:data": self._shg_blob,
                 p + "nlo:pd:shg-int:photodiode": self._intra_now, p + "nlo:pd:shg:power": self._shg_power,
             })
-        self.recorder = SimRecorder(dlc, n, self.trans_at, clock=clock) if recorder else None
+        self.recorder = SimRecorder(dlc, n, self.trans_at, clock=clock, seed=seed) if recorder else None
         self.ta = None
         if shg if ta is None else ta:
             self.ta = SimTA(dlc, n, ecdl, clock=clock, seed=seed)
@@ -1040,11 +1050,13 @@ class SimRecorder:
     sample-count-set s once it is enabled, until it has sample-count-set samples (then it disables itself;
     the data stays until the next recording). Samples are made when they are read (get-data, binary blocks
     'x' the time in s and 'y' channel 1): level_at(times), what the input showed then, as far as the
-    simulation knows it."""
+    simulation knows it. While it records, the DLC pro refuses the scope's data, its lock going on and finding
+    lock points as busy, now and then (conflicts): its data acquisition is shared."""
 
     LIMIT = 1 << 20
+    ACQUIRES = (("get", "scope:data"), ("set", "dl:lock:lock-enabled"), ("exec", "dl:lock:find-candidates"))
 
-    def __init__(self, dlc: "FakeDLCPro", n: int, level_at, clock=time.monotonic):
+    def __init__(self, dlc: "FakeDLCPro", n: int, level_at, clock=time.monotonic, seed=None):
         self.dlc, self.level_at, self.clock = dlc, level_at, clock
         self.p = p = f"laser{n}:recorder:"
         self.t0 = None     # when the recording going on began
@@ -1052,6 +1064,13 @@ class SimRecorder:
         self.done = 0      # samples of a recording that has stopped
         self.reads = 0     # get-data calls
         self.busy = False  # get-data refused while it records (as a real one might)
+        self.conflicts = 0.0  # while it records, the scope's data, its laser's lock going on and finding lock points
+        #                       are refused as busy this often (the DLC pro's data acquisition is shared; the lab's
+        #                       refused now and then: decop -1032 "data acquisition busy")
+        self.refused = 0   # ...how many times
+        self._acquires = {(kind, f"laser{n}:{name}") for kind, name in self.ACQUIRES}
+        self._rng = random.Random(seed)
+        dlc.busy_checks.append(self._conflict)
         d = dlc.params
         d.update({
             p + "enabled": False, p + "state": lambda: self._state()[0],
@@ -1094,6 +1113,17 @@ class SimRecorder:
         if self.t0 is not None:
             return 1, "recording"
         return (2, "finished") if self.done else (0, "idle")
+
+    def recording(self) -> bool:
+        return self.t0 is not None and self.count() < self.dlc.params[self.p + "sample-count-set"]
+
+    def _conflict(self, kind: str, name: str) -> bool:
+        """Refuse that now, as busy? (conflicts)"""
+        if not self.conflicts or (kind, name) not in self._acquires or not self.recording():
+            return False
+        hit = self._rng.random() < self.conflicts
+        self.refused += hit
+        return hit
 
     def _get_data(self, start, count):
         from .dlcpro import encode_blocks, float_block

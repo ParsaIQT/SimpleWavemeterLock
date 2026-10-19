@@ -10,8 +10,8 @@ import re
 import pytest
 
 from wmlock.dlcpro import DecopError, DLCPro, lock_points
-from wmlock.modehop import (COMMANDS, FALC_OFFSET, STEP_MAX, WRITABLE, Failed, Guard, HopParams, Move, Point,
-                            Read, Recenter, Runner, Set, _steps, analyse, perform)
+from wmlock.modehop import (BUSY_TRIES, COMMANDS, FALC_OFFSET, STEP_MAX, WRITABLE, Failed, Guard, HopParams, Move,
+                            Point, Read, Recenter, Runner, Set, _steps, analyse, perform)
 from wmlock.sim import ECDL, FakeDLCPro, SimLocked
 
 I0, V0 = 150.0, 70.0
@@ -688,7 +688,7 @@ def lab_bench(seed=21, drift=0.0, **kwargs):
     laser = ECDL(400.0, seed=seed, multimode=0.9, hysteresis=0.4, mm_noise=0.004)
     b = Bench(laser, laser.freq(V0, I0), seed=seed, scan=True, drift=drift)
     b.dlc.params["laser1:scan:amplitude"] = SimLocked.LAB_SCAN
-    lock = b.lock_it(seed=seed, shg=True, lockpoints=True, **{**SimLocked.LAB, **kwargs})
+    lock = b.lock_it(seed=seed, shg=True, **{"lockpoints": True, **SimLocked.LAB, **kwargs})
     lock.settle()
     assert lock.locked() and abs(b.off_mhz()) < 1
     b.shg_usual = lock._intra_now()
@@ -880,15 +880,16 @@ def test_falc_offset_nulled_in_a_relock_without_lockpoint_too(scan):
     assert b.dlc.params["laser1:scan:enabled"] is scan  # as it was
 
 
-@pytest.mark.parametrize("gain", [1.0, 8.0, -3.0])
-def test_the_lab_error_signal_sits_at_zero_neatly_afterwards(gain):
+@pytest.mark.parametrize("gain, sign", [(1.0, 0), (8.0, 0), (-3.0, 0), (-9.6, -1)])
+def test_the_lab_error_signal_sits_at_zero_neatly_afterwards(gain, sign):
     """The error signal as on the lab's screen, 20 mV of DC on it, and a FALC input offset that shows in it `gain`
-    times over (not known yet): afterwards it sits at zero, and on the way it never goes much further from it than
-    where it began (a little of the way first, as if one to one, tells how much). Knowing that, the next time it
-    goes straight there."""
+    times over (not known yet; the lab's: -9.6, its sign learned): afterwards it sits at zero, and on the way it never
+    goes much further from it than where it began (a little of the way first, as if one to one, tells how much).
+    Knowing that, the next time it goes straight there."""
     b, lock = lab_bench(pdh_dc=0.02, falc_gain=gain)
     lock.jump(1)
-    b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+    b, rec, r = recover(b.laser, b.target, HopParams.from_dict({**SHG.to_dict(), "falc_sign": sign}), cavity=True,
+                        bench=b)
     assert r.state == "done" and lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12), r.error
     assert abs(lock.shown_dc()) < 0.0012
     assert max(abs(0.02 + gain * o) for o in b.writes("falc1:input:offset")) < 0.027
@@ -900,6 +901,60 @@ def test_the_lab_error_signal_sits_at_zero_neatly_afterwards(gain):
                         bench=b)
     assert r.state == "done" and abs(lock.shown_dc()) < 0.0012, r.error
     assert len(b.writes("falc1:input:offset")) - n <= 2
+
+
+def test_a_trace_lost_while_nulling_puts_the_offset_back(monkeypatch):
+    """As in the lab's log: relocking without a lockpoint, the FALC offset was moved, then the DLC pro refused the
+    scope's data as busy, and the offset was left moved (+50 mV: half a volt on the trace, the offset showing ten
+    times over, inverted), the notes saying it had not been. Now it is put back where it was."""
+    monkeypatch.setattr("wmlock.modehop.BUSY_WAIT", 0.0)
+    b, lock = lab_bench(seed=29, pdh_dc=0.02, falc_gain=-9.6, lockpoints=False)
+    lock.jump(1)
+    b.dlc.busy_checks.append(lambda kind, name: kind == "get" and name == "laser1:scope:data"
+                             and len(b.writes("falc1:input:offset")) >= 1)
+    b, rec, r = recover(b.laser, b.target, HopParams.from_dict({**SHG.to_dict(), "falc_sign": -1}), cavity=True,
+                        bench=b)
+    assert r.state == "done" and lock.locked(), r.error
+    assert b.dlc.params["falc1:input:offset"] == 0.0 and abs(lock.shown_dc() - 0.02) < 1e-9
+    assert any("no error-signal trace after moving the FALC input offset" in n for n in rec.notes)
+    assert r.result.learned.get("falc_sign", -1) == -1  # (not taken for an offset the trace does not follow)
+
+
+def test_a_write_the_controller_refuses_as_busy_is_tried_again_and_never_put_back(monkeypatch):
+    """As in the lab's log: the DLC pro refused to turn the cavity lock off as the recovery took the laser over
+    ("-1032 data acquisition busy"), and putting things back then turned it off, which it never was. Refused a few
+    times, it is tried again; refused every time, the recovery fails and the lock is left on, as it was."""
+    monkeypatch.setattr("wmlock.modehop.BUSY_WAIT", 0.0)
+    b, lock = shg_bench(seed=28)
+    lock.jump(1)
+    refused = []
+
+    def twice(kind, name):
+        if kind == "set" and name == "laser1:dl:lock:lock-enabled" and len(refused) < 2:
+            refused.append(name)
+            return True
+        return False
+
+    b.dlc.busy_checks.append(twice)
+    b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+    assert r.state == "done" and lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12), r.error
+    assert len(refused) == 2
+
+    b, lock = shg_bench(seed=28)
+    lock.jump(1)
+    refused.clear()
+
+    def every_try(kind, name):  # (and it would take the next)
+        if kind == "set" and name == "laser1:dl:lock:lock-enabled" and len(refused) < BUSY_TRIES:
+            refused.append(name)
+            return True
+        return False
+
+    b.dlc.busy_checks.append(every_try)
+    b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+    assert r.state == "failed" and "-1032 data acquisition busy" in r.error and len(refused) == BUSY_TRIES
+    assert b.writes("dl:lock:lock-enabled") == [] and b.dlc.params["laser1:dl:lock:lock-enabled"] is True
+    assert lock.locked()  # (on its wrong peak still: nothing was turned off)
 
 
 def test_a_learned_falc_gain_that_no_longer_holds_is_found_out_afresh():
@@ -1147,13 +1202,38 @@ def test_plain_relock_ticks_lock_without_lockpoint():
     assert lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12) and abs(r.result.lock_e) < 3
 
 
+def test_a_plain_relock_must_see_its_lock_locked_and_its_transmission_up():
+    """Relocking without a lockpoint, the wavemeter alone would take a laser parked on target, its lock on hold, for
+    one relocked (in the lab's log, a relock that the next ten seconds found at 46 % of its transmission). So its
+    lock must report locked, and its transmission come up as usual; here the first time it stays on hold: tried
+    again, and relocked."""
+    laser = ECDL(400.0, seed=30, multimode=0.9, hysteresis=0.4, mm_noise=0.004)
+    b, lock = locked_bench(laser, seed=30, shg=True, lockpoints=False, pdh_dc=0.009)
+    lock.jump(1)
+    real, held = lock._lock_enabled, []
+
+    def on_hold_once(on):
+        real(on)
+        if on and not held:
+            held.append(True)
+            lock.peak = None  # on hold: not locked (and parked at the target, the wavemeter cannot tell)
+            lock._search_until = math.inf
+
+    b.dlc.on_set["laser1:dl:lock:lock-enabled"] = on_hold_once
+    p = HopParams.from_dict({**SHG.to_dict(), "trans_locked": 0.8})
+    b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "done" and lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12), r.error
+    assert any(n.startswith("the cavity lock would not lock") for n in rec.notes) and held
+    assert any(n.startswith("relocked, transmission 0.8") for n in rec.notes)
+
+
 def test_plain_relock_that_fails_unticks_it_again():
     b, lock = shg_bench(seed=29)
     lock.jump(1)
     lock._nearest = lambda f: (lock.f_res + 1.5e-3, 1.0)  # this lock always goes for the next peak up
     p = HopParams.from_dict({**SHG.to_dict(), "relock": "plain"})
     b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
-    assert r.state == "failed" and "caught a peak +1500 MHz away" in r.error
+    assert r.state == "failed" and re.search(r"caught a peak \+150\d MHz away", r.error), r.error
     assert b.writes("dl:lock:lock-without-lockpoint") == [True, False] and lock.lockpoints  # as it was
 
 

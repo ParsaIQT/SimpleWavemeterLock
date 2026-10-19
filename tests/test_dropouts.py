@@ -107,11 +107,36 @@ def test_a_recorder_not_read_while_it_records_is_read_when_full(demo):
     assert [round(d.duration * 1e3, 1) for d in got] == [pytest.approx(3.0, abs=0.3), pytest.approx(2.0, abs=0.3)]
 
 
-def test_while_the_lock_should_not_hold_nothing_counts(demo):
-    m, got, _ = run_monitor(demo, lambda: (False, 0.45, 0), [0.003, 0.05])
-    assert m.method == "recorder" and got == []
+def test_while_the_lock_should_not_hold_nothing_is_recorded(demo):
+    """Its lock off, being recovered or not reporting locked: nothing is recorded, the recorder stays stopped (the
+    DLC pro's data acquisition left to the recovery and to the displays); it records once the lock should hold, and
+    stops at once when nudged that it should not (a recovery begins), and records again after."""
+    shg = demo.laser(demo.SHG)
+    rec, hold, got = shg.lock.recorder, [False], []
+    m = Monitor("127.0.0.1", demo.dlcs[2].port, 1, status=lambda: (hold[0], 0.45, 0), report=got.append,
+                summary=lambda text: None, name="channel 7")
+    m.start()
+    try:
+        time.sleep(1.0)
+        shg.lock.blip(0.003)
+        time.sleep(1.0)
+        assert not rec.recording() and m.method == "" and got == []
+        hold[0] = True
+        assert wait_for(lambda: m.method == "recorder" and rec.recording(), 5)
+        hold[0] = False
+        m.nudge()
+        assert wait_for(lambda: not rec.recording(), 0.5)
+        shg.lock.blip(0.003)
+        time.sleep(0.5)
+        hold[0] = True
+        assert wait_for(rec.recording, 2)
+        time.sleep(2.5)
+        assert got == []  # (that one, while it should not hold, was not seen)
+    finally:
+        m.stop()
+        m.join(10)
     m, got, _ = run_monitor(demo, lambda: (True, None, 0), [0.003, 0.05])  # its level locked not known yet
-    assert got == []
+    assert m.method == "recorder" and got == []
 
 
 def test_without_a_recorder_it_polls_and_says_why(demo, caplog):
@@ -148,8 +173,8 @@ def test_lock_dropouts_are_logged_in_the_console_and_a_file(quiet_demo, tmp_path
             shg.lock.blip(0.004)
             time.sleep(1.2)
             shg.lock.blip(0.0015)
-            assert wait_for(lambda: ch.drops_total == 2, 5)
-            lines = [json.loads(x) for x in path.read_text().splitlines()]
+            assert wait_for(lambda: ch.drops_total == 2 and len(path.read_text().splitlines()) == 2, 5)  # (written
+            lines = [json.loads(x) for x in path.read_text().splitlines()]  # just after it is counted)
             assert [x["duration_ms"] for x in lines] == [pytest.approx(4.0, abs=0.3), pytest.approx(1.5, abs=0.3)]
             assert lines[0]["channel"] == demo.SHG and lines[0]["method"] == "recorder" and lines[0]["low_v"] < 0.1
             assert lines[0]["limit_v"] == pytest.approx(0.5 * ch.hop.trans_locked, rel=0.1)
@@ -164,10 +189,9 @@ def test_lock_dropouts_are_logged_in_the_console_and_a_file(quiet_demo, tmp_path
                 time.sleep(0.15)
             time.sleep(1.2)
             shg.lock.blip(0.002)
-            assert wait_for(lambda: ch.drops_total == 7, 5)
+            assert wait_for(lambda: ch.drops_total == 7 and len(path.read_text().splitlines()) == 7, 5)
             said = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
             assert len(said) == 4 and "(3 more since the last one said here)" in said[-1], said
-            assert len(path.read_text().splitlines()) == 7
 
             dlc.execute("(param-set! 'laser1:dl:lock:lock-enabled #f)")  # turned off by hand: not a dropout
             assert wait_for(lambda: ch.cavity_on is False, 3)
@@ -176,6 +200,33 @@ def test_lock_dropouts_are_logged_in_the_console_and_a_file(quiet_demo, tmp_path
         finally:
             e.stop()
     assert dlc.params["laser1:recorder:inputs:channel1:low-pass-filter:enabled"] is True  # put back
+
+
+def test_the_recorder_stops_for_a_recovery_which_needs_the_data_acquisition(quiet_demo):  # noqa: F811
+    """While its recorder records, a DLC pro refuses a scope trace, its lock going on, finding lock points, as busy
+    (the lab's did now and then: "-1032 data acquisition busy", which once failed a recovery). Here every time:
+    the recorder stops the moment a recovery begins, and what is refused before it has are tried again. It relocks,
+    and once its lock holds again, the recorder records again."""
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    rec = shg.lock.recorder
+    rec.conflicts = 1.0
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    e.DROP_SETTLE_S = 1.0
+    try:
+        assert wait_for(lambda: demo.SHG in e.monitors and e.monitors[demo.SHG].method == "recorder"
+                        and rec.recording(), 15)
+        with shg.lock.mutex:
+            shg.lock.peak += 60e-6  # held 60 MHz off: the wrong peak
+        assert wait_for(lambda: abs(ch.error_mhz - 60) < 5, 3)
+        e.engage(demo.SHG)  # Relock
+        assert ch.state == "recovering"
+        assert wait_for(lambda: not rec.recording(), 1.0)
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked(), 60), ch.message
+        assert shg.lock.peak == pytest.approx(shg.lock.f_res, abs=1e-12) and "busy" not in (ch.message or "")
+        assert wait_for(rec.recording, 10)  # watching its dropouts again
+    finally:
+        e.stop()
 
 
 def test_no_monitor_unless_wanted(quiet_demo):  # noqa: F811

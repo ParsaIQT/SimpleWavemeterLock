@@ -15,7 +15,12 @@ own, watches the cavity transmission (the input its lock detection watches, as a
             reads may be missed.
 A DLC pro has to do all this besides its own work and its other clients' (TOPAS's displays, say): so it is
 asked little, and seldom (TOPAS said "acquisition busy" now and then while the recorder was read back to
-back, every quarter of a millisecond).
+back, every quarter of a millisecond). And its data acquisition is shared: while the recorder records, the
+DLC pro now and then refuses a scope trace, or its lock going on, as busy (decop -1032 "data acquisition
+busy"), which a recovery needs. So nothing is recorded while the lock should not hold (off, being
+recovered, just relocked, not reporting locked): the recorder is stopped then, at once when the engine
+starts a recovery (nudge), and the recovery's operations are tried again when refused as busy
+(modehop.perform).
 
 A dropout is the transmission below its limit for two samples at least, MIN_S at the least (Detector),
 while the lock should hold (status(): its cavity lock on, no recovery running, and settled). Each is
@@ -118,6 +123,7 @@ class Monitor(threading.Thread):
         self.laser, self.label = laser, name or f"laser{laser}"
         self.status, self.report, self.summary = status, report, summary
         self._stop_ev = threading.Event()
+        self._wake = threading.Event()  # set by nudge() (and stop()): look at status() now
         self.method = ""        # 'recorder' or 'polling', once it watches
         self.why_not = ""       # why not with the recorder
         self.resolution = 0.0   # s between samples
@@ -130,6 +136,35 @@ class Monitor(threading.Thread):
 
     def stop(self):
         self._stop_ev.set()
+        self._wake.set()
+
+    def nudge(self):
+        """Look at status() now, not at the next read: a recovery is beginning, say (the recorder stops for it)."""
+        self._wake.set()
+
+    def _sleep(self, seconds: float) -> bool:
+        """Wait that long, or until nudged or stopped; True if stopping."""
+        self._wake.wait(seconds)
+        self._wake.clear()
+        return self._stop_ev.is_set()
+
+    def _idle(self) -> bool:
+        """While its lock should not hold (off, being recovered, just relocked, not reporting locked): nothing
+        recorded, the recorder stopped, its data acquisition left to the recovery and to your displays. True once it
+        should hold again, False if stopping."""
+        stopped = False
+        while not self._stop_ev.is_set():
+            self._tick()
+            if self.status()[0]:
+                return True
+            if not stopped:
+                stopped = True
+                try:
+                    self.client.set(self._p("enabled"), False)
+                except DecopError:
+                    pass
+            self._sleep(0.5)
+        return False
 
     # --------------------------------------------------------------- running
     def run(self):
@@ -243,16 +278,19 @@ class Monitor(threading.Thread):
         self.when_full = False  # read a recording only once it is full (it would not be read while it records)
         detector = Detector(self.MIN_S)
         first, empty = True, 0
-        while not self._stop_ev.is_set():
+        while self._idle():
             got = self._one(n, sig, detector, first)
-            first = False
             detector.gap(self.resolution)
+            if got is None:  # stopped short: the lock should not hold now
+                continue
+            first = False
             empty = empty + 1 if got == 0 else 0
             if empty >= 3:
                 raise NoRecorder("its recordings stopped coming")
 
-    def _one(self, n: int, sig: int, detector: Detector, first: bool) -> int:
-        """One recording, read as it comes in, every READ_S (and once full): the number of samples read."""
+    def _one(self, n: int, sig: int, detector: Detector, first: bool):
+        """One recording, read as it comes in, every READ_S (and once full): the number of samples read; None if it
+        was stopped short, the lock no longer to hold (the recorder stopped at once)."""
         c, p = self.client, self._p
         c.set(p("enabled"), False)
         t_wall, t0 = time.time(), time.monotonic()
@@ -271,8 +309,11 @@ class Monitor(threading.Thread):
         read, t_full, wait = 0, None, 0.0
         last, grew = count, time.monotonic()  # its count of samples, and when it last grew
         while read < size and not self._stop_ev.is_set():
-            if wait > 0 and self._stop_ev.wait(wait):
+            if wait > 0 and self._sleep(wait):
                 break
+            if not self.status()[0]:  # (a recovery begins, say: its data acquisition is wanted)
+                c.set(p("enabled"), False)
+                return None
             count = min(self._count(), size)
             now = time.monotonic()  # (the samples it had then)
             if count >= size and t_full is None:
@@ -403,6 +444,12 @@ class Monitor(threading.Thread):
         times = deque(maxlen=64)  # (sample number, time.time()) of the last reads
         i = 0
         while not self._stop_ev.is_set():
+            if not self.status()[0]:  # nothing to watch: not asked
+                detector.gap(period)
+                self._tick()
+                last = None
+                self._sleep(0.5)
+                continue
             t, mono = time.time(), time.monotonic()
             v = self.client.get_float(name)
             i += 1

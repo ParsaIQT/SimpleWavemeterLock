@@ -122,6 +122,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import time
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 
@@ -325,23 +326,46 @@ def full_name(laser: int, name: str) -> str:
     return name if name.startswith(ABSOLUTE) else f"laser{laser}:{name}"
 
 
+BUSY_TRIES = 12   # an operation the controller refuses as busy is tried again, up to this many times in all...
+BUSY_WAIT = 0.25  # ...this long apart (s): its data acquisition (the recorder's, a display's) is busy for a moment
+
+
+def busy(exc) -> bool:
+    """The controller refused because it was busy for a moment (decop -1032 "data acquisition busy": its data
+    acquisition was taken, by the recorder or by a display, say): worth another try."""
+    text = str(exc).lower()
+    return "-1032" in text or "busy" in text
+
+
+def _again(call):
+    """call(), again while the controller says it is busy (busy()), BUSY_WAIT apart, up to BUSY_TRIES times."""
+    for k in range(BUSY_TRIES):
+        try:
+            return call()
+        except DecopError as e:
+            if k == BUSY_TRIES - 1 or not busy(e):
+                raise
+        time.sleep(BUSY_WAIT)
+
+
 def perform(client, laser: int, op):
-    """Carry out one of Runner's operations with a DLCPro client; returns its result."""
+    """Carry out one of Runner's operations with a DLCPro client; returns its result. Refused as busy, it is
+    tried again (BUSY_TRIES)."""
     kind = op[0]
     if kind == "set":
-        client.set(full_name(laser, op[1]), op[2])
+        _again(lambda: client.set(full_name(laser, op[1]), op[2]))
         return None
     if kind == "get":
         out = []
         for name in op[1]:
             try:
-                out.append(client.get_value(full_name(laser, name)))
+                out.append(_again(lambda name=name: client.get_value(full_name(laser, name))))
             except DecopError:
                 out.append(None)
         return out
     if kind == "exec":
         try:
-            return client.exec(full_name(laser, op[1]), *op[2])
+            return _again(lambda: client.exec(full_name(laser, op[1]), *op[2]))
         except DecopError as e:
             return e
     raise ValueError(f"unknown operation {op!r}")
@@ -2446,6 +2470,7 @@ class Runner:
         self.v_written = rec.V
         self.prompt = ""          # step by step: what it is waiting to do
         self.journal = {}         # name -> what to put back on failure, in the order first written
+        self._unsure = None       # the setting whose first write is on its way: refused, nothing to put back
         self.trouble = []         # what could not be put back
         self._ops = deque()
         self._then = None         # after the ops: 'read', 'advance', 'answer' or 'restored'
@@ -2502,6 +2527,7 @@ class Runner:
         elif isinstance(req, Set):
             if req.restore is not None and req.name not in self.journal:
                 self.journal[req.name] = req.restore
+                self._unsure = req.name
             self._ops.append(("set", req.name, req.value))
             self._then = "advance"
             self._next()
@@ -2631,6 +2657,7 @@ class Runner:
         why = self._refusal(op)
         if why:
             self._ops.clear()
+            self._not_written(op)
             if self.state == "running":
                 self._fail(why)
             else:
@@ -2647,10 +2674,19 @@ class Runner:
             wire = op
         self.io.do(wire, lambda result=None: self._acked(tok, op, result), lambda exc: self._write_failed(tok, op, exc))
 
+    def _not_written(self, op):
+        """op was refused (by the controller, or here): if it was the first write of its setting, there is nothing
+        to put back (putting it back would write what was refused: a cavity lock turned off that never was)."""
+        if op[0] == "set" and op[1] == self._unsure:
+            self.journal.pop(op[1], None)
+            self._unsure = None
+
     def _acked(self, tok: int, op, result):
         if tok != self._token or not self.busy:
             return
         kind = op[0]
+        if kind == "set" and op[1] == self._unsure:
+            self._unsure = None
         if kind == "current":
             self.i_written = op[1]
         elif kind == "offset":
@@ -2684,9 +2720,11 @@ class Runner:
             self._end("failed", f"controller: {exc}" if self.state == "running" else self.error)
         elif self.state == "stopping":
             self._ops.clear()
+            self._not_written(op)
             self._restore()
-        else:  # the controller refused something: put things back
+        else:  # the controller refused something: put things back (not that, which it did not take)
             self._ops.clear()
+            self._not_written(op)
             self._fail(f"controller: {exc}")
 
     def _expect_reading(self):

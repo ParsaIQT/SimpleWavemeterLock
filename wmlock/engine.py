@@ -1212,11 +1212,13 @@ class Engine:
 
     def _drop_status(self, ch: Channel, key) -> tuple:
         """For its dropout monitor: (should its lock hold, the limit its transmission counts below (None: not
-        known yet), its transmission's signal id)."""
+        known yet), its transmission's signal id). Not while it is off, not reporting locked, or being recovered:
+        the monitor stops its recorder then (the DLC pro refuses a recovery's scope traces and its lock going on
+        as busy now and then while it records)."""
         with self.lock:
             if (ch.device, ch.laser) != key:
                 return False, None, None
-            if not ch.cavity_on or ch.state == "recovering":
+            if not ch.cavity_on or not says_locked(ch.cavity_txt) or ch.state == "recovering":
                 ch.hold_since = None
                 return False, None, ch.trans_sig
             now = time.monotonic()
@@ -1501,6 +1503,9 @@ class Engine:
         c = self._controller(ch.device)
         c.cancel(ch.param)
         ch.state, ch.message = "recovering", ""
+        m = self.monitors.get(ch.n)
+        if m is not None:
+            m.nudge()  # (its recorder stops at once: the recovery needs the DLC pro's data acquisition)
         ch.token += 1
         ch.hop_why, ch.hop_t = why, now
         for d in (ch.trans_hist, ch.shg_hist, ch.trans_fine, ch.shg_fine):  # (what it relocked to is learned afresh)

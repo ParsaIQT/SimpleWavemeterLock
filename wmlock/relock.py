@@ -439,7 +439,9 @@ class CavitySteps:
     def relock_plain(self):
         """Re-enable the lock, set to lock without a lockpoint (else it locks only at a selected one):
         it finds the resonance by itself, the laser being at its target. With a FALC pro, the error
-        signal's DC level nulled first (scan_dc)."""
+        signal's DC level nulled first (scan_dc). Relocked: its lock reports locked, the wavemeter agrees, and its
+        transmission is up as usual (lock_min of the way from its zero to its level locked, if that is known; the
+        wavemeter alone would take a laser parked on target, its lock on hold, for one relocked)."""
         free = self.orig.get("dl:lock:lock-without-lockpoint")
         scanning = (yield from self.scan_dc()) if self.falc_name else False
         yield from self.ask("Relock: re-enable the cavity lock" + ("" if free else ", ticking lock without lockpoint"))
@@ -451,11 +453,27 @@ class CavitySteps:
             yield mh.Set(SCAN, True, restore=True)
         yield mh.Set(LOCK, True, restore=False)
         self.unlocked = False
-        if (yield from self.verify()):
-            return True
-        self.relock_trouble = f"the cavity lock caught a peak {self.e:+.0f} MHz away"
-        self.note(self.relock_trouble)
-        return False
+        if not (yield from self.wait_locked()):
+            state = yield mh.Get(("dl:lock:state-txt",))
+            self.relock_trouble = f"the cavity lock would not lock (“{state[0] or '?'}” after {self.LOCK_S:g} s)"
+            self.note(self.relock_trouble)
+            return False
+        if not (yield from self.verify()):
+            self.relock_trouble = f"the cavity lock caught a peak {self.e:+.0f} MHz away"
+            self.note(self.relock_trouble)
+            return False
+        usual = self.p.trans_locked
+        level = (yield from self.sample_level(self.LEVEL_WAITS)) if usual > 0 else None
+        z = self.zero if self.zero is not None else usable_zero(self.p.trans_zero, usual)
+        if level is not None and usual > z and level - z < self.p.lock_min * (usual - z):
+            self.relock_trouble = (f"locked, but the transmission is {volts(level, usual)} V, "
+                                   f"{(level - z) / (usual - z):.2f} of the way from its zero ({volts(z, usual)} V) to "
+                                   f"its level locked ({volts(usual)} V)")
+            self.note(self.relock_trouble)
+            return False
+        if level is not None:
+            self.note(f"relocked, transmission {volts(level, usual)} V")
+        return True
 
     def scan_dc(self):
         """What only the master's scan shows, before a relock without lockpoint: the error signal's DC level,
@@ -782,7 +800,7 @@ class CavitySteps:
             return
         aim = max(0.5 * tol, 2 * noise)  # once at it, as close as that
         lo, hi = o0 - p.falc_max, o0 + p.falc_max
-        seen, dc, gain = [(start, dc0)], dc0, p.falc_gain
+        seen, dc, gain, lost = [(start, dc0)], dc0, p.falc_gain, False
         probe, base = (None, None) if gain else (0, (start, dc0))  # finding out how much, from base (offset, level)
         for _ in range(2 * len(self.FALC_PROBE) + self.FALC_STEPS):
             if probe is None and abs(dc) <= max(aim, 2 * noise):
@@ -806,7 +824,8 @@ class CavitySteps:
             yield mh.Set(name, new, restore=o0)
             cur = self.falc_now = new
             got = yield from self.dc_now()
-            if got is None:
+            if got is None:  # (the scope refused, busy, say): back to the best offset seen, below
+                lost = True
                 break
             dc, spread, _ = got
             noise = max(noise, spread)
@@ -820,7 +839,10 @@ class CavitySteps:
                 gain, probe, base = 0.0, 0, (cur, dc)
         if not gain:
             moved = cur - (base[0] if base else start)
-            if 0.3 * abs(moved) >= 3 * noise:
+            if lost:
+                self.note(f"no error-signal trace after moving the FALC input offset to {cur:+.4f} V: put back to "
+                          f"{start:+.4f} V")
+            elif 0.3 * abs(moved) >= 3 * noise:
                 err = self.orig.get("dl:lock:error-channel")
                 self.note(f"the error signal on the scope ({signal_name(err)}) does not follow the FALC pro's input "
                           f"offset, so it is not the FALC's input: offset put back, left alone")
@@ -843,6 +865,9 @@ class CavitySteps:
         else:
             self.falc_text = (f"FALC input offset {start:+.4f} → {best_o:+.4f} V, error signal DC "
                               f"{dc0 * 1e3:+.1f} → {best_dc * 1e3:+.1f} mV")
+        if lost:
+            self.note(f"no error-signal trace after moving the FALC input offset to {cur:+.4f} V: back to "
+                      f"{best_o:+.4f} V")
         self.note(f"{self.falc_text} ({steps})")
         if abs(best_o - cur) > 1e-9:
             yield from self.ask(f"Back to the best FALC input offset seen, {best_o:+.4f} V")
@@ -1118,10 +1143,14 @@ def setup_report(client, laser: int, hop, lp) -> list:
             add("ok", f"watched with the DLC pro's recorder (now “{r['recorder:state-txt'] or '?'}”), the transmission "
                       f"every {hop.drop_ms:g} ms, read every 2 s: while this program runs the recorder is its own, "
                       f"and its settings are put back when it closes")
+            add("info", "the recorder is stopped while the lock should not hold (off, not reporting locked, being "
+                        "recovered): while it records, the DLC pro refuses scope traces and its lock going on as busy "
+                        "now and then, which a recovery needs")
         if hop.dropouts:
             add("info", f"a dropout: the transmission below the slipping limit (above) for two samples or more "
-                        f"({2 * hop.drop_ms:g} ms), while its lock is on and no recovery runs; each one goes to the "
-                        f"console and to ~/.simplewavemeterlock-dropouts.jsonl, and how many, once an hour")
+                        f"({2 * hop.drop_ms:g} ms), while its lock is on, reporting locked, and no recovery runs; each "
+                        f"one goes to the console and to ~/.simplewavemeterlock-dropouts.jsonl, and how many, once an "
+                        f"hour")
 
         add("head", "Scope (laser scope)")
         s = get("scope:channel1:signal", "scope:channel2:signal", "scope:channelx:xy-signal", "scope:variant")
