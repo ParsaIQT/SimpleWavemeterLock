@@ -1639,7 +1639,7 @@ class Engine:
             where = f"left at {rec.mA(r.i_written):.2f} mA, {r.v_written:.2f} {ch.unit}"
         if "dl:lock:lock-enabled" in r.journal:
             where += ", cavity lock left off"
-        for name in ("lp_code", "lp_kind", "peak_y", "falc_sign", "trans_zero"):  # worth keeping, even so
+        for name in ("lp_code", "lp_kind", "peak_y", "falc_sign", "falc_gain", "trans_zero"):  # worth keeping, even so
             if name in rec.learned:
                 setattr(ch.hop, name, rec.learned[name])
                 self.dirty = True

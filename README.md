@@ -267,7 +267,8 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   every relock, by lockpoint or not, as you would by hand: the scan runs (relocking without a
   lockpoint, it is turned on for a moment for this), the error signal's level away from the
   resonances is read off the scope, and the input offset steps against it. *Check setup…* says
-  which FALC pro and input it uses, or why it leaves it alone.
+  which FALC pro and input it uses, or why it leaves it alone. How it reads the level, and how it
+  steps: see *The error signal's DC level* below.
 * **Log its lock dropouts**: see *Lock dropouts* below.
 * **Step by step**: before each step, the recovery waits for you (see *Before the first run*).
 
@@ -549,9 +550,52 @@ recovery does what you would do by hand:
 | Ramp the PC towards the target, every few steps adjusting the current up towards the top end of where the mode quality is still at its maximum, until centered | the piezo in 0.5 V steps, the SHG peak after each; every 4 steps the current up 0.1 mA at a time while the peak stays at its best, then two back |
 | Make sure the master is single-mode-ish before moving the scan offset, then move it slowly towards the target, watching the SHG sweep; trim the current when the mode loses quality | *the walk*: the SHG sweep after every trim and every 0.5 V of piezo, and at the operating point (the map: every map point, both ends of the margin check, and the operating point) |
 | Lock the SHG cavity | SHG scan off, `nlo:shg:lock:lock-enabled` on; the intra-cavity signal (`nlo:pd:shg-int:photodiode`) must come up, to within 10 % of the optimum's (the catch), or at least 80 % of its usual locked (learned while the laser runs, else what it was when the recovery began): if not, the master is not single-mode, and it is caught (the current trimmed) again, once; then it is handed back all the same, and says so |
-| Start the master's scan, bring the right cavity peak into it, show the lock points, pick it in the XY display (scan output against Fine In 1) | the scan runs; the transmission is looked at ten times, unevenly spaced: mostly between the peaks, their median is its zero; the DLC pro is asked to find its lock points (`dl:lock:find-candidates`) before each look at them; from those candidates (`dl:lock:candidates`), the tall peak where the wavemeter puts the target (scan offset − deviation / piezo tuning), within ± 150 MHz, and the only one there; it must stand at least half as tall as the right peak did last time (from the lockpoint you selected), so a transverse mode is never taken for it |
-| Correct the FALC's input offset (~0.01 V) so the error signal has no DC | the error signal's level away from the resonances, from the scope; the input offset steps against it, checking on the trace after each step that it does what it should (relocking without a lockpoint, the same, the scan on for a moment for it) |
-| Lock | `dl:lock:select-lockpoint` on that candidate, then `lock-enabled`; the lock must report locked, the wavemeter must agree it is the right peak, and the transmission (the median of a few looks) must reach half the peak's height above zero; it is its level locked from then on |
+| Start the master's scan, bring the right cavity peak into it, show the lock points, pick it in the XY display (scan output against Fine In 1) | the scan runs; the transmission is looked at ten times, unevenly spaced: mostly between the peaks, their median is its zero; the DLC pro is asked to find its lock points (`dl:lock:find-candidates`) before each look at them; from those candidates (`dl:lock:candidates`), the tall peak where the wavemeter puts the target (scan offset − deviation / piezo tuning), within ± 150 MHz, and the only one there. A peak a sample or so wide (yours, in a 0.3 V scan) looks anywhere from about half its height to all of it in one scan, so each peak's tallest look over up to four scans counts, and the right one must stand at least 0.35 of the right peak's usual height (from the lockpoint you selected, then learned), so a transverse mode is never taken for it |
+| Correct the FALC's input offset (~0.01 V) so the error signal has no DC | the error signal's level away from the resonances, from three traces off the scope; the input offset steps against it, checking on the traces after each step that it does what it should (relocking without a lockpoint, the same, the scan on for a moment for it); see *The error signal's DC level* |
+| Lock | `dl:lock:select-lockpoint` on that peak's candidate in the scan running then (however tall it looks there), then `lock-enabled`; the lock must report locked (within 20 s), the wavemeter must agree it is the right peak, and the transmission (the median of a few looks) must reach half the peak's height above zero; it is its level locked from then on |
+
+### The error signal's DC level
+
+The error signal as it looks on your screen (scan of 0.31 V, Fine In 1 and the lock input):
+a carrier and its sidebands 20 MHz out, each feature a sample or so wide, and between the
+carrier and each sideband the tails of the dispersion, flat-ish steps some 0.04 V up on one
+side and down on the other; two weaker lines 52 MHz either side with small features of their
+own. The steps are no DC level: they are odd about the carrier, as are all the features, and
+the DC is what is left. So:
+
+* its **level** is the mean of the samples within 15 % of the biggest excursion from the
+  level (the features' lobes left out, sampled anywhere on them; the steps and tails kept, to
+  cancel), three times over from the median, over a window symmetric about the carrier when
+  the scope's x is the scan (XY against the scan output or the piezo). Before, it was the mean
+  of the middle half of the samples with ten peak widths either side of every transmission peak
+  left out: on your trace that left out the flat baseline and kept the tails beyond the
+  sidebands, and read anything from −6 to +7 mV on a trace whose DC was 0 (the simulator, the
+  carrier within ±1 MHz of the middle of the scan; up to ±12 mV off the middle). Now ±0.5 mV.
+* each look is the **median of three traces**; a level within 2 mV (or three times the scatter
+  of the three) is left alone.
+* **how much the offset moves the error signal** (the FALC's input stage may show it several
+  times over, or subtract it) is learned: until it is, the offset moves a tenth of the way (as
+  if one to one), then more, until the trace shows clearly how much; then the rest of the way,
+  and again from there until within half its tolerance; known, straight there. Before, it went
+  the whole way as if one to one: with an offset that shows 8 times over, a 20 mV DC first went
+  to −140 mV. Now the trace goes no further from zero than where it began (30 % further if the
+  offset subtracts, the first time).
+* the **best offset seen is kept**; if that is no better than where it began, the offset is put
+  back.
+* a **relock that failed with the offset moved**: the next try puts it back where it was when
+  the recovery began, with which it was locked before, as you would by hand (and the one after
+  nulls again).
+
+In the simulator with the error signal as on your screen (*SimLocked.LAB*), 108 relocks (0, 3
+or 20 mV of DC; an offset that shows 1, 8 or −3 times over): with 20 mV every relock ends within
+1.3 mV of zero, the trace never further from zero on the way than where it began (26 mV, the
+first time, with −3); already at zero, it is not touched. Before: left at up to 20 mV (a noisy
+step read as *does not follow*), on the way up to 157 mV off (8 times over), and a trace already
+at zero moved by up to 2 mV (32 mV on the way). And on a relock's second and third tries, the
+old nulling stepped from where the offset had been when the recovery began, not where the last
+try had left it: it pushed the trace about (20 → −5 → +22 mV in one run) and could decide the
+trace did not follow the offset at all, until the recovery gave up and put the offset back,
+after which your own Lock press worked.
 
 How a sweep is judged: a single-mode master gives one tall peak per free spectral range of
 the SHG cavity, plus small transverse-mode bumps (always the same); a second mode adds its
@@ -631,8 +675,10 @@ Safety:
   putting the current back can leave the laser on another mode than it was: so before giving
   up a map brings the current back the way that gives the mode it began on, if the first map
   saw which way that is. If it
-  cannot tell which cavity peak is right, or the DLC pro will not take the lockpoint, the
-  laser is left at its target, unlocked and scanning, for you to pick the peak. If the lock
+  cannot tell which cavity peak is right, or the DLC pro will not take the lockpoint, it locks
+  with the lockpoint the DLC pro has selected, if that is within ± 150 MHz of the target (yours,
+  or an earlier relock's), as you would by hand, the wavemeter judging; only without one there is
+  the laser left at its target, unlocked and scanning, for you to pick the peak. If the lock
   caught a wrong peak three times, the laser is left on its new, good operating point with
   the lock off.
 * At most 4 recoveries an hour; beyond that it stops and says so (a laser that stopped lasing
@@ -727,11 +773,18 @@ Things to know:
     command without arguments, so it is taken to find them once, in the scan running then).
   * Re-enabling a lock that should find its resonance by itself needs `lock-without-lockpoint`;
     it is ticked first, put back if relocking fails, and left ticked once it locked.
-  * "Locked" is the lock state 5, or a state text starting with "locked".
-  * The FALC pro's input offset moves the error signal straight up and down, so the first
-    recovery learns which way it moves, and later ones null the DC in one step. If the trace
-    ever did not follow the offset (the scope showing some other signal than the FALC's input),
-    the offset is put back and left alone, and the row says so.
+  * "Locked" is the lock state 5, or a state text starting with "locked", within 20 s.
+  * The FALC pro's input offset moves the error signal straight up and down, by some factor
+    (its input stage): the first recovery learns which way and how much, and later ones null
+    the DC in one step. If the trace ever did not follow the offset (the scope showing some
+    other signal than the FALC's input), the offset is put back and left alone, and the row
+    says so.
+  * The reference cavity's lines are a sample or so wide in your scan (0.3 MHz in 0.31 V of
+    1000 samples, both ways): their tops and lobes fall anywhere between samples. Peaks are told
+    from several scans, the lockpoint is selected on the peak chosen whatever height it shows
+    then, and the DC level does not depend on where the samples fall on the lobes. With lines
+    0.1 MHz wide, peaks that looked 0.34 of their height made the relock give up, unlocked and
+    scanning (2 in 20 relocks); now none.
   * The wavemeter and the reference cavity get the 739 nm fundamental, picked off directly, so
     the readings do not depend on the SHG cavity's lock, which stays off while the modes are
     mapped.

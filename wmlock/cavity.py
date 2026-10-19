@@ -274,15 +274,20 @@ class PeakChoice:
     tall: list = field(default_factory=list)  # [(x, y, off MHz)] of every tall peak seen
 
 
+SAMPLED = 0.35  # a narrow peak sampled about a sample wide shows anything from about half its height (less, for
+#                 narrower) to all of it: a scan's tallest at least this fraction of the usual height is a TEM00
+
+
 def choose_peak(cands, x_pred: float, kv: float, window: float, y_ref: float = 0.0, kind: str = "",
                 gap: float = 0.0) -> PeakChoice:
     """The lockpoint candidate on the right peak.
 
-    cands: [(x, y, type)] from the DLC pro. x_pred: scan output (V) where the target frequency is,
-    from the wavemeter; kv: MHz/V. The right peak is a tall one (at least half as tall as the
-    usual TEM00 peak, y_ref, or as the tallest in the scan) within +-window MHz of x_pred, and the
-    only one there. Candidates of `kind` are preferred (the type of the lockpoint chosen by hand);
-    candidates closer than `gap` V belong to one peak, whose highest is taken."""
+    cands: [(x, y, type)] from the DLC pro (from one scan, or several: each peak's tallest counts). x_pred:
+    scan output (V) where the target frequency is, from the wavemeter; kv: MHz/V. The right peak is a tall one
+    (at least half as tall as the tallest in the scan, and SAMPLED of the usual TEM00 peak, y_ref, if known) within
+    +-window MHz of x_pred, and the only one there. Candidates of `kind` are preferred
+    (the type of the lockpoint chosen by hand); candidates closer than `gap` V belong to one peak, whose
+    highest is taken."""
     if kind and any(t == kind for _, _, t in cands):
         cands = [c for c in cands if c[2] == kind]
     if not cands:
@@ -296,10 +301,10 @@ def choose_peak(cands, x_pred: float, kv: float, window: float, y_ref: float = 0
             groups.append([c])
     tops = [max(g, key=lambda c: c[1]) for g in groups]
     highest = max(y for _, y, _ in tops)
-    if y_ref > 0 and highest < 0.5 * y_ref:
+    if y_ref > 0 and highest < SAMPLED * y_ref:
         return PeakChoice(False, text=f"no TEM00 peak in the scan: the tallest is {highest / y_ref:.2f} "
                                       f"of the usual height")
-    tall = [(x, y, t, (x - x_pred) * kv) for x, y, t in tops if y >= 0.5 * max(y_ref, highest)]
+    tall = [(x, y, t, (x - x_pred) * kv) for x, y, t in tops if y >= max(0.5 * highest, SAMPLED * y_ref)]
     seen = [(x, y, off) for x, y, _, off in tall]
     near = sorted((c for c in tall if abs(c[3]) <= window), key=lambda c: abs(c[3]))
     if not near:
@@ -313,26 +318,50 @@ def choose_peak(cands, x_pred: float, kv: float, window: float, y_ref: float = 0
     return PeakChoice(True, x, y, t, off, f"peak at {x:.3f} V, {off:+.0f} MHz from the target", seen)
 
 
-def dc_level(err, trans=None) -> float:
-    """The error signal's level away from the resonances. With the transmission (same samples),
-    the samples near its peaks are left out; of the rest, the mean of the middle half (the
-    dispersive tails either side of a resonance cancel, the resonances themselves drop out)."""
-    keep = list(err)
-    if trans is not None and len(trans) == len(err) and err:
-        for widen in (10, 3, 1):
-            near = set()
-            for p in find_peaks(trans):
-                w = p.hi - p.lo + 1
-                near.update(range(p.lo - widen * w, p.hi + widen * w + 1))
-            rest = [e for k, e in enumerate(err) if k not in near]
-            if len(rest) >= len(err) // 5:
-                keep = rest
-                break
-    if not keep:
+def same_peak(cands, x: float, kind: str, gap: float):
+    """The candidate on the peak at x (V) in another scan: the nearest within gap/2, of `kind` if any is; None if
+    there is none."""
+    near = [c for c in cands if abs(c[0] - x) <= 0.5 * gap]
+    if kind and any(t == kind for _, _, t in near):
+        near = [c for c in near if c[2] == kind]
+    return min(near, key=lambda c: abs(c[0] - x)) if near else None
+
+
+def dc_level(err, trans=None, x=None) -> float:
+    """The error signal's DC level: its level away from the resonances, which the FALC pro's input offset nulls.
+
+    A PDH error signal's features (the dispersion at each line and at its sidebands, and any absorption there)
+    are odd about their centers, and so are the tails between and beside them, which the transmission does not
+    show: between a carrier and its sidebands some 0.04 of the signal's height, up on one side and down on the
+    other. So the mean of the samples within a fraction (CLIP) of the biggest excursion from the level, three
+    times over from the median: the features' lobes left out (a sample or so wide, sampled anywhere on them),
+    their tails kept, to cancel. With the transmission and the scan voltage x (same samples), over a window
+    symmetric about the carrier (the tallest transmission sample), if that holds a fifth of the trace or more:
+    the tails cancel there exactly."""
+    idx = range(len(err))
+    if trans is not None and x is not None and len(trans) == len(err) == len(x) and err:
+        c = max(idx, key=lambda k: trans[k])
+        lo, hi = min(x), max(x)
+        half = min(x[c] - lo, hi - x[c])
+        inside = [k for k in idx if abs(x[k] - x[c]) <= half]
+        if len(inside) >= len(err) // 5:
+            idx = inside
+    vals = [err[k] for k in idx if math.isfinite(err[k])]
+    if not vals:
         return math.nan
-    s = sorted(keep)
-    mid = s[len(s) // 4:len(s) - len(s) // 4] or s
-    return sum(mid) / len(mid)
+    level = _median(vals)
+    big = max(abs(v - level) for v in vals)
+    floor = 6 * noise(err)
+    for _ in range(3):
+        cut = max(CLIP * big, floor)
+        near = [v for v in vals if abs(v - level) <= cut]
+        if not near:
+            break
+        level = sum(near) / len(near)
+    return level
+
+
+CLIP = 0.15  # dc_level: samples further than this fraction of the biggest excursion from the level are features
 
 
 def decimate_xy(x, y, n: int = 400):

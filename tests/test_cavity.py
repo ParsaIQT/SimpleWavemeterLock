@@ -5,7 +5,7 @@ import random
 import pytest
 
 from wmlock.cavity import (ModeCheck, ModeRef, choose_peak, dc_level, decimate, find_peaks, judge, peak_top,
-                           reference_from, sweep, updated)
+                           reference_from, same_peak, sweep, updated)
 
 
 def lorentz(x, w):
@@ -135,9 +135,48 @@ def test_dc_level_ignores_the_resonances():
     for c in (500, 300.3, 812.7):  # a resonance anywhere in the scan, with its dispersive tails
         trans = [0.8 * lorentz(k - c, 1.0) for k in range(n)]
         err = [0.012 + 0.5 * (-(k - c) / 0.5) * lorentz(k - c, 1.0) for k in range(n)]
-        assert dc_level(err, trans) == pytest.approx(0.012, abs=1e-3), c
+        assert dc_level(err, trans, list(range(n))) == pytest.approx(0.012, abs=1e-3), c  # (about the carrier)
         assert dc_level(err) == pytest.approx(0.012, abs=2e-3), c
     assert math.isnan(dc_level([]))
+
+
+def test_dc_level_of_the_lab_error_signal():
+    """As on the lab's screen (SimLocked.LAB): a carrier and its sidebands 20 MHz out, the dispersion's tails
+    between them (some 0.04 V, up on one side of the carrier and down on the other), weaker lines 52 MHz either side,
+    all a sample or so wide, the transmission showing only the lines: its DC level to a millivolt, wherever the
+    carrier is in the scan (without the scan voltage, near the middle, where a relock has it). The mean of the
+    middle half of the samples misses by several."""
+    from wmlock.sim import ECDL, FakeDLCPro, SimLocked
+
+    laser = ECDL(400.0, seed=3)
+    dlc = FakeDLCPro("SN", "lab", {1: {"current": 150.0, "offset": 70.0, "scan": True}}, serve=False)
+    dlc.params["laser1:scan:amplitude"] = SimLocked.LAB_SCAN
+    lock = SimLocked(dlc, 1, laser, laser.freq(70.0, 150.0), seed=3, pdh_dc=0.007, **SimLocked.LAB)
+    worst = blind = trimmed = 0.0
+    for k in range(-10, 11):
+        lock.wobble = 2.0 * k  # MHz: the carrier anywhere within 20 MHz of the middle of the scan
+        x, trans, err = zip(*lock._master_scan())
+        worst = max(worst, abs(dc_level(err, trans, x) - 0.007))
+        if abs(k) <= 2:
+            blind = max(blind, abs(dc_level(err) - 0.007))
+        s = sorted(err)
+        trimmed = max(trimmed, abs(sum(s[250:750]) / 500 - 0.007))
+    assert worst < 0.0012 and blind < 0.0012 and trimmed > 0.003
+
+
+def test_a_narrow_peak_sampled_low_is_still_the_tem00():
+    """A TEM00 peak a sample or so wide shows anywhere from about half its height to all of it in a scan; the
+    tallest of a few scans counts. A transverse mode a third as tall is still not taken for it."""
+    kv = 400.0
+    scan = [(70.0, 0.21, "t"), (70.13, 0.008, "t"), (69.87, 0.007, "t")]  # 0.42 of the usual 0.5
+    c = choose_peak(scan, x_pred=70.0, kv=kv, window=150, y_ref=0.5)
+    assert c.ok and c.x == 70.0
+    assert not choose_peak([(71.39, 0.15, "t")], x_pred=71.39, kv=kv, window=150, y_ref=0.5).ok
+    c = choose_peak(scan + [(70.0003, 0.48, "t")], x_pred=70.0, kv=kv, window=150, y_ref=0.5)  # and another scan
+    assert c.ok and c.y == 0.48
+    # the peak chosen, as the next scan shows it: the nearest candidate of its type
+    assert same_peak([(69.9, 0.4, "t"), (70.001, 0.2, "t"), (70.0, 0.1, "p")], 70.0, "t", 0.09) == (70.001, 0.2, "t")
+    assert same_peak([(69.9, 0.4, "t")], 70.0, "t", 0.09) is None
 
 
 def test_decimate_keeps_narrow_peaks():

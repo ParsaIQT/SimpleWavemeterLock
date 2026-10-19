@@ -182,7 +182,8 @@ class HopParams:
     shg_area: float = 0.0     # the SHG sweep of the laser single-mode (cavity.ModeRef)
     shg_side: float = 0.0
     shg_n: int = 0
-    falc_sign: int = 0        # +-1: how the input offset shows in the error signal (0: not known)
+    falc_sign: int = 0        # +-1: how the input offset shows in the error signal (0: not known)...
+    falc_gain: float = 0.0    # ...and how much: V of error signal per V of input offset, sign and all (0: not known)
     seed_ok: float = 0.0      # mW: its seed power, lasing as usual
     trans_locked: float = 0.0  # V: the cavity transmission (its lock detection's input), locked as usual...
     trans_zero: float = 0.0   # V: ...and off resonance (its DC offset), measured while the master scans
@@ -196,7 +197,7 @@ class HopParams:
     opt_t: str = ""           # when it was taken
 
     LEARNED = ("kv", "spacing", "peak_y", "lp_kind", "lp_code", "shg_area", "shg_side", "shg_n", "falc_sign",
-               "seed_ok", "trans_locked", "trans_zero", "shg_lock", "shg_ratio")
+               "falc_gain", "seed_ok", "trans_locked", "trans_zero", "shg_lock", "shg_ratio")
     OPTIMUM = ("opt_i", "opt_v", "opt_shg", "opt_t")
 
     @classmethod

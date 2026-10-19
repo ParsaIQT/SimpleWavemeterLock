@@ -32,8 +32,9 @@ class Bench:
     """The laser on its controller, and the wavemeter: operations land at once (their answers come
     back one at a time), each reading takes dt seconds."""
 
-    def __init__(self, laser, target, noise=0.5, dt=0.1, seed=0, current=I0, offset=V0, scan=False):
+    def __init__(self, laser, target, noise=0.5, dt=0.1, seed=0, current=I0, offset=V0, scan=False, drift=0.0):
         self.laser, self.target = laser, target
+        self.drift, self.wobble = drift, 0.0  # MHz: its random walk per reading (a free-running laser's), where it is
         self.start = (current, offset)
         self.dlc = FakeDLCPro("SN-B", "bench", {1: {"current": current, "offset": offset, "scan": scan}},
                               serve=False)
@@ -71,11 +72,13 @@ class Bench:
 
     def freq(self):
         if self.lock is not None:
-            return self.lock.frequency()
+            return self.lock.frequency(self.wobble)
         return self.laser.freq(self.V, self.act)
 
     def reading(self):
         self.t += self.dt
+        if self.drift:
+            self.wobble += self.rng.gauss(0.0, self.drift)
         return self.t, (self.freq() - self.target) * 1e6 + self.rng.gauss(0.0, self.noise)
 
     def do(self, op, done, failed):
@@ -677,6 +680,21 @@ def settings(b):
     return {k: b.dlc.params[k] for k in ORIGINAL}
 
 
+def lab_bench(seed=21, drift=0.0, **kwargs):
+    """The SHG laser as in the lab (SimLocked.LAB): its reference cavity's lines a sample or so wide in a scan of
+    0.31 V, its PDH sidebands 20 MHz out (the dispersion's tails some 0.04 V either side of the carrier between
+    them), two weaker lines 52 MHz either side; the error signal's DC level `pdh_dc`, nulled when the lockpoint was
+    picked by hand (none), unless given."""
+    laser = ECDL(400.0, seed=seed, multimode=0.9, hysteresis=0.4, mm_noise=0.004)
+    b = Bench(laser, laser.freq(V0, I0), seed=seed, scan=True, drift=drift)
+    b.dlc.params["laser1:scan:amplitude"] = SimLocked.LAB_SCAN
+    lock = b.lock_it(seed=seed, shg=True, lockpoints=True, **{**SimLocked.LAB, **kwargs})
+    lock.settle()
+    assert lock.locked() and abs(b.off_mhz()) < 1
+    b.shg_usual = lock._intra_now()
+    return b, lock
+
+
 @pytest.mark.parametrize("p", [SHG, SHG_MAP], ids=["walk", "map"])
 def test_shg_laser_relocked_the_way_you_would_by_hand(p):
     b, lock = shg_bench()
@@ -690,16 +708,19 @@ def test_shg_laser_relocked_the_way_you_would_by_hand(p):
     assert abs(lock.dc()) < 0.002 and b.writes("falc1:input:offset")[-1] == pytest.approx(-0.009, abs=0.001)
     # in your order: both locks off, scan the SHG cavity and find a single-mode mode on target, lock the SHG cavity,
     # scan (its lock points shown: found afresh before each look at them), null, pick, lock
+    # (the input offset a little, then more: how much it moves the error signal is not known yet)
     order = [n.replace("laser1:", "") for n, _ in b.dlc.log if "cc:current" not in n and "scan:offset" not in n]
-    assert order == ["dl:lock:lock-enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "nlo:shg:scan:enabled",
-                     "nlo:shg:scan:enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "dl:lock:find-candidates",
-                     "falc1:input:offset", "dl:lock:find-candidates", "dl:lock:select-lockpoint",
-                     "dl:lock:lock-enabled"]
+    falc = order.count("falc1:input:offset")
+    assert 2 <= falc <= 4 and order == [
+        "dl:lock:lock-enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "nlo:shg:scan:enabled",
+        "nlo:shg:scan:enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "dl:lock:find-candidates"] + [
+        "falc1:input:offset"] * falc + ["dl:lock:find-candidates", "dl:lock:select-lockpoint", "dl:lock:lock-enabled"]
     assert settings(b) == ORIGINAL and b.dlc.params["laser1:scan:enabled"] is True  # as it was
     learned = r.result.learned
     assert learned["lp_code"] == ord("t") and learned["lp_kind"] == "t"
     assert learned["peak_y"] == pytest.approx(0.8, abs=0.1)  # its sampled top: 90 % of it, at least
-    assert learned["falc_sign"] == 1 and learned["shg_area"] > 0 and learned["shg_side"] < 0.1
+    assert learned["falc_sign"] == 1 and learned["falc_gain"] == pytest.approx(1.0, rel=0.25)
+    assert learned["shg_area"] > 0 and learned["shg_side"] < 0.1
     assert learned["seed_ok"] == pytest.approx(20.0, abs=0.5)  # its TA's seed, lasing as usual
     assert "single mode" in r.result.summary and "FALC input offset" in r.result.summary
     rec_ = r.result.record
@@ -781,8 +802,17 @@ def test_a_lockpoint_the_dlc_pro_will_not_take():
 
     b.dlc.commands["laser1:dl:lock:select-lockpoint"] = never
     b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
-    assert r.state == "failed" and "would not take the lockpoint" in r.error
     assert [args[2] for n, args in b.dlc.log if n.endswith("select-lockpoint")] == [116, 116, 0, 0, 1, 1, 2, 2, 3, 3]
+    # the lockpoint picked by hand is still there, at the target: locked with that, as you would
+    assert r.state == "done" and lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12), r.error
+    assert any("would not take the lockpoint: locking with the lockpoint the DLC pro has" in n for n in rec.notes)
+
+    b, lock = shg_bench(seed=15)
+    lock.jump(1)
+    lock.lockpoint = None  # none selected: left for you
+    b.dlc.commands["laser1:dl:lock:select-lockpoint"] = never
+    b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+    assert r.state == "failed" and "would not take the lockpoint" in r.error and "select the peak by hand" in r.error
     assert not lock.locked() and b.dlc.params["laser1:scan:enabled"] is True
 
 
@@ -850,6 +880,85 @@ def test_falc_offset_nulled_in_a_relock_without_lockpoint_too(scan):
     assert b.dlc.params["laser1:scan:enabled"] is scan  # as it was
 
 
+@pytest.mark.parametrize("gain", [1.0, 8.0, -3.0])
+def test_the_lab_error_signal_sits_at_zero_neatly_afterwards(gain):
+    """The error signal as on the lab's screen, 20 mV of DC on it, and a FALC input offset that shows in it `gain`
+    times over (not known yet): afterwards it sits at zero, and on the way it never goes much further from it than
+    where it began (a little of the way first, as if one to one, tells how much). Knowing that, the next time it
+    goes straight there."""
+    b, lock = lab_bench(pdh_dc=0.02, falc_gain=gain)
+    lock.jump(1)
+    b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+    assert r.state == "done" and lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12), r.error
+    assert abs(lock.shown_dc()) < 0.0012
+    assert max(abs(0.02 + gain * o) for o in b.writes("falc1:input:offset")) < 0.027
+    assert r.result.learned["falc_gain"] == pytest.approx(gain, rel=0.2)
+    lock.pdh_dc = 0.032  # it drifts: 12 mV again
+    lock.jump(1)
+    n = len(b.writes("falc1:input:offset"))
+    b, rec, r = recover(b.laser, b.target, HopParams.from_dict({**SHG.to_dict(), **r.result.learned}), cavity=True,
+                        bench=b)
+    assert r.state == "done" and abs(lock.shown_dc()) < 0.0012, r.error
+    assert len(b.writes("falc1:input:offset")) - n <= 2
+
+
+def test_a_learned_falc_gain_that_no_longer_holds_is_found_out_afresh():
+    """Learned 8 V/V, but someone has turned the FALC's input gain down since (1 V/V): the step there moves the error
+    signal an eighth of what it should, which shows, and it goes on with what it saw."""
+    b, lock = lab_bench(seed=27, pdh_dc=0.02, falc_gain=1.0)
+    lock.jump(1)
+    p = HopParams.from_dict({**SHG.to_dict(), "falc_gain": 8.0, "falc_sign": 1})
+    b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "done" and lock.locked(), r.error
+    assert abs(lock.shown_dc()) < 0.0012 and r.result.learned["falc_gain"] == pytest.approx(1.0, rel=0.2)
+
+
+def test_the_lab_error_signal_already_at_zero_is_left_alone():
+    """Nulled by hand when the lockpoint was picked: the error signal's DC level, looked at in three traces, is
+    within its tolerance, and the input offset is not touched (the dispersion's tails between the carrier and its
+    sidebands are no DC level)."""
+    b, lock = lab_bench(seed=22)
+    lock.jump(1)
+    b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+    assert r.state == "done" and lock.locked(), r.error
+    assert b.writes("falc1:input:offset") == [] and "left alone" in r.result.summary
+
+
+def test_narrow_peaks_sampled_a_sample_wide_are_told_and_locked():
+    """The lab's cavity with lines narrower still (0.1 MHz: in a scan, under half a sample wide, it shows anything
+    from a sixth of its height to all of it), the master drifting: the peak picked by hand looked as tall as it is,
+    the scans of the relock may not (with these, the tallest looked 0.34 and 0.39 of that, and the relock gave up,
+    unlocked and scanning). The right peak is told from a few scans (the tallest look of each peak counts), and the
+    lockpoint selected on the peak chosen as the next scan shows it, however tall it looks there."""
+    for seed in (20, 36):
+        b, lock = lab_bench(seed=seed, lw=0.1, drift=0.15)
+        lock.jump(1)
+        b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+        assert r.state == "done" and lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12), (seed, r.error)
+        assert not any("locking with the lockpoint the DLC pro has" in n for n in rec.notes), seed
+
+
+def test_a_relock_that_fails_with_the_offset_moved_goes_back_to_it():
+    """The cavity lock would not take with the input offset nulled (whatever the reason): the next try puts it back
+    where it was when the recovery began, with which it was locked before, as you would by hand."""
+    b, lock = shg_bench(seed=26)
+    lock.jump(1)
+    real = lock._engage
+
+    def picky(near=None):
+        if abs(b.dlc.params["falc1:input:offset"]) > 1e-6:
+            lock.peak, lock.dv = None, 0.0  # with the offset moved it does not lock
+            return
+        real(near)
+
+    lock._engage = picky
+    b, rec, r = recover(b.laser, b.target, SHG, cavity=True, bench=b)
+    assert r.state == "done" and lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12), r.error
+    assert b.dlc.params["falc1:input:offset"] == 0.0 and abs(lock.dc() - 0.009) < 1e-9
+    assert any("would not lock at the lockpoint" in n for n in rec.notes)
+    assert any("back to +0.0000 V, as it was locked before" in n for n in rec.notes)
+
+
 STEPS = {
     "map": (148.0, 60.0, 80.0, [
         "Map the modes: by way of 152.00 mA go to 148.00 mA, then sweep the current up to 152.00 mA and back "
@@ -879,10 +988,13 @@ def test_step_by_step(method):
         else:
             runner.on_reading(*b.reading())
     assert runner.state == "done", runner.error
+    probes = [a for a in asked if a.startswith("See how the FALC input offset moves the error signal's DC level (+")]
+    asked = [a for a in asked if a not in probes]  # (a little of the way first: how much it moves it is not known)
     steps = (["Take the laser over: turn its cavity lock off (now locked), turn the SHG cavity's lock off"] + middle
              + ["Lock the SHG cavity (single mode", "Start the scan and find the cavity peak",
                 "Null the error signal's DC level (+", "Select the lockpoint at ", "Lock to the peak at "])
-    assert len(asked) == len(steps) and all(a.startswith(s) for a, s in zip(asked, steps)), asked
+    assert 1 <= len(probes) <= 2 and len(asked) == len(steps), asked
+    assert all(a.startswith(s) for a, s in zip(asked, steps)), asked
     if method == "map":
         assert "mA, sweeping up from 148.00 mA as the map found the mode there (" in asked[2]
 
@@ -1217,6 +1329,7 @@ def test_a_laser_that_is_fine_is_relocked_and_nothing_else():
             runner.on_reading(*b.reading())
     assert runner.state == "done", runner.error
     assert b.writes("dl:cc:current-set") == [] and b.writes("scan:offset") == []
+    asked = [a for a in asked if not a.startswith("See how the FALC input offset moves")]  # (first, a little of it)
     steps = ["Take the laser over", "Lock the SHG cavity (single mode", "Start the scan", "Null the error signal",
              "Select the lockpoint", "Lock to the peak"]
     assert len(asked) == len(steps) and all(a.startswith(x) for a, x in zip(asked, steps)), asked
@@ -1533,10 +1646,11 @@ def test_after_a_hop_to_the_near_neighbour_it_is_caught_back_on_the_right_mode()
     assert re.match(r"relocked, caught the right mode at 151\.\d0 mA \(1 go up and down\), walked the piezo 70\.00 → "
                     r"70\.\d\d V, .*SHG peak (0\.9\d|1\.0\d) of the optimum's", r.result.summary), r.result.summary
     order = [n.replace("laser1:", "") for n, _ in b.dlc.log if "cc:current" not in n and "scan:offset" not in n]
-    assert order == ["dl:lock:lock-enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "nlo:shg:scan:enabled",
-                     "nlo:shg:scan:enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "dl:lock:find-candidates",
-                     "falc1:input:offset", "dl:lock:find-candidates", "dl:lock:select-lockpoint",
-                     "dl:lock:lock-enabled"]
+    falc = order.count("falc1:input:offset")  # (a little of the way first: how much the offset moves it)
+    assert 2 <= falc <= 4 and order == [
+        "dl:lock:lock-enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "nlo:shg:scan:enabled",
+        "nlo:shg:scan:enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "dl:lock:find-candidates"] + [
+        "falc1:input:offset"] * falc + ["dl:lock:find-candidates", "dl:lock:select-lockpoint", "dl:lock:lock-enabled"]
     assert settings(b) == ORIGINAL
     learned = r.result.learned
     assert learned["shg_ratio"] == pytest.approx(1.0, abs=0.05)  # its sweep shows the peak as its signal locked

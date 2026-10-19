@@ -496,8 +496,13 @@ class SimLocked:
     (`tem`: offset in FSR, relative height) between; transmission on Fine In 1 (t00 V at a TEM00
     peak, on a DC offset `t_dc`; its lock detection, the window, watches it too; its present value
     while the master scans, unlocked, is that somewhere in the scan), the PDH error signal on
-    Fast In 3 (amplitude `pdh` V, sidebands 20 MHz out), with a DC offset `pdh_dc` plus the FALC
-    pro's input offset. The lock (lock-enabled):
+    Fast In 3 (amplitude `pdh` V, sign `pdh_sign`, sidebands `sideband` MHz out, their features
+    `pdh_sb` of the carrier's, with `pdh_phase` of absorption from a demodulation phase off), with a DC
+    offset `pdh_dc` plus the FALC pro's input offset (times `falc_gain`). `carriers`: other lines in
+    the light, [(MHz from the laser, power relative to it)], each with peaks and features of its own
+    (sidebands of a fiber EOM, say). LAB is a cavity like the one in the lab: lines 0.3 MHz wide,
+    sidebands 20 MHz out, two weaker lines 52 MHz either side, all three sampled a sample or so wide by
+    a scan of 0.31 V. The lock (lock-enabled):
       lockpoints=True   locks to the resonance at the selected lockpoint (select-lockpoint
                         x y type, which must name one of the candidates the DLC pro found
                         when last asked, find-candidates, in the scan running then; type = the
@@ -529,21 +534,32 @@ class SimLocked:
     SEARCH_S = 1.5    # then ReLock searching this long,
     SEARCH_MHZ = 60.0  # sweeping the laser this far either way
 
+    LAB = dict(lw=0.3, t00=0.05, pdh=1.7, pdh_sign=-1, sideband=20.2, pdh_sb=0.76, pdh_phase=-0.25,
+               carriers=((-51.6, 0.14), (51.6, 0.18)), t_noise=0.0003, e_noise=0.002)
+    LAB_SCAN = 0.31  # V: the scan amplitude, about the laser
+
     def __init__(self, dlc: "FakeDLCPro", n: int, ecdl: "ECDL", f_res: float, shg: bool = True,
                  lockpoints: bool = True, fsr: float = 1.5, lw: float = 6.0, tem=((0.37, 0.18), (0.71, 0.08)),
                  t00: float = 0.8, pdh: float = 0.4, pdh_dc: float = 0.0, falc: int = 1, range_v: float = 30.0,
                  falc_in_trace: bool = True, falc_sign: int = 1, seed=None, ta: bool | None = None,
-                 clock=time.monotonic, t_dc: float = 0.0, hop_search: float = 0.0, recorder: bool = True):
+                 clock=time.monotonic, t_dc: float = 0.0, hop_search: float = 0.0, recorder: bool = True,
+                 sideband: float = 20.0, pdh_sb: float = 0.5, pdh_phase: float = 0.0, pdh_sign: int = 1,
+                 carriers=(), falc_gain: float | None = None, t_noise: float = 0.002, e_noise: float = 0.002):
         """falc_in_trace: the error signal on the scope includes the FALC's input offset, which adds
-        to it (falc_sign 1) or subtracts (-1). ta: a TA between master and SHG cavity (by default
-        with an SHG stage); clock: its time, for its protection."""
+        to it (falc_sign 1) or subtracts (-1), times falc_gain if given (V of error signal per V of offset,
+        its sign included). ta: a TA between master and SHG cavity (by default with an SHG stage); clock:
+        its time, for its protection."""
         self.dlc, self.n, self.ecdl = dlc, n, ecdl
         self.p = p = f"laser{n}:"
         self.f_res, self.fsr, self.lw, self.tem, self.t00, self.t_dc = f_res, fsr, lw, tuple(tem), t00, t_dc
-        self.pdh, self.pdh_dc, self.sideband = pdh, pdh_dc, 20.0
+        self.pdh, self.pdh_dc, self.sideband = pdh, pdh_dc, sideband
+        self.pdh_sb, self.pdh_phase, self.pdh_sign = pdh_sb, pdh_phase, pdh_sign
+        self.carriers = tuple(carriers)
+        self.t_noise, self.e_noise = t_noise, e_noise
         self.has_shg, self.falc, self.range_v = shg, falc, range_v
         self.hop_search = hop_search
-        self.falc_in_trace, self.falc_sign = falc_in_trace, falc_sign
+        self.falc_in_trace = falc_in_trace
+        self.falc_gain = float(falc_sign if falc_gain is None else falc_gain)
         self.rng = random.Random(seed)
         self.mutex = threading.RLock()
         self.wobble = 0.0       # MHz: the free-running laser's drift (from SimLaser)
@@ -625,14 +641,25 @@ class SimLocked:
     def dc(self) -> float:
         """The error signal's DC level as the FALC sees it: its own offset plus the input offset."""
         off = self.dlc.params.get(f"falc{self.falc}:input:offset", 0.0) if self.falc else 0.0
-        return self.pdh_dc + self.falc_sign * off
+        return self.pdh_dc + self.falc_gain * off
 
     def shown_dc(self) -> float:
         """The error signal's DC level as the scope shows it."""
         return self.dc() if self.falc_in_trace else self.pdh_dc
 
     def _airy(self, f: float):
-        """(transmission V, error signal V without DC) of the reference cavity at f THz."""
+        """(transmission V, error signal V without DC) of the reference cavity for light at f THz: its line
+        and the other lines in it (carriers)."""
+        t, e = self._line(f)
+        for mhz, power in self.carriers:
+            ti, ei = self._line(f + mhz * 1e-6)
+            t, e = t + power * ti, e + power * ei
+        return t, e
+
+    def _line(self, f: float):
+        """(transmission V, error signal V without DC) of the reference cavity for one line at f THz: the PDH
+        error signal of a TEM00 resonance, dispersion at the carrier and at the sidebands (with some absorption
+        there, if the demodulation phase is off)."""
         d = (f - self.f_res) * 1e3 / self.fsr  # in FSR
         t = e = 0.0
         for off, h in ((0.0, 1.0),) + self.tem:
@@ -642,8 +669,10 @@ class SimLocked:
             t += h / (1 + x * x)
             if off == 0.0:
                 s = 2 * self.sideband / self.lw
-                e += -x / (1 + x * x) + 0.5 * (x - s) / (1 + (x - s) ** 2) + 0.5 * (x + s) / (1 + (x + s) ** 2)
-        return self.t00 * t, self.pdh * e
+                lo, hi = x + s, x - s
+                e += (-x / (1 + x * x) + self.pdh_sb * (hi / (1 + hi * hi) + lo / (1 + lo * lo))
+                      + self.pdh_sb * self.pdh_phase * (1 / (1 + hi * hi) - 1 / (1 + lo * lo)))
+        return self.t00 * t, self.pdh_sign * self.pdh * e
 
     def _nearest(self, f: float):
         """The resonance (any transverse mode) nearest f THz, and its relative height."""
@@ -661,7 +690,7 @@ class SimLocked:
 
     def _offset_mhz(self) -> float:
         """How far from the resonance center the lock holds the laser (from the DC level)."""
-        r = max(min(self.dc() / self.pdh, 0.5), -0.5)  # -x/(1+x^2) = -dc/pdh
+        r = max(min(self.dc() / (self.pdh_sign * self.pdh), 0.5), -0.5)  # -x/(1+x^2) = -dc/pdh
         x = (1 - math.sqrt(max(1 - 4 * r * r, 0.0))) / (2 * r) if abs(r) > 1e-12 else 0.0
         return x * self.lw / 2
 
@@ -793,7 +822,7 @@ class SimLocked:
                 self.ecdl.lase(v + self.dv, i)
             if self.locked() and self._blipped(self.clock()):
                 t = 0.0  # (for a moment, no transmission)
-            noise = self.rng.gauss(0.0, 0.002)
+            noise = self.rng.gauss(0.0, self.t_noise if sig == 0 else self.e_noise)
             return (t + self.t_dc if sig == 0 else e + self.shown_dc()) + noise
 
     def _blipped(self, t: float) -> bool:
@@ -813,7 +842,7 @@ class SimLocked:
                 base += sum(power * self._airy(f + (ghz - main) * 1e-3)[0]
                             for power, ghz in self.ecdl.components(x, i))
             rng = self._rec_rng
-            return [(self.t_dc if self._blipped(t) else base) + rng.gauss(0.0, 0.002) for t in times]
+            return [(self.t_dc if self._blipped(t) else base) + rng.gauss(0.0, self.t_noise) for t in times]
 
     def _master_scan(self):
         """One scan period: [(x, transmission, error)]; self.found: the lockpoint candidates in it (tops)."""
@@ -829,8 +858,8 @@ class SimLocked:
             for power, ghz in self.ecdl.components(x, i):
                 ti, ei = self._airy(self.ecdl.f0 + ghz * 1e-3 + self.wobble * 1e-6)
                 tr, er = tr + power * ti, er + power * ei
-            rows.append((x, tr + self.t_dc + self.rng.gauss(0.0, 0.002),
-                         er + self.shown_dc() + self.rng.gauss(0.0, 0.002)))
+            rows.append((x, tr + self.t_dc + self.rng.gauss(0.0, self.t_noise),
+                         er + self.shown_dc() + self.rng.gauss(0.0, self.e_noise)))
         self.ecdl.m = m0
         self.ecdl.lase(v + self.dv, i)
         up = rows[:self.N // 2]

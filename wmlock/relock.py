@@ -87,9 +87,15 @@ def volts(x: float, scale: float = 0.0) -> str:
 
 class CavitySteps:
     SHG_LOCK_S = 10.0   # s for the SHG cavity to lock
-    LOCK_S = 10.0       # s for the cavity lock to report locked
+    LOCK_S = 20.0       # s for the cavity lock to report locked
+    PEAK_LOOKS = 4      # scans looked at, at most, to tell the right cavity peak
     SETTLE_S = 0.5      # s after starting a scan or changing a scope channel, for fresh traces
-    FALC_TOL = 0.002    # V: an error-signal DC level smaller than this is left alone
+    FALC_TOL = 0.002    # V: an error-signal DC level within this (or within 3 times its scatter) is left alone
+    FALC_NOISE = 0.0003  # V: the scatter of a look at the DC level taken to be at least this
+    FALC_TRACES = 3     # traces per look at the DC level (their median)
+    FALC_PROBE = (0.1, 0.3, 0.7, 1.5)  # how much the input offset moves the error signal not known: moved this
+    #                     much of the way (as if one to one) until the error signal shows it
+    FALC_STEPS = 5      # steps at most once that is known
     ZERO_WAITS = (0.05, 0.08, 0.13, 0.07, 0.11, 0.17, 0.06, 0.09, 0.14, 0.1)  # s between looks at the transmission
     #                     while the master scans (uneven: never in step with the scan); their median is its zero
     LEVEL_WAITS = (0.05, 0.08, 0.13, 0.07, 0.11, 0.06)  # ...and locked: their median is its level locked
@@ -113,6 +119,8 @@ class CavitySteps:
         self.lp_kind = self.p.lp_kind
         self.peak_y = self.p.peak_y
         self.falc_name, self.falc_orig = "", 0.0
+        self.falc_now = 0.0        # V: the input offset as it is now (a relock may have moved it)
+        self.falc_failed = False   # the last relock failed with the input offset moved: the next goes back
         self.scope = {}            # scope channel -> signal shown now (what we may have changed)
         self.shg_level = None      # V: the intra-cavity signal with the SHG cavity locked, at the start
         self.mode_text = ""        # how single-mode it was when handed back
@@ -206,7 +214,7 @@ class CavitySteps:
         if p.falc and boards:
             if board and isinstance(o.get("dl:lock:error-channel"), int):
                 self.falc_name = f"falc{board}:input:offset"
-                self.falc_orig = float(o[self.falc_name])
+                self.falc_orig = self.falc_now = float(o[self.falc_name])
             else:
                 self.note("cannot tell which FALC pro the lock uses, or on which input its error signal is: "
                           "its input offset is left alone")
@@ -423,6 +431,7 @@ class CavitySteps:
         if self.cavity:
             relock = self.relock_lockpoint if self.relock_mode == "lockpoint" else self.relock_plain
             if not (yield from relock()):
+                self.falc_failed = bool(self.falc_name) and abs(self.falc_now - self.falc_orig) > 1e-6
                 return False
         yield from self.tidy()
         return True
@@ -472,7 +481,7 @@ class CavitySteps:
             else:
                 self.note(f"the transmission while scanning, {volts(zero, top)} V, is no zero next to the "
                           f"{volts(top)} V it has locked: not taken")
-        yield from self.null_falc()
+        yield from self.falc_before_lock()
         if not self.scan_after_unlock:
             yield mh.Set(SCAN, False)
             yield mh.Wait(self.SETTLE_S)
@@ -489,19 +498,21 @@ class CavitySteps:
         yield mh.Set(SCAN, True, restore=self.scan_after_unlock)
         yield mh.Wait(settle)
         zero = yield from self.sample_level(self.ZERO_WAITS)  # mostly between the peaks: its zero
-        choice, cands = None, []
-        for _ in range(3):
+        choice, cands, seen = None, [], []
+        for _ in range(self.PEAK_LOOKS):
             cands = yield from self.candidates()
-            choice = cavity.choose_peak(cands, x_pred, self.kv, p.window, self.peak_y, self.lp_kind)
+            seen += cands  # a narrow peak sampled a sample or so wide: its tallest look counts (choose_peak)
+            choice = cavity.choose_peak(seen, x_pred, self.kv, p.window, self.peak_y, self.lp_kind)
             if choice.ok:
                 break
             if amp and abs(x_pred - self.V) > 0.4 * amp and self.v_lo <= x_pred <= self.v_hi:
                 yield from self.move(offset=x_pred, read=False)  # the target in the middle of the scan
+                seen = []
             yield mh.Wait(settle)
         yield from self.keep_scan(x_pred, choice, cands)
         if not choice.ok:
-            raise mh.Failed(f"cannot tell which cavity peak is right: {choice.text} "
-                            f"(left at the target, unlocked, scanning)", keep=True)
+            why = f"cannot tell which cavity peak is right: {choice.text}"
+            return (yield from self.lock_as_selected(x_pred, why, zero))
         self.note(f"cavity peak: {choice.text}")
         if zero is not None:
             if choice.y > 0 and zero < 0.5 * choice.y:
@@ -510,13 +521,22 @@ class CavitySteps:
             else:
                 self.note(f"the transmission while scanning, {volts(zero, choice.y)} V, is no zero next to the "
                           f"peak's {volts(choice.y)} V: not taken")
-        if self.falc_name:
-            yield from self.null_falc()
-        choice = yield from self.select(x_pred, choice)
-        if choice is None:
-            raise mh.Failed("the DLC pro would not take the lockpoint: select the peak by hand "
-                            "(the laser is at the target, scanning)", keep=True)
-        yield from self.ask(f"Lock to the peak at {choice.x:.3f} V")
+        yield from self.falc_before_lock()
+        picked = yield from self.select(x_pred, choice)
+        if picked is None:
+            why = "the DLC pro would not take the lockpoint"
+            return (yield from self.lock_as_selected(x_pred, why, zero, nulled=True))
+        yield from self.ask(f"Lock to the peak at {picked.x:.3f} V")
+        if not (yield from self.lock_and_check(max(choice.y, picked.y))):
+            return False
+        y = 0.7 * self.peak_y + 0.3 * choice.y if self.peak_y else choice.y  # (its tallest look, as it looks usually)
+        self.learned.update(peak_y=round(y, 4), lp_kind=choice.kind)
+        return True
+
+    def lock_and_check(self, top: float):
+        """Enable the cavity lock (at the lockpoint selected): locked, and where the wavemeter says it belongs,
+        with its transmission at least half way from its zero up to the peak's top (V) in the scan? Its level
+        locked is learned, if so."""
         self.stage = "locking the cavity"
         yield mh.Set(LOCK, True, restore=False)
         self.unlocked = False
@@ -529,19 +549,40 @@ class CavitySteps:
             self.note(self.relock_trouble)
             return False
         level = yield from self.sample_level(self.LEVEL_WAITS)
-        z = self.zero if self.zero is not None else usable_zero(self.p.trans_zero, choice.y)
-        if level is not None and choice.y > z and level - z < 0.5 * (choice.y - z):
-            self.relock_trouble = (f"locked, but the transmission is {volts(level, choice.y)} V, "
-                                   f"{(level - z) / (choice.y - z):.2f} of the peak's {volts(choice.y)} V above zero "
-                                   f"({volts(z, choice.y)} V)")
+        z = self.zero if self.zero is not None else usable_zero(self.p.trans_zero, top)
+        if level is not None and top > z and level - z < 0.5 * (top - z):
+            self.relock_trouble = (f"locked, but the transmission is {volts(level, top)} V, "
+                                   f"{(level - z) / (top - z):.2f} of the peak's {volts(top)} V above zero "
+                                   f"({volts(z, top)} V)")
             self.note(self.relock_trouble)
             return False
-        self.learned.update(peak_y=round(choice.y, 4), lp_kind=choice.kind)
         if level is not None and level > z:
             self.learned["trans_locked"] = round(level, 5)  # locked where it belongs: its transmission as it should be
-        self.note("locked to the right peak" + (f", transmission {volts(level, choice.y)} V" if level is not None
+        self.note("locked to the right peak" + (f", transmission {volts(level, top)} V" if level is not None
                                                 else ""))
         return True
+
+    def lock_as_selected(self, x_pred: float, why: str, zero, nulled: bool = False):
+        """The right peak could not be picked here (why): if the DLC pro has a lockpoint selected near the target
+        (selected by hand, or by an earlier relock), lock with that, as you would, the wavemeter judging; else
+        leave the laser at the target, unlocked, scanning, for you. nulled: the error signal's DC level already."""
+        p = self.p
+        (pos,) = yield mh.Get(("dl:lock:lockpoint:position",))
+        x = pos[0] if isinstance(pos, tuple) and len(pos) >= 2 and _num(pos[0]) else None
+        y = pos[1] if x is not None and _num(pos[1]) else 0.0
+        if x is None or (abs(x) < 1e-9 and abs(y) < 1e-9) or abs(x - x_pred) * abs(self.kv) > p.window:
+            where = "none" if x is None or (abs(x) < 1e-9 and abs(y) < 1e-9) else (
+                f"at {x:.3f} V, {(x - x_pred) * self.kv:+.0f} MHz from the target")
+            raise mh.Failed(f"{why}; the lockpoint selected is {where} (left at the target, unlocked, scanning: "
+                            f"select the peak by hand)", keep=True)
+        self.note(f"{why}: locking with the lockpoint the DLC pro has, at {x:.3f} V "
+                  f"({(x - x_pred) * self.kv:+.0f} MHz from the target)")
+        if not nulled:
+            yield from self.falc_before_lock()
+        yield from self.ask(f"{why}: lock with the lockpoint selected, at {x:.3f} V, as you would")
+        if self.zero is None and zero is not None and y > 0 and zero < 0.5 * y:
+            self.zero = zero
+        return (yield from self.lock_and_check(y if y > 0 else self.peak_y))
 
     def candidates(self):
         """The lockpoint candidates in the scan running now: the DLC pro finds (and shows) them only when
@@ -574,13 +615,15 @@ class CavitySteps:
         yield from self.ask(f"Select the lockpoint at {c.x:.3f} V, {c.y:.3f} V")
         self.stage = "selecting the lockpoint"
         why = "no answer"
+        gap = 0.25 * p.window / max(abs(self.kv), 1e-9)
         for code in codes:
             for _ in range(2):
                 cands = yield from self.candidates()
-                fresh = cavity.choose_peak(cands, x_pred, self.kv, p.window, self.peak_y, self.lp_kind)
-                if not fresh.ok:
-                    why = fresh.text
-                    break
+                hit = cavity.same_peak(cands, c.x, c.kind, gap)  # the peak chosen, as this scan shows it
+                if hit is None:
+                    why = f"no candidate on the peak at {c.x:.3f} V in this scan"
+                    continue
+                fresh = cavity.PeakChoice(True, hit[0], hit[1], hit[2], c.off, c.text)
                 r = yield mh.Exec("dl:lock:select-lockpoint", (float(fresh.x), float(fresh.y), int(code)))
                 if isinstance(r, Exception):
                     why = str(r)
@@ -648,8 +691,10 @@ class CavitySteps:
         self.record["scan"] = rec
 
     # ------------------------------------------------------- the FALC pro
-    def error_trace(self):
-        """(error signal, transmission or None) over a scan, borrowing a scope channel if need be."""
+    def error_trace(self, settle: bool = True):
+        """(error signal, transmission or None, scan voltage or None) over a scan, borrowing a scope channel if
+        need be. settle: one acquired since the last write (else just a fresh one). The scope's x is the scan
+        voltage if it shows one (XY against the scan output or the piezo, as wide as the scan)."""
         o = self.orig
         err, spec = o.get("dl:lock:error-channel"), o.get("dl:lock:spectrum-input-channel")
         c1, c2 = "scope:channel1:signal", "scope:channel2:signal"
@@ -659,7 +704,9 @@ class CavitySteps:
             keep = c2 if self.scope.get(c1) == spec else c1  # keep the transmission in view
             yield mh.Set(keep, err, restore=o.get(keep))
             self.scope[keep] = err
-        yield mh.Wait(self.settle("scan:frequency"), after_write=True)  # a trace acquired since the last change
+            settle = True
+        if settle:
+            yield mh.Wait(self.settle("scan:frequency"), after_write=True)  # a trace acquired since the last change
         blob = yield from self.fresh("scope:data")
         try:
             a = float_arrays(blob) if blob is not None else {}
@@ -670,53 +717,138 @@ class CavitySteps:
                                                                          self.scope.get(c2)) else None
         if not e:
             return None
-        return e, t
+        x, amp = a.get("x"), o.get("scan:amplitude")
+        scan = (o.get("scope:channelx:xy-signal") in SCAN_X and x and len(x) == len(e) and _num(amp) and amp > 0
+                and 0.5 * amp <= max(x) - min(x) <= 2 * amp)
+        return e, t, (x if scan else None)
 
-    def null_falc(self):
-        """Null the error signal's DC level with the FALC pro's input offset, by at most falc_max,
-        checking on the error signal that each step does what it should."""
-        p, name, o0 = self.p, self.falc_name, self.falc_orig
-        tr = yield from self.error_trace()
-        if tr is None:
-            self.note("no error-signal trace: the FALC pro's input offset is left alone")
-            return
-        dc = before = cavity.dc_level(*tr)
-        rec = self.record["falc"] = {"name": name, "offset0": o0, "dc0": round(dc, 5),
-                                     "error": cavity.decimate(tr[0], 300)}
-        if not math.isfinite(dc) or abs(dc) <= self.FALC_TOL:
-            self.falc_text = f"error signal DC {dc * 1e3:+.1f} mV" if math.isfinite(dc) else ""
-            return
-        gain = p.falc_sign or 1  # how the DC level follows the input offset
-        cur = o0
-        for _ in range(4):
-            new = min(max(cur - dc / gain, o0 - p.falc_max), o0 + p.falc_max)
-            if abs(new - cur) < 1e-5:
-                self.note(f"the FALC input offset is at its limit, {o0:+.4f} ± {p.falc_max:g} V")
-                break
-            yield from self.ask(f"Null the error signal's DC level ({dc * 1e3:+.1f} mV): FALC input offset "
-                                f"{cur:+.4f} → {new:+.4f} V")
-            self.stage = "nulling the error signal's DC level"
-            yield mh.Set(name, new, restore=o0)
-            tr = yield from self.error_trace()
+    def dc_now(self):
+        """The error signal's DC level now (cavity.dc_level): the median of FALC_TRACES traces, their spread (the
+        highest less the lowest) and the last trace; None if there is no trace."""
+        got, last = [], None
+        for k in range(self.FALC_TRACES):
+            tr = yield from self.error_trace(settle=k == 0)
             if tr is None:
                 break
-            dc2 = cavity.dc_level(*tr)
-            g = (dc2 - dc) / (new - cur)
-            if not math.isfinite(g) or abs(g) < 0.3:
-                yield mh.Set(name, o0, restore=o0)
+            last = tr
+            v = cavity.dc_level(*tr)
+            if math.isfinite(v):
+                got.append(v)
+        if not got:
+            return None
+        return statistics.median(got), max(got) - min(got), last
+
+    def falc_before_lock(self):
+        """Before (re)locking: null the error signal's DC level with the FALC pro's input offset; but after a relock
+        that failed with the offset moved, back to where it was, with which it was locked before (alternately,
+        then: a lock that fails for another reason is tried both ways)."""
+        if not self.falc_name:
+            return
+        if self.falc_failed:
+            self.falc_failed = False
+            name, was, now = self.falc_name, self.falc_orig, self.falc_now
+            yield from self.ask(f"The last relock failed with the FALC input offset at {now:+.4f} V: back to "
+                                f"{was:+.4f} V, as it was locked before")
+            self.stage = "putting the FALC input offset back"
+            yield mh.Set(name, was, restore=was)
+            self.falc_now = was
+            self.falc_text = f"FALC input offset back to {was:+.4f} V (nulled, the relock had failed)"
+            self.note(f"the last relock failed with the FALC input offset at {now:+.4f} V: back to {was:+.4f} V, "
+                      f"as it was locked before, not nulled this time")
+            return
+        yield from self.null_falc()
+
+    def null_falc(self):
+        """Null the error signal's DC level with the FALC pro's input offset, by at most falc_max from where it was
+        when the recovery began. Each look at the level is the median of FALC_TRACES traces; a level within
+        FALC_TOL, or within 3 times their scatter, is left alone. How much the offset moves the error signal
+        (falc_gain, V per V, sign and all) is learned: until it is, the offset is moved FALC_PROBE of the way (as
+        if one to one) until the error signal shows that clearly, which tells it; known, straight there, again from
+        where that got it, until within half its tolerance (a step that should have shown and did not: found out
+        afresh). The best offset seen is kept, and if that is no better than where it began, it is put back."""
+        p, name, o0 = self.p, self.falc_name, self.falc_orig
+        look = yield from self.dc_now()
+        if look is None:
+            self.note("no error-signal trace: the FALC pro's input offset is left alone")
+            return
+        dc0, spread, tr = look
+        start = cur = self.falc_now
+        rec = self.record["falc"] = {"name": name, "offset0": round(start, 5), "dc0": round(dc0, 5),
+                                     "error": cavity.decimate(tr[0], 300)}
+        noise = max(spread, self.FALC_NOISE)
+        tol = max(self.FALC_TOL, 3 * noise)
+        if abs(dc0) <= tol:
+            self.falc_text = f"error signal DC {dc0 * 1e3:+.1f} mV, left alone"
+            return
+        aim = max(0.5 * tol, 2 * noise)  # once at it, as close as that
+        lo, hi = o0 - p.falc_max, o0 + p.falc_max
+        seen, dc, gain = [(start, dc0)], dc0, p.falc_gain
+        probe, base = (None, None) if gain else (0, (start, dc0))  # finding out how much, from base (offset, level)
+        for _ in range(2 * len(self.FALC_PROBE) + self.FALC_STEPS):
+            if probe is None and abs(dc) <= max(aim, 2 * noise):
+                break
+            if probe is not None:
+                if probe >= len(self.FALC_PROBE):
+                    break
+                new = base[0] - self.FALC_PROBE[probe] * base[1] / float(p.falc_sign or 1)
+                probe += 1
+                why = "See how the FALC input offset moves the error signal's DC level"
+            else:
+                new = cur - dc / gain
+                why = "Null the error signal's DC level"
+            new = min(max(new, lo), hi)
+            if abs(new - cur) < 1e-6:
+                self.note(f"the FALC input offset is at its limit, {o0:+.4f} ± {p.falc_max:g} V")
+                break
+            was = cur, dc
+            yield from self.ask(f"{why} ({dc * 1e3:+.1f} mV): FALC input offset {cur:+.4f} → {new:+.4f} V")
+            self.stage = "nulling the error signal's DC level"
+            yield mh.Set(name, new, restore=o0)
+            cur = self.falc_now = new
+            got = yield from self.dc_now()
+            if got is None:
+                break
+            dc, spread, _ = got
+            noise = max(noise, spread)
+            seen.append((cur, dc))
+            if probe is not None:
+                if abs(dc - base[1]) >= 3 * noise:  # it shows: that much
+                    gain, probe = (dc - base[1]) / (cur - base[0]), None
+            elif abs(dc - was[1]) >= 3 * noise:
+                gain = (dc - was[1]) / (cur - was[0])
+            elif abs(was[1]) >= 6 * noise:  # it should have shown, and did not: not as learned, find out afresh
+                gain, probe, base = 0.0, 0, (cur, dc)
+        if not gain:
+            moved = cur - (base[0] if base else start)
+            if 0.3 * abs(moved) >= 3 * noise:
                 err = self.orig.get("dl:lock:error-channel")
                 self.note(f"the error signal on the scope ({signal_name(err)}) does not follow the FALC pro's input "
                           f"offset, so it is not the FALC's input: offset put back, left alone")
+                self.learned["falc_gain"] = 0.0
                 self.learned["falc_sign"] = 0
-                return
-            gain, cur, dc = g, new, dc2
-            if abs(dc) <= self.FALC_TOL:
-                break
+            else:
+                self.note(f"moving the FALC input offset {moved:+.4f} V did not clearly move the error signal's DC "
+                          f"level ({dc0 * 1e3:+.1f} mV): put back")
+            yield mh.Set(name, start, restore=o0)
+            self.falc_now = start
+            rec.update(offset=round(start, 5), dc=round(dc0, 5))
+            return
+        self.learned["falc_gain"] = round(gain, 4)
         self.learned["falc_sign"] = 1 if gain > 0 else -1
-        rec.update(offset=round(cur, 5), dc=round(dc, 5))
-        self.falc_text = (f"FALC input offset {o0:+.4f} → {cur:+.4f} V, error signal DC "
-                          f"{before * 1e3:+.1f} → {dc * 1e3:+.1f} mV")
-        self.note(self.falc_text)
+        best_o, best_dc = min(seen, key=lambda od: abs(od[1]))
+        steps = f"{len(seen) - 1} step{'s' if len(seen) != 2 else ''}; the offset moves it {gain:+.3g} V/V"
+        if abs(best_dc) > abs(dc0) - 2 * noise:  # no better than it was: as it was
+            best_o, best_dc = start, dc0
+            self.falc_text = f"error signal DC {dc0 * 1e3:+.1f} mV, nulling did not bring it down: offset put back"
+        else:
+            self.falc_text = (f"FALC input offset {start:+.4f} → {best_o:+.4f} V, error signal DC "
+                              f"{dc0 * 1e3:+.1f} → {best_dc * 1e3:+.1f} mV")
+        self.note(f"{self.falc_text} ({steps})")
+        if abs(best_o - cur) > 1e-9:
+            yield from self.ask(f"Back to the best FALC input offset seen, {best_o:+.4f} V")
+            yield mh.Set(name, best_o, restore=o0)
+            self.falc_now = best_o
+        rec.update(offset=round(best_o, 5), dc=round(best_dc, 5), gain=round(gain, 4), steps=len(seen) - 1)
 
     def tidy(self):
         """Give back the scope channels, and the scan setting the laser had while locked."""
@@ -962,8 +1094,14 @@ def setup_report(client, laser: int, hop, lp) -> list:
             if use and isinstance(err, int):
                 add("ok", f"before relocking, the DC level of the error signal ({signal_name(err)}) is nulled with "
                           f"falc{use}'s input offset, by at most ±{hop.falc_max:g} V from where it is, as the scan "
-                          f"shows it" + (" (the scan on for a moment: it relocks without lockpoint)"
-                                         if mode == "plain" else ""))
+                          f"shows it (left alone within {CavitySteps.FALC_TOL * 1e3:g} mV)"
+                          + (" (the scan on for a moment: it relocks without lockpoint)" if mode == "plain" else ""))
+                if hop.falc_gain:
+                    add("info", f"the input offset moves the error signal {hop.falc_gain:+.3g} V/V (learned): straight "
+                                f"there")
+                else:
+                    add("info", "how much the input offset moves the error signal is not known yet: the first relock "
+                                "moves it a little of the way, then more, until the trace shows it, and learns that")
                 if _num(amp) and amp <= 0:
                     add("warn", "the scan amplitude is 0: no DC level to see, the input offset is left alone")
             else:

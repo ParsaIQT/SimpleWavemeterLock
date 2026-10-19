@@ -893,7 +893,9 @@ class HopDialog(QtWidgets.QDialog):
             out.append(f"lockpoint type {p.lp_kind!r}" + (f" = {p.lp_code}" if p.lp_code >= 0 else ""))
         if p.shg_area:
             out.append(f"single-mode SHG sweep: side peak {p.shg_side * 100:.0f} %")
-        if p.falc_sign:
+        if p.falc_gain:
+            out.append(f"the FALC offset moves the error signal {p.falc_gain:+.3g} V/V")
+        elif p.falc_sign:
             out.append("the FALC offset shows on the error signal")
         if p.seed_ok:
             out.append(f"seed {p.seed_ok:.1f} mW lasing")
@@ -1216,6 +1218,8 @@ class RecoveryDialog(QtWidgets.QDialog):
             plot.hlines.append((f["dc"], "ok"))
             after = (f"; input offset {f['offset0']:+.4f} → {f['offset']:+.4f} V took it to "
                      f"{f['dc'] * 1e3:+.1f} mV (green)")
+            if f.get("gain"):
+                after += f" in {f.get('steps', 0)} steps (the offset moves it {f['gain']:+.3g} V/V)"
         return self._box(f"the error signal over the scan before nulling, close up on its baseline: DC level "
                          f"{f['dc0'] * 1e3:+.1f} mV (amber){after}", plot)
 
