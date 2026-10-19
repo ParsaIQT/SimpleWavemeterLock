@@ -312,15 +312,16 @@ def test_shg_laser_put_back_on_the_right_peak(quiet_demo, tmp_path):
         assert wait_for(lambda: ch.guard.armed, 5)  # watching it again
         shg.hop_mode(-1)  # the master hops: its lock relocks 6 GHz away and calls that locked
         assert wait_for(lambda: ch.state == "recovering", 5)
-        assert wait_for(lambda: ch.state == "on" and not ch.message and "walked" in ch.note, 60), ch.message
-        assert shg.lock.locked() and abs(ch.error_mhz) < 3  # (the mode it hopped to, walked onto the target)
-        assert shg.lock.shg_state()[0] == 5 and "single mode" in ch.note
+        assert wait_for(lambda: ch.state == "on" and not ch.message and "caught" in ch.note, 60), ch.message
+        assert shg.lock.locked() and abs(ch.error_mhz) < 3 and shg.ecdl.m == 0  # back on its own mode, caught
+        assert shg.lock.shg_state()[0] == 5 and "of the optimum's" in ch.note
         (lo, hi), off = ch.last["i_window"], ch.last["act_offset"]  # measured: 148.58 ... 151.58 mA
         assert lo == pytest.approx(148.58) and hi == pytest.approx(151.58) and ch.last["i_top"] == pytest.approx(154.58)
         assert_gentle(currents_written(dlc, 1), lo - off - 1e-3, hi - off + 1e-3)  # set (off: as the piezo was)
-        assert ch.last["ok"] and ch.last["walk"] and ch.last["scan"]["x"]  # kept for a look...
+        assert ch.last["ok"] and ch.last["catch"] and ch.last["walk"] and ch.last["scan"]["x"]  # kept for a look...
+        assert ch.last["ref"][0] == pytest.approx(70.0, abs=0.5)  # (where it was on target: its right mode there)
         lines = (tmp_path / "log.jsonl").read_text().splitlines()
-        assert len(lines) == 2 and "relocked, walked the piezo" in lines[1]  # ...and logged
+        assert len(lines) == 2 and "relocked, caught the right mode at" in lines[1]  # ...and logged
     finally:
         e.stop()
 
@@ -595,7 +596,7 @@ def test_a_cavity_lock_that_keeps_losing_it_is_taken_over(quiet_demo):
         relocks = shg.lock.relocks
         time.sleep(3)
         assert shg.lock.relocks == relocks and shg.lock.locked() and e.trans_levels(ch)[0] > 0.75  # it holds
-        assert "single mode" in ch.note and not shg.lock._slips()
+        assert ("single mode" in ch.note or "of the optimum's" in ch.note) and not shg.lock._slips()
         assert ch.hop.trans_zero == pytest.approx(0.0, abs=0.003)  # measured while the master scanned
     finally:
         e.stop()
@@ -754,7 +755,7 @@ def test_a_relock_with_its_channel_off_looks_when_its_dlc_pro_says_so_and_relock
         src.untick(demo.SHG)  # someone unticks it again, mid-recovery
         assert wait_for(lambda: src.use[demo.SHG] and len(src.switched) == 2, 3)  # on again at once
         assert wait_for(lambda: ch.state != "recovering", 90)
-        assert ch.state == "on" and not ch.message and "relocked, walked the piezo" in ch.note, ch.message
+        assert ch.state == "on" and not ch.message and "relocked, caught the right mode" in ch.note, ch.message
         time.sleep(0.3)
         assert src.switched == [(demo.SHG, True), (demo.SHG, True), (demo.SHG, False)] and not src.use[demo.SHG]
         assert ch.off and shg.lock.locked() and abs(shg.true_freq(time.monotonic()) - target) * 1e6 < 5
@@ -778,7 +779,7 @@ def test_a_look_gives_its_dlc_pro_the_time_to_relock_by_itself(quiet_demo):
         assert wait_for(lambda: ch.look_why == "its cavity lock said “relocking”", 3), ch.looked
         assert wait_for(lambda: not ch.look_why, 15)
         assert ch.looked.startswith("its cavity lock said “relocking”: locked on target"), ch.looked
-        assert ch.state == "on" and not ch.note and wait_for(lambda: ch.off, 2)  # no recovery
+        assert ch.state == "on" and ch.last is None and wait_for(lambda: ch.off, 2)  # no recovery
         assert src.switched == [(demo.SHG, True), (demo.SHG, False)]
     finally:
         e.stop()
@@ -837,5 +838,52 @@ def test_no_relock_when_its_channel_cannot_be_switched_on(quiet_demo):
         assert ch.message == ("cavity lock off: no recovery, cannot switch channel 7 on on the wavemeter: "
                               "SetSwitcherSignalStates: WLM busy")
         assert dlc.written("laser1:dl:cc:current-set") == [] and not ch.borrowed  # nothing touched
+    finally:
+        e.stop()
+
+
+def near_modes(demo):
+    """The demo's SHG master made like the 739 nm one: its modes 2.2 GHz (4 pm) apart, going multimode near their
+    edges; locked by hand on target, as before."""
+    shg = demo.laser(demo.SHG)
+    e = shg.ecdl
+    e.fsr, e.hysteresis, e.multimode = 2.2, 0.3, 0.4
+    e.m, e.shift = 0, 0.0
+    shg.lock.settle()
+    return shg
+
+
+def test_relock_takes_the_optimum_and_a_hop_to_the_near_mode_is_caught_back(quiet_demo):
+    """Clicked on a laser set up by hand, Relock takes its optimum (current, piezo voltage, SHG signal locked), the
+    first time only. It hops to the next mode up (739.053 → 739.049 nm): caught back on its own mode by the current,
+    the piezo free to go to the optimum's ± 30 V for that."""
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = near_modes(demo)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+    try:
+        assert wait_for(lambda: ch.cavity_on is True and ch.shg_txt == "locked" and ch.current is not None, 5)
+        e.engage(demo.SHG)  # Relock
+        assert ch.state == "on" and wait_for(lambda: ch.hop.optimum, 5)
+        hop = ch.hop
+        assert hop.opt_i == pytest.approx(dlc.current_act(1), abs=0.01) and hop.i_nom == hop.opt_i
+        assert hop.opt_v == pytest.approx(dlc.offset(1)) and hop.opt_shg == pytest.approx(1.23, abs=0.03)
+        assert ch.note.startswith("optimum taken: ") and hop.opt_t
+        e.toggle(demo.SHG)  # stop watching, and click Relock again: not taken again
+        hop.opt_t = "kept"
+        e.engage(demo.SHG)
+        assert wait_for(lambda: ch.guard.armed and ch.fine_at is not None, 10) and hop.opt_t == "kept"
+
+        shg.hop_mode(+1)
+        assert wait_for(lambda: ch.state == "recovering", 5)
+        assert wait_for(lambda: ch.state == "on" and "caught the right mode" in ch.note, 60), ch.message
+        assert shg.ecdl.m == 0 and shg.lock.locked() and abs(ch.error_mhz) < 3 and not ch.message
+        lo, hi = ch.last["v_window"]
+        assert lo <= hop.opt_v - 30.0 + 1e-6 and hi >= hop.opt_v + 30.0 - 1e-6  # room for its tries from there
+        assert ch.last["ref"][0] == pytest.approx(hop.opt_v, abs=0.2) and ch.last["optimum"][0] == hop.opt_i
+        assert ch.last["catch"][-1]["caught"]
+
+        assert wait_for(lambda: ch.guard.armed, 5)
+        e.take_optimum(demo.SHG)  # by hand, as it is now
+        assert wait_for(lambda: hop.opt_t != "kept", 5) and ch.note.startswith("optimum taken: ")
     finally:
         e.stop()

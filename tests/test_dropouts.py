@@ -76,7 +76,7 @@ def test_the_monitor_reads_the_recorder_and_puts_its_settings_back(demo):
     dlc = demo.dlcs[2]
     before = {k: v for k, v in dlc.params.items() if ":recorder:" in k and not callable(v)}
     m, got, summaries = run_monitor(demo, lambda: (True, 0.45, 0), [0.003, 0.0012, 0.0002, 0.05], SUMMARY_S=2.0,
-                                    _summary_at=time.monotonic() + 2.0)
+                                    _summary_at=time.monotonic() + 2.0, dt=0.00025)
     assert m.method == "recorder" and m.resolution == pytest.approx(0.00025, rel=0.05)
     ms = [round(d.duration * 1e3, 2) for d in got]
     assert len(ms) == 3 and ms[0] == pytest.approx(3.0, abs=0.3) and ms[1] == pytest.approx(1.25, abs=0.3)
@@ -88,9 +88,21 @@ def test_the_monitor_reads_the_recorder_and_puts_its_settings_back(demo):
     assert after == before  # put back as it was found
 
 
+def test_by_default_a_sample_a_millisecond_read_every_two_seconds(demo):
+    """Asking the controller little, and seldom: TOPAS shares it (and said 'acquisition busy' when it was read back
+    to back)."""
+    rec = demo.laser(demo.SHG).lock.recorder
+    m, got, _ = run_monitor(demo, lambda: (True, 0.45, 0), [0.004, 0.0008, 0.0025], wait=4.5)
+    assert m.method == "recorder" and m.resolution == pytest.approx(0.001, rel=0.05)
+    assert demo.dlcs[2].written("laser1:recorder:sample-count-set")[0] == 30000  # 30 s (put back since)
+    ms = [round(d.duration * 1e3) for d in got]
+    assert ms == [4, pytest.approx(2.5, abs=0.6)]  # (0.8 ms: one sample at most, too short)
+    assert rec.reads <= 6  # some 6.5 s: the first look, then one read every 2 s
+
+
 def test_a_recorder_not_read_while_it_records_is_read_when_full(demo):
     demo.laser(demo.SHG).lock.recorder.busy = True
-    m, got, _ = run_monitor(demo, lambda: (True, 0.45, 0), [0.003, 0.002], wait=2.5, RECORD_S=1.5)
+    m, got, _ = run_monitor(demo, lambda: (True, 0.45, 0), [0.003, 0.002], wait=2.5, RECORD_S=1.5, dt=0.00025)
     assert m.method == "recorder" and m.when_full
     assert [round(d.duration * 1e3, 1) for d in got] == [pytest.approx(3.0, abs=0.3), pytest.approx(2.0, abs=0.3)]
 
@@ -107,9 +119,9 @@ def test_without_a_recorder_it_polls_and_says_why(demo, caplog):
     for k in [k for k in dlc.params if ":recorder:" in k]:
         del dlc.params[k]
     with caplog.at_level(logging.INFO, logger="wmlock.dropouts"):
-        m, got, _ = run_monitor(demo, lambda: (True, 0.45, 0), [0.08], wait=6.0)
-    assert m.method == "polling" and "no recorder" in m.why_not
-    assert len(got) == 1 and got[0].method == "polling" and got[0].duration == pytest.approx(0.08, abs=0.03)
+        m, got, _ = run_monitor(demo, lambda: (True, 0.45, 0), [0.2], wait=6.0)
+    assert m.method == "polling" and "no recorder" in m.why_not and m.resolution == pytest.approx(0.05, abs=0.02)
+    assert len(got) == 1 and got[0].method == "polling" and got[0].duration == pytest.approx(0.2, abs=0.06)
     assert any("by polling" in r.getMessage() and "no recorder" in r.getMessage() for r in caplog.records)
 
 
@@ -127,7 +139,8 @@ def test_lock_dropouts_are_logged_in_the_console_and_a_file(quiet_demo, tmp_path
     shg = demo.laser(demo.SHG)
     path = tmp_path / "dropouts.jsonl"
     with caplog.at_level(logging.INFO, logger="wmlock.dropouts"):
-        e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True), drop_path=path)
+        e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, drop_ms=0.25),
+                           drop_path=path)
         e.DROP_SETTLE_S = 1.0
         try:
             assert wait_for(lambda: ch.hop.trans_locked > 0 and e.monitors[demo.SHG].method == "recorder", 10)
@@ -141,7 +154,8 @@ def test_lock_dropouts_are_logged_in_the_console_and_a_file(quiet_demo, tmp_path
             assert lines[0]["channel"] == demo.SHG and lines[0]["method"] == "recorder" and lines[0]["low_v"] < 0.1
             assert lines[0]["limit_v"] == pytest.approx(0.5 * ch.hop.trans_locked, rel=0.1)
             said = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-            assert any(re.search(r"channel 7: lock dropout 4\.\d ms: transmission down to", s) for s in said), said
+            said_at = r"channel 7: lock dropout 4\.\d ms: transmission down to .*, at \d\d:\d\d:\d\d\.\d{3}; "
+            assert any(re.search(said_at, s) for s in said), said
             assert "2 in the last hour" in said[-1]
 
             time.sleep(1.2)

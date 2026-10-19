@@ -47,9 +47,9 @@ of what they were over the last few minutes while it ran as it should
 (HopParams.trans_locked, shg_lock), and what a relock measured until then.
 
 Lock dropouts (dropouts.py): for each laser its DLC pro locks to a cavity, a monitor of its own watches the
-transmission for the lock losing the laser even for a fraction of a millisecond, while its lock is on and no
-recovery runs (and DROP_SETTLE_S after); each dropout is logged (the console, and a line of JSON in
-drop_path), and how many there were, once an hour.
+transmission for the lock losing the laser even for a couple of milliseconds (HopParams.drop_ms between
+samples), while its lock is on and no recovery runs (and DROP_SETTLE_S after); each dropout is logged (the
+console, and a line of JSON in drop_path), and how many there were, once an hour.
 
 Currents are shown, and the nominal current given, as measured (current-act);
 the set current (current-set) is what a recovery writes, and is watched for
@@ -184,9 +184,11 @@ class Channel:
         self.drops = deque()   # (time.time(), s) of its dropouts over the last hour
         self.drops_total = 0   # ...since the program started
         self.drop_last = ""    # the last one, said
-        self.drop_said = 0.0   # monotonic: when the console last had one...
+        self.drop_said = 0.0   # time.time(): when the last one the console had happened...
         self.drop_unsaid = 0   # ...and how many since were not said there (at most one a second)
         self.hold_since = None  # monotonic: since when its lock should hold (on, no recovery)
+        # where it was on target as it should be (the catch: its right mode is there)
+        self.fine_at = None    # (monotonic, scan offset, set current) when last polled so
 
     @property
     def param(self) -> str:
@@ -376,6 +378,7 @@ class Engine:
     LOOK_GAP = 60.0  # s: ...and comes this long after the last at the soonest
     LOOK_N = 5       # readings in a row on target (its locks saying locked) end a look; off target, it is relocked
     WAIT_S = 10.0    # s a recovery waits for readings once its wavemeter channel is switched on for it
+    FINE_S = 900.0   # s: where it was last on target as it should be, if that recent, is where its right mode is
 
     def __init__(self, config: dict, make_source, discovery_targets=None, extra_devices=(), log_path=None,
                  drop_path=None):
@@ -759,6 +762,8 @@ class Engine:
         ch.state, ch.message = "on", ""
         ch.token += 1
         ch.guard.reset()
+        if check and not hop.optimum:  # clicked on a laser set up by hand: its optimum, the first time
+            self._take_optimum(ch)
         if check and ch.off:  # is it locked on target? A look, its channel switched on for it
             ch.look_next = 0.0
             self._look(ch, "Relock clicked")
@@ -873,8 +878,11 @@ class Engine:
 
         def on_offset(v):
             with self.lock:
-                if ch.device == key and ch.laser == laser and ch.state == "off":
-                    ch.offset = v
+                if ch.device == key and ch.laser == laser:
+                    if ch.state == "off":
+                        ch.offset = v
+                    if ch.current_set is not None and self._running_fine(ch):
+                        ch.fine_at = (time.monotonic(), v, ch.current_set)  # (a cavity lock moves the offset)
 
         def read_unit(client):
             unit = client.get_str(f"laser{laser}:scan:unit") or "V"
@@ -1186,8 +1194,9 @@ class Engine:
         """A dropout monitor for a laser its DLC pro locks, while HopParams.dropouts says so."""
         hop, key = ch.hop, (ch.device, ch.laser)
         want = bool(ch.device) and hop.enabled and hop.cavity and hop.dropouts
+        dt = min(max(hop.drop_ms, 0.05), 100.0) * 1e-3
         m = self.monitors.get(ch.n)
-        if m is not None and (not want or m.key != key):
+        if m is not None and (not want or m.key != key or abs(m.dt - dt) > 1e-9):
             m.stop()
             del self.monitors[ch.n]
             m = None
@@ -1196,7 +1205,7 @@ class Engine:
             m = DropoutMonitor(d.ip, d.port, ch.laser, status=lambda: self._drop_status(ch, key),
                                report=lambda drop: self._dropped(ch, key, drop),
                                summary=lambda text: self._drop_summary(ch, key, text),
-                               name=f"channel {ch.n}" + (f" {ch.name}" if ch.name else ""))
+                               name=f"channel {ch.n}" + (f" {ch.name}" if ch.name else ""), dt=dt)
             m.key = key
             self.monitors[ch.n] = m
             m.start()
@@ -1232,14 +1241,15 @@ class Engine:
                 how += f" (polled every {d.resolution * 1e3:.0f} ms)"
             ch.drop_last = (f"{time.strftime('%H:%M:%S', time.localtime(d.t))} {how}, transmission down to "
                             f"{volts(d.low, usual)} V")
+            at = time.strftime("%H:%M:%S", time.localtime(d.t)) + f".{int(d.t % 1 * 1000):03d}"
             text = (f"lock dropout {how}: transmission down to {volts(d.low, usual)} V (counts below "
-                    f"{volts(d.limit, usual)} V; locked {volts(usual, usual)} V); {len(ch.drops)} in the last hour")
-            mono = time.monotonic()
-            say = mono - ch.drop_said >= 1.0
+                    f"{volts(d.limit, usual)} V; locked {volts(usual, usual)} V), at {at}; {len(ch.drops)} in the last "
+                    f"hour")
+            say = d.t - ch.drop_said >= 1.0  # (by when they happened: they are read a few seconds' worth at a time)
             if say:
                 if ch.drop_unsaid:
                     text += f" ({ch.drop_unsaid} more since the last one said here)"
-                ch.drop_said, ch.drop_unsaid = mono, 0
+                ch.drop_said, ch.drop_unsaid = d.t, 0
             else:
                 ch.drop_unsaid += 1
             who = f"channel {ch.n}" + (f" {ch.name}" if ch.name else "")
@@ -1372,6 +1382,44 @@ class Engine:
                 if ch.device == key and ch.laser == laser and not ch.hop.i_nom:
                     ch.hop.i_nom, ch.current = round(v, 3), v
                     self.dirty = True
+
+        self._controller(key).submit(job)
+
+    def take_optimum(self, n: int):
+        """The laser as it is now is at its optimum (set by hand): its current, piezo voltage and SHG signal locked
+        are what the catch goes back to."""
+        with self.lock:
+            ch = self.channels[n]
+            if not ch.device:
+                ch.message = "right-click to link a laser first"
+            elif ch.state == "recovering":
+                ch.message = "take the optimum: not while it recovers"
+            else:
+                self._take_optimum(ch)
+
+    def _take_optimum(self, ch: Channel):
+        key, laser, shg = ch.device, ch.laser, ch.hop.shg
+        names = (CURRENT_ACT, ACTUATOR) + ((SHG_STATE, SHG_INTRA) if shg else ())
+
+        def job(client):
+            got = perform(client, laser, ("get", names))
+            with self.lock:
+                if ch.device != key or ch.laser != laser:
+                    return
+                act, v = got[0], got[1]
+                if not (_num(act) and _num(v)):
+                    ch.message = "cannot read its current and offset: the optimum is not taken"
+                    return
+                hop = ch.hop
+                hop.opt_i, hop.opt_v, hop.i_nom = round(act, 3), round(v, 4), round(act, 3)
+                hop.opt_t = time.strftime("%Y-%m-%d %H:%M")
+                level = got[3] if shg and says_locked(got[2]) and _num(got[3]) and got[3] > 0 else 0.0
+                hop.opt_shg = round(level, 4)
+                self.dirty = True
+                ch.note = (f"optimum taken: {act:.2f} mA, {v:.2f} {ch.unit}" + (
+                    f", SHG {level:.3f} V locked" if level else ", SHG not locked: its level not known" if shg else ""))
+                ch.note_t = time.monotonic()
+                log.info("channel %d: %s", ch.n, ch.note)
 
         self._controller(key).submit(job)
 
@@ -1517,7 +1565,13 @@ class Engine:
         off = a0 - i0
         i_lo, i_hi = max(hop.i_nom - hop.i_below - off, 0.0), hop.i_nom + hop.i_window - off
         i_top = hop.i_nom + max(hop.jump_max, hop.i_window) - off
-        v_lo, v_hi = max(lp.v_min, v0 - hop.v_window), min(lp.v_max, v0 + hop.v_window)
+        v_lo, v_hi = v0 - hop.v_window, v0 + hop.v_window
+        if hop.how() == "catch" and hop.pc_try > 0:  # (its tries from the optimum's piezo voltage +- pc_try)
+            vo = hop.opt_v if hop.optimum else v0
+            v_lo, v_hi = min(v_lo, vo - hop.pc_try), max(v_hi, vo + hop.pc_try)
+        v_lo, v_hi = max(lp.v_min, v_lo), min(lp.v_max, v_hi)
+        fine = ch.fine_at
+        ref = (fine[1], fine[2]) if fine and time.monotonic() - fine[0] <= self.FINE_S else None
         ch.current, ch.current_set, ch.offset = a0, i0, v0
         if not i_lo <= min(i_hi, clip):
             self._recovery_failed(ch, f"current-clip, {clip + off:.2f} mA measured, is below its window ("
@@ -1528,9 +1582,9 @@ class Engine:
             self._recovery_failed(ch, f"the offset, {v0:.2f} V, is outside {lp.v_min:g} … {lp.v_max:g} V")
             return
         rec = Recenter(hop, i0, v0, i_lo, i_hi, v_lo, v_hi, cavity=locked, quick=quick, shg=hop.shg, act_offset=off,
-                       i_top=i_top, i_clip=clip)
+                       i_top=i_top, i_clip=clip, ref=ref)
         io = _HopIO(self, ch, controller)
-        runner = Runner(rec, io, time.monotonic(), finished=lambda r: self._recovery_done(ch, r))
+        runner = Runner(rec, io, time.monotonic(), timeout=rec.timeout, finished=lambda r: self._recovery_done(ch, r))
         if runner.busy:
             ch.runner = runner
             if ch.off:  # (begun at once, not lasing: its channel is being switched on)
@@ -1613,6 +1667,8 @@ class Engine:
             "why": ch.hop_why or "recenter now", "ok": r.state == "done", "outcome": outcome,
             "took_s": round(r.now - ch.hop_t, 1), "i_window": [round(rec.mA(rec.i_lo), 4), round(rec.mA(rec.i_hi), 4)],
             "i_top": round(rec.mA(rec.i_top), 4), "v_window": [rec.v_lo, rec.v_hi], "seed": ch.seed,
+            "ref": [round(rec.v_ref, 4), round(rec.mA(rec.i_ref, rec.v_ref), 4)],
+            "optimum": [ch.hop.opt_i, ch.hop.opt_v, ch.hop.opt_shg, ch.hop.opt_t] if ch.hop.optimum else None,
             "kv": rec.kv, "ff": rec.ff, "unit": ch.unit, **rec.record,
             "notes": [[None if t is None else round(t - r.started, 1), text] for t, text in rec.record["notes"]],
         }

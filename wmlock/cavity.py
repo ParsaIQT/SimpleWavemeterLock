@@ -16,7 +16,9 @@
 
 Peaks are characterised by their area (the sum of the samples above the floor) as well as their
 height: a resonance only a few samples wide can be sampled anywhere between its top and its
-flank, which changes its height a lot and its area little. Where the scan turns, a resonance
+flank, which changes its height a lot and its area little. Its true height (its top, between
+samples) is had from its highest sample and its two neighbours (peak_top): what the SHG cavity
+locked to the laser would show, its intra-cavity signal's maximum. Where the scan turns, a resonance
 can show cut short, or as two crossings run into one: such peaks are left out, where the scan
 voltage shows where it turns, and peaks that do not recur in the sweep are not taken for a
 second mode (each resonance is crossed sweeping up and again sweeping down, once per FSR).
@@ -129,6 +131,7 @@ class ModeCheck:
     height: float = 0.0    # of the biggest peak, above the floor
     floor: float = 0.0     # the level between resonances
     peaks: list = field(default_factory=list)  # [(index, height, area)], whole peaks only
+    top: float = 0.0       # the tallest peak's true height above the floor, between samples (peak_top)
 
     def split(self, area: float = 0.0):
         """(side, n_main): main peaks have at least MAIN of `area` (by default the biggest one's);
@@ -173,6 +176,25 @@ def turnarounds(scan) -> list:
     return out
 
 
+def peak_top(y, i: int, base: float) -> float:
+    """The height above base of the resonance whose highest sample is y[i], between samples: near its top a
+    resonance is a Lorentzian, whose reciprocal is a parabola; through the reciprocals of y[i] and its two
+    neighbours (above base), the parabola's lowest point. y[i] - base if that does not work (at an edge, or
+    in the noise)."""
+    h = y[i] - base
+    if not 0 < i < len(y) - 1 or h <= 0:
+        return max(h, 0.0)
+    a, c = y[i - 1] - base, y[i + 1] - base
+    if a <= 0 or c <= 0 or a > h or c > h:
+        return h
+    u0, um, up = 1.0 / h, 1.0 / a, 1.0 / c
+    curv, slope = 0.5 * (um + up) - u0, 0.5 * (up - um)  # 1/y = curv x^2 + slope x + u0, x in samples from i
+    if curv <= 0 or abs(slope) > 2 * curv:  # (its lowest point more than a sample away: not a top)
+        return h
+    lowest = u0 - slope * slope / (4 * curv)
+    return min(1.0 / lowest, 2.0 * h) if lowest > 0 else h
+
+
 def sweep(y, scan=None) -> ModeCheck:
     """Measure an SHG sweep (the intra-cavity signal, in acquisition order). Peaks cut off by
     the ends of the trace are left out, and with the scan voltage (scan: same samples) those
@@ -189,7 +211,9 @@ def sweep(y, scan=None) -> ModeCheck:
     big = max((p for p in whole if p.w in alike), key=lambda p: p.w, default=None) or max(whole, key=lambda p: p.w)
     if big.w <= 0:
         return ModeCheck()
-    return ModeCheck(True, big.w, big.h, floor_level(y), [(p.i, p.h, p.w) for p in whole])
+    base = floor_level(y)
+    return ModeCheck(True, big.w, big.h, base, [(p.i, p.h, p.w) for p in whole],
+                     max(peak_top(y, p.i, base) for p in whole))
 
 
 SIDE_DEFAULT = 0.2   # with nothing to compare to: a side peak bigger than this means multimode

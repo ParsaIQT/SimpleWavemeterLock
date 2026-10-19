@@ -349,9 +349,10 @@ class CavitySteps:
 
     def lock_shg(self):
         """Lock the SHG cavity: its intra-cavity signal must come up, and as high as usual (as learned
-        while it ran, else where it was locked when the recovery began): if not, the master is not
-        single-mode, whatever its sweep looked like (self.doubt), unless trimming the current for
-        that has not brought it up already (then it is handed back all the same, and says so)."""
+        while it ran, else where it was locked when the recovery began; the catch: within 1 - catch_min of
+        the optimum's): if not, the master is not single-mode, whatever its sweep looked like (self.doubt),
+        unless trimming the current for that has not brought it up already (then it is handed back all the
+        same, and says so). The catch learns how its sweep's peak compares with the signal locked."""
         s = self.last_sweep
         yield from self.ask(f"Lock the SHG cavity ({self.mode_text or 'its mode was not checked'})")
         self.stage = "locking the SHG cavity"
@@ -362,7 +363,8 @@ class CavitySteps:
             level = 0.5 * self.shg_level
         else:  # or half way up the main peak of the sweep (the scope may scale it differently, though)
             level = s.floor + 0.5 * s.height if s is not None and s.seen else None
-        usual = self.p.shg_lock or self.shg_level or 0.0  # its intra-cavity signal, locked single-mode
+        catch = self.method == "catch"
+        usual = self.usual_shg() if catch else (self.p.shg_lock or self.shg_level or 0.0)  # locked, single-mode
         good, text, intra, top = 0, None, None, 0.0
         for _ in range(int(self.SHG_LOCK_S / 0.5)):
             yield mh.Wait(0.5)
@@ -378,21 +380,39 @@ class CavitySteps:
             self.note(self.relock_trouble)
             self.doubt = True
             return False
-        if usual > 0 and top and top < cavity.AREA_MIN * usual:
-            if not self.explored:
+        floor = s.floor if catch and s is not None and s.seen else 0.0
+        least = self.p.catch_min if catch else cavity.AREA_MIN
+        share = (top - floor) / (usual - floor) if usual > floor and top else 1.0
+        if share < least:
+            if catch and s is not None and s.top > 0 and top > floor and not self.explored:
+                # its sweep made more of the peak than the signal locked shows: from now on, as the signal locked
+                self.ratio = max(self.ratio, s.top / (top - floor))
+                self.explored += 1
                 self.relock_trouble = (f"the SHG cavity locked, but its intra-cavity signal is {top:.3f} V, "
-                                       f"{top / usual:.2f} of usual: the master is not single-mode")
+                                       f"{share:.2f} of the optimum's, short of what its sweep showed: caught again")
+                self.note(self.relock_trouble)
+                self.doubt = True
+                return False
+            if not catch and not self.explored:
+                self.relock_trouble = (f"the SHG cavity locked, but its intra-cavity signal is {top:.3f} V, "
+                                       f"{share:.2f} of usual: the master is not single-mode")
                 self.note(self.relock_trouble)
                 self.doubt = True
                 return False
             # (a second mode whose peaks the sweep cannot tell from the main ones, or a weaker TA, say)
-            self.shg_text = f"SHG signal only {top / usual:.2f} of usual"
-            self.note(f"SHG cavity locked, its intra-cavity signal {top:.3f} V, {top / usual:.2f} of usual, and "
-                      f"trimming the current did not bring it up: handed back all the same")
+            self.shg_text = f"SHG signal only {share:.2f} of {'the optimum' if catch else 'usual'}"
+            self.note(f"SHG cavity locked, its intra-cavity signal {top:.3f} V, {share:.2f} of "
+                      f"{'the optimum' if catch else 'usual'}, and trimming the current did not bring it up: handed "
+                      f"back all the same")
             return True
-        self.note("SHG cavity locked" + (f", intra-cavity signal {top:.3f} V" if top else ""))
+        self.note("SHG cavity locked" + (f", intra-cavity signal {top:.3f} V" if top else "")
+                  + (f", {share:.2f} of the optimum's" if catch and usual > floor and top else ""))
         if top:
             self.learned["shg_lock"] = round(top if not self.p.shg_lock else 0.7 * self.p.shg_lock + 0.3 * top, 4)
+        if s is not None and s.seen and s.top > 0 and top > s.floor:  # (single-mode here, the catch's or the walk's)
+            r = s.top / (top - s.floor)  # its sweep's peak, as a share of the signal locked (both above the floor)
+            if 0.2 <= r <= 5.0:  # (another scale on the scope, say: the catch compares with the optimum's so)
+                self.learned["shg_ratio"] = round(r if not self.p.shg_ratio else 0.7 * self.p.shg_ratio + 0.3 * r, 4)
         return True
 
     # ----------------------------------------------------------- handing back
@@ -825,7 +845,9 @@ def setup_report(client, laser: int, hop, lp) -> list:
     v = g["scan:offset"]
     inside = _num(v) and lp.v_min <= v <= lp.v_max
     add("ok" if inside else "error", f"offset {fmt(v, ' V')} (lock limits {lp.v_min:g} … {lp.v_max:g} V); "
-                                     f"recoveries move it at most ±{hop.v_window:g} V")
+                                     f"recoveries move it at most ±{hop.v_window:g} V"
+                                     + (f" (the catch's tries: the optimum's ±{hop.pc_try:g} V)"
+                                        if hop.how() == "catch" and hop.pc_try > 0 else ""))
     add("ok", f"scan {fmt(g['scan:enabled'])}, amplitude {fmt(g['scan:amplitude'], ' V')}, "
               f"{fmt(g['scan:frequency'], ' Hz', 1)}")
     amp = g["scan:amplitude"]
@@ -956,12 +978,12 @@ def setup_report(client, laser: int, hop, lp) -> list:
                         f"the transmission, which can miss those shorter than the time between reads (some ms)")
         else:
             add("ok", f"watched with the DLC pro's recorder (now “{r['recorder:state-txt'] or '?'}”), the transmission "
-                      f"every 0.25 ms: while this program runs the recorder is its own, and its settings are put back "
-                      f"when it closes")
+                      f"every {hop.drop_ms:g} ms, read every 2 s: while this program runs the recorder is its own, "
+                      f"and its settings are put back when it closes")
         if hop.dropouts:
-            add("info", "a dropout: the transmission below the slipping limit (above) for 0.5 ms or more, while its "
-                        "lock is on and no recovery runs; each one goes to the console and to "
-                        "~/.simplewavemeterlock-dropouts.jsonl, and how many, once an hour")
+            add("info", f"a dropout: the transmission below the slipping limit (above) for two samples or more "
+                        f"({2 * hop.drop_ms:g} ms), while its lock is on and no recovery runs; each one goes to the "
+                        f"console and to ~/.simplewavemeterlock-dropouts.jsonl, and how many, once an hour")
 
         add("head", "Scope (laser scope)")
         s = get("scope:channel1:signal", "scope:channel2:signal", "scope:channelx:xy-signal", "scope:variant")
@@ -995,17 +1017,49 @@ def setup_report(client, laser: int, hop, lp) -> list:
             if hop.shg_area:
                 add("info", f"single-mode look learned: main peak area {hop.shg_area:.3g}, biggest side peak "
                             f"{hop.shg_side * 100:.0f} %")
+            catch = hop.how() == "catch" and hop.opt_shg > 0
             add("info", (f"intra-cavity signal locked, usually {hop.shg_lock:.3f} V: " if hop.shg_lock else
                          "its usual intra-cavity signal locked is learned while it runs: ")
-                + f"a recovery's SHG lock must come up to {cavity.AREA_MIN:g} of that, else the master is not "
-                  "single-mode (two modes alike look like one in a sweep) and the current is trimmed; watched, its "
-                  f"average over 10 s below {hop.lock_min:g} of it starts a recovery")
+                + (f"a recovery's SHG lock must come within {100 * (1 - hop.catch_min):.0f} % of the optimum's "
+                   f"({hop.opt_shg:.3f} V), else it is caught again" if catch else
+                   f"a recovery's SHG lock must come up to {cavity.AREA_MIN:g} of that, else the master is not "
+                   "single-mode (two modes alike look like one in a sweep) and the current is trimmed")
+                + f"; watched, its average over 10 s below {hop.lock_min:g} of it starts a recovery")
             add("info", "whether the master lases is told by the SHG sweep too: flat (no resonance), it does not, "
                         "whatever its seed power says (a master that does not lase still sends its TA broadband "
                         "light); then the current jumps up until the sweep shows resonances again")
 
     add("head", "Finding a mode on target")
-    if hop.how() == "walk":
+    if hop.how() == "catch":
+        add("info", f"catch, as by hand: back onto the right mode (the one it was on target on before it hopped) by "
+                    f"the current: up to the top of its window, then down {hop.step:g} mA at a time until the laser is "
+                    f"on it and its SHG peak (the tallest resonance in the SHG sweep, between samples) is within "
+                    f"{100 * (1 - hop.catch_min):.0f} % of the optimum's; on into the mode's best and back up to the "
+                    f"top end of it. Not caught in {hop.catch_tries} goes, the same from the optimum's piezo voltage "
+                    f"+ and - {hop.pc_try:g} V; then the piezo onto the target in {hop.walk_step:g} V steps, the "
+                    f"current parked high in the mode every 4. A laser on the right mode and as good as that is only "
+                    f"relocked. Not to be had at all: the mode it is on walked onto the target instead (walk)")
+        if hop.optimum:
+            g = get("scan:offset", "dl:cc:current-act")
+            v, act = g["scan:offset"], g["dl:cc:current-act"]
+            add("ok", f"the optimum, taken {hop.opt_t or 'by hand'}: {hop.opt_i:.2f} mA, {hop.opt_v:.2f} V"
+                      + (f", SHG {hop.opt_shg:.3f} V locked" if hop.opt_shg else "")
+                      + (f" (now {act:.2f} mA, {v:.2f} V)" if _num(v) and _num(act) else ""))
+            if not hop.opt_shg and hop.shg:
+                add("warn", "the optimum's SHG level is not known (its SHG cavity was not locked when it was taken): "
+                            "the SHG peak is compared with its usual level locked instead; take it again, locked")
+            lo, hi = hop.opt_v - hop.pc_try, hop.opt_v + hop.pc_try
+            if hop.pc_try > 0 and (lo < lp.v_min or hi > lp.v_max):
+                add("warn", f"the tries from {lo:.1f} and {hi:.1f} V go beyond the lock's offset limits "
+                            f"({lp.v_min:g} … {lp.v_max:g} V): those beyond are not tried")
+        else:
+            add("warn" if hop.shg else "info",
+                "the optimum is not taken yet: set the laser up by hand, then click Relock (or right-click › Take the "
+                "optimum now); until then the SHG peak is compared with its usual level locked, and the tries go "
+                f"from where the piezo is ± {hop.pc_try:g} V")
+        if hop.shg_ratio:
+            add("info", f"its SHG sweep shows the peak at {hop.shg_ratio:.2f} of the signal locked (learned)")
+    elif hop.how() == "walk":
         add("info", f"walk: single mode first by the SHG sweep, trimming the current; within {hop.reach:g} GHz (else "
                     f"first hop to a nearer mode with the current), the piezo onto the target in {hop.walk_step:g} V "
                     f"steps, the mode looked at after each and the current trimmed when it gets worse. A laser that "

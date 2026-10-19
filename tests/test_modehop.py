@@ -610,8 +610,11 @@ def test_params_round_trip():
     f = p.forget()
     assert f.kv == 0 and f.lp_code == -1 and f.lp_kind == "" and f.shg and f.i_nom == 151.25 and f.seed_ok == 0
     assert f.method == "map" and f.seed == "amp:seed-limits:power" and f.jump == 3.0
-    assert HopParams(shg=True).how() == "walk" and HopParams(method="walk").how() == "walk"
+    assert HopParams(shg=True).how() == "catch" and HopParams(method="walk").how() == "walk"
     assert HopParams().how() == "map" and HopParams(shg=True, method="map").how() == "map"
+    o = HopParams(shg=True, opt_i=150.2, opt_v=71.5, opt_shg=1.23, opt_t="2026-10-19 21:03", shg_ratio=0.97).forget()
+    assert o.optimum and (o.opt_i, o.opt_v, o.opt_shg) == (150.2, 71.5, 1.23) and o.shg_ratio == 0  # it was set by hand
+    assert not HopParams().optimum and HopParams.from_dict(o.to_dict()) == o
     assert HopParams().seed_names == ("amp:pd:seed:power", "amp:seed-limits:power")
     assert HopParams(seed="off").seed_names == ()
     assert HopParams(seed=" dl:pd:seed:power ").seed_names == ("dl:pd:seed:power",)
@@ -654,7 +657,8 @@ def test_cancel_with_a_write_on_its_way_waits_for_it():
 
 
 # ------------------------------------------------ SHG lasers, relocked by lockpoint
-SHG = HopParams(enabled=True, i_nom=I0, cavity=True, shg=True)  # the walk, by default
+SHG = HopParams(enabled=True, i_nom=I0, cavity=True, shg=True, method="walk")
+SHG_CATCH = HopParams(enabled=True, i_nom=I0, cavity=True, shg=True)  # by default (auto), the catch
 SHG_MAP = HopParams(enabled=True, i_nom=I0, cavity=True, shg=True, method="map", i_below=2.0, v_window=10.0)
 ORIGINAL = {"laser1:scope:channel1:signal": 0, "laser1:scope:channel2:signal": 2,
             "laser1:nlo:shg:scope:channel1:signal": 82, "laser1:nlo:shg:scope:channel2:signal": 90}
@@ -1465,3 +1469,233 @@ def test_cancelled_mid_walk_with_the_feedforward_everything_goes_back_in_small_s
     assert r.state == "failed" and r.restored and (b.I, b.V) == (I0, V0) and b.laser.lasing
     acts = measured_currents(b)
     assert min(acts) >= 149.8 and all(abs(x - y) <= STEP_MAX + 1e-9 for x, y in zip(acts, acts[1:]))
+
+
+# ------------------------------------------------- the catch: back onto the right mode
+def near_bench(seed=40, ff=0.0, i_stop=None, i_start=None, **ecdl):
+    """A TA-SHG pro like the 739 nm one: its master's modes 2.2 GHz (4 pm) apart, going multimode near their edges,
+    locked by hand to the cavity peak at its target (as is its SHG cavity); optionally its feedforward on (ff mA/V,
+    as ff_bench) and stopping lasing below i_stop, starting again above i_start."""
+    kw = dict(fsr=2.2, hysteresis=0.3, multimode=0.4, mm_noise=0.004)
+    kw.update(ecdl)
+    laser = ECDL(400.0, seed=seed, i_stop=i_stop, i_start=i_start, **kw)
+    b = Bench(laser, laser.freq(V0, I0), seed=seed, scan=True)
+    if ff:
+        d = b.dlc.params
+        d["laser1:dl:cc:feedforward-enabled"], d["laser1:dl:cc:feedforward-factor"] = True, ff
+        b.dlc.bias[1] = -ff * V0
+    lock = b.lock_it(seed=seed, shg=True, lockpoints=True, pdh_dc=0.009)
+    lock.settle()
+    assert lock.locked() and abs(b.off_mhz()) < 1 and b.act == pytest.approx(I0)
+    b.shg_usual = lock._intra_now()
+    return b, lock
+
+
+def optimum(b, **kwargs) -> HopParams:
+    """The catch (the default with an SHG stage), the optimum taken where the bench began, as clicking Relock on it
+    would have."""
+    return HopParams.from_dict({**SHG_CATCH.to_dict(), "opt_i": I0, "opt_v": V0, "opt_shg": b.shg_usual,
+                                "opt_t": "2026-10-19 21:03", **kwargs})
+
+
+def hop_up(b, lock, by=1.6):
+    """Its selection filter drifts: it hops to the next mode up in frequency (739.053 → 739.049 nm), and its lock
+    catches another peak."""
+    b.laser.nudge(+by)
+    lock.frequency()
+    assert b.laser.m == 1
+
+
+def test_after_a_hop_to_the_near_neighbour_it_is_caught_back_on_the_right_mode():
+    """The night it failed: its modes 2.2 GHz apart, it hops to the next one up. Walked, the piezo takes that mode onto
+    the target, 5.5 V from where it was. Caught, as by hand: the current up, then down a step at a time until it is
+    on the right mode, its SHG peak within 10 % of the optimum's; on into the mode's best and back up to the top end
+    of it, the piezo onto the target; the SHG cavity locked, the error signal's DC nulled, and locked."""
+    b, lock = near_bench()
+    hop_up(b, lock)
+    b, rec, r = recover(b.laser, b.target, optimum(b, method="walk"), cavity=True, bench=b)
+    assert r.state == "done" and b.laser.m == 1 and abs(b.V - V0) == pytest.approx(5.5, abs=0.3), r.error
+
+    b, lock = near_bench()
+    hop_up(b, lock)
+    b, rec, r = recover(b.laser, b.target, optimum(b), cavity=True, bench=b)
+    assert r.state == "done", r.error
+    assert b.laser.m == 0 and abs(b.V - V0) < 1.5 and b.I > I0  # the right mode, the piezo about where it was
+    assert lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12) and b.single_mode()
+    assert lock.shg_state() == (5, "locked") and abs(lock.dc()) < 0.002
+    currents = b.writes("dl:cc:current-set")
+    top = currents.index(max(currents))
+    assert max(currents) == pytest.approx(I0 + 2.0) and currents[:top] == sorted(currents[:top])  # up quickly...
+    down = currents[top:currents.index(min(currents[top:]))]
+    assert all(0.09 < x - y < 0.11 for x, y in zip(down, down[1:]))  # ...then down a step at a time
+    go = r.result.record["catch"][0]
+    assert go["caught"] and go["right"] == 0 and go["points"][-1][2] >= 0.9
+    assert re.match(r"relocked, caught the right mode at 151\.\d0 mA \(1 go up and down\), walked the piezo 70\.00 → "
+                    r"70\.\d\d V, .*SHG peak (0\.9\d|1\.0\d) of the optimum's", r.result.summary), r.result.summary
+    order = [n.replace("laser1:", "") for n, _ in b.dlc.log if "cc:current" not in n and "scan:offset" not in n]
+    assert order == ["dl:lock:lock-enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "nlo:shg:scan:enabled",
+                     "nlo:shg:scan:enabled", "nlo:shg:lock:lock-enabled", "scan:enabled", "dl:lock:find-candidates",
+                     "falc1:input:offset", "dl:lock:find-candidates", "dl:lock:select-lockpoint",
+                     "dl:lock:lock-enabled"]
+    assert settings(b) == ORIGINAL
+    learned = r.result.learned
+    assert learned["shg_ratio"] == pytest.approx(1.0, abs=0.05)  # its sweep shows the peak as its signal locked
+    assert r.result.kv == pytest.approx(400, rel=0.05)
+
+
+def test_not_caught_where_it_is_it_is_caught_from_the_optimum_piezo_voltage_and_walked_back():
+    """Hysteresis can keep it off the right mode wherever the current goes in its window: it hops back only 1.14 mA
+    up, the window ends 0.95 mA up. Three goes, then from the optimum's piezo voltage + 30 V, where it is caught (12
+    GHz from the target there, as the piezo tuning says); walked back 30 V, the current parked high in the mode now
+    and then on the way (the piezo takes the mode away from it), and it is on target, on the right mode."""
+    b, lock = near_bench(hysteresis=0.8, multimode=0.3, ksv=0.32)
+    hop_up(b, lock, 2.3)
+    b, rec, r = recover(b.laser, b.target, optimum(b, i_window=0.95, v_window=40.0, kv=400.0), cavity=True, bench=b)
+    assert r.state == "done", r.error
+    assert b.laser.m == 0 and abs(b.off_mhz()) < 1 and lock.locked() and b.single_mode()
+    goes = r.result.record["catch"]
+    assert [g["caught"] for g in goes] == [False, False, False, True] and goes[3]["v"] == pytest.approx(V0 + 30)
+    assert goes[3]["right"] == pytest.approx(12000, rel=0.05)
+    assert "not caught in 3 goes at 70.00 V: piezo to 100.00 V (the optimum's 70.00 V +30 V)" in rec.notes
+    assert sum(n.startswith("parked the current high") for n in rec.notes) >= 2
+    assert re.match(r"relocked, caught the right mode at 150\.\d\d mA, 100\.00 V \(4 goes up and down\), walked the "
+                    r"piezo 70\.00 → 70\.\d\d V", r.result.summary), r.result.summary
+
+
+def test_a_laser_that_is_fine_is_left_alone_by_the_catch_too():
+    b, lock = near_bench(seed=41)
+    lock.jump(1)  # its lock caught the next cavity peak, 1.5 GHz off: the laser is on its mode
+    b, rec, r = recover(b.laser, b.target, optimum(b, kv=400.0), cavity=True, bench=b)
+    assert r.state == "done" and b.writes("dl:cc:current-set") == [], r.error
+    assert "the laser itself was fine" in r.result.summary and lock.locked()
+    assert lock.peak == pytest.approx(b.target, abs=1e-12)
+    assert any(re.match(r"on the right mode, its SHG peak (0\.9\d|1\.0\d) of the optimum's: only the piezo", n)
+               for n in rec.notes), rec.notes
+
+
+def test_its_right_mode_beyond_the_window_the_mode_it_is_on_is_walked_onto_the_target():
+    """Modes 6 GHz apart, the window 0.8 mA up: the right one comes back only 0.86 mA up (with 2 mA it is caught).
+    Not caught, the laser goes back where it began and the mode it is on is walked onto the target instead,
+    as the walk would: locked on another mode rather than not at all."""
+    b, lock = shg_bench(seed=11)
+    b.laser.nudge(+3.9)
+    p = HopParams.from_dict({**SHG_CATCH.to_dict(), "i_window": 0.8})
+    b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "done", r.error
+    assert r.result.summary.startswith("relocked, the right mode not caught, walked the mode it was on instead: "
+                                       "walked the piezo 70.00 → "), r.result.summary
+    assert lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12) and b.single_mode()
+    assert re.search(r"going up and sweeping down 3 times,? in 149\.00 … 150\.80 mA", rec.fell_back), rec.fell_back
+
+    b, lock = shg_bench(seed=11)
+    b.laser.nudge(+3.9)
+    b, rec, r = recover(b.laser, b.target, SHG_CATCH, cavity=True, bench=b)
+    assert r.state == "done" and not rec.fell_back and b.laser.m == 0 and lock.locked(), r.error
+
+
+def test_an_optimum_it_cannot_come_back_to_says_so():
+    """The optimum taken with more SHG power than there is now (its TA weaker since, say): the right mode's peak
+    never comes within 10 % of it. The message says so, and that the optimum may want taking again; with 30 %
+    allowed, it is caught."""
+    b, lock = near_bench(seed=43)
+    hop_up(b, lock)
+    b, rec, r = recover(b.laser, b.target, optimum(b, opt_shg=1.3 * b.shg_usual, kv=400.0), cavity=True, bench=b)
+    assert r.state == "done" and rec.fell_back.startswith("its SHG peak on the right mode was no more than 0.7"), \
+        rec.fell_back
+    assert "if the optimum has changed, take it again (right-click › Take the optimum now)" in rec.fell_back
+    b, lock = near_bench(seed=43)
+    hop_up(b, lock)
+    b, rec, r = recover(b.laser, b.target, optimum(b, opt_shg=1.3 * b.shg_usual, kv=400.0, catch_min=0.7),
+                        cavity=True, bench=b)
+    assert r.state == "done" and not rec.fell_back and b.laser.m == 0 and b.single_mode(), r.error
+
+
+def test_a_scope_that_shows_the_peaks_on_another_scale_is_learned_by_the_first_relock():
+    """The SHG scope shows the intra-cavity signal at half the scale its photodiode reads it locked: the first catch
+    finds the peak no more than 0.5 of the optimum's everywhere and walks the mode it is on; its relock learns how a
+    sweep shows the peak against the signal locked, and the next hop is caught."""
+    b, lock = near_bench(seed=46)
+    real = b.dlc.params["laser1:nlo:pd:shg-int:photodiode"]
+    b.dlc.params["laser1:nlo:pd:shg-int:photodiode"] = lambda: 2.0 * real()
+    hop_up(b, lock)
+    p = optimum(b, opt_shg=2.0 * b.shg_usual, shg_lock=2.0 * b.shg_usual, kv=400.0)
+    b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "done" and rec.fell_back.startswith("its SHG peak on the right mode was no more than 0.5"), \
+        (r.error, rec.fell_back)
+    ratio = r.result.learned["shg_ratio"]
+    assert ratio == pytest.approx(0.49, abs=0.03)
+    b, lock = near_bench(seed=46)  # (as it was, and the same hop)
+    real = b.dlc.params["laser1:nlo:pd:shg-int:photodiode"]
+    b.dlc.params["laser1:nlo:pd:shg-int:photodiode"] = lambda: 2.0 * real()
+    hop_up(b, lock)
+    b, rec, r = recover(b.laser, b.target, HopParams.from_dict({**p.to_dict(), "shg_ratio": ratio}), cavity=True,
+                        bench=b)
+    assert r.state == "done" and not rec.fell_back and b.laser.m == 0 and lock.locked() and b.single_mode(), r.error
+
+
+def test_how_its_sweep_shows_the_peak_against_the_signal_locked_is_learned():
+    """Its photodiode reads the signal locked 20 % lower than the SHG scope shows the peaks: the sweep's peaks are
+    compared with the optimum's as the scope would show it, from then on."""
+    b, lock = near_bench(seed=44)
+    real = b.dlc.params["laser1:nlo:pd:shg-int:photodiode"]
+    b.dlc.params["laser1:nlo:pd:shg-int:photodiode"] = lambda: 0.8 * real()
+    hop_up(b, lock)
+    p = optimum(b, opt_shg=0.8 * b.shg_usual, shg_lock=0.8 * b.shg_usual, kv=400.0)
+    b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "done" and b.laser.m == 0 and b.single_mode(), r.error
+    assert r.result.learned["shg_ratio"] == pytest.approx(1.26, abs=0.04)
+
+
+@pytest.mark.parametrize("ase", [0.0, 0.7], ids=["seed-tells", "seed-fooled"])
+def test_a_laser_that_stopped_lasing_lases_again_and_is_caught(ase):
+    """Not lasing when the recovery begins: its seed power says so, or (sending its TA 70 % of its power, broadband)
+    the wavemeter's silence and its flat SHG sweep do. The current jumps up, comes back down slowly, and it is
+    caught on its own mode."""
+    b, lock = near_bench(seed=42, i_stop=I0 - 1.3, i_start=I0 + 2.4)
+    b.laser.stop()
+    b.laser.ase = ase
+    b, rec, r = recover(b.laser, b.target, optimum(b, kv=400.0), cavity=True, bench=b)
+    assert r.state == "done", r.error
+    assert rec.panics == 1 and b.laser.lasing and lock.locked() and abs(b.off_mhz()) < 1 and b.single_mode()
+    assert b.laser.m == 0 and abs(b.V - V0) < 1.5
+
+
+def test_the_catch_with_the_feedforward():
+    """With the DLC pro's feedforward on, the window is on the measured current, wherever the piezo goes."""
+    b, lock = near_bench(seed=45, ff=-0.15, hysteresis=0.8, multimode=0.3, ksv=0.32, i_stop=I0 - 1.2,
+                         i_start=I0 + 2.5)
+    hop_up(b, lock, 2.3)
+    p = optimum(b, i_window=0.95, v_window=40.0)  # (its piezo tuning measured: with the feedforward's share)
+    b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b)
+    assert r.state == "done", r.error
+    assert rec.panics == 0 and b.laser.lasing and b.laser.m == 0 and lock.locked() and abs(b.off_mhz()) < 1
+    acts = measured_currents(b)
+    assert min(acts) >= I0 - 1.0 - 1e-9 and max(acts) <= I0 + 0.95 + 1e-9
+
+
+def test_monte_carlo_catches_over_random_lasers_with_near_modes():
+    """Random masters, their modes 1.8 to 3 GHz apart, hopping one mode either way: caught back on the right mode
+    wherever that can be single-mode on target within the window (and the piezo has the room for its tries from the
+    optimum's +- 30 V); else walked on the mode they are on. Never left unlocked."""
+    right = feasible = 0
+    for seed in range(40):
+        rng = random.Random(7000 + seed)
+        fsr = rng.uniform(1.8, 3.0)
+        laser = ECDL(400.0, fsr=fsr, hysteresis=rng.uniform(0.1, 0.35) * fsr, multimode=rng.uniform(0.1, 0.25) * fsr,
+                     ki=rng.uniform(-0.4, -0.15), ksi=rng.uniform(-3.0, -1.5), ksv=rng.uniform(0.28, 0.36),
+                     mm_noise=0.004, seed=seed)
+        b, lock = locked_bench(laser, seed=seed, shg=True, lockpoints=True, pdh_dc=rng.uniform(-0.03, 0.03))
+        lo, hi = laser.limits()
+        a, margin = laser.misalignment(laser.m, V0 + lock.dv, b.act), rng.uniform(0.02, 0.3) * fsr
+        laser.nudge((a - lo + margin) if rng.random() < 0.5 else -(hi - a + margin))
+        lock.frequency()
+        assert laser.m != 0, seed
+        mis = [laser.misalignment(0, V0, I0 + 0.01 * k) for k in range(-100, 201)]
+        can = any(abs(a) < laser.zone(a)[0] for a in mis)  # the right mode single-mode on target in the window
+        b, rec, r = recover(laser, b.target, optimum(b, v_window=40.0), noise=rng.uniform(0.3, 3.0), cavity=True,
+                            bench=b, seed=seed)
+        assert r.state == "done", (seed, r.error)
+        assert lock.locked() and abs(b.off_mhz()) < 1 and b.second_mode() < 0.1, seed
+        feasible += can
+        right += can and laser.m == 0
+    assert feasible >= 30 and right >= 0.95 * feasible, (right, feasible)

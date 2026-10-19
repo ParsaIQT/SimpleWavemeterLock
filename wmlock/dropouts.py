@@ -4,19 +4,23 @@
 The engine's polls, twice a second, would see few of them. A monitor per laser, on a connection of its
 own, watches the cavity transmission (the input its lock detection watches, as a rule Fine In 1):
 
-  recorder  the DLC pro's recorder (laserN:recorder) records it every fraction of a millisecond, and the
-            monitor reads the samples as they come in (recorder:data:get-data); when a recording is full,
-            the next starts at once. (If it will not be read while it records, each recording is read once
-            full, before the next: a gap of that long.) How often it really samples is measured, and what it
-            records is checked against the input's present value. Its settings are put back when the
-            monitor stops (when the program closes, say).
+  recorder  the DLC pro's recorder (laserN:recorder) records it every millisecond (dt), and the monitor
+            reads what it has recorded every READ_S, a few thousand samples at a time (recorder:data:get-data);
+            when a recording is full, the next starts at once. (If it will not be read while it records, each
+            recording is read once full, before the next: a gap of that long.) How often it really samples is
+            measured, and what it records is checked against the input's present value. Its settings are put
+            back when the monitor stops (when the program closes, say).
   polling   without a recorder, or with one that does not record as expected (the console says why), the
-            input's present value is read as fast as the controller answers (up to POLL_HZ): a dropout
-            shorter than the interval between reads may be missed.
+            input's present value is read POLL_HZ times a second: a dropout shorter than the interval between
+            reads may be missed.
+A DLC pro has to do all this besides its own work and its other clients' (TOPAS's displays, say): so it is
+asked little, and seldom (TOPAS said "acquisition busy" now and then while the recorder was read back to
+back, every quarter of a millisecond).
 
-A dropout is the transmission below its limit for MIN_S at least (Detector), while the lock should hold
-(status(): its cavity lock on, no recovery running, and settled). Each is reported (report), and once an
-hour the monitor's own figures (summary): how it watches, and how much of the time.
+A dropout is the transmission below its limit for two samples at least, MIN_S at the least (Detector),
+while the lock should hold (status(): its cavity lock on, no recovery running, and settled). Each is
+reported (report), and once an hour the monitor's own figures (summary): how it watches, and how much of
+the time.
 """
 from __future__ import annotations
 
@@ -27,7 +31,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from .dlcpro import IO_VALUE, DecopError, DLCPro, float_arrays, signal_name
+from .dlcpro import IO_VALUE, NONE, DecopError, DLCPro, float_arrays, signal_name
 
 log = logging.getLogger(__name__)
 
@@ -92,20 +96,25 @@ class Monitor(threading.Thread):
     Called from its thread: status() -> (should hold, limit V or None, signal id or None), before each batch
     of samples; report(Dropout); summary(text) once an hour."""
 
-    DT = 0.00025         # s between the recorder's samples asked for (4 kHz)
+    DT = 0.001           # s between the recorder's samples asked for, by default (1 kHz)
     RECORD_S = 30.0      # s a recording lasts; the next starts when it is full
-    CHUNK = 4000         # samples read at a time
+    READ_S = 2.0         # s between reads of what it has recorded
+    STALL_S = 3.0        # s without a new sample: it stopped short of full
+    CHUNK = 4000         # samples read at a time, at most
     START_S = 3.0        # s for a recording to start
     MIN_S = 0.0005       # s: shorter, not a dropout (with min_n samples at least)
-    POLL_HZ = 200.0      # polling: at most this many reads a second
+    POLL_HZ = 20.0       # polling: at most this many reads a second
     SUMMARY_S = 3600.0
     RETRY_S = 10.0       # s before trying again after the controller stopped answering
-    SAVED = ("inputs:channel1:signal", "inputs:channel1:low-pass-filter:enabled", "recording-time",
-             "sample-count-set", "enabled")
+    SAVED = ("inputs:channel1:signal", "inputs:channel1:low-pass-filter:enabled", "inputs:channel2:signal",
+             "recording-time", "sample-count-set", "enabled")
 
-    def __init__(self, host: str, port: int, laser: int, status, report, summary, name: str = ""):
+    def __init__(self, host: str, port: int, laser: int, status, report, summary, name: str = "",
+                 dt: float = DT):
+        """dt: s between the recorder's samples."""
         super().__init__(daemon=True, name=f"dropouts {name or host}")
         self.client = DLCPro(host, port, timeout=2.0)
+        self.dt = dt
         self.laser, self.label = laser, name or f"laser{laser}"
         self.status, self.report, self.summary = status, report, summary
         self._stop_ev = threading.Event()
@@ -212,7 +221,7 @@ class Monitor(threading.Thread):
         if not self.saved:
             self.saved = {n: v for n, v in found.items() if v is not None}
         limit = self._get("sample-count-limit")
-        n = int(self.RECORD_S / self.DT)
+        n = int(self.RECORD_S / self.dt)
         if isinstance(limit, int) and limit > 0:
             n = min(n, limit)
         try:
@@ -221,10 +230,15 @@ class Monitor(threading.Thread):
             if found["inputs:channel1:low-pass-filter:enabled"] is not None:
                 c.set(p("inputs:channel1:low-pass-filter:enabled"), False)
             c.set(p("sample-count-set"), n)
-            c.set(p("recording-time"), n * self.DT)
+            c.set(p("recording-time"), n * self.dt)
         except DecopError as e:
             raise NoRecorder(f"it would not take its settings ({e})") from None
-        self.resolution = self._asked_dt() or self.DT
+        if found["inputs:channel2:signal"] not in (None, NONE):
+            try:  # (its samples would come along too: twice as much to send)
+                c.set(p("inputs:channel2:signal"), NONE)
+            except DecopError:
+                pass
+        self.resolution = self._asked_dt() or self.dt
         self.chunk = self.CHUNK
         self.when_full = False  # read a recording only once it is full (it would not be read while it records)
         detector = Detector(self.MIN_S)
@@ -238,7 +252,7 @@ class Monitor(threading.Thread):
                 raise NoRecorder("its recordings stopped coming")
 
     def _one(self, n: int, sig: int, detector: Detector, first: bool) -> int:
-        """One recording, read as it comes in: the number of samples read."""
+        """One recording, read as it comes in, every READ_S (and once full): the number of samples read."""
         c, p = self.client, self._p
         c.set(p("enabled"), False)
         t_wall, t0 = time.time(), time.monotonic()
@@ -254,45 +268,47 @@ class Monitor(threading.Thread):
             return 0
         size = self._get("sample-count")
         size = size if isinstance(size, int) and size > 0 else n
-        read, stalled, t_full = 0, 0, None
+        read, t_full, wait = 0, None, 0.0
+        last, grew = count, time.monotonic()  # its count of samples, and when it last grew
         while read < size and not self._stop_ev.is_set():
+            if wait > 0 and self._stop_ev.wait(wait):
+                break
             count = min(self._count(), size)
+            now = time.monotonic()  # (the samples it had then)
             if count >= size and t_full is None:
-                t_full = time.monotonic()  # (when it was full, give or take a poll)
+                t_full = now  # (when it was full, give or take a poll)
             self._tick()
             if count < read:  # it started afresh by itself (someone else, say)
                 return read
-            if count == read:
-                stalled += 1
-                if stalled > 20:  # (2 s: it stopped short of full)
-                    return read
-                self._stop_ev.wait(0.1)
-                continue
-            stalled = 0
-            if self.when_full and count < size:
-                self._stop_ev.wait(0.1)
-                continue
-            k = min(count - read, self.CHUNK)
-            try:
-                values = self._samples(read, k)
-            except NoRecorder:
-                if self.when_full or count >= size:
-                    raise
-                self.when_full, self.chunk = True, self.CHUNK  # (refused while recording: once it is full, then)
-                self._say("the recorder's data cannot be read while it records: each recording is read once full, "
-                          "before the next (a gap of that long)", warn=True)
-                continue
-            if not values:
-                raise NoRecorder("its data had no samples")
-            dt = self._dt(t0, count, size, t_full)
-            if first:
-                self._check(values, sig, dt)
-                first = False
-            limit = self._account(len(values), dt, detector)
-            if limit is not None:
-                for i0, span, low in detector.feed(read, dt, values, limit):
-                    self.report(Dropout(t_wall + i0 * dt, span * dt, low, limit, "recorder", dt))
-            read += len(values)
+            if count != last:
+                last, grew = count, now
+            elif count < size and now - grew > self.STALL_S:
+                return read  # it stopped short of full
+            if count > read and not (self.when_full and count < size):
+                while read < count and not self._stop_ev.is_set():
+                    try:
+                        values = self._samples(read, min(count - read, self.CHUNK))
+                    except NoRecorder:
+                        if self.when_full or count >= size:
+                            raise
+                        self.when_full, self.chunk = True, self.CHUNK  # (refused while recording: once it is full)
+                        self._say("the recorder's data cannot be read while it records: each recording is read "
+                                  "once full, before the next (a gap of that long)", warn=True)
+                        break
+                    if not values:
+                        raise NoRecorder("its data had no samples")
+                    dt = self._dt(t0, count, size, t_full, now)
+                    if first:
+                        self._check(values, sig, dt)
+                        first = False
+                    limit = self._account(len(values), dt, detector)
+                    if limit is not None:
+                        for i0, span, low in detector.feed(read, dt, values, limit):
+                            self.report(Dropout(t_wall + i0 * dt, span * dt, low, limit, "recorder", dt))
+                    read += len(values)
+            # the next look: READ_S on, or as it should be full, whichever comes first
+            end = t0 + size * (self.resolution or self.dt)
+            wait = max(min(self.READ_S, end + 0.02 - time.monotonic()), 0.2)
         return read
 
     def _count(self) -> int:
@@ -323,19 +339,19 @@ class Monitor(threading.Thread):
         if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
             return 0.0
         for scale in (1.0, 1e-3, 1e-6):
-            if 0.2 * self.DT <= v * scale <= 5 * self.DT:
+            if 0.2 * self.dt <= v * scale <= 5 * self.dt:
                 return v * scale
         return 0.0
 
-    def _dt(self, t0: float, count: int, size: int, t_full) -> float:
+    def _dt(self, t0: float, count: int, size: int, t_full, at: float) -> float:
         """s between samples: as measured (the unit of its sampling-interval is not taken on trust), once the
-        recording has gone on a while (count samples by now), or by when it was full; until then by that
+        recording has gone on a while (count samples at `at`), or by when it was full; until then by that
         sampling-interval, or as asked for."""
         if t_full is not None:
             if t_full - t0 > 1.0:
                 self.resolution = (t_full - t0) / size
-        elif count > 0 and time.monotonic() - t0 > 1.0:
-            self.resolution = (time.monotonic() - t0) / count
+        elif count > 0 and at - t0 > 1.0:
+            self.resolution = (at - t0) / count
         return self.resolution
 
     def _check(self, values, sig: int, dt: float):

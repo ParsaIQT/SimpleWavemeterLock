@@ -570,6 +570,9 @@ class ChannelRow(QtWidgets.QFrame):
             m.addAction("Recenter now", lambda: self.engine.recenter(self.n)).setEnabled(
                 bool(ch.device) and ch.state != "engaging")
         m.addAction("Check setup…", self.setup_dialog).setEnabled(bool(ch.device))
+        if ch.hop.enabled and ch.hop.shg:
+            m.addAction("Take the optimum now (as set by hand)", lambda: self.engine.take_optimum(self.n)).setEnabled(
+                bool(ch.device) and ch.state != "recovering")
         if ch.last:
             m.addAction("Last recovery…", self.last_dialog)
 
@@ -591,7 +594,7 @@ class ChannelRow(QtWidgets.QFrame):
 
     def hop_dialog(self):
         ch = self.engine.channels[self.n]
-        d = HopDialog(self, ch)
+        d = HopDialog(self, ch, take=lambda: self.engine.take_optimum(self.n))
         if d.exec():
             self.engine.set_hop_params(self.n, d.params())
 
@@ -684,11 +687,14 @@ class HopDialog(QtWidgets.QDialog):
     RELOCK = (("auto", "as its DLC pro is set: by lockpoint, unless it locks without one"),
               ("lockpoint", "pick the right peak and select it as the lockpoint, as by hand"),
               ("plain", "re-enable the lock and let it find its resonance"))
-    METHOD = (("auto", "walk with an SHG stage, else map"),
+    METHOD = (("auto", "catch with an SHG stage, else map"),
+              ("catch", "catch: back onto its own mode by the current (up, then down until its SHG peak is back), "
+                        "then the piezo onto the target"),
               ("walk", "walk: single mode first, then the piezo slowly onto the target, as by hand"),
               ("map", "map: sweep the current over the window, up and down, and pick the best mode"))
 
-    def __init__(self, parent, ch):
+    def __init__(self, parent, ch, take=None):
+        """take: take the optimum now (Engine.take_optimum for this channel), if it can be."""
         super().__init__(parent)
         self.setWindowTitle(f"Mode-hop recovery · channel {ch.n}")
         self.ch = ch
@@ -756,9 +762,41 @@ class HopDialog(QtWidgets.QDialog):
         self.method.addItems([label for _, label in self.METHOD])
         self.method.setCurrentIndex(next((k for k, (key, _) in enumerate(self.METHOD) if key == p.method), 0))
         form.addRow("Method", self.method)
+        self.catch_pct = number(round(100 * (1 - p.catch_min)), 1, 60, 0, 1)
+        self.catch_tries = QtWidgets.QSpinBox()
+        self.catch_tries.setRange(1, 10)
+        self.catch_tries.setValue(p.catch_tries)
+        self.pc_try = number(p.pc_try, 0, 100, 1, 5)
+        form.addRow("Catch", row("its SHG peak within", self.catch_pct, "% of the optimum's;", self.catch_tries,
+                                 "goes, then from the optimum's piezo voltage ±", self.pc_try, "V"))
+        self.pc_try.setToolTip("The right mode: the one it was on target on before it hopped. Each go takes the "
+                               "current to the top of\nits window, then down a step at a time, until the laser is on "
+                               "the right mode and its SHG\npeak (the tallest resonance in the SHG cavity's sweep) is "
+                               "within that of the optimum's.\nNot caught in that many goes, it tries from the "
+                               "optimum's piezo voltage + and - this\n(the piezo may go that far for it), then walks "
+                               "the piezo back onto the target, the\ncurrent parked high in the mode every few steps. "
+                               "0: no tries elsewhere.")
+        self.optimum = Text("", "dim")
+        self._cleared = False
+        self._opt_seen = None
+        take_btn = QtWidgets.QPushButton("Take now")
+        take_btn.setEnabled(take is not None and bool(ch.device))
+        take_btn.setToolTip("The laser as it is now is at its optimum, set by hand: its current, piezo voltage and SHG "
+                            "signal locked\nare what the catch goes back to (taken by itself the first time Relock is "
+                            "clicked).")
+        if take is not None:
+            take_btn.clicked.connect(take)
+        clear = QtWidgets.QPushButton("Clear")
+        clear.setToolTip("Forget it: taken again the next time Relock is clicked")
+        clear.clicked.connect(self._clear_optimum)
+        form.addRow("Optimum", row(self.optimum, take_btn, clear))
+        self._show_optimum()
+        self._timer = QtCore.QTimer(self)  # (taken now: it comes in a moment later)
+        self._timer.timeout.connect(self._show_optimum)
+        self._timer.start(300)
         self.reach = number(p.reach, 0.5, 100, 1, 0.5)
         self.walk_step = number(p.walk_step, 0.05, 5, 2, 0.1)
-        form.addRow("Walk", row("from a single-mode mode within", self.reach, "GHz, in", self.walk_step,
+        form.addRow("Walk", row("from a single-mode mode within", self.reach, "GHz (walk), in", self.walk_step,
                                 "V steps"))
         self.margin = number(p.margin, 0.05, 5, 2, 0.05)
         form.addRow("Keep a hop at least", row(self.margin, "mA away, both ways (the map checks it)"))
@@ -805,15 +843,18 @@ class HopDialog(QtWidgets.QDialog):
         self.falc.setChecked(p.falc)
         self.falc_max = number(p.falc_max, 0.001, 1.0, 3, 0.005)
         form.addRow(row(self.falc, self.falc_max, "V"))
-        self.dropouts = QtWidgets.QCheckBox("Log its lock dropouts, from half a millisecond (the transmission below "
-                                            "the slipping limit), with the DLC pro's recorder")
+        self.dropouts = QtWidgets.QCheckBox("Log its lock dropouts (the transmission below the slipping limit), "
+                                            "with the DLC pro's recorder, sampled every")
         self.dropouts.setChecked(p.dropouts)
-        self.dropouts.setToolTip("Each one goes to the console (with the time, how long, how low) and to\n"
-                                 "~/.simplewavemeterlock-dropouts.jsonl; once an hour, how many there were.\n"
-                                 "While this program runs it uses the DLC pro's recorder (its settings are put\n"
-                                 "back when it closes); without one, it polls the transmission instead, which\n"
-                                 "can miss dropouts shorter than the time between reads.")
-        form.addRow(self.dropouts)
+        self.dropouts.setToolTip("Two samples in a row below the limit are a dropout. Each one goes to the console\n"
+                                 "(with the time, how long, how low) and to ~/.simplewavemeterlock-dropouts.jsonl;\n"
+                                 "once an hour, how many there were. While this program runs it uses the DLC pro's\n"
+                                 "recorder (its settings are put back when it closes), reading what it recorded\n"
+                                 "every 2 s; without one, it polls the transmission instead, which can miss\n"
+                                 "dropouts shorter than the time between reads. Sampling less often asks less of\n"
+                                 "the controller (and of TOPAS, which shares it).")
+        self.drop_ms = number(p.drop_ms, 0.1, 20.0, 2, 0.25)
+        form.addRow(row(self.dropouts, self.drop_ms, "ms"))
         self.confirm = QtWidgets.QCheckBox("Step by step: ask me before each step (for the first runs on a laser)")
         self.confirm.setChecked(p.confirm)
         form.addRow(self.confirm)
@@ -862,7 +903,30 @@ class HopDialog(QtWidgets.QDialog):
             out.append(f"transmission zero {volts(p.trans_zero, p.trans_locked)} V")
         if p.shg_lock:
             out.append(f"SHG signal {p.shg_lock:.3f} V locked")
+        if p.shg_ratio:
+            out.append(f"SHG peak in a sweep {p.shg_ratio:.2f} of the signal locked")
         return ", ".join(out)
+
+    def _show_optimum(self):
+        """The optimum as taken (it may come in while the dialog is open: then the nominal current with it)."""
+        p = self._p
+        now = None if self._cleared else (p.opt_i, p.opt_v, p.opt_shg, p.opt_t)
+        if now == self._opt_seen:
+            return
+        if self._opt_seen is not None and now is not None and p.optimum:
+            self.i_nom.setValue(p.opt_i)  # (taking it sets the nominal current too)
+        self._opt_seen = now
+        if now is None or not p.optimum:
+            self.optimum.paint("not taken: taken when Relock is first clicked on the laser set up by hand", "dim")
+        else:
+            self.optimum.paint(f"{p.opt_i:.2f} mA, {p.opt_v:.2f} {self.ch.unit}"
+                               + (f", SHG {p.opt_shg:.3f} V locked" if p.opt_shg else ", SHG level not known")
+                               + (f" ({p.opt_t})" if p.opt_t else ""), "fg")
+
+    def _clear_optimum(self):
+        self._cleared = True
+        self._show_optimum()
+        self.optimum.paint("cleared: taken again the next time Relock is clicked", "dim")
 
     def _slip_levels(self):
         """Where the transmission's zero and level locked put the limit, with lock_min as set."""
@@ -877,8 +941,8 @@ class HopDialog(QtWidgets.QDialog):
 
     def _who(self):
         cavity = self.who.currentIndex() == 1
-        for w in (self.relock, self.window, self.falc, self.falc_max, self.dropouts, self.peak_tol, self.lock_min,
-                  self.slip_levels):
+        for w in (self.relock, self.window, self.falc, self.falc_max, self.dropouts, self.drop_ms, self.peak_tol,
+                  self.lock_min, self.slip_levels):
             w.setEnabled(cavity)
         self.tolerance.setEnabled(not cavity)
 
@@ -892,7 +956,7 @@ class HopDialog(QtWidgets.QDialog):
             enabled=self.enabled.isChecked(), cavity=self.who.currentIndex() == 1, shg=self.shg.isChecked(),
             method=self.METHOD[self.method.currentIndex()][0],
             relock=self.RELOCK[self.relock.currentIndex()][0], falc=self.falc.isChecked(),
-            dropouts=self.dropouts.isChecked(),
+            dropouts=self.dropouts.isChecked(), drop_ms=self.drop_ms.value(),
             falc_max=self.falc_max.value(), window=self.window.value(), peak_tol=self.peak_tol.value(),
             lock_min=self.lock_min.value(), confirm=self.confirm.isChecked(),
             i_nom=round(self.i_nom.value(), 3), i_window=self.i_window.value(), i_below=self.i_below.value(),
@@ -900,15 +964,19 @@ class HopDialog(QtWidgets.QDialog):
             step=self.step.value(), margin=self.margin.value(), tolerance=self.tolerance.value(),
             grace=self.grace.value(), max_per_hour=self.per_hour.value(), seed=self.seed.text().strip() or "auto",
             seed_min=self.seed_min.value(), jump=self.jump.value(), jump_max=self.jump_max.value(),
-            ramp=self.ramp.value())
+            ramp=self.ramp.value(), catch_min=round(1 - self.catch_pct.value() / 100, 4),
+            catch_tries=self.catch_tries.value(), pc_try=self.pc_try.value())
         if not self.forget:
             for name in HopParams.LEARNED:
+                setattr(out, name, getattr(p, name))
+        if not self._cleared:
+            for name in HopParams.OPTIMUM:
                 setattr(out, name, getattr(p, name))
         return out
 
 
 class Plot(QtWidgets.QWidget):
-    """A small, plain plot: lines, dots, vertical lines and shaded spans, with the ranges marked."""
+    """A small, plain plot: lines, dots, vertical and horizontal lines and shaded spans, with the ranges marked."""
 
     def __init__(self, xlabel: str = "", ylabel: str = "", height: int = 160, ylim=None):
         super().__init__()
@@ -917,6 +985,7 @@ class Plot(QtWidgets.QWidget):
         self.vlines = []  # (x, color)
         self.spans = []   # (x0, x1, color)
         self.hlines = []  # (y, color)
+        self.hspans = []  # (y0, y1, color)
         self.setMinimumHeight(height)
         self.setMinimumWidth(420)
 
@@ -933,7 +1002,8 @@ class Plot(QtWidgets.QWidget):
         p.fillRect(self.rect(), QtGui.QColor("#1b1c20"))
         xs = ([x for s in self.series for x in s[0]] + [v[0] for v in self.vlines]
               + [a for s in self.spans for a in s[:2]])
-        ys = [y for s in self.series for y in s[1]] + [h[0] for h in self.hlines]
+        ys = ([y for s in self.series for y in s[1]] + [h[0] for h in self.hlines]
+              + [a for s in self.hspans for a in s[:2]])
         if not xs or not ys:
             p.setPen(QtGui.QColor(C["dim"]))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "nothing to show")
@@ -959,6 +1029,10 @@ class Plot(QtWidgets.QWidget):
             c = QtGui.QColor(C.get(color, color))
             c.setAlpha(50)
             p.fillRect(QtCore.QRectF(X(min(a, b)), r.top(), abs(X(b) - X(a)), r.height()), c)
+        for a, b, color in self.hspans:
+            c = QtGui.QColor(C.get(color, color))
+            c.setAlpha(40)
+            p.fillRect(QtCore.QRectF(r.left(), Y(max(a, b)), r.width(), abs(Y(a) - Y(b))), c)
         p.setPen(QtGui.QPen(QtGui.QColor(C["line"]), 1))
         p.drawRect(r)
         p.setClipRect(r)
@@ -1019,6 +1093,8 @@ class RecoveryDialog(QtWidgets.QDialog):
         steps.setPlainText("\n".join(f"{t:6.1f} s  {text}" if t is not None else f"{'':8s} {text}"
                                      for t, text in rec.get("notes", [])))
         tabs.addTab(steps, "Steps")
+        if rec.get("catch"):
+            tabs.addTab(self._scroll([self._catch(c) for c in rec["catch"]]), "Catch")
         if rec.get("walk"):
             tabs.addTab(self._scroll(self._walk(rec["walk"])), "Walk")
         if rec.get("maps"):
@@ -1073,6 +1149,26 @@ class RecoveryDialog(QtWidgets.QDialog):
         title = (f"map at {m['v']:.2f} V: frequency from the target against current, sweeping up (blue dots), then "
                  f"down (green), and parking (amber rings){best}" + ("; × where it showed two modes" if bad else ""))
         return self._box(title, plot)
+
+    def _catch(self, c):
+        """One go of the catch: the frequency from the target against the current, coming down; green where the SHG
+        peak was within catch_min of the optimum's, red where it was not, grey not looked at; where the right mode
+        is shaded."""
+        plot = Plot("current (mA, measured)", "GHz", 180)
+        least = c.get("min", 0.9)
+        for good, color, style in ((True, "ok", "dots"), (False, "err", "cross"), (None, "dim", "dots")):
+            sel = [p for p in c["points"] if p[1] is not None and (p[2] is None if good is None else
+                                                                   p[2] is not None and (p[2] >= least) == good)]
+            plot.add([p[0] for p in sel], [p[1] / 1e3 for p in sel], color, style, 2)
+        right, tol = c.get("right", 0.0) / 1e3, c.get("tol", 0.0) / 1e3
+        plot.hspans.append((right - tol, right + tol, "ok"))
+        plot.hlines.append((0.0, "dim"))
+        last = c["points"][-1] if c["points"] else None
+        end = (f"caught at {last[0]:.2f} mA" + (f", its SHG peak {last[2]:.2f} of the optimum's" if last[2] is not None
+                                                else "")) if c.get("caught") and last else "not caught"
+        return self._box(f"go {c.get('go', '?')} at {c.get('v', 0):.2f} V: frequency from the target against the "
+                         f"current, coming down from the top of the window; the right mode shaded; green its SHG peak "
+                         f"within {100 * (1 - least):.0f} % of the optimum's, × not, grey not looked at: {end}", plot)
 
     def _walk(self, pts):
         """The walk: frequency from the target against the scan offset, the mode as the SHG sweep had

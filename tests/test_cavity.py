@@ -4,7 +4,7 @@ import random
 
 import pytest
 
-from wmlock.cavity import (ModeCheck, ModeRef, choose_peak, dc_level, decimate, find_peaks, judge,
+from wmlock.cavity import (ModeCheck, ModeRef, choose_peak, dc_level, decimate, find_peaks, judge, peak_top,
                            reference_from, sweep, updated)
 
 
@@ -41,6 +41,24 @@ def test_peaks_are_found_however_narrow_and_sampled():
         areas.append(main[0].w)
     assert max(areas) / min(areas) < 1.15  # the area does not care where the samples fall...
     assert max(heights) / min(heights) > 1.5  # ...the height does
+
+
+def test_the_true_height_of_a_peak_is_had_between_samples():
+    """What the SHG cavity locked to the laser would show, its intra-cavity signal's maximum: from a sweep whose
+    resonances are two samples wide, wherever the samples fall (the highest sample alone: 20 % short at worst)."""
+    tops, highest = [], []
+    for k in range(8):
+        phase = 0.3 + k / 8 / 400  # (an eighth of a sample at a time)
+        m = sweep(shg_sweep([(1.0, 0.0)], n=1200, finesse=200, phase=phase, fsr_samples=400))
+        tops.append(m.top)
+        highest.append(m.height)
+    assert min(tops) == pytest.approx(1.0, abs=0.03) and max(tops) == pytest.approx(1.0, abs=0.03)
+    assert min(highest) < 0.9
+    assert sweep(shg_sweep([(0.7, 0.0), (0.3, 0.45)], finesse=200)).top == pytest.approx(0.7, abs=0.03)
+    y = [0.0, 0.2, 1.0, 0.2, 0.0]  # a Lorentzian sampled on its top: as it is
+    assert peak_top(y, 2, 0.0) == pytest.approx(1.0)
+    y = [1.0 / (1 + (2 * (x - 2.5)) ** 2) for x in range(6)]  # ...and half way between samples
+    assert peak_top(y, 2, 0.0) == pytest.approx(1.0, abs=1e-9) and peak_top(y, 0, 0.0) == pytest.approx(y[0])
 
 
 def test_flat_or_noisy_traces_have_no_peaks():

@@ -203,6 +203,31 @@ def test_hop_dialog_round_trip(app):
                           confirm=True, falc_max=0.02, peak_tol=40.0, lock_min=0.3)  # measured values forgotten
 
 
+def test_hop_dialog_shows_the_optimum_and_takes_it(app):
+    from wmlock.engine import Channel
+
+    ch = Channel(7, {"hop": {"enabled": True, "cavity": True, "shg": True, "i_nom": 150.0, "shg_ratio": 0.98}})
+    ch.device = "192.168.1.20"
+    taken = []
+    d = gui.HopDialog(None, ch, take=lambda: taken.append(1))
+    assert d.optimum.text().startswith("not taken: taken when Relock is first clicked")
+    assert "SHG peak in a sweep 0.98 of the signal locked" in d.learned.toolTip()
+    take = next(b for b in d.findChildren(QtWidgets.QPushButton) if b.text() == "Take now")
+    take.click()
+    assert taken == [1]
+    ch.hop.opt_i, ch.hop.opt_v, ch.hop.opt_shg, ch.hop.opt_t = 150.31, 70.12, 1.231, "2026-10-19 21:03"
+    ch.hop.i_nom = 150.31  # (as the engine takes it, a moment later)
+    spin(app, 0.5)
+    assert d.optimum.text() == "150.31 mA, 70.12 V, SHG 1.231 V locked (2026-10-19 21:03)"
+    assert d.i_nom.value() == pytest.approx(150.31)
+    d.catch_pct.setValue(15)
+    d.pc_try.setValue(20.0)
+    p = d.params()
+    assert p.catch_min == 0.85 and p.pc_try == 20.0 and p.opt_shg == 1.231 and p.i_nom == 150.31
+    d._clear_optimum()
+    assert d.params().opt_i == 0 and not d.params().optimum and d.params().shg_ratio == 0.98
+
+
 def test_recovery_and_setup_dialogs(app, demo):
     rec = {"time": "2026-10-13 12:00:00", "channel": 7, "ok": True, "outcome": "jumped +6.000 GHz: relocked",
            "took_s": 42.0, "notes": [[1.0, "map 1"], [None, "locked"]],
@@ -215,13 +240,17 @@ def test_recovery_and_setup_dialogs(app, demo):
            "falc": {"name": "falc1:input:offset", "offset0": 0.0, "dc0": 0.009, "error": [0.009, 0.01, 0.008],
                     "offset": -0.009, "dc": 0.0001},
            "walk": [[70.0, 149.6, 6000.0, True], [69.5, 149.6, 5800.0, False], [69.5, 149.7, 5780.0, True],
-                    [55.0, 149.7, 1.0, None]]}
+                    [55.0, 149.7, 1.0, None]],
+           "catch": [{"v": 70.0, "go": 1, "caught": False, "right": 0.0, "tol": 880.0, "min": 0.9,
+                      "points": [[152.0, -2200.0, None], [151.9, -150.0, 0.7], [151.8, 2200.0, None]]},
+                     {"v": 100.0, "go": 2, "caught": True, "right": 12000.0, "tol": 880.0, "min": 0.9,
+                      "points": [[152.0, 9800.0, None], [151.9, 11950.0, 0.95]]}]}
     d = gui.RecoveryDialog(None, rec)
     d.show()
     spin(app, 0.1)
     tabs = d.findChild(QtWidgets.QTabWidget)
-    assert [tabs.tabText(k) for k in range(tabs.count())] == ["Steps", "Walk", "Map", "SHG sweeps", "Cavity peaks",
-                                                              "Error signal"]
+    assert [tabs.tabText(k) for k in range(tabs.count())] == ["Steps", "Catch", "Walk", "Map", "SHG sweeps",
+                                                              "Cavity peaks", "Error signal"]
     for k in range(tabs.count()):
         tabs.setCurrentIndex(k)
         spin(app, 0.05)  # every plot paints
