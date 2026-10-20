@@ -31,6 +31,10 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
   target, the current kept high in the mode on the way; the SHG cavity is relocked too. With a
   TA, its seed power shows whether the laser lases: if it stops, its current is jumped up at once
   and brought back down slowly.
+* **Several PCs** (optional, on by default): every copy of the program on the LAN finds the
+  others by itself. Each window shows every wavemeter, framed under its name, and the other
+  PCs' lasers can be adjusted from it (setpoint, Lock, Relock, Continue…), by the PC they
+  belong to. A few kB/s, UDP (see *Several PCs*).
 * Fast by construction: the wavemeter is read in its own thread, all network I/O
   happens in one worker thread per controller (writes are coalesced, Nagle off),
   and the GUI only repaints numbers that changed. Nothing ever blocks the window.
@@ -52,6 +56,7 @@ discovery uses 255.255.255.255 only.
 python -m wmlock                 # on the wavemeter PC: reads wlmData.dll directly (fastest)
 python -m wmlock --http http://wavemeter-pc:8000   # anywhere else, via server/server.py
 python -m wmlock --sim           # demo: simulated wavemeter, two fake DLC pros, a reference laser
+python -m wmlock --view          # no wavemeter on this PC: the other PCs' only (see Several PCs)
 ```
 
 The source you choose is remembered, so afterwards plain `python -m wmlock` or
@@ -60,7 +65,8 @@ double-clicking `wmlock.pyw` (Windows, no console window) is enough. Started fro
 *Lock dropouts*). Other options:
 `--dll PATH` for a non-standard DLL location, `--channels 1,2,5` to override the
 switch's channel list, `--config FILE` for a different settings file (default
-`~/.simplewavemeterlock.json`).
+`~/.simplewavemeterlock.json`), `--name NAME` for this wavemeter's name on every PC
+(see *Several PCs*).
 
 The WLM software must be running, with the multichannel switch cycling over the
 channels you want. It reads every channel as soon as the WLM has a new result,
@@ -78,7 +84,8 @@ it switches that channel back on when the laser needs relocking, then off again
 | **Relock** button | For a laser its DLC pro locks to a cavity (*Mode-hop recovery… ▸ Locked by its DLC pro*), in place of Lock: this program does not lock it to the wavemeter. Click it to have the laser watched (*Watching*, green) and relocked after a mode hop, when it is locked more than 50 MHz from its target (another peak: the wavemeter is never that far off), or when its lock keeps losing it and relocking (its transmission, on average, far below its level locked); if any of that is so when you click, it is relocked there and then. Normally it does nothing at all, also while someone has its wavemeter channel switched off (see *Its wavemeter channel switched off*). Click *Watching* to stop. |
 | `set` field | Setpoint as vacuum wavelength in nm. Type and press Enter, or put the cursor next to a digit and use ↑/↓ or the mouse wheel to step that digit. This works while locked, so you can walk the laser. |
 | Double-click the name | Rename |
-| Right-click empty space | Rescan LAN (F5), Show hidden channels, Always on top, Larger/smaller digits (Ctrl +/−); with `--sim`, Simulate a fault |
+| Right-click empty space | Rescan LAN (F5), Network…, Show hidden channels, Always on top, Larger/smaller digits (Ctrl +/−); with `--sim`, Simulate a fault |
+| Another PC's wavemeter | Its rows work as they do on that PC (see *Several PCs*); click its name to fold it away or back; right-click its name: Network…, Forget (once it is gone) |
 
 Greyed digits mean the channel has had no new reading for 3 s; a grey *off* in their place, that
 someone unticked the channel in the WLM software (see *Its wavemeter channel switched off*).
@@ -175,6 +182,53 @@ Things to know:
 * In `--sim`, channel 6 (729 nm) is a cavity-locked reference.
   *Right-click empty space ▸ Simulate a fault* gives it mode hops, a cavity unlock or a
   blocked beam, or steps the wavemeter, so you can watch all of the above happen.
+
+## Several PCs
+
+Run the program on each PC that has a wavemeter: they find each other on the LAN by
+themselves. Each window then shows every wavemeter, framed in a colour of its own under its
+name, this PC's first. Another PC's rows show what they show on that PC, live, and work as they
+do there: type a setpoint (or step its digits), click Lock, Relock, Continue or Stop, right-click
+for *Setpoint = current reading*, *Recenter now*, *Lock settings…* or *Rename…*. The PC the
+wavemeter belongs to does it, exactly as if it had been clicked there: nothing is ever written to
+a wavemeter or a laser by any other PC. Its row says so for 10 minutes (*⇄ setpoint 739.052750 nm
+from Lab 2 · WS7 (LAB2-PC), 5 s ago*), and its console logs it. Linking lasers, mode-hop recovery
+and the reference laser are set up on the PC itself.
+
+![several PCs](docs/share.png)
+
+* **Names.** Each wavemeter is labelled by its name, the same on every PC: until you give it
+  one, its PC's name (with its model, *WS7*, if the WLM says). Right-click › *Network…* › *Its
+  name*, or start with `--name "Lab 2 · WS7"`. The colour of its frame comes from its name (no two
+  alike), so it is the same on every screen too. With other PCs about, the window's title has this PC's.
+* **Lightweight.** UDP only, and only what changed. A PC showing another's 7 channels (5 of them
+  locked) gets about 2.5 kB/s from it: new readings at most 10 times a second (only those that
+  changed), the rest of a row only when it changes, all of it every 5 s in case something was
+  lost. Fold a wavemeter away (click its name) or minimize the window: about 0.3 kB/s. Alone on
+  the LAN, a PC sends a 170-byte hello to each broadcast address every 5 s. Every datagram stays
+  under 1200 bytes. The status bar shows what goes to and fro (*⇄ 2 other PCs · 5.1 kB/s*).
+* **Finding each other.** By broadcast every 5 s, as the DLC pros are found (UDP port 47474,
+  shared by the copies on a PC; each copy has a port of its own besides), and through the PCs
+  each one knows. A PC on another subnet, which broadcasts do not reach: list it in *Network…* ›
+  *Also talk to* (`lab3-pc, 10.1.2.3`): one PC listing it is enough, the others hear of it.
+* **Who may adjust.** Any PC in the same *Group* (none by default: every copy on the LAN). To
+  keep it to your own, set the same *Key* on each: everything is then signed with it
+  (HMAC-SHA256), nothing unsigned is taken, and an adjustment stamped over 2 minutes away from
+  this PC's clock is refused (an old one replayed). Untick *Let the other PCs adjust the lasers
+  here* and that PC can only be watched. An adjustment is sent again until it is answered (2 s at
+  most) and done once; one not done says why on the row it was asked from (*not done on Lab 2:
+  …*). *Continue* allows only the step its row showed: if the recovery has moved on meanwhile, it
+  is refused, and says which step it waits for now. A setpoint overtaken on the way by a later
+  one is not done.
+* **Gone.** A PC not heard from turns its status amber, then red after 10 s (*not heard from for
+  25 s*), its rows grey; its lasers stay as they were, locked by their own PC. One closed says so
+  (*closed at 18:02*) and goes after 10 minutes; one restarted takes its old place.
+* **No wavemeter here.** `python -m wmlock --view` (remembered, as the other sources are) on an
+  office PC shows, and adjusts, the others' (and has no frame of its own on their screens).
+* **In the demo** (`--sim`), copies find each other on the same PC only (port 47475), never the
+  real ones. Try two, with settings files and names of their own:
+  `python -m wmlock --sim --name "Demo A"` and
+  `python -m wmlock --sim --name "Demo B" --config demo-b.json`.
 
 ## Mode-hop recovery
 
@@ -835,6 +889,11 @@ Things to know:
   through the Windows firewall on the lab network (Windows asks on first run).
   Controllers behind a router won't hear the broadcast; use *Enter IP address…*,
   and they are remembered after that.
+* **Other PCs not found** (*⇄ 0 other PCs*): they say hello by UDP broadcast on port 47474,
+  and answer from a port of their own: allow Python through the Windows firewall on every PC,
+  for the type the lab network is (a university network is often *Domain* or *Public*, not
+  *Private*). The same *Group* and *Key* on all of them (*Network…*); one on another subnet:
+  *Also talk to*. *Network…* lists the PCs found, and the traffic.
 * **`cannot load wlmData`**: 64-bit Python needs the 64-bit `wlmData.dll`
   (System32), 32-bit Python the 32-bit one (SysWOW64). Point `--dll` at the
   right one if it isn't found.
@@ -871,6 +930,8 @@ wmlock/relock.py     taking over and handing back a DLC pro's cavity and SHG loc
 wmlock/dropouts.py   lock dropouts: the DLC pro's recorder (or polling) read, dropouts found
 wmlock/cavity.py     reading SHG sweeps, cavity scans and error signals, pure maths
 wmlock/engine.py     threads and state: source → lock → per-controller workers
+wmlock/view.py       what a row shows (Qt-free): painted here, and sent to the other PCs
+wmlock/share.py      the other PCs: found, their rows shown, adjustments asked and done (UDP)
 wmlock/gui.py        Qt window
 wmlock/sim.py        simulated wavemeter, mode-hopping lasers (and TAs), fake DLC pros (demo and tests)
 server/server.py     optional HTTP server for the wavemeter PC
@@ -903,4 +964,9 @@ content, its TA's seed photodiode and seed protection, the SHG cavity's sweep an
 reference cavity's transmission and PDH error signal with a DC level, a lock that cannot hold a
 master on two modes (ReLock catching it again and again), the FALC pro's input
 offset, lockpoint candidates and selection; the synchronous tests drive them through the real
-client and protocol, without sockets.
+client and protocol, without sockets. Several PCs are tested with two or three copies in one
+process, each with its own simulated wavemeter and DLC pros, over the loopback interface: found
+directly and through another, rows shown as they are, adjustments done once (also when tries
+are lost, overtaken or stale), refused when not allowed, keys and groups that keep others out,
+PCs gone quiet, closed and restarted, the traffic measured; and in the window, another PC's
+wavemeter framed under its name, adjusted from it, folded away.

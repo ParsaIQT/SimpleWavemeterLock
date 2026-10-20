@@ -1262,6 +1262,7 @@ class SimSource(Source):
     does."""
 
     label = "simulation"
+    model = "simulated WS7"
     switchable = True
 
     def __init__(self, sink, lasers, exposure=0.02, wavemeter=None):

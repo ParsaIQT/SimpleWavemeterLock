@@ -189,6 +189,10 @@ class Channel:
         self.hold_since = None  # monotonic: since when its lock should hold (on, no recovery)
         # where it was on target as it should be (the catch: its right mode is there)
         self.fine_at = None    # (monotonic, scan offset, set current) when last polled so
+        # the last adjustment made from another PC (share.py)
+        self.remote_note = ""  # what, and from where
+        self.remote_t = 0.0    # monotonic...
+        self.remote_wall = 0.0  # ...and time.time(): when
 
     @property
     def param(self) -> str:
@@ -1737,6 +1741,83 @@ class Engine:
         if ch.looked:
             out.append(("info", f"last look, its channel switched on for it: {ch.looked}"))
         return out
+
+    # ------------------------------------------------- adjustments from other PCs
+    def remote(self, n: int, do: str, args: dict, who: str) -> tuple:
+        """An adjustment of channel n asked by another PC (share.py), done as if clicked here: (done, why not). who:
+        that PC, said on the row for a while (Channel.remote_note). Done but nothing changed: (True, 'unchanged')."""
+        with self.lock:
+            ch = self.channels.get(n)
+            if ch is None or n not in self.rows():
+                return False, f"no channel {n} shown there"
+            ref = self._is_reference(ch)
+            if do == "setpoint":
+                nm = args.get("nm")
+                if ref:
+                    return False, "the reference laser has no setpoint"
+                if nm is not None and not (_num(nm) and nm > 0):
+                    return False, f"not a wavelength: {nm!r}"
+                if nm == ch.setpoint_nm:
+                    return True, "unchanged"
+                self.set_setpoint(n, nm)
+                what = f"setpoint {nm} nm" if nm else "setpoint cleared"
+            elif do == "lock":
+                if ch.state != "off":
+                    return True, "unchanged"
+                if ref:
+                    return False, "the reference laser is locked to its cavity, not to the wavemeter"
+                self.engage(n)
+                if ch.state == "off":
+                    return False, ch.message or "not locked"
+                what = "Relock clicked" if ch.relock else "locked"
+            elif do == "unlock":
+                if ch.state == "recovering":
+                    return False, "it is recovering: stop that instead"
+                if ch.state == "off":
+                    return True, "unchanged"
+                self.disengage(n)
+                what = "watching stopped" if ch.relock else "unlocked"
+            elif do == "stop":
+                if ch.state != "recovering":
+                    return True, "unchanged"
+                self.cancel_recovery(n)
+                what = "recovery stopped"
+            elif do == "continue":
+                prompt = ch.hop_prompt
+                if not prompt:
+                    return False, "it is not waiting for a step to be allowed any more"
+                if prompt != args.get("prompt"):
+                    return False, f"the step it waits for is another one now: “{prompt}”"
+                self.confirm_step(n)
+                what = f"step allowed: {prompt}"
+            elif do == "setpoint_to_reading":
+                if ref or not ch.freq > 0 or ch.state == "recovering":
+                    return False, "no valid reading" if not ch.freq > 0 else "not now"
+                self.setpoint_to_current(n)
+                what = f"setpoint = reading, {ch.setpoint_nm} nm"
+            elif do == "recenter":
+                if ch.state in ("recovering", "engaging"):
+                    return False, f"not while {ch.state}"
+                self.recenter(n)
+                if ch.state != "recovering":
+                    return False, ch.message or "not recentered"
+                what = "Recenter now"
+            elif do == "rename":
+                name = str(args.get("name", "")).strip()[:80]
+                if name == ch.name:
+                    return True, "unchanged"
+                self.rename(n, name)
+                what = f"renamed “{name}”"
+            elif do == "lock_params":
+                p = args.get("p")
+                if not isinstance(p, dict) or not all(_num(x) for x in p.values()):
+                    return False, "not lock settings"
+                self.set_params(n, LockParams.from_dict({**ch.lock.p.to_dict(), **p}))  # (those not said: as they are)
+                what = "lock settings changed"
+            else:
+                return False, f"cannot {do!r} from another PC"
+            ch.remote_note, ch.remote_t, ch.remote_wall = f"{what} from {who}", time.monotonic(), time.time()
+            return True, ""
 
     # -------------------------------------------------------------- discovery
     def start_discovery(self):

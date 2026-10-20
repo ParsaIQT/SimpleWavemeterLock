@@ -1,4 +1,6 @@
+import importlib
 import re
+import socket
 import time
 
 import pytest
@@ -463,3 +465,115 @@ def test_row_of_a_channel_switched_off_stays_while_watched(app):
         win.close()
         spin(app, 0.1)
         demo.close()
+
+
+def test_another_pcs_wavemeter_is_framed_under_its_name_and_adjusted_from_here(app):
+    """Another PC found: its rows show in a frame of their own under its wavemeter's name (and this PC's under its
+    own), as they show there; clicks and setpoints typed here are done there; folded away, it sends less."""
+    from test_share import PC
+
+    a, b = PC("Lab A"), None
+    win = gui.MainWindow(a.engine, lambda: None, a.share)
+    a.start()
+    win.show()
+    try:
+        spin(app, 0.3)
+        assert not win.local.framed and not win.local.header.isVisible()  # (alone: as ever)
+        b = PC("Lab B", peers=[a]).start()
+        assert wait_for(lambda: (app.processEvents(), bool(win.panel_list) and 7 in win.panel_list[0].rows)[1], 5)
+        spin(app, 0.6)
+        panel = win.panel_list[0]
+        assert panel.header.title.text() == "Lab B" and panel.framed and win.local.framed
+        colors = gui.panel_colors(["Lab A", "Lab B"])
+        assert panel.header.title._color == colors["Lab B"] != colors["Lab A"] == win.local.header.title._color
+        assert win.local.header.title.text() == "Lab A" and win.local.header.detail.text() == "this PC"
+        assert win.windowTitle() == "Wavemeter Lock · Lab A" and win.st_net.text().startswith("⇄ 1 other PC")
+        assert panel.header.status.text().endswith("readings/s")
+        row = panel.rows[1]
+        assert row.wl.text().startswith("396.959") and row.name.text() == "397"
+        assert row.btn.text() == "Lock" and row.info.text() == "no laser linked" and row.btn.isEnabled()
+        assert "on Lab B" in row.wl.toolTip()
+
+        e = b.engine
+        e.link(1, b.demo.dlcs[0].key, 1)
+        row._clicked()  # Lock, there
+        assert wait_for(lambda: (app.processEvents(), e.channels[1].state == "on")[1], 3)
+        assert wait_for(lambda: (app.processEvents(), row.btn.text() == "Locked")[1], 2)
+        assert e.channels[1].remote_note == f"locked from {a.share.who}" and row.info.text().startswith("laser1 @ ")
+        row.sp.setValue(396.9592)  # (as typed, Enter)
+        assert wait_for(lambda: e.channels[1].setpoint_nm == 396.9592, 2)
+        spin(app, 0.5)
+        assert row.sp.value() == pytest.approx(396.9592) and row.dev.text().endswith("MHz")
+        row.show_menu(row.rect().center())
+        items = [x.text() for x in row._menu.actions() if x.text()]
+        assert items == ["Lab B: channel 1 397", "Setpoint = current reading", "Lock settings…", "Recenter now",
+                         "Rename…"]
+        row._menu.close()
+        row._clicked()  # Locked: unlock, there
+        assert wait_for(lambda: (app.processEvents(), e.channels[1].state == "off")[1], 3)
+
+        QtTest = importlib.import_module(qt.BINDING + ".QtTest")
+        QtTest.QTest.mouseClick(panel.header, QtCore.Qt.MouseButton.LeftButton)  # fold it away: it sends less
+        spin(app, 0.3)
+        assert panel.folded and not row.isVisible() and win.gui["folded"] == ["Lab B"]
+        assert panel.peer.wanted == "slow" and panel.header.detail.text().endswith("7 channels: 7 off")
+        assert wait_for(lambda: b.share.peers[a.share.id].want == "slow", 3)
+        panel.fold(False)
+        spin(app, 0.2)
+        assert row.isVisible() and win.gui["folded"] == [] and panel.peer.wanted == "fast"
+
+        b.share.settings["control"] = False  # there, the others may only watch
+        assert wait_for(lambda: (app.processEvents(), not row.btn.isEnabled() and row.sp.isReadOnly())[1], 4)
+        assert panel.header.detail.text().endswith("watch only")
+        b.close()
+        assert wait_for(lambda: (app.processEvents(), panel.header.status.text().startswith("closed at"))[1], 3)
+        assert row.wl._color == "dim"
+    finally:
+        win.close()
+        spin(app, 0.1)
+        if b is not None:
+            b.close()
+        a.demo.close()
+
+
+def test_network_dialog_round_trip(app):
+    from wmlock.share import Share
+
+    e = Engine({}, lambda sink: None)
+    settings = {"label": "Lab 2 · WS7", "group": "ions", "key": "k", "peers": ["lab3-pc", "10.1.2.3:5000"],
+                "control": False, "port": 47000}
+    d = gui.ShareDialog(None, Share(e, settings))
+    assert d.values() == {"on": True, **settings}
+    assert d.found.text().startswith("no other PC yet")
+    d.label.setText("")
+    assert d.values()["label"] == "" and d.label.placeholderText() == socket.gethostname()  # (its default name)
+    d.peers.setText("a; b ,c")
+    assert d.values()["peers"] == ["a", "b", "c"]
+
+
+def test_a_pc_without_a_wavemeter_shows_the_others(app):
+    """--view: no wavemeter here, the others' wavemeters only (this PC's empty frame not shown)."""
+    from test_share import PC, free_port
+
+    from wmlock.share import Share
+    from wmlock.wavemeter import NullSource
+
+    a = PC("Lab A").start()
+    e = Engine({}, NullSource)
+    share = Share(e, {"label": "office", "port": free_port(), "lan": False, "peers": [f"127.0.0.1:{a.port}"]})
+    win = gui.MainWindow(e, lambda: None, share)
+    e.start()
+    share.start()
+    win.show()
+    try:
+        spin(app, 0.6)
+        assert win.st_wlm.text() == "no wavemeter on this PC"
+        assert wait_for(lambda: (app.processEvents(), bool(win.panel_list) and win.panel_list[0].rows)[1], 5)
+        spin(app, 0.2)
+        assert not win.local.isVisible() and win.panel_list[0].header.title.text() == "Lab A"
+        assert win.panel_list[0].rows[1].wl.text().startswith("396.959")
+        assert a.peer("office").src["viewer"]  # (no frame for it on the others: nothing in it)
+    finally:
+        win.close()
+        spin(app, 0.1)
+        a.close()

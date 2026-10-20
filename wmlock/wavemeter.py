@@ -70,6 +70,7 @@ def decode_wlm(ch: int, value: float, t: float) -> Reading:
 
 class Source(threading.Thread):
     label = "source"
+    model = ""          # what the wavemeter is ('WS7'), if it says
     switchable = False  # it can switch channels on and off (switch)
 
     def __init__(self, sink, interval: float):
@@ -170,6 +171,7 @@ class WlmDll:
             ("GetSwitcherChannel", [L], L, False),
             ("GetSwitcherSignalStates", [L, P, P], L, False),
             ("SetSwitcherSignalStates", [L, L, L], L, False),
+            ("GetWLMVersion", [L], L, False),
         ):
             try:
                 f = getattr(lib, name)
@@ -184,6 +186,11 @@ class WlmDll:
 
     def running(self) -> bool:
         return self.lib.GetWLMCount(0) > 0
+
+    def model(self) -> str:
+        """'WS7', say ('' if it does not say)."""
+        t = self.lib.GetWLMVersion(0) if "GetWLMVersion" in self.has else 0
+        return f"WS{t}" if 4 <= t <= 30 else ""
 
     def channels(self):
         """(measured, off): the channels the WLM measures, and those its switch has with 'Use' unticked (when it
@@ -250,6 +257,8 @@ class DllSource(Source):
                         self._set_state(False, "wlmServer is not running")
                         self._stop_ev.wait(1.0)
                         continue
+                    if not self.model:
+                        self.model = wlm.model()
                     active, off = (self.fixed, []) if self.fixed else wlm.channels()
                     self._set_active(active, off)
                     self._set_state(True)
@@ -265,6 +274,20 @@ class DllSource(Source):
                 self._stop_ev.wait(2.0)
                 continue
             self._stop_ev.wait(self.interval)
+
+
+class NullSource(Source):
+    """No wavemeter on this PC (--view): the other PCs' are shown (share.py)."""
+
+    label = "no wavemeter"
+    viewer = True
+
+    def __init__(self, sink):
+        super().__init__(sink, 1.0)
+
+    def run(self):
+        self._set_state(True)
+        self._stop_ev.wait()
 
 
 # -------------------------------------------------------------------------- HTTP

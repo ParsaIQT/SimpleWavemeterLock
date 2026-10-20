@@ -1,4 +1,4 @@
-"""python -m wmlock [--sim | --http URL | --dll [PATH]] [--config FILE]"""
+"""python -m wmlock [--sim | --http URL | --dll [PATH] | --view] [--name NAME] [--config FILE]"""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,8 @@ from pathlib import Path
 
 from . import config as cfgfile
 from .engine import Engine
-from .wavemeter import DllSource, HttpSource
+from .share import SIM_PORT, Share
+from .wavemeter import DllSource, HttpSource, NullSource
 
 
 def main(argv=None) -> int:
@@ -20,6 +21,10 @@ def main(argv=None) -> int:
                      help="read the wavemeter through server/server.py, e.g. http://wlm-pc:8000")
     src.add_argument("--dll", metavar="PATH", nargs="?", const="",
                      help="read wlmData.dll directly (the default), optionally from PATH")
+    src.add_argument("--view", action="store_true",
+                     help="no wavemeter on this PC: show, and adjust, the other PCs' wavemeters only")
+    p.add_argument("--name", metavar="NAME",
+                   help="this wavemeter's name, shown over its lasers on every PC (remembered)")
     p.add_argument("--channels", metavar="LIST",
                    help="with --dll: show these channels instead of asking the switch, e.g. 1,2,5")
     p.add_argument("--config", metavar="FILE", help="settings file (default: ~/.simplewavemeterlock.json)")
@@ -27,6 +32,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         datefmt="%Y-%m-%d %H:%M:%S")
     logging.getLogger("wmlock.dropouts").setLevel(logging.INFO)  # (its hourly summaries too)
+    logging.getLogger("wmlock.share").setLevel(logging.INFO)  # (the other PCs found, their adjustments here)
 
     path = args.config or cfgfile.default_path(args.sim)
     config = cfgfile.load(path)
@@ -51,7 +57,11 @@ def main(argv=None) -> int:
             config["source"] = "dll"
             if args.dll:
                 config["dll_path"] = args.dll
-        if config.get("source") == "http" and config.get("http_url"):
+        elif args.view:
+            config["source"] = "view"
+        if config.get("source") == "view":
+            make_source = NullSource
+        elif config.get("source") == "http" and config.get("http_url"):
             url = config["http_url"]
             interval = config.get("poll_ms", 20) / 1e3
 
@@ -72,10 +82,17 @@ def main(argv=None) -> int:
     drop_path = log_path.with_name(log_path.name.replace("-recoveries", "-dropouts"))
     engine = Engine(config, make_source, discovery_targets=targets, extra_devices=extra, log_path=log_path,
                     drop_path=drop_path)
+    shared = config.setdefault("share", {})  # the other PCs (share.py)
+    if args.name is not None:
+        shared["label"] = args.name.strip()
+    if args.sim:  # demos find each other on this PC only, never the real ones
+        shared.setdefault("port", SIM_PORT)
+        shared.setdefault("lan", False)
+    share = Share(engine, shared)
     try:
         from .gui import run
 
-        return run(engine, lambda: cfgfile.save(path, engine.to_config()))
+        return run(engine, lambda: cfgfile.save(path, engine.to_config()), share)
     finally:
         if demo:
             demo.close()
