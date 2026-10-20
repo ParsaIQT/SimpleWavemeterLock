@@ -18,6 +18,7 @@ import socket
 import threading
 import time
 
+from . import dac as daclib
 from .dlcpro import DISCOVERY_PORT
 from .wavemeter import C_NM_THZ, Source
 
@@ -1152,8 +1153,12 @@ class SimLaser:
     fault is injected."""
 
     def __init__(self, ch, wavelength_nm, tuning=0.4, dlc=None, n=1, offset0=70.0,
-                 drift=3.0, signal=True, cavity=False, lock=None, seed=None):
+                 drift=3.0, signal=True, cavity=False, lock=None, seed=None, dac=None):
+        """dac: (a dac.SimBoard, its output, the output fed forward or None, GHz per V of that): a laser without a
+        digital controller, its piezo driver (tuning: GHz per V at the output, about offset0) and its current fed
+        by the board's outputs."""
         self.ch, self.f0 = ch, C_NM_THZ / wavelength_nm
+        self.dac = dac
         self.tuning = tuning      # GHz per V of scan offset (sign matters)
         self.dlc, self.n, self.offset0 = dlc, n, offset0
         self.drift = drift        # MHz/sqrt(s) random walk of a free-running laser
@@ -1203,6 +1208,11 @@ class SimLaser:
                 return self.f0 + mhz * 1e-6
             self.walk += random.gauss(0.0, self.drift * math.sqrt(dt))
             wobble = self.walk + 20.0 * math.sin(now / 30.0 + self.phase)  # MHz
+            if self.dac is not None:  # its piezo driver and current fed by an analog output board
+                board, ao, ff, ff_ghz = self.dac
+                ghz = self.tuning * (board.volts[ao] - self.offset0) + (ff_ghz * board.volts[ff] if ff is not None
+                                                                        else 0.0)
+                return self.f0 + ghz * 1e-3 + wobble * 1e-6
             if self.ecdl is None:
                 return self.f0 + wobble * 1e-6
             p, params = f"laser{self.n}:", self.dlc.params
@@ -1344,8 +1354,10 @@ class Demo:
     ]
     REFERENCE = 6
     SHG = 7  # cavity-locked by its DLC pro: try the mode-hop recovery on it
+    DAC = 8  # with dac=True: a laser without a digital controller, on a simulated analog output board
+    DAC_LASER = (8, 935.17976, 8.0, 2, 3, 0.4, "935 (DAC)")  # ch, nm, GHz/V, output, feed-forward output, GHz/V, name
 
-    def __init__(self, discovery_port=DISCOVERY_PORT, wavemeter=None, exposure=0.02):
+    def __init__(self, discovery_port=DISCOVERY_PORT, wavemeter=None, exposure=0.02, dac=False):
         self.dlcs = [
             FakeDLCPro("SIM-000123", "Ca+ blue", {1: {"product": "DL pro 397"}, 2: {"product": "DL pro 866"}}),
             FakeDLCPro("SIM-000456", "Ca+ red", {1: {"product": "DL pro 854"}, 2: {"product": "DL pro 423"}}),
@@ -1374,6 +1386,14 @@ class Demo:
         self.names = {ch: name for ch, *_, name in self.CHANNELS}
         self.targets = ["127.0.0.1"]  # never broadcast on the real LAN in demo mode
         self.extra_devices = [] if self.responder else [d.key for d in self.dlcs]
+        self.board = None
+        if dac:  # an old laser: its piezo driver on output 2 of a simulated board, its current fed forward on 3
+            number = max(daclib.SIM_BOARDS, default=-1) + 1
+            self.board = daclib.SIM_BOARDS[number] = daclib.SimBoard(number)
+            self.dac_key = daclib.key("sim", number)
+            ch, nm, ghz, ao, ff, ff_ghz, name = self.DAC_LASER
+            self.lasers.append(SimLaser(ch, nm, ghz, offset0=0.3, drift=3.0, dac=(self.board, ao, ff, ff_ghz)))
+            self.names[ch] = name
 
     def make_source(self, sink):
         return SimSource(sink, self.lasers, self.exposure, self.wavemeter)
@@ -1382,6 +1402,8 @@ class Demo:
         return next(laser for laser in self.lasers if laser.ch == ch)
 
     def wavelength(self, ch: int) -> float:
+        if self.board is not None and ch == self.DAC:
+            return self.DAC_LASER[1]
         return next(wl for c, wl, *_ in self.CHANNELS if c == ch)
 
     def close(self):
@@ -1389,3 +1411,5 @@ class Demo:
             self.responder.close()
         for d in self.dlcs:
             d.close()
+        if self.board is not None:
+            daclib.SIM_BOARDS.pop(self.board.number, None)

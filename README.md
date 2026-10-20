@@ -31,6 +31,9 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
   target, the current kept high in the mode on the way; the SHG cavity is relocked too. With a
   TA, its seed power shows whether the laser lases: if it stops, its current is jumped up at once
   and brought back down slowly.
+* **Lasers without a digital controller**: their piezo driver on an analog output (a DAC), as the
+  LabVIEW program Epimetheus drove them, on its Measurement Computing board (see *Lasers on an
+  analog output*).
 * **Several PCs** (optional, on by default): every copy of the program on the LAN finds the
   others by itself. Each window shows every wavemeter, framed under its name, and the other
   PCs' lasers can be adjusted from it (setpoint, Lock, Relock, Continue…), by the PC they
@@ -46,6 +49,9 @@ Python ≥ 3.8 and one Qt binding (PySide6 preferred; PyQt5 and PyQt6 also work)
 ```
 pip install PySide6 ifaddr
 ```
+
+For lasers on an analog output board (*Lasers on an analog output*), also `pip install mcculw`, with
+MCC's InstaCal installed (Windows).
 
 `ifaddr` is optional. It is used to broadcast on every network adapter; without it
 discovery uses 255.255.255.255 only.
@@ -79,7 +85,7 @@ it switches that channel back on when the laser needs relocking, then off again
 
 | | |
 |---|---|
-| Right-click a channel | Link laser ▸ controller ▸ laserN, Enter IP address…, Rescan LAN, Unlink, Setpoint = current reading, Lock settings…, Mode-hop recovery…, Recenter now, Check setup…, Last recovery…, Use as reference laser, Rename…, Hide channel |
+| Right-click a channel | Link laser ▸ controller ▸ laserN, Enter IP address…, Analog output (DAC)…, Rescan LAN, Unlink, Setpoint = current reading, Lock settings…, Mode-hop recovery… (on an analog output: Analog output…), Recenter now, Check setup…, Last recovery…, Use as reference laser, Rename…, Hide channel |
 | **Lock** button | Engage or release. Without a setpoint it locks to the current reading. Green means locked; a red bar means it unlocked itself, and the reason is shown under the deviation. Amber *Recentering* means a mode-hop recovery is running: click to stop it (everything goes back). Blue *Continue*: step by step, it waits for you to allow the step shown on the row. |
 | **Relock** button | For a laser its DLC pro locks to a cavity (*Mode-hop recovery… ▸ Locked by its DLC pro*), in place of Lock: this program does not lock it to the wavemeter. Click it to have the laser watched (*Watching*, green) and relocked after a mode hop, when it is locked more than 50 MHz from its target (another peak: the wavemeter is never that far off), or when its lock keeps losing it and relocking (its transmission, on average, far below its level locked); if any of that is so when you click, it is relocked there and then. Normally it does nothing at all, also while someone has its wavemeter channel switched off (see *Its wavemeter channel switched off*). Click *Watching* to stop. |
 | `set` field | Setpoint as vacuum wavelength in nm. Type and press Enter, or put the cursor next to a digit and use ↑/↓ or the mouse wheel to step that digit. This works while locked, so you can walk the laser. |
@@ -118,6 +124,55 @@ offset = offset_at_engage − (P·e + I·Σe)
   left alone. Locks always start released when the program starts.
 * If someone unticks the channel's "Use" in the WLM software, the lock is held where it is
   (*lock held* on its row, still shown), and goes on when the channel is ticked again.
+
+## Lasers on an analog output
+
+Older lasers, with a piezo driver and no DLC pro, are locked through an analog output (a DAC) that
+feeds their piezo driver, as Epimetheus (the LabVIEW program) did. Right-click the channel ›
+*Link laser* › *Analog output (DAC)…* and pick the board, the output and the limits. The lock then
+moves that output's voltage in place of a DLC pro's scan offset. Everything else (setpoint, Lock,
+reference laser, the other PCs) works as for any laser; mode-hop recovery needs a DLC pro, so it is
+not offered.
+
+* **The board**: a Measurement Computing board, as Epimetheus's: its ULx *Dev0* is board 0 in InstaCal.
+  It is driven through MCC's Python library, `pip install mcculw` (Windows, with InstaCal installed
+  and the board set up in it). Each output is written with the range InstaCal has for it (±10 V if
+  none), and nothing else is ever written: no test pattern, no zeroing at the start.
+* **A DAC cannot be read back.** What this program last wrote to each output is kept (in the
+  settings), and the lock starts from there. Whenever the board is opened (at the start, or plugged in
+  again; a power cut leaves it at 0 V) every output in use is set back to it. An output this program
+  never wrote is not known, and it is not locked until you set it: right-click › *Analog output…*,
+  type the voltage the laser sits at now (in Epimetheus: its offset plus its PID's output, the *piezo*
+  it shows) and click *Set*. While the laser is not locked, the same dialog moves it by hand (↑/↓ on a
+  digit, as for the setpoint).
+* **Limits**: by default as in Epimetheus. The output never leaves ±1.2 V, and while locked it moves
+  at most ±0.8 V from where it locked, 0.02 V a reading at most (*Lock settings…*: Min/Max offset,
+  Max excursion, Max step).
+* **Feed-forward** (Epimetheus's current output, `index_I`): a second output can follow the first's
+  moves divided by a ratio (its *Feed_forward*), from where it was when the lock engaged. It, too, must
+  be set by hand once.
+* **Gains** are per reading, in V/GHz (see *The lock*), positive if the frequency rises with the
+  voltage, which is what Epimetheus's Kc = −1 meant. Epimetheus's PID acted on the wavelength in nm,
+  over time. Its Kc and Ti (in minutes) correspond here to P ≈ |Kc|·λ²/c and
+  I ≈ |Kc|·λ²/c·Δt/(60·Ti), with λ²/c in nm/GHz (2.9·10⁻³ at 935 nm, 5.3·10⁻⁴ at 399 nm) and Δt the
+  time between the channel's readings in seconds. Its Kc = −1 and Ti = 0.0005 min give, at 935 nm with
+  a reading every 0.1 s, P = 0.003 and I = 0.01 V/GHz: the defaults here.
+* **One program per board.** Epimetheus rewrites all 16 outputs every 4 ms: do not run it at the same
+  time, nor anything else that drives the board (Atlas).
+* In `--sim`, channel 8 is such a laser (8 GHz/V) on a simulated board, its current fed forward on
+  output 3.
+
+Where Epimetheus kept a laser's settings (`config.ini`, a `[laser_n]` each), and where they go here:
+
+| Epimetheus | Here |
+|---|---|
+| `index_P` | *Analog output (DAC)…* › Output |
+| `index_I` (−1: none), its Feed_forward | › Feed its moves forward to output … divided by |
+| `last_offset_P` (+ the PID's output) | *Analog output…*: the voltage now, set once |
+| `last_offset_I` | *Analog output…*: the second output, set once |
+| `wavelength_target` | the setpoint (`set`) |
+| `wavelength_source` (`H_1`: Hermes's channel 1) | the channel the laser is on, on this wavemeter |
+| `P`, `I`, `D` (Kc, Ti in min, Td) | *Lock settings…* P and I (see Gains); D: none |
 
 ## Reference laser
 
@@ -894,6 +949,9 @@ Things to know:
   for the type the lab network is (a university network is often *Domain* or *Public*, not
   *Private*). The same *Group* and *Key* on all of them (*Network…*); one on another subnet:
   *Also talk to*. *Network…* lists the PCs found, and the traffic.
+* **An analog output shows *offline: mcculw cannot be used***: `pip install mcculw`, and install
+  InstaCal, with the board in it (*offline: MCC board 0: … is it in InstaCal?*). *cannot lock: output
+  2: its voltage is not known*: set it once by hand (right-click › *Analog output…* › *Set*).
 * **`cannot load wlmData`**: 64-bit Python needs the 64-bit `wlmData.dll`
   (System32), 32-bit Python the 32-bit one (SysWOW64). Point `--dll` at the
   right one if it isn't found.
@@ -923,6 +981,7 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 wmlock/wavemeter.py  wavemeter sources: wlmData.dll (ctypes), HTTP, push changes only
 wmlock/dlcpro.py     DLC pro client (DeCoP command line, TCP 1998) + UDP discovery (60010)
+wmlock/dac.py        analog outputs (DACs) for lasers without a digital controller: MCC boards (mcculw), simulated
 wmlock/lock.py       the PI lock, pure maths
 wmlock/reference.py  wavemeter referencing to a cavity-locked laser, pure maths
 wmlock/modehop.py    mode-hop recovery: lasing watch and panic, the catch, the walk, the current map, driver
@@ -969,4 +1028,7 @@ process, each with its own simulated wavemeter and DLC pros, over the loopback i
 directly and through another, rows shown as they are, adjustments done once (also when tries
 are lost, overtaken or stale), refused when not allowed, keys and groups that keep others out,
 PCs gone quiet, closed and restarted, the traffic measured; and in the window, another PC's
-wavemeter framed under its name, adjusted from it, folded away.
+wavemeter framed under its name, adjusted from it, folded away. Lasers on an analog output are
+locked through a simulated board, end to end: never locked from an output not known, set back after
+a restart, kept within their limits, the output fed forward, a refused write unlocking them; the MCC
+board through a stand-in for mcculw (nothing written but what is asked, each output in its range).

@@ -120,12 +120,11 @@ def _info(e, ch, now: float):
         return ch.message, "err", ""
     if not ch.device:
         return "right-click to link a laser" + remote_text(ch, now), "dim", ""
-    dev = e.devices.get(ch.device)
     ctrl = e.controllers.get(ch.device)
-    where = f"laser{ch.laser} @ {dev.name if dev else ch.device}"
+    where = e.where(ch)
     more = hop_text(ch, now) + remote_text(ch, now)
     if ctrl is not None and ctrl.online is False:
-        return f"{where}   offline", "err", ""
+        return f"{where}   offline" + (f": {ctrl.error}" if ch.dac and ctrl.error else ""), "err", ""
     if ch.lasing is False and ch.hop.enabled:
         return f"{where}   NOT LASING: seed {ch.seed:.2f} mW{more}", "err", ""
     if slipping(ch):

@@ -370,9 +370,11 @@ def test_stopping_a_recovery_puts_current_and_offset_back(quiet_demo):
     try:
         e.engage(1)
         assert wait_for(lambda: ch.state == "on" and ch.guard.armed, 5)
-        offset = dlc.offset(1)
+        armed = dlc.offset(1)
         demo.laser(1).hop_mode(+1)
         assert wait_for(lambda: "mapping" in ch.hop_stage and dlc.current(1) < 149.5, 10)
+        offset = ch.runner.rec.V0  # where the recovery took it over (the lock may have moved it a hair since it armed)
+        assert offset == pytest.approx(armed, abs=0.01)
         e.toggle(1)  # the button, while recentering: stop
         assert wait_for(lambda: ch.state == "off", 5)
         assert ch.message == "recovery stopped (current and offset put back)"

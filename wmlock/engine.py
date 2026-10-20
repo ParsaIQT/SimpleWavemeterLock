@@ -81,6 +81,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
+from . import dac
 from .dlcpro import DLCPro, DecopError, Device, discover, probe
 from .dropouts import Monitor as DropoutMonitor
 from .dropouts import log as drop_log
@@ -101,6 +102,8 @@ SHG_INTRA = "nlo:pd:shg-int:photodiode"
 WATCHED = (ACTUATOR, CURRENT, CURRENT_ACT, CAVITY_LOCK, "dl:lock:state-txt", SHG_STATE, SHG_INTRA)
 FINE_N = 600   # polls: a level locked as usual is the median of the last this many running as it should...
 FINE_MIN = 10  # ...once there are this many (until then, the one learned before)
+DAC_LOCK = dict(kp=0.0, ki=0.01, max_step=0.02, v_min=-1.2, v_max=1.2, excursion=0.8)  # a laser on an analog output:
+#                Epimetheus's limits (±1.2 V; its PID's output ±0.8 V), a gentle start for the gain
 
 
 def _num(x) -> bool:
@@ -125,8 +128,13 @@ class Channel:
         self.f_set = NAN
         self.set_setpoint(cfg.get("setpoint_nm"))
         link = cfg.get("link") or {}
-        self.device = link.get("device") or None  # controller key: 'ip' or 'ip:port'
-        self.laser = int(link.get("laser", 1))
+        self.device = link.get("device") or None  # controller key: 'ip' or 'ip:port'; an analog output's: 'dac:mcc:0'
+        self.laser = int(link.get("ao", link.get("laser", 1)))  # laserN of its DLC pro; on a DAC, the output's number
+        ff = link.get("ff_ao")
+        self.ff_ao = ff if isinstance(ff, int) and not isinstance(ff, bool) else None  # on a DAC: a second output, fed
+        self.ff_ratio = float(link.get("ff_ratio") or 0.0) if self.ff_ao is not None else 0.0  # the moves of the first
+        #                                                                               divided by this (Epimetheus's)
+        self.ff0 = None       # V: that output where the lock engaged
         self.lock = Lock(LockParams.from_dict(cfg.get("lock")))
         self.hop = HopParams.from_dict(cfg.get("hop"))
         # live state, written by engine threads and read by the GUI
@@ -213,11 +221,20 @@ class Channel:
         d = {"name": self.name, "hidden": self.hidden, "lock": self.lock.p.to_dict()}
         if self.setpoint_nm:
             d["setpoint_nm"] = self.setpoint_nm
-        if self.device:
+        if self.device and dac.is_dac(self.device):
+            d["link"] = {"device": self.device, "ao": self.laser}
+            if self.ff_ao is not None:
+                d["link"].update(ff_ao=self.ff_ao, ff_ratio=self.ff_ratio)
+        elif self.device:
             d["link"] = {"device": self.device, "laser": self.laser}
         if self.hop != HopParams():
             d["hop"] = self.hop.to_dict()
         return d
+
+    @property
+    def dac(self) -> bool:
+        """It is driven by an analog output (dac.py), not by a DLC pro."""
+        return dac.is_dac(self.device)
 
     @property
     def relock(self) -> bool:
@@ -246,10 +263,11 @@ class Controller(threading.Thread):
     POLL = 0.5   # s between read-backs of watched parameters
     RETRY = 2.0  # s before reconnecting after a failure
 
-    def __init__(self, key: str, host: str, port: int):
+    def __init__(self, key: str, host: str = "", port: int = 0, client=None):
+        """client: in place of a DLC pro's (an analog output board's: dac.DacClient)."""
         super().__init__(daemon=True, name=f"dlcpro {key}")
         self.key = key
-        self.client = DLCPro(host, port, timeout=1.0)
+        self.client = client if client is not None else DLCPro(host, port, timeout=1.0)
         self.online = None  # None until the first exchange
         self.error = ""
         self._cv = threading.Condition()
@@ -402,6 +420,7 @@ class Engine:
         self.rate = 0.0          # new readings per second, all channels
         self._n_readings, self._rate_t = 0, time.monotonic()
         self.known = list(dict.fromkeys(config.get("known_devices") or []))
+        self.dacs = dac.Memory(config.get("dac"))  # what each analog output was last set to
         self.devices = {}
         for key in [*self.known, *extra_devices]:
             d = Device.from_key(key)
@@ -677,7 +696,12 @@ class Engine:
         if u is not None:
             ch.offset = u
             tok = ch.token
-            self._controller(ch.device).set(ch.param, u, lambda e: self._comm_failed(ch, tok, e))
+            c = self._controller(ch.device)
+            c.set(ch.param, u, lambda e: self._comm_failed(ch, tok, e))
+            if ch.ff_ao is not None and ch.ff_ratio and ch.ff0 is not None:  # (an analog output's feed-forward)
+                p = ch.lock.p
+                ff = min(max(ch.ff0 + (u - ch.lock.u0) / ch.ff_ratio, p.v_min), p.v_max)
+                c.set(f"laser{ch.ff_ao}:{ACTUATOR}", ff, lambda e: self._comm_failed(ch, tok, e))
         if not ch.lock.active:
             self._disengage(ch, ch.lock.message)
 
@@ -719,17 +743,19 @@ class Engine:
             ch.token += 1
             ch.guard.reset()
             tok, laser, params = ch.token, ch.laser, ch.lock.p
+            ff_ao = ch.ff_ao if ch.dac and ch.ff_ratio else None
 
             def job(client):
-                v = client.get_float(f"laser{laser}:{ACTUATOR}")
+                v = client.get_float(f"laser{laser}:{ACTUATOR}")  # (an analog output never set: not known, an error)
                 try:
                     unit = client.get_str(f"laser{laser}:scan:unit") or "V"
                 except DecopError:
                     unit = "V"
+                ff0 = client.get_float(f"laser{ff_ao}:{ACTUATOR}") if ff_ao is not None else None
                 with self.lock:
                     if ch.token != tok:
                         return
-                    ch.offset, ch.unit = v, unit
+                    ch.offset, ch.unit, ch.ff0 = v, unit, ff0
                     if not params.v_min <= v <= params.v_max:
                         ch.state, ch.message = "off", f"offset {v:.3f} outside {params.v_min:g} … {params.v_max:g}"
                         ch.token += 1
@@ -834,16 +860,29 @@ class Engine:
             self.layout_version += 1
             self.dirty = True
 
-    def link(self, n: int, key: str, laser: int):
-        key = Device.from_key(key).key
+    def link(self, n: int, key: str, laser: int, ff_ao=None, ff_ratio: float = 0.0):
+        """Channel n's laser: laserN of the DLC pro at key; or, key an analog output board's ('dac:mcc:0', dac.py),
+        its output number laser, with ff_ao an output fed forward (its moves: the first's divided by ff_ratio)."""
+        on_dac = dac.is_dac(key)
+        key = key if on_dac else Device.from_key(key).key
         with self.lock:
             for other in self.channels.values():
                 if other.n != n and other.device == key and other.laser == laser:
                     self._unlink(other)
-                    other.message = f"laser{laser} moved to channel {n}"
+                    other.message = (f"output {laser} moved to channel {n}" if on_dac else
+                                     f"laser{laser} moved to channel {n}")
             ch = self.channels[n]
             self._unlink(ch)
             ch.device, ch.laser = key, int(laser)
+            if on_dac:
+                if ff_ao is not None and ff_ratio:
+                    ch.ff_ao, ch.ff_ratio = int(ff_ao), float(ff_ratio)
+                if ch.lock.p == LockParams():  # (a DLC pro's offset limits: not an output's)
+                    ch.lock.p = LockParams(**{**ch.lock.p.to_dict(), **DAC_LOCK})
+                ch.hop.enabled = False  # (mode-hop recovery needs a DLC pro)
+                self._watch(ch)
+                self.dirty = True
+                return
             self._watch(ch)
             if key not in self.known:
                 self.known.append(key)
@@ -870,6 +909,7 @@ class Engine:
         if m is not None:
             m.stop()
         ch.device, ch.offset, ch.message = None, None, ""
+        ch.ff_ao, ch.ff_ratio, ch.ff0 = None, 0.0, None
         ch.current = ch.current_set = ch.cavity_on = ch.seed = ch.lasing = ch.shg_level = None
         ch.cavity_txt = ch.shg_txt = ch.seed_name = ""
         ch.shg_hist.clear()
@@ -896,6 +936,11 @@ class Engine:
 
         c.watch(f"laser{laser}:{ACTUATOR}", on_offset)
         c.submit(read_unit)
+        if ch.dac:  # (its outputs set back to where this program left them whenever the board is opened: dac.py)
+            for ao in (laser, ch.ff_ao):
+                if ao is not None:
+                    c.client.use(ao)
+            return  # (nothing else to watch on an output)
         self._watch_hop(ch)
 
     def _watch_hop(self, ch: Channel):
@@ -1291,10 +1336,53 @@ class Engine:
     def _controller(self, key: str) -> Controller:
         c = self.controllers.get(key)
         if c is None:
-            d = Device.from_key(key)
-            c = self.controllers[key] = Controller(key, d.ip, d.port)
+            if dac.is_dac(key):
+                c = self.controllers[key] = Controller(key, client=dac.DacClient(key, self.dacs))
+            else:
+                d = Device.from_key(key)
+                c = self.controllers[key] = Controller(key, d.ip, d.port)
             c.start()
         return c
+
+    def where(self, ch: Channel) -> str:
+        """Its laser, as its row says it: 'laser1 @ Ca+ blue', 'AO 3 @ USB-3106 (MCC board 0)'."""
+        if ch.dac:
+            c = self.controllers.get(ch.device)
+            name = c.client.name if c is not None else dac.title(ch.device)
+            ff = f" (+ AO {ch.ff_ao} fed forward)" if ch.ff_ao is not None else ""
+            return f"AO {ch.laser}{ff} @ {name}"
+        dev = self.devices.get(ch.device)
+        return f"laser{ch.laser} @ {dev.name if dev else ch.device}"
+
+    def set_output(self, n: int, volts: float, ff: bool = False):
+        """An analog output set by hand (its feed-forward output, ff), within its lock's limits; not while its lock
+        has it. Returns the voltage asked for (None: not done)."""
+        with self.lock:
+            ch = self.channels[n]
+            ao = ch.ff_ao if ff else ch.laser
+            if not ch.dac or ao is None:
+                return None
+            if ch.state != "off":
+                ch.message = "set by hand: not while it is locked"
+                return None
+            p = ch.lock.p
+            v = round(min(max(float(volts), p.v_min), p.v_max), 6)
+            key = ch.device
+
+            def done():
+                with self.lock:
+                    if ch.device == key and not ff:
+                        ch.offset = v
+                    if ch.message.startswith(("cannot lock", "set by hand", "output")):
+                        ch.message = ""
+
+            def failed(exc):
+                with self.lock:
+                    if ch.device == key:
+                        ch.message = f"output {ao}: {exc}"
+
+            self._controller(key).set(f"laser{ao}:{ACTUATOR}", v, on_error=failed, on_done=done)
+            return v
 
     # -------------------------------------------------------------- reference
     def set_reference(self, n: int):
@@ -1354,6 +1442,8 @@ class Engine:
         and times out recoveries that wait in vain."""
         with self.lock:
             now = time.monotonic()
+            if self.dacs.changed and now - self.dacs.changed > 30.0:  # (analog outputs moved: saved now and then)
+                self.dirty = True
             if self.reference is not None:
                 self.reference.tick(now)
             for ch in list(self.channels.values()):
@@ -1365,6 +1455,8 @@ class Engine:
     def set_hop_params(self, n: int, params: HopParams):
         with self.lock:
             ch = self.channels[n]
+            if ch.dac:
+                params.enabled = False  # (mode-hop recovery needs a DLC pro)
             if ch.state == "on" and (params.cavity != ch.hop.cavity or (params.cavity and not params.enabled)):
                 self._disengage(ch, "")  # locked to the wavemeter, or watched, as it no longer should be
             ch.hop = params
@@ -1398,6 +1490,8 @@ class Engine:
             ch = self.channels[n]
             if not ch.device:
                 ch.message = "right-click to link a laser first"
+            elif ch.dac:
+                ch.message = "take the optimum: not on an analog output"
             elif ch.state == "recovering":
                 ch.message = "take the optimum: not while it recovers"
             else:
@@ -1437,6 +1531,8 @@ class Engine:
                 return
             if not ch.device:
                 ch.message = "right-click to link a laser first"
+            elif ch.dac:
+                ch.message = "recenter: not on an analog output (it needs a DLC pro)"
             elif not (math.isfinite(self._hop_error(ch)) or (ch.off and ch.f_set > 0)):
                 ch.message = "recenter: needs a setpoint and a valid reading"
             else:
@@ -1704,11 +1800,15 @@ class Engine:
                 ch.setup = [("error", "no laser linked")]
                 return
             ch.setup = None
-            key, laser, hop, lp = ch.device, ch.laser, ch.hop, ch.lock.p
+            key, laser, hop, lp, ff, on_dac = ch.device, ch.laser, ch.hop, ch.lock.p, ch.ff_ao, ch.dac
             wlm = self._channel_report(ch)
 
             def job(client):
-                report = setup_report(client, laser, hop, lp) + wlm
+                if on_dac:  # (an analog output: the board, what its outputs were set to)
+                    report = client.report(laser, ff) + [("info", f"lock: {lp.v_min:g} … {lp.v_max:g} V, at most "
+                                                                  f"±{lp.excursion:g} V from where it locked")]
+                else:
+                    report = setup_report(client, laser, hop, lp) + wlm
                 with self.lock:
                     if ch.device == key:
                         ch.setup = report
@@ -1880,6 +1980,7 @@ class Engine:
             cfg = dict(self.config)
             cfg["channels"] = {str(n): ch.to_config() for n, ch in sorted(self.channels.items())}
             cfg["known_devices"] = list(self.known)
+            cfg["dac"] = self.dacs.to_config()
             if self.reference is not None:
                 cfg["reference"] = self.reference.to_config()
             else:

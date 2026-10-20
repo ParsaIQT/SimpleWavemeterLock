@@ -17,8 +17,8 @@ import time
 import types
 import zlib
 
-from . import view
-from .engine import Engine
+from . import dac, view
+from .engine import DAC_LOCK, Engine
 from .lock import LockParams
 from .modehop import HopParams
 from .qt import Qt, QtCore, QtGui, QtWidgets
@@ -149,8 +149,10 @@ class DigitSpinBox(QtWidgets.QDoubleSpinBox):
         self.setToolTip("Setpoint, vacuum wavelength (nm).\n"
                         "Put the cursor next to a digit and use ↑/↓ or the wheel to step it.")
 
+    NONE_AT_MINIMUM = True  # (its minimum shows "—": no setpoint, which stepping leaves alone)
+
     def stepBy(self, steps: int):
-        if self.value() == self.minimum():
+        if self.NONE_AT_MINIMUM and self.value() == self.minimum():
             return
         le = self.lineEdit()
         text, pos = le.text(), le.cursorPosition()
@@ -186,6 +188,21 @@ class DigitSpinBox(QtWidgets.QDoubleSpinBox):
     def focusOutEvent(self, ev):
         self._focus_bg(False)
         super().focusOutEvent(ev)
+
+
+class VoltBox(DigitSpinBox):
+    """An analog output's voltage, set by hand: ↑/↓ or the wheel step the digit left of the cursor; typed, it takes
+    effect on Enter."""
+
+    NONE_AT_MINIMUM = False
+
+    def __init__(self, lo: float, hi: float):
+        super().__init__()
+        self.setSpecialValueText("")
+        self.setFrame(True)
+        self.setRange(lo, hi)
+        self.setDecimals(4)
+        self.setToolTip("Volts at the output. Put the cursor next to a digit and use ↑/↓ or the wheel to step it.")
 
 
 class Row(QtWidgets.QFrame):
@@ -427,6 +444,7 @@ class ChannelRow(Row):
                 a.triggered.connect(functools.partial(self._link, d.key, k))
         link.addSeparator()
         link.addAction("Enter IP address…", self.link_dialog)
+        link.addAction("Analog output (DAC)…", self.dac_dialog)
         link.addAction("Rescan LAN", e.start_discovery)
         if ch.device:
             m.addAction("Unlink", lambda: e.unlink(self.n))
@@ -442,6 +460,10 @@ class ChannelRow(Row):
         m.popup(self.mapToGlobal(pos))
 
     def _hop_actions(self, m, ch):
+        if ch.dac:  # (an analog output: no DLC pro to recover it with)
+            m.addAction("Analog output…", self.output_dialog)
+            m.addAction("Check setup…", self.setup_dialog)
+            return
         m.addAction("Mode-hop recovery…", self.hop_dialog).setEnabled(bool(ch.device))
         if ch.state == "recovering":
             if ch.hop_prompt:
@@ -467,6 +489,21 @@ class ChannelRow(Row):
             host, laser = d.values()
             if host:
                 self.engine.link(self.n, host, laser)
+
+    def dac_dialog(self):
+        ch = self.engine.channels[self.n]
+        d = DacDialog(self, ch)
+        if d.exec():
+            v = d.values()
+            self.engine.link(self.n, v["device"], v["ao"], v["ff_ao"], v["ff_ratio"])
+            p = ch.lock.p.to_dict()
+            p.update(v_min=v["v_min"], v_max=v["v_max"], excursion=v["excursion"])
+            self.engine.set_params(self.n, LockParams(**p))
+
+    def output_dialog(self):
+        d = OutputDialog(self, self.engine, self.n)
+        d.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        d.show()
 
     def settings_dialog(self):
         ch = self.engine.channels[self.n]
@@ -796,7 +833,7 @@ class LinkDialog(QtWidgets.QDialog):
         self.host = QtWidgets.QComboBox()
         self.host.setEditable(True)
         self.host.addItems([d.key for d in engine.device_list()])
-        self.host.setEditText(ch.device or "")
+        self.host.setEditText(ch.device if ch.device and not ch.dac else "")
         self.host.lineEdit().setPlaceholderText("192.168.1.20")
         self.laser = QtWidgets.QComboBox()
         self.laser.addItems([f"laser{k}" for k in range(1, 5)])
@@ -812,6 +849,142 @@ class LinkDialog(QtWidgets.QDialog):
 
     def values(self):
         return self.host.currentText().strip(), self.laser.currentIndex() + 1
+
+
+class DacDialog(QtWidgets.QDialog):
+    """A laser without a digital controller: its piezo driver on an analog output (dac.py), and maybe its current on
+    a second one, fed forward."""
+
+    def __init__(self, parent, ch):
+        super().__init__(parent)
+        self.setWindowTitle(f"Analog output · channel {ch.n}")
+        form = QtWidgets.QFormLayout(self)
+
+        def row(*widgets):
+            box = QtWidgets.QHBoxLayout()
+            for w in widgets:
+                box.addWidget(Text(w, "dim") if isinstance(w, str) else w)
+            box.addStretch(1)
+            return box
+
+        def number(value, lo, hi, dec, step):
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setLocale(QtCore.QLocale.c())
+            sb.setRange(lo, hi)
+            sb.setDecimals(dec)
+            sb.setSingleStep(step)
+            sb.setValue(value)
+            return sb
+
+        kind, number_now = dac.parse(ch.device) if ch.dac else ("mcc", 0)
+        self.kinds = [("mcc", "Measurement Computing (mcculw, as set up in InstaCal)")]
+        if dac.SIM_BOARDS:
+            self.kinds.append(("sim", "simulated"))
+        self.kind = QtWidgets.QComboBox()
+        self.kind.addItems([label for _, label in self.kinds])
+        self.kind.setCurrentIndex(next((k for k, (name, _) in enumerate(self.kinds) if name == kind), 0))
+        self.board = QtWidgets.QSpinBox()
+        self.board.setRange(0, 99)
+        self.board.setValue(number_now)
+        form.addRow("Board", row(self.kind, "number", self.board, "(InstaCal's: Epimetheus's 'Dev0' is 0)"))
+        self.ao = QtWidgets.QSpinBox()
+        self.ao.setRange(0, 63)
+        self.ao.setValue(ch.laser if ch.dac else 0)
+        form.addRow("Output", row(self.ao, "drives its piezo driver (Epimetheus's index_P)"))
+        self.ff = QtWidgets.QCheckBox("Feed its moves forward to output")
+        self.ff.setChecked(ch.ff_ao is not None)
+        self.ff_ao = QtWidgets.QSpinBox()
+        self.ff_ao.setRange(0, 63)
+        self.ff_ao.setValue(ch.ff_ao if ch.ff_ao is not None else 1)
+        self.ff_ratio = number(ch.ff_ratio or 1.0, 0.01, 1e4, 3, 0.1)
+        form.addRow(row(self.ff, self.ff_ao, "divided by", self.ff_ratio,
+                        "(Epimetheus's current output, index_I, and Feed_forward)"))
+        p = ch.lock.p if ch.dac else LockParams(**{**LockParams().to_dict(), **DAC_LOCK})
+        self.v_min = number(p.v_min, -10.0, 10.0, 3, 0.1)
+        self.v_max = number(p.v_max, -10.0, 10.0, 3, 0.1)
+        form.addRow("Never outside", row(self.v_min, "…", self.v_max, "V (Epimetheus: ±1.2 V)"))
+        self.excursion = number(p.excursion, 0.0, 20.0, 3, 0.1)
+        form.addRow("Locked, at most", row("±", self.excursion, "V from where it locked (Epimetheus: ±0.8 V)"))
+        form.addRow(Text("A DAC cannot be read back: before its first lock, set the output by hand (right-click ›\n"
+                         "Analog output…) to where the laser is now: in Epimetheus, its offset plus its PID's output\n"
+                         "(the 'piezo' it shows). From then on it is kept, and set back after a restart.", "dim"))
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def values(self) -> dict:
+        ff = self.ff.isChecked()
+        return {"device": dac.key(self.kinds[self.kind.currentIndex()][0], self.board.value()), "ao": self.ao.value(),
+                "ff_ao": self.ff_ao.value() if ff else None, "ff_ratio": self.ff_ratio.value() if ff else 0.0,
+                "v_min": min(self.v_min.value(), self.v_max.value()),
+                "v_max": max(self.v_min.value(), self.v_max.value()), "excursion": self.excursion.value()}
+
+
+class OutputDialog(QtWidgets.QDialog):
+    """An analog output set by hand, where its laser sits while not locked (Epimetheus's offset); and the output fed
+    forward, if any."""
+
+    def __init__(self, parent, engine, n):
+        super().__init__(parent)
+        self.engine, self.n = engine, n
+        ch = engine.channels[n]
+        self.setWindowTitle(f"Analog output · channel {n}")
+        form = QtWidgets.QFormLayout(self)
+        p = ch.lock.p
+        self.boxes, self.buttons = [], []
+        for ff, ao in ((False, ch.laser), (True, ch.ff_ao)):
+            if ao is None:
+                continue
+            box = VoltBox(p.v_min, p.v_max)
+            known = engine.dacs.get(ch.device, ao)
+            box.setValue(known if known is not None else 0.0)
+            box.valueChanged.connect(functools.partial(self._set, ff))
+            put = QtWidgets.QPushButton("Set")
+            put.setToolTip("Write the voltage shown (one never set by this program is not known: this makes it so)")
+            put.clicked.connect(lambda _=False, ff=ff, box=box: self._set(ff, box.value()))
+            last = Text("", "dim")
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(box)
+            row.addWidget(Text("V", "dim"))
+            row.addWidget(put)
+            row.addWidget(last)
+            row.addStretch(1)
+            form.addRow(f"Output {ao}" + (" (fed forward)" if ff else ""), row)
+            self.boxes.append((ff, ao, box, last))
+            self.buttons.append(put)
+        self.note = Text("", "dim")
+        form.addRow(self.note)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start(250)
+        self._refresh()
+
+    def _set(self, ff: bool, value: float):
+        self.engine.set_output(self.n, value, ff)
+
+    def _refresh(self):
+        e = self.engine
+        ch = e.channels[self.n]
+        free = ch.state == "off"
+        for put in self.buttons:
+            put.setEnabled(free)
+        for _, ao, box, last in self.boxes:
+            known = e.dacs.get(ch.device, ao)
+            last.paint(f"set to {known:.4f} V" if known is not None else "not set yet: its voltage is not known",
+                       "dim" if known is not None else "warn")
+            box.setEnabled(free)
+            if not free and not box.hasFocus() and known is not None and abs(box.value() - known) > 5e-5:
+                box.blockSignals(True)
+                box.setValue(known)
+                box.blockSignals(False)
+        p = ch.lock.p
+        self.note.paint(f"Within {p.v_min:g} … {p.v_max:g} V (its lock's limits). " +
+                        ("Locked: its lock moves it." if not free else "Each change is written at once."), "dim")
 
 
 class LockDialog(QtWidgets.QDialog):

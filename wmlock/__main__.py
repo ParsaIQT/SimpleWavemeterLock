@@ -6,7 +6,8 @@ import logging
 from pathlib import Path
 
 from . import config as cfgfile
-from .engine import Engine
+from .engine import DAC_LOCK, Engine
+from .lock import LockParams
 from .share import SIM_PORT, Share
 from .wavemeter import DllSource, HttpSource, NullSource
 
@@ -41,7 +42,7 @@ def main(argv=None) -> int:
     if args.sim:
         from .sim import Demo
 
-        demo = Demo()
+        demo = Demo(dac=True)
         for ch, name in demo.names.items():
             config.setdefault("channels", {}).setdefault(str(ch), {"name": name})
         config.setdefault("reference", {"channel": demo.REFERENCE})
@@ -49,6 +50,14 @@ def main(argv=None) -> int:
         shg["link"] = {"device": demo.dlcs[2].key, "laser": 1}  # its port is new every time
         shg.setdefault("setpoint_nm", demo.wavelength(demo.SHG))
         shg.setdefault("hop", {"enabled": True, "cavity": True, "shg": True, "i_nom": 149.58})  # measured
+        old = config["channels"][str(demo.DAC)]  # a laser without a digital controller, on a simulated DAC
+        _, _, _, ao, ff, _, _ = demo.DAC_LASER
+        old["link"] = {"device": demo.dac_key, "ao": ao, "ff_ao": ff, "ff_ratio": 5.0}
+        old.setdefault("setpoint_nm", demo.wavelength(demo.DAC))
+        old.setdefault("lock", {**LockParams().to_dict(), **DAC_LOCK})
+        last = config.setdefault("dac", {}).setdefault("last", {})  # (the simulated board starts at 0 V: where it is)
+        last.setdefault(f"{demo.dac_key[4:]}/{ao}", 0.3)
+        last.setdefault(f"{demo.dac_key[4:]}/{ff}", 0.0)
         make_source, targets, extra = demo.make_source, demo.targets, demo.extra_devices
     else:
         if args.http:

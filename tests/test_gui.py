@@ -577,3 +577,67 @@ def test_a_pc_without_a_wavemeter_shows_the_others(app):
         win.close()
         spin(app, 0.1)
         a.close()
+
+
+def test_a_laser_on_an_analog_output(app):
+    """Linked to an analog output (Link laser › Analog output (DAC)…): its row says which, its menu has the output set
+    by hand in place of mode-hop recovery, and the output dialog writes the board (not while locked)."""
+    from wmlock.lock import LockParams
+    from wmlock.sim import Demo, SimWavemeter
+
+    demo = Demo(discovery_port=0, wavemeter=SimWavemeter(noise=0.3, amplitude=0.0, walk=0.0), exposure=0.004, dac=True)
+    e = Engine({}, demo.make_source, discovery_targets=["127.0.0.1"])
+    win = gui.MainWindow(e, lambda: None)
+    e.start()
+    win.show()
+    try:
+        assert wait_for(lambda: (app.processEvents(), 8 in win.rows and e.channels[8].freq > 0)[1], 5)
+        row, ch = win.rows[8], e.channels[8]
+        row.show_menu(row.rect().center())
+        link = next(a for a in row._menu.actions() if a.text() == "Link laser").menu()
+        assert "Analog output (DAC)…" in [a.text() for a in link.actions()]
+        row._menu.close()
+        d = gui.DacDialog(row, ch)
+        assert d.values() == {"device": "dac:mcc:0", "ao": 0, "ff_ao": None, "ff_ratio": 0.0, "v_min": -1.2,
+                              "v_max": 1.2, "excursion": 0.8}  # (Epimetheus's: its board, its limits)
+        d.kind.setCurrentIndex(1)
+        d.board.setValue(demo.board.number)
+        d.ao.setValue(2)
+        d.ff.setChecked(True)
+        d.ff_ao.setValue(3)
+        d.ff_ratio.setValue(5.0)
+        d.v_max.setValue(1.0)
+        v = d.values()
+        assert v == {"device": demo.dac_key, "ao": 2, "ff_ao": 3, "ff_ratio": 5.0, "v_min": -1.2, "v_max": 1.0,
+                     "excursion": 0.8}
+        e.link(8, v["device"], v["ao"], v["ff_ao"], v["ff_ratio"])
+        e.set_params(8, LockParams(**{**ch.lock.p.to_dict(), "v_max": v["v_max"]}))
+        spin(app, 0.6)
+        assert row.info.text().startswith("AO 2 (+ AO 3 fed forward) @ simulated DAC")
+        row.show_menu(row.rect().center())
+        items = [a.text() for a in row._menu.actions() if a.text()]
+        assert "Analog output…" in items and "Check setup…" in items and "Mode-hop recovery…" not in items
+        assert "Recenter now" not in items
+        row._menu.close()
+        out = gui.OutputDialog(row, e, 8)
+        out.show()
+        spin(app, 0.3)
+        (_, ao, box, last), (_, ff_ao, ff_box, _) = out.boxes
+        assert (ao, ff_ao) == (2, 3) and last.text() == "not set yet: its voltage is not known"
+        box.setValue(0.3)  # (as typed, Enter)
+        out.buttons[1].click()  # 0 V, as shown: set (else not known: no lock)
+        assert wait_for(lambda: (app.processEvents(), demo.board.volts[2] == 0.3)[1], 2)
+        assert wait_for(lambda: e.dacs.get(demo.dac_key, 3) == 0.0, 2)
+        spin(app, 0.4)
+        assert last.text() == "set to 0.3000 V" and box.maximum() == 1.0
+        e.set_setpoint(8, 935.17976)
+        row._clicked()  # Lock
+        assert wait_for(lambda: (app.processEvents(), ch.state == "on")[1], 3), ch.message
+        spin(app, 0.4)
+        assert not box.isEnabled() and out.note.text().endswith("Locked: its lock moves it.")
+        assert row.btn.text() == "Locked"
+        out.close()
+    finally:
+        win.close()
+        spin(app, 0.1)
+        demo.close()
