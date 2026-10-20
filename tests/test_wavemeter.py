@@ -307,3 +307,374 @@ def test_server_reports_only_used_channels(monkeypatch):
     assert ch["channel_2"]["use"] is False  # 'Use' unticked: POST .../use can tick it
     assert ch["channel_4"]["is_valid"]
     assert data["environment"] == {"temperature_c": 24.5, "pressure_mbar": 1001.0}
+
+
+# ------------------------------------------------- several wavemeters on one PC
+class Server:
+    """One wavemeter's WLM software, as wlmData sees it."""
+
+    def __init__(self, serial, kind=7, freqs=None, n=4, use=(1, 2, 3, 4)):
+        self.serial, self.kind, self.n, self.use = serial, kind, n, set(use)
+        self.freqs = dict(freqs or {})
+
+
+class MultiLib:
+    """Stands in for wlmData.dll with several wavemeters running: PresetWLMIndex has every other call address one of
+    them, for the whole program (the first until it is called)."""
+
+    def __init__(self, *servers):
+        self.servers = list(servers)
+        self.index = 0
+        self.sets = []  # (serial, ch, use): SetSwitcherSignalStates, on which wavemeter
+
+    def _s(self):
+        return self.servers[self.index] if 0 <= self.index < len(self.servers) else None
+
+    def GetWLMCount(self, _):
+        return len(self.servers)
+
+    def PresetWLMIndex(self, i):
+        self.index = i
+        return 0
+
+    def GetWLMVersion(self, k):
+        s = self._s()
+        return -5 if s is None else {0: s.kind, 1: s.serial}.get(k, 0)
+
+    def GetFrequencyNum(self, ch, _):
+        s = self._s()
+        return -5.0 if s is None else s.freqs.get(ch, 0.0)
+
+    def GetChannelsCount(self, _):
+        s = self._s()
+        return s.n if s else 0
+
+    def GetSwitcherMode(self, _):
+        return 1
+
+    def GetSwitcherChannel(self, _):
+        return 1
+
+    def GetSwitcherSignalStates(self, ch, use, show):
+        s = self._s()
+        use._obj.value = int(s is not None and ch in s.use)
+        return 0
+
+    def SetSwitcherSignalStates(self, ch, use, show):
+        s = self._s()
+        (s.use.add if use else s.use.discard)(ch)
+        self.sets.append((s.serial, ch, use))
+        return 0
+
+
+class MeterSink(Sink):
+    def __init__(self):
+        super().__init__()
+        self.meters = []
+
+    def on_wavemeter(self, model, serial):
+        self.meters.append((model, serial))
+
+
+def multi_hub(lib, claims=None):
+    hub = wavemeter.WlmHub(claims=claims)
+    w = fake_wlm(lib)
+    w.has |= {"GetWLMVersion", "PresetWLMIndex"}
+    hub.wlm = w
+    return hub
+
+
+def a_and_b():
+    a = Server(1234, 7, {1: 400.0, 2: 401.0}, use=(1, 2))
+    b = Server(5678, 6, {1: 600.0, 2: 601.0, 3: 602.0}, use=(1, 2, 3))
+    return a, b
+
+
+def test_the_wavemeters_of_a_pc_are_found_by_serial_number():
+    a, b = a_and_b()
+    lib = MultiLib(a, b)
+    w = multi_hub(lib).dll()
+    assert w.scan() == [wavemeter.Found(0, "WS7", 1234), wavemeter.Found(1, "WS6", 5678)]
+    assert w.preset_used
+    lib.servers = [b]  # one stopped: the one left is the first
+    assert w.scan() == [wavemeter.Found(0, "WS6", 5678)]
+    assert wavemeter.meter_name("WS7", 1234) == "WS7 1234" and wavemeter.meter_name("", 0) == ""
+
+
+def test_each_source_reads_its_own_wavemeter_never_the_others():
+    a, b = a_and_b()
+    lib = MultiLib(a, b)
+    hub = multi_hub(lib)
+    sa, sb = MeterSink(), MeterSink()
+    src_a = DllSource(sa, interval=0.0003, serial=1234, hub=hub)
+    src_b = DllSource(sb, interval=0.0003, serial=5678, hub=hub)
+    src_a.start()
+    src_b.start()
+    stop = threading.Event()
+
+    def change():  # new readings all the time, on both
+        k = 0
+        while not stop.is_set():
+            k += 1
+            a.freqs[1], b.freqs[1] = 400.0 + k * 1e-6, 600.0 + k * 1e-6
+            time.sleep(0.0002)
+
+    t = threading.Thread(target=change, daemon=True)
+    t.start()
+    try:
+        assert wait_for(lambda: len(sa.readings) > 300 and len(sb.readings) > 300, 10)
+        assert sa.meters == [("WS7", 1234)] and sb.meters == [("WS6", 5678)]
+        assert sa.active[-1] == [1, 2] and sb.active[-1] == [1, 2, 3]
+        lib.servers = [b, a]  # their WLM software started again, the other way round
+        n_a, n_b = len(sa.readings), len(sb.readings)
+        assert wait_for(lambda: len(sa.readings) > n_a + 300 and len(sb.readings) > n_b + 300, 10)
+    finally:
+        stop.set()
+        src_a.stop()
+        src_b.stop()
+    assert all(r.freq < 500 for r in sa.readings) and all(r.freq > 500 for r in sb.readings)
+
+
+def test_a_source_given_none_takes_the_one_it_is_told_and_keeps_to_it():
+    a, b = a_and_b()
+    lib = MultiLib(a, b)
+    sink = MeterSink()
+    seen = []
+
+    def choose(cands):
+        seen.extend(cands)
+        return next(f for f, freqs in cands if abs(freqs.get(1, 0) - 600.0) < 0.01)
+
+    src = DllSource(sink, interval=0.001, hub=multi_hub(lib), choose=choose)
+    src.start()
+    try:
+        assert wait_for(lambda: sink.meters == [("WS6", 5678)] and sink.readings)
+        assert [(f.serial, freqs) for f, freqs in seen] == [(1234, {1: 400.0, 2: 401.0}),
+                                                             (5678, {1: 600.0, 2: 601.0, 3: 602.0})]
+        assert src.wanted == 5678 and all(r.freq > 500 for r in sink.readings)
+    finally:
+        src.stop()
+    sink = MeterSink()
+    src = DllSource(sink, interval=0.001, hub=multi_hub(lib), choose=lambda cands: None)  # no telling: the first
+    src.start()
+    try:
+        assert wait_for(lambda: sink.meters == [("WS7", 1234)])
+    finally:
+        src.stop()
+
+
+def test_a_wavemeter_not_running_is_not_stood_in_for():
+    a, b = a_and_b()
+    lib = MultiLib(a)
+    sink = MeterSink()
+    src = DllSource(sink, interval=0.001, serial=5678, model="WS6", hub=multi_hub(lib))
+    src.start()
+    try:
+        assert wait_for(lambda: sink.states and sink.states[-1] == (False, "WS6 5678 is not running (this PC has "
+                                                                           "WS7 1234)"))
+        time.sleep(0.05)
+        assert sink.readings == [] and sink.meters == []
+        lib.servers = [a, b]  # its WLM software started
+        assert wait_for(lambda: sink.states[-1] == (True, "") and sink.readings, 3)
+        assert sink.meters == [("WS6", 5678)] and all(r.freq > 500 for r in sink.readings)
+    finally:
+        src.stop()
+
+
+def test_a_channel_is_switched_on_its_own_wavemeter():
+    a, b = a_and_b()
+    lib = MultiLib(a, b)
+    hub = multi_hub(lib)
+    sa, sb = MeterSink(), MeterSink()
+    src_a = DllSource(sa, interval=0.001, serial=1234, hub=hub)
+    src_b = DllSource(sb, interval=0.001, serial=5678, hub=hub)
+    src_a.start()
+    src_b.start()
+    try:
+        assert wait_for(lambda: sa.off and sa.off[-1] == [3, 4] and sb.off and sb.off[-1] == [4])
+        src_b.switch(4, True)
+        assert wait_for(lambda: sb.active[-1] == [1, 2, 3, 4])
+        assert lib.sets == [(5678, 4, 1)] and 4 not in a.use
+    finally:
+        src_a.stop()
+        src_b.stop()
+
+
+def test_two_copies_of_the_program_never_read_the_same_wavemeter(tmp_path):
+    a, b = a_and_b()
+    lib = MultiLib(a, b)
+    first, second = multi_hub(lib, wavemeter.Claims(tmp_path)), multi_hub(lib, wavemeter.Claims(tmp_path))
+    s1, s2 = MeterSink(), MeterSink()
+    src1 = DllSource(s1, interval=0.001, serial=1234, hub=first)
+    src1.start()
+    try:
+        assert wait_for(lambda: s1.meters == [("WS7", 1234)])
+        assert not second.free(1234) and second.free(5678)
+        src2 = DllSource(s2, interval=0.001, hub=second)  # (given none: the one the other copy does not read)
+        src2.start()
+        try:
+            assert wait_for(lambda: s2.meters == [("WS6", 5678)])
+            src2.select(1234)
+            assert wait_for(lambda: s2.states[-1] == (False, "WS7 1234: another copy of this program on this PC "
+                                                             "reads it"))
+        finally:
+            src2.stop()
+            src2.join(2)
+    finally:
+        src1.stop()
+        src1.join(2)
+    assert first.free(1234) and second.free(5678)  # (let go of when they stopped)
+
+
+def test_two_sources_swap_their_wavemeters():
+    a, b = a_and_b()
+    lib = MultiLib(a, b)
+    hub = multi_hub(lib)
+    sa, sb = MeterSink(), MeterSink()
+    src_a = DllSource(sa, interval=0.001, serial=1234, hub=hub)
+    src_b = DllSource(sb, interval=0.001, serial=5678, hub=hub)
+    src_a.start()
+    src_b.start()
+    try:
+        assert wait_for(lambda: sa.readings and sb.readings)
+        hub.swap(src_a, src_b)
+        assert wait_for(lambda: sa.meters[-1] == ("WS6", 5678) and sb.meters[-1] == ("WS7", 1234))
+        n_a, n_b = len(sa.readings), len(sb.readings)
+        a.freqs[2], b.freqs[2] = 401.5, 601.5
+        assert wait_for(lambda: any(r.freq == 601.5 for r in sa.readings[n_a:])
+                        and any(r.freq == 401.5 for r in sb.readings[n_b:]))
+        assert all(r.freq > 500 for r in sa.readings[n_a:]) and all(r.freq < 500 for r in sb.readings[n_b:])
+        assert hub.taken == {1234: src_b, 5678: src_a}
+    finally:
+        src_a.stop()
+        src_b.stop()
+
+
+def test_the_settings_lock_lets_one_copy_have_them(tmp_path):
+    from wmlock.config import FileLock, lock_path
+
+    path = lock_path(tmp_path / "s.json")
+    assert path.name == "s.json.lock"
+    one, two = FileLock(path), FileLock(path)
+    assert one.acquire() and one.held
+    assert not two.acquire() and not two.held
+    one.release()
+    assert two.acquire()
+    two.release()
+
+
+# ------------------------------------------------- HTTP: a server.py with several wavemeters
+class MultiHandler(BaseHTTPRequestHandler):
+    """A server.py serving two wavemeters (?wlm=), or one from before (old: it ignores ?wlm, says nothing of whose)."""
+    meters = {1234: 755.2227, 5678: 384.2}
+    old = False
+    paths = []
+
+    def _send(self, status, data):
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        MultiHandler.paths.append(self.path)
+        path, _, query = self.path.partition("?")
+        if path == "/api/v1/wavemeters":
+            if self.old:
+                self._send(404, {"detail": "Not Found"})
+            else:
+                self._send(200, {"wavemeters": [{"index": i, "model": "WS7", "serial": s}
+                                                for i, s in enumerate(self.meters)]})
+            return
+        wlm = int(query.split("=")[1]) if query.startswith("wlm=") and not self.old else next(iter(self.meters))
+        if wlm not in self.meters:
+            self._send(404, {"detail": f"wavemeter {wlm} is not running there (it has WS7 1234, WS7 5678)"})
+            return
+        data = {"channels": {"channel_1": channel("Valid", self.meters[wlm])}}
+        if not self.old:
+            data["wavemeter"] = {"model": "WS7", "serial": wlm}
+        self._send(200, data)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def multi_server():
+    MultiHandler.protocol_version = "HTTP/1.1"
+    MultiHandler.old, MultiHandler.paths = False, []
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), MultiHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv
+    srv.shutdown()
+
+
+def test_http_source_reads_the_wavemeter_it_keeps_to(multi_server):
+    url = f"127.0.0.1:{multi_server.server_port}"
+    found = wavemeter.HttpMeters(url)
+    try:
+        assert wait_for(lambda: [f.serial for f in found.scan()] == [1234, 5678])
+    finally:
+        found.stop()
+    first, second = MeterSink(), MeterSink()
+    s1 = HttpSource(first, url, interval=0.01)  # (given none: the server's first, kept to)
+    s2 = found.make_source(second, 5678, "WS7")
+    s1.start()
+    s2.start()
+    try:
+        assert wait_for(lambda: first.meters == [("WS7", 1234)] and second.meters == [("WS7", 5678)])
+        assert wait_for(lambda: first.readings and second.readings)
+        assert first.readings[0].freq == 755.2227 and second.readings[0].freq == 384.2
+        assert s1.wanted == 1234 and any(p.endswith("?wlm=5678") for p in MultiHandler.paths)
+        s2.select(4321)  # not running there
+        assert wait_for(lambda: second.states[-1] == (False, "wavemeter 4321 is not running there (it has WS7 1234, "
+                                                              "WS7 5678)"))
+        MultiHandler.old = True  # a server.py from before: it cannot say whose its readings are
+        s2.select(5678)
+        assert wait_for(lambda: second.states[-1][1].endswith("cannot tell its wavemeters apart: update its "
+                                                              "server.py"))
+    finally:
+        s1.stop()
+        s2.stop()
+
+
+def test_server_serves_each_wavemeter_of_its_pc(monkeypatch):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    a, b = a_and_b()
+    lib = MultiLib(a, b)
+    lib.GetTemperature = lambda _: 24.5
+    lib.GetPressure = lambda _: 1001.0
+    lib.GetWavelengthNum = lambda ch, _: C_NM_THZ / lib.GetFrequencyNum(ch, 0)
+    wlm_data = types.ModuleType("wlmData")
+    wlm_data.dll = lib
+    wlm_data.LoadDLL = lambda path: None
+    wlm_const = types.ModuleType("wlmConst")
+    for name, value in dict(ErrWlmMissing=-5, ErrNoSignal=-1, ErrBadSignal=-2, ErrLowSignal=-3,
+                            ErrBigSignal=-4, ErrOutOfRange=-14, ErrTemperature=-1000).items():
+        setattr(wlm_const, name, value)
+    monkeypatch.setitem(sys.modules, "wlmData", wlm_data)
+    monkeypatch.setitem(sys.modules, "wlmConst", wlm_const)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "server"))
+    server = importlib.import_module("server")
+    try:
+        with TestClient(server.app) as client:
+            assert client.get("/api/v1/wavemeters").json() == {"wavemeters": [
+                {"index": 0, "model": "WS7", "serial": 1234}, {"index": 1, "model": "WS6", "serial": 5678}]}
+            first = client.get("/api/v1/wavelength").json()  # (none asked for: the first, as from before)
+            assert first["wavemeter"] == {"model": "WS7", "serial": 1234}
+            assert first["channels"]["channel_1"]["frequency_thz"] == 400.0
+            other = client.get("/api/v1/wavelength?wlm=5678").json()
+            assert other["wavemeter"] == {"model": "WS6", "serial": 5678}
+            assert other["channels"]["channel_3"]["frequency_thz"] == 602.0
+            assert client.get("/api/v1/wavelength").json()["wavemeter"]["serial"] == 1234  # (set back each time)
+            r = client.get("/api/v1/wavelength?wlm=4321")
+            assert r.status_code == 404 and "WS7 1234, WS6 5678" in r.json()["detail"]
+            assert client.post("/api/v1/channel/4/use?wlm=5678", json={"use": True}).status_code == 200
+            assert lib.sets == [(5678, 4, 1)] and 4 not in a.use
+    finally:
+        sys.modules.pop("server", None)

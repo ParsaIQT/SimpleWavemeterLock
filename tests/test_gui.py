@@ -641,3 +641,99 @@ def test_a_laser_on_an_analog_output(app):
         win.close()
         spin(app, 0.1)
         demo.close()
+
+
+def test_a_pc_with_two_wavemeters_frames_each_and_swaps_their_settings(app, monkeypatch):
+    """Two wavemeters on this PC (meters.py): each framed under its name, with its own rows and status; their settings
+    swapped, one hidden and shown again; a laser driven from one asked about before it is linked on the other."""
+    from wmlock.meters import Meter, Meters
+    from wmlock.sim import Demo, SimWavemeter
+
+    demo = Demo(discovery_port=0, wavemeter=SimWavemeter(noise=0.3, amplitude=0.0, walk=0.0), exposure=0.004,
+                meters=2, serials=[1234, 5678])
+    devices = [d.key for d in demo.dlcs]
+    config = {"channels": {"1": {"name": "397"}}}
+    first = Engine(config, demo.make_source, discovery_targets=["127.0.0.1"], extra_devices=devices)
+
+    def make(section, serial, model):
+        return Meter(Engine(section, lambda sink: demo.make_source(sink, serial, model),
+                            discovery_targets=["127.0.0.1"], extra_devices=devices))
+
+    meters = Meters(config, Meter(first), demo, make)
+    asked = []
+    monkeypatch.setattr(gui.MainWindow, "confirm", lambda self, title, text: asked.append((title, text)) or True)
+    win = gui.MainWindow(first, lambda: None, None, meters)
+    meters.start()
+    win.show()
+    try:
+        assert wait_for(lambda: (app.processEvents(), len(win.locals) == 2 and 3 in win.locals[1].rows)[1], 5)
+        a, b = win.locals
+        assert a is win.local and a.framed and b.framed and a.header.isVisible()
+        assert a.header.title.text() == "simulated WS7 1234" and b.header.title.text() == "simulated WS6 5678"
+        assert a.header.title._color != b.header.title._color
+        assert list(b.rows) == [1, 2, 3] and 7 in win.rows and b.rows[1].engine is meters.items[1].engine
+        assert wait_for(lambda: (app.processEvents(), b.rows[1].wl.text().startswith("369.5245")
+                                 and a.rows[1].wl.text().startswith("396.959"))[1], 3)
+        spin(app, 0.6)
+        assert win.st_wlm.text().startswith("● 2 wavemeters   10 ch")
+        assert a.header.detail.text() == "this PC" and a.header.status.text().endswith("readings/s")
+        QtTest = importlib.import_module(qt.BINDING + ".QtTest")
+        QtTest.QTest.mouseClick(b.header, QtCore.Qt.MouseButton.LeftButton)  # fold it away
+        assert b.folded and not b.rows[1].isVisible() and "simulated WS6 5678" in win.gui["folded"]
+        b.fold(False)
+
+        a.engine.link(1, demo.dlcs[0].key, 1)  # 397 on this one: linked on the other too, it is asked first
+        asked.clear()
+        assert win.may_link(b.engine, demo.dlcs[0].key, 1)
+        assert asked[0][0] == "Link laser" and asked[0][1].startswith("Channel 1 of simulated WS7 1234 drives it")
+        asked.clear()
+        assert win.may_link(b.engine, demo.dlcs[0].key, 2) and not asked  # (another laser: nothing to ask)
+        a.engine.unlink(1)
+
+        win.swap(a, b)  # the settings under each go with the other's wavemeter
+        assert wait_for(lambda: (app.processEvents(), a.rows.get(1) is not None and
+                                 a.rows[1].wl.text().startswith("369.5245") and list(a.rows) == [1, 2, 3]
+                                 and b.rows.get(1) is not None and b.rows[1].wl.text().startswith("396.959")
+                                 and list(b.rows) == [1, 2, 3, 4, 5, 6, 7])[1], 5)
+        assert asked and asked[-1][0] == "Swap settings" and a.rows[1].name.text() == "397"
+        spin(app, 0.6)
+        assert a.header.title.text() == "simulated WS6 5678"  # (named by what it reads, until named)
+
+        win.show_menu(QtCore.QPoint(5, 5))  # (each one's simulated lasers can be given a fault)
+        sim = next(x for x in win._menu.actions() if x.text() == "Simulate a fault").menu()
+        texts = [x.text() for x in sim.actions()]
+        assert "simulated WS6 5678" in texts and "simulated WS7 1234" in texts
+        assert "Channel 1 397: mode hop up" in texts and "Channel 7: stops lasing" in texts  # (as swapped)
+        win._menu.close()
+
+        win.hide_meter(b)
+        assert wait_for(lambda: (app.processEvents(), win.locals == [a] and not a.framed)[1], 3)
+        assert meters.hidden() == [(1234, "simulated WS7 1234")]
+        win.show_menu(QtCore.QPoint(5, 5))
+        shown = next(x for x in win._menu.actions() if x.text() == "Show wavemeter").menu()
+        assert [x.text() for x in shown.actions()] == ["simulated WS7 1234"]
+        win._menu.close()
+        win.show_meter(1234)
+        assert wait_for(lambda: (app.processEvents(), len(win.locals) == 2 and win.locals[1].rows)[1], 5)
+        assert win.locals[1].framed and win.locals[1].label == "simulated WS7 1234"
+    finally:
+        win.close()
+        spin(app, 0.1)
+        demo.close()
+
+
+def test_a_second_copy_with_the_same_settings_says_so_and_closes(tmp_path, monkeypatch):
+    from wmlock import __main__ as entry
+    from wmlock.config import FileLock, lock_path
+
+    said = []
+    monkeypatch.setattr(gui, "refuse", lambda title, text: said.append(text) or 1)
+    path = tmp_path / "settings.json"
+    first = FileLock(lock_path(path))  # (the copy running)
+    assert first.acquire()
+    try:
+        assert entry.main(["--view", "--config", str(path)]) == 1
+    finally:
+        first.release()
+    assert said and said[0].startswith("The program is running already, with these settings")
+    assert str(path) in said[0] and not path.exists()  # (nothing written: they are the other's)

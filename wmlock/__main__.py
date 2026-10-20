@@ -3,13 +3,33 @@ from __future__ import annotations
 
 import argparse
 import logging
+import zlib
 from pathlib import Path
 
 from . import config as cfgfile
 from .engine import DAC_LOCK, Engine
 from .lock import LockParams
-from .share import SIM_PORT, Share
-from .wavemeter import DllSource, HttpSource, NullSource
+from .meters import Meter, Meters
+from .share import SIM_PORT, Settings, Share
+from .wavemeter import Claims, DllSource, HttpMeters, NullSource, WlmHub
+
+
+def log_paths(path, serial=None):
+    """Where recoveries and lock dropouts are logged (lines of JSON): next to the settings file, by its name; a
+    wavemeter of this PC's other than the first, with its serial number in the names."""
+    path = Path(path)
+    tag = f"-wlm{serial}" if serial else ""
+    rec = path.with_name(path.stem.lstrip(".") + tag + "-recoveries.jsonl")
+    if path.name.startswith("."):
+        rec = rec.with_name("." + rec.name)
+    return rec, rec.with_name(rec.name.replace("-recoveries", "-dropouts"))
+
+
+def sim_serials(path) -> list:
+    """The demo's simulated wavemeters' serial numbers: the same each time with the same settings file, others with
+    another (two demos on a PC: no two alike)."""
+    base = 100 + 2 * (zlib.crc32(str(Path(path).resolve()).encode()) % 450)
+    return [base, base + 1]
 
 
 def main(argv=None) -> int:
@@ -17,15 +37,16 @@ def main(argv=None) -> int:
                                 description="Minimal wavemeter lock for TOPTICA DLC pro lasers.")
     src = p.add_mutually_exclusive_group()
     src.add_argument("--sim", action="store_true",
-                     help="demo: simulated wavemeter and two fake DLC pros on localhost")
+                     help="demo: two simulated wavemeters, four fake DLC pros on localhost")
     src.add_argument("--http", metavar="URL",
-                     help="read the wavemeter through server/server.py, e.g. http://wlm-pc:8000")
+                     help="read the wavemeter(s) through server/server.py, e.g. http://wlm-pc:8000")
     src.add_argument("--dll", metavar="PATH", nargs="?", const="",
                      help="read wlmData.dll directly (the default), optionally from PATH")
     src.add_argument("--view", action="store_true",
                      help="no wavemeter on this PC: show, and adjust, the other PCs' wavemeters only")
     p.add_argument("--name", metavar="NAME",
-                   help="this wavemeter's name, shown over its lasers on every PC (remembered)")
+                   help="this wavemeter's name (the first's, on a PC with several), shown over its lasers on every PC "
+                        "(remembered)")
     p.add_argument("--channels", metavar="LIST",
                    help="with --dll: show these channels instead of asking the switch, e.g. 1,2,5")
     p.add_argument("--config", metavar="FILE", help="settings file (default: ~/.simplewavemeterlock.json)")
@@ -34,15 +55,27 @@ def main(argv=None) -> int:
                         datefmt="%Y-%m-%d %H:%M:%S")
     logging.getLogger("wmlock.dropouts").setLevel(logging.INFO)  # (its hourly summaries too)
     logging.getLogger("wmlock.share").setLevel(logging.INFO)  # (the other PCs found, their adjustments here)
+    logging.getLogger("wmlock.meters").setLevel(logging.INFO)  # (this PC's wavemeters, which settings are whose)
 
     path = args.config or cfgfile.default_path(args.sim)
+    held = cfgfile.FileLock(cfgfile.lock_path(path))  # one copy of the program at a time with these settings
+    try:
+        if not held.acquire():
+            from .gui import refuse
+
+            return refuse("Wavemeter Lock", f"The program is running already, with these settings ({path}): its "
+                                            f"window shows every wavemeter of this PC. Another copy needs settings of "
+                                            f"its own (--config FILE).")
+    except OSError:  # (no lock file can be made there: as ever)
+        pass
     config = cfgfile.load(path)
-    demo, targets, extra = None, None, ()
+    meter = config.get("wavemeter") if isinstance(config.get("wavemeter"), dict) else {}
+    demo, targets, extra, backend = None, None, (), None
 
     if args.sim:
         from .sim import Demo
 
-        demo = Demo(dac=True)
+        demo = Demo(dac=True, meters=2, serials=sim_serials(path))
         for ch, name in demo.names.items():
             config.setdefault("channels", {}).setdefault(str(ch), {"name": name})
         config.setdefault("reference", {"channel": demo.REFERENCE})
@@ -58,7 +91,14 @@ def main(argv=None) -> int:
         last = config.setdefault("dac", {}).setdefault("last", {})  # (the simulated board starts at 0 V: where it is)
         last.setdefault(f"{demo.dac_key[4:]}/{ao}", 0.3)
         last.setdefault(f"{demo.dac_key[4:]}/{ff}", 0.0)
-        make_source, targets, extra = demo.make_source, demo.targets, demo.extra_devices
+        second = config.setdefault("other_wavemeters", {}).setdefault(str(demo.serials[1]), {})
+        for ch, name in demo.second_names.items():  # the other simulated wavemeter on this simulated PC
+            second.setdefault("channels", {}).setdefault(str(ch), {"name": name})
+        backend, targets, extra = demo, demo.targets, demo.extra_devices
+        serial = meter.get("serial") if meter.get("serial") in demo.serials else None
+
+        def make_source(sink):
+            return demo.make_source(sink, serial)
     else:
         if args.http:
             config["source"], config["http_url"] = "http", args.http
@@ -71,40 +111,52 @@ def main(argv=None) -> int:
         if config.get("source") == "view":
             make_source = NullSource
         elif config.get("source") == "http" and config.get("http_url"):
-            url = config["http_url"]
-            interval = config.get("poll_ms", 20) / 1e3
+            backend = HttpMeters(config["http_url"], config.get("poll_ms", 20) / 1e3)
 
             def make_source(sink):
-                return HttpSource(sink, url, interval)
+                return backend.make_source(sink, meter.get("serial"), meter.get("model", ""))
         else:
             config["source"] = "dll"
             dll = config.get("dll_path") or None
             chans = [int(c) for c in args.channels.split(",")] if args.channels else None
             interval = config.get("poll_ms", 2) / 1e3
+            backend = WlmHub(dll, Claims(Path.home()))  # (another copy of the program: none of the same wavemeters)
 
             def make_source(sink):
-                return DllSource(sink, dll, interval, chans)
+                return DllSource(sink, dll, interval, chans, serial=meter.get("serial"), model=meter.get("model", ""),
+                                 hub=backend, choose=sink.choose_wavemeter)
 
-    log_path = Path(path).with_name(Path(path).stem.lstrip(".") + "-recoveries.jsonl")
-    if Path(path).name.startswith("."):
-        log_path = log_path.with_name("." + log_path.name)
-    drop_path = log_path.with_name(log_path.name.replace("-recoveries", "-dropouts"))
-    engine = Engine(config, make_source, discovery_targets=targets, extra_devices=extra, log_path=log_path,
-                    drop_path=drop_path)
+    rec, drops = log_paths(path)
+    engine = Engine(config, make_source, discovery_targets=targets, extra_devices=extra, log_path=rec,
+                    drop_path=drops)
     shared = config.setdefault("share", {})  # the other PCs (share.py)
     if args.name is not None:
         shared["label"] = args.name.strip()
     if args.sim:  # demos find each other on this PC only, never the real ones
         shared.setdefault("port", SIM_PORT)
         shared.setdefault("lan", False)
-    share = Share(engine, shared)
+    siblings = set()  # (this PC's wavemeters' instances on the network: they ignore each other)
+    share = Share(engine, shared, siblings=siblings)
+
+    def make(section, serial, model):
+        """Another wavemeter of this PC's: its engine (its settings: section) and its instance on the network."""
+        rec, drops = log_paths(path, serial)
+        e = Engine(section, lambda sink: backend.make_source(sink, serial, model), discovery_targets=targets,
+                   extra_devices=[*extra, *engine.known], log_path=rec, drop_path=drops)
+        return Meter(e, Share(e, Settings(section.setdefault("share", {}), shared), siblings=siblings,
+                              subscribe=False))
+
+    meters = Meters(config, Meter(engine, share), backend, make)
     try:
         from .gui import run
 
-        return run(engine, lambda: cfgfile.save(path, engine.to_config()), share)
+        return run(engine, lambda: cfgfile.save(path, meters.to_config()), share, meters)
     finally:
         if demo:
             demo.close()
+        if isinstance(backend, HttpMeters):
+            backend.stop()
+        held.release()
 
 
 if __name__ == "__main__":

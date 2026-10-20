@@ -38,6 +38,9 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
   others by itself. Each window shows every wavemeter, framed under its name, and the other
   PCs' lasers can be adjusted from it (setpoint, Lock, Relock, Continue…), by the PC they
   belong to. A few kB/s, UDP (see *Several PCs*).
+* **Several wavemeters on one PC**: one copy of the program reads them all, each framed under its
+  own name with its own channels, lasers and settings, told apart by their serial numbers (see
+  *Several wavemeters on one PC*).
 * Fast by construction: the wavemeter is read in its own thread, all network I/O
   happens in one worker thread per controller (writes are coalesced, Nagle off),
   and the GUI only repaints numbers that changed. Nothing ever blocks the window.
@@ -61,7 +64,7 @@ discovery uses 255.255.255.255 only.
 ```
 python -m wmlock                 # on the wavemeter PC: reads wlmData.dll directly (fastest)
 python -m wmlock --http http://wavemeter-pc:8000   # anywhere else, via server/server.py
-python -m wmlock --sim           # demo: simulated wavemeter, two fake DLC pros, a reference laser
+python -m wmlock --sim           # demo: two simulated wavemeters, fake DLC pros, a reference laser
 python -m wmlock --view          # no wavemeter on this PC: the other PCs' only (see Several PCs)
 ```
 
@@ -72,7 +75,9 @@ double-clicking `wmlock.pyw` (Windows, no console window) is enough. Started fro
 `--dll PATH` for a non-standard DLL location, `--channels 1,2,5` to override the
 switch's channel list, `--config FILE` for a different settings file (default
 `~/.simplewavemeterlock.json`), `--name NAME` for this wavemeter's name on every PC
-(see *Several PCs*).
+(see *Several PCs*). One copy of the program at a time uses a settings file: started again with the
+same one, it says so and closes (one copy reads every wavemeter of its PC: see *Several wavemeters on
+one PC*).
 
 The WLM software must be running, with the multichannel switch cycling over the
 channels you want. It reads every channel as soon as the WLM has a new result,
@@ -92,6 +97,7 @@ it switches that channel back on when the laser needs relocking, then off again
 | Double-click the name | Rename |
 | Right-click empty space | Rescan LAN (F5), Network…, Show hidden channels, Always on top, Larger/smaller digits (Ctrl +/−); with `--sim`, Simulate a fault |
 | Another PC's wavemeter | Its rows work as they do on that PC (see *Several PCs*); click its name to fold it away or back; right-click its name: Network…, Forget (once it is gone) |
+| A wavemeter of this PC's, with others (see *Several wavemeters on one PC*) | Click its name to fold it away or back; right-click its name: Swap settings with…, Hide this wavemeter…, Network…; right-click empty space: Show wavemeter |
 
 Greyed digits mean the channel has had no new reading for 3 s; a grey *off* in their place, that
 someone unticked the channel in the WLM software (see *Its wavemeter channel switched off*).
@@ -158,7 +164,9 @@ not offered.
   time between the channel's readings in seconds. Its Kc = −1 and Ti = 0.0005 min give, at 935 nm with
   a reading every 0.1 s, P = 0.003 and I = 0.01 V/GHz: the defaults here.
 * **One program per board.** Epimetheus rewrites all 16 outputs every 4 ms: do not run it at the same
-  time, nor anything else that drives the board (Atlas).
+  time, nor anything else that drives the board (Atlas). MCC's library itself allows one program at a
+  time: on a PC with several wavemeters, this one program drives the board for the lasers of all of
+  them (see *Several wavemeters on one PC*).
 * In `--sim`, channel 8 is such a laser (8 GHz/V) on a simulated board, its current fed forward on
   output 3.
 
@@ -171,7 +179,7 @@ Where Epimetheus kept a laser's settings (`config.ini`, a `[laser_n]` each), and
 | `last_offset_P` (+ the PID's output) | *Analog output…*: the voltage now, set once |
 | `last_offset_I` | *Analog output…*: the second output, set once |
 | `wavelength_target` | the setpoint (`set`) |
-| `wavelength_source` (`H_1`: Hermes's channel 1) | the channel the laser is on, on this wavemeter |
+| `wavelength_source` (`H_1`: Hermes's channel 1) | the channel the laser is on, in its wavemeter's frame (name it Hermes) |
 | `P`, `I`, `D` (Kc, Ti in min, Td) | *Lock settings…* P and I (see Gains); D: none |
 
 ## Reference laser
@@ -253,7 +261,7 @@ and the reference laser are set up on the PC itself.
 ![several PCs](docs/share.png)
 
 * **Names.** Each wavemeter is labelled by its name, the same on every PC: until you give it
-  one, its PC's name (with its model, *WS7*, if the WLM says). Right-click › *Network…* › *Its
+  one, its PC's name (with its model and serial number, *WS7 1234*, if the WLM says). Right-click › *Network…* › *Its
   name*, or start with `--name "Lab 2 · WS7"`. The colour of its frame comes from its name (no two
   alike), so it is the same on every screen too. With other PCs about, the window's title has this PC's.
 * **Lightweight.** UDP only, and only what changed. A PC showing another's 7 channels (5 of them
@@ -284,6 +292,46 @@ and the reference laser are set up on the PC itself.
   real ones. Try two, with settings files and names of their own:
   `python -m wmlock --sim --name "Demo A"` and
   `python -m wmlock --sim --name "Demo B" --config demo-b.json`.
+
+## Several wavemeters on one PC
+
+A PC that runs two wavemeters (each with its WLM software) needs nothing special: start the program
+once, as usual. It reads both, and shows each framed under its own name, with its own channels,
+lasers, setpoints, reference laser and recoveries, as if each had a PC of its own; the other PCs show
+each in a frame of its own too, and adjust each.
+
+![two wavemeters on one PC](docs/two_wavemeters.png)
+
+* **Told apart by serial number.** HighFinesse's DLL reads one wavemeter at a time, for the whole
+  program: the first one, unless told otherwise (`PresetWLMIndex`). Each wavemeter here is known by
+  its serial number (the *1234* of *WS7 1234*): the DLL is told which before each read, and asked whose
+  readings they were after, so that one wavemeter's readings never reach another's lasers. One whose
+  WLM software is closed is not stood in for by the other: its frame says *WS6 5678 is not running (this
+  PC has WS7 1234)* and its lasers get no readings (a lock holds still, as it does whenever its WLM
+  program is closed) until it runs again. The order the WLM programs were started in does not matter.
+* **Names.** Until you name it (right-click its name › *Network…* › *Its name*), each is called by what
+  it is and its PC: *WS7 1234 · LAB-PC*.
+* **Settings.** The settings file is the first one's, as with one wavemeter, and says which it is for;
+  the others' are kept in it too (under `other_wavemeters`, by serial number). Each laser stays with
+  its wavemeter's settings, whichever WLM program starts first. The first time the program runs on a PC
+  with two, the settings it had go with the wavemeter whose readings are near their setpoints (failing
+  that, the first one), and the other gets settings of its own. Settings given the wrong one (each
+  laser's channel shows another laser): unlock their lasers, then right-click its name › *Swap settings
+  with…*: the channels, names, links, setpoints and reference set up under each then go with the other.
+* **One program, one board.** MCC's library allows one program at a time, so one copy reads both
+  wavemeters and drives the analog output board for the lasers of both (see *Lasers on an analog
+  output*). A laser already linked to a channel of the other wavemeter is asked about before it is
+  linked again: two locks would fight over it.
+* **Hide one** (right-click its name › *Hide this wavemeter…*): neither shown nor read any more, its
+  settings kept; right-click empty space › *Show wavemeter* brings it back. A wavemeter found running
+  later (its WLM program started after this one) gets its frame then.
+* **Another copy of the program** on the same PC (with settings of its own, `--config`) leaves alone the
+  wavemeters the first reads.
+* **Logs**: the recoveries and lock dropouts of a second wavemeter's lasers go to files of their own
+  (`.simplewavemeterlock-wlm5678-recoveries.jsonl`).
+* **Through `server/server.py`** (`--http`): it serves each wavemeter of its PC, and the program shows
+  each of them.
+* **In the demo** (`--sim`) there are two simulated wavemeters, each with its own lasers.
 
 ## Mode-hop recovery
 
@@ -955,6 +1003,11 @@ Things to know:
 * **`cannot load wlmData`**: 64-bit Python needs the 64-bit `wlmData.dll`
   (System32), 32-bit Python the 32-bit one (SysWOW64). Point `--dll` at the
   right one if it isn't found.
+* **The program is running already, with these settings**: one copy reads every wavemeter of its PC;
+  close the other (it may be minimized, or have no window left, in the task manager as `python`).
+* **`WS7 1234 is not running (this PC has WS6 5678)`**: that wavemeter's WLM program is closed; its
+  settings wait for it, never read from the other. Settings given the wrong wavemeter: *Swap settings
+  with…* (see *Several wavemeters on one PC*).
 * **Lock runs away straight after engaging**: the gain sign is wrong for that
   laser; negate P and I.
 
@@ -967,9 +1020,11 @@ when the switch actually uses it (`GetSwitcherSignalStates`); one with "Use"
 unticked is reported `"Disabled"` with `"use": false`, and
 `POST /api/v1/channel/<n>/use` with `{"use": true}` ticks it (`false` unticks
 it), for a laser whose channel someone switched off (*Its wavemeter channel
-switched off*). Same endpoint, same JSON otherwise, so other clients keep
-working. Run it on the wavemeter PC next to HighFinesse's
-`wlmData.py`/`wlmConst.py`:
+switched off*). On a PC with several wavemeters, each answer says whose it is
+(`"wavemeter": {"model": "WS7", "serial": 1234}`), `?wlm=1234` asks for that
+one (the first without it), and `GET /api/v1/wavemeters` lists them. Same
+endpoint, same JSON otherwise, so other clients keep working. Run it on the
+wavemeter PC next to HighFinesse's `wlmData.py`/`wlmConst.py`:
 
 ```
 pip install fastapi uvicorn
@@ -989,6 +1044,7 @@ wmlock/relock.py     taking over and handing back a DLC pro's cavity and SHG loc
 wmlock/dropouts.py   lock dropouts: the DLC pro's recorder (or polling) read, dropouts found
 wmlock/cavity.py     reading SHG sweeps, cavity scans and error signals, pure maths
 wmlock/engine.py     threads and state: source → lock → per-controller workers
+wmlock/meters.py     this PC's wavemeters, an engine each: found, settings kept, swapped, hidden
 wmlock/view.py       what a row shows (Qt-free): painted here, and sent to the other PCs
 wmlock/share.py      the other PCs: found, their rows shown, adjustments asked and done (UDP)
 wmlock/gui.py        Qt window
@@ -1032,3 +1088,10 @@ wavemeter framed under its name, adjusted from it, folded away. Lasers on an ana
 locked through a simulated board, end to end: never locked from an output not known, set back after
 a restart, kept within their limits, the output fed forward, a refused write unlocking them; the MCC
 board through a stand-in for mcculw (nothing written but what is asked, each output in its range).
+Several wavemeters on one PC run against a stand-in for wlmData with several WLM programs behind
+`PresetWLMIndex`: two sources reading all the time, their WLM programs restarted the other way round,
+never a reading of one passed to the other (the tests fail if the DLL is not set before each read, or
+the readings' wavemeter not checked after); a channel switched on its own wavemeter; one not running
+not stood in for; the settings given the wavemeter their setpoints know; two copies of the program
+kept off each other's; swapped; through server.py; and in the window and on another PC, each framed
+under its own name and adjusted from there.

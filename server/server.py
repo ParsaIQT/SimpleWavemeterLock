@@ -17,10 +17,21 @@ unticked is reported "Disabled" with "use": false, and
 
 ticks it again (false unticks it), as SimpleWavemeterLock does to relock a
 laser whose channel someone switched off, before switching it off again.
+
+A PC with several wavemeters (each with its WLM software running): each answer
+says whose it is ("wavemeter": {"model": "WS7", "serial": 1234}), ?wlm=1234 asks
+for that one (404 if it is not running), the first one without it; and
+
+    GET /api/v1/wavemeters   {"wavemeters": [{"index": 0, "model": "WS7", "serial": 1234}, ...]}
+
+lists them. wlmData addresses one wavemeter at a time (PresetWLMIndex), for the
+whole server: each request sets it, one at a time.
 """
 import ctypes
 import sys
+import threading
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -32,6 +43,8 @@ import wlmConst
 
 DLL_PATH = "wlmData.dll"
 MAX_CHANNELS = 17  # the real count comes from GetChannelsCount
+DLL_LOCK = threading.Lock()  # one request at a time talks to wlmData: it addresses one wavemeter at a time
+PRESET = [False]  # PresetWLMIndex has been called (there were several): set it for every request since
 
 
 def load_wlm_dll():
@@ -67,6 +80,63 @@ def get_status_message(freq):
     return "Valid"
 
 
+def _call(name, *args, default=0):
+    f = getattr(wlmData.dll, name, None)
+    return f(*args) if f is not None else default
+
+
+def _preset(index):
+    if getattr(wlmData.dll, "PresetWLMIndex", None) is not None:
+        wlmData.dll.PresetWLMIndex(index)
+        PRESET[0] = True
+
+
+def _meter():
+    """The model and serial number of the wavemeter addressed."""
+    t, serial = _call("GetWLMVersion", 0), _call("GetWLMVersion", 1)
+    return (f"WS{t}" if 4 <= t <= 30 else ""), (serial if serial > 0 else 0)
+
+
+def wavemeters():
+    """The wavemeters running on this PC: [(index, model, serial)], found as HighFinesse's own example finds them."""
+    n = wlmData.dll.GetWLMCount(0)
+    if n <= 0:
+        return []
+    if n == 1 or getattr(wlmData.dll, "PresetWLMIndex", None) is None:
+        if PRESET[0]:
+            _preset(0)
+        return [(0, *_meter())]
+    out, seen = [], set()
+    for i in range(n + 4):
+        _preset(i)
+        model, serial = _meter()
+        if serial and serial not in seen:
+            seen.add(serial)
+            out.append((i, model, serial))
+            if len(out) == n:
+                break
+    return out
+
+
+def select(wlm):
+    """Address the wavemeter asked for (None: the first): its (index, model, serial), or the answer to give if it
+    cannot be."""
+    found = wavemeters()
+    if not found:
+        return JSONResponse(status_code=503, content={"detail": "wlmServer is not running on the host machine."})
+    if wlm is None:
+        f = found[0]
+    else:
+        f = next((f for f in found if f[2] == wlm), None)
+        if f is None:
+            here = ", ".join(f"{m} {s}".strip() for _, m, s in found)
+            return JSONResponse(status_code=404, content={"detail": f"wavemeter {wlm} is not running there (it has "
+                                                                    f"{here})"})
+    if PRESET[0]:
+        _preset(f[0])
+    return f
+
+
 def channel_count():
     n = wlmData.dll.GetChannelsCount(0)
     return min(n, MAX_CHANNELS) if n > 0 else 1
@@ -91,16 +161,31 @@ def channel_in_use(ch, n):
     return channel_use(ch, n) is True
 
 
-@app.get("/api/v1/wavelength", tags=["Metrics"])
-def get_wavelength_data():
-    """Fetches real-time data for all channels statelessly."""
+@app.get("/api/v1/wavemeters", tags=["Metrics"])
+def get_wavemeters():
+    """The wavemeters running on this PC (each with its WLM software)."""
+    with DLL_LOCK:
+        return {"wavemeters": [{"index": i, "model": m, "serial": s} for i, m, s in wavemeters()]}
 
-    # 1. Check if WLM Server is actually running
+
+@app.get("/api/v1/wavelength", tags=["Metrics"])
+def get_wavelength_data(wlm: Optional[int] = None):
+    """Fetches real-time data for all channels statelessly (of wavemeter wlm, by its serial number: on a PC with
+    several)."""
+    with DLL_LOCK:
+        return _wavelength_data(wlm)
+
+
+def _wavelength_data(wlm):
+    # 1. Check if WLM Server is actually running (the one asked for)
     if wlmData.dll.GetWLMCount(0) == 0:
         return JSONResponse(
             status_code=503,
             content={"error": "wlmServer is not running on the host machine."}
         )
+    meter = select(wlm)
+    if isinstance(meter, JSONResponse):
+        return meter
 
     # 2. Read Global Environment Metrics
     temp_raw = wlmData.dll.GetTemperature(0.0)
@@ -140,6 +225,7 @@ def get_wavelength_data():
     # Return structured JSON payload
     return {
         "server_status": "Online",
+        "wavemeter": {"model": meter[1], "serial": meter[2]},
         "environment": {
             "temperature_c": temperature,
             "pressure_mbar": pressure
@@ -153,10 +239,19 @@ class Use(BaseModel):
 
 
 @app.post("/api/v1/channel/{ch}/use", tags=["Control"])
-def set_channel_use(ch: int, body: Use):
-    """Tick (use: true) or untick a channel's 'Use' in the WLM software (its 'Show' left as it is)."""
+def set_channel_use(ch: int, body: Use, wlm: Optional[int] = None):
+    """Tick (use: true) or untick a channel's 'Use' in the WLM software (its 'Show' left as it is); of wavemeter
+    wlm, by its serial number, on a PC with several."""
+    with DLL_LOCK:
+        return _set_channel_use(ch, body, wlm)
+
+
+def _set_channel_use(ch, body, wlm):
     if wlmData.dll.GetWLMCount(0) == 0:
         return JSONResponse(status_code=503, content={"detail": "wlmServer is not running on the host machine."})
+    meter = select(wlm)
+    if isinstance(meter, JSONResponse):
+        return meter
     n = channel_count()
     if not 1 <= ch <= n:
         return JSONResponse(status_code=404, content={"detail": f"no channel {ch} (the switch has {n})"})

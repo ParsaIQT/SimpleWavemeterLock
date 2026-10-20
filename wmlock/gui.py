@@ -20,6 +20,7 @@ import zlib
 from . import dac, view
 from .engine import DAC_LOCK, Engine
 from .lock import LockParams
+from .meters import Meter
 from .modehop import HopParams
 from .qt import Qt, QtCore, QtGui, QtWidgets
 from .reference import ACQUIRING, HOLD, MOVED, TRACKING, RefParams, fmt_duration
@@ -373,10 +374,10 @@ class Row(QtWidgets.QFrame):
 
 
 class ChannelRow(Row):
-    """A row of this PC's wavemeter."""
+    """A row of a wavemeter of this PC (its engine's)."""
 
-    def __init__(self, win: "MainWindow", n: int):
-        self.engine = win.engine
+    def __init__(self, win: "MainWindow", n: int, engine: Engine | None = None):
+        self.engine = engine if engine is not None else win.engine
         super().__init__(win, n)
 
     def refresh(self, now: float):
@@ -390,7 +391,7 @@ class ChannelRow(Row):
         elif ch.state == "recovering":
             self.engine.cancel_recovery(self.n)
         elif self._is_ref:
-            self.win.reference_dialog()
+            self.win.reference_dialog(self.engine)
         else:
             self.engine.toggle(self.n)
 
@@ -411,11 +412,12 @@ class ChannelRow(Row):
         m.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._menu = m
         if ref is not None and ref.channel == self.n:
-            m.addAction("Reference settings…", self.win.reference_dialog)
+            m.addAction("Reference settings…", lambda: self.win.reference_dialog(e))
             if ref.state == MOVED:
                 m.addAction("The reference laser moved: follow it", e.reference_reanchor)
-                m.addAction(f"The wavemeter moved: accept {ref.offset:+.1f} MHz as drift", self.win.accept_drift)
-            m.addAction("Stop using as reference", self.win.stop_reference)
+                m.addAction(f"The wavemeter moved: accept {ref.offset:+.1f} MHz as drift",
+                            lambda: self.win.accept_drift(e))
+            m.addAction("Stop using as reference", lambda: self.win.stop_reference(e))
             m.addSeparator()
             self._hop_actions(m, ch)
             m.addSeparator()
@@ -453,7 +455,7 @@ class ChannelRow(Row):
         m.addAction("Lock settings…", self.settings_dialog)
         self._hop_actions(m, ch)
         m.addAction("Use as reference laser" + (f" (instead of channel {ref.channel})" if ref else ""),
-                    lambda: self.win.use_as_reference(self.n))
+                    lambda: self.win.use_as_reference(self.n, e))
         m.addSeparator()
         m.addAction("Rename…", self.rename_dialog)
         m.addAction("Hide channel", lambda: e.set_hidden(self.n, True))
@@ -481,13 +483,14 @@ class ChannelRow(Row):
             m.addAction("Last recovery…", self.last_dialog)
 
     def _link(self, key: str, laser: int, *_):
-        self.engine.link(self.n, key, laser)
+        if self.win.may_link(self.engine, key, laser):
+            self.engine.link(self.n, key, laser)
 
     def link_dialog(self):
         d = LinkDialog(self, self.engine, self.engine.channels[self.n])
         if d.exec():
             host, laser = d.values()
-            if host:
+            if host and self.win.may_link(self.engine, host, laser):
                 self.engine.link(self.n, host, laser)
 
     def dac_dialog(self):
@@ -495,6 +498,8 @@ class ChannelRow(Row):
         d = DacDialog(self, ch)
         if d.exec():
             v = d.values()
+            if not self.win.may_link(self.engine, v["device"], v["ao"], v["ff_ao"]):
+                return
             self.engine.link(self.n, v["device"], v["ao"], v["ff_ao"], v["ff_ratio"])
             p = ch.lock.p.to_dict()
             p.update(v_min=v["v_min"], v_max=v["v_max"], excursion=v["excursion"])
@@ -657,7 +662,7 @@ class RemoteRow(Row):
 
 
 class PanelHeader(QtWidgets.QWidget):
-    """A wavemeter's name over its rows; another PC's folds away with a click."""
+    """A wavemeter's name over its rows; framed, it folds away with a click."""
 
     def __init__(self, panel: "Panel"):
         super().__init__()
@@ -675,27 +680,28 @@ class PanelHeader(QtWidgets.QWidget):
         h.addWidget(self.status)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(panel.show_menu)
-        if panel.peer is not None:
-            self.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.setToolTip("Click to fold it away, or back; right-click for more")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Click to fold it away, or back; right-click for more")
 
     def mousePressEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton and self.panel.peer is not None:
+        if ev.button() == Qt.MouseButton.LeftButton and self.panel.framed:
             self.panel.fold(not self.panel.folded)
         super().mousePressEvent(ev)
 
 
 class Panel(QtWidgets.QFrame):
-    """One wavemeter's rows, framed in its colour under its name while other PCs are about: this PC's (peer None),
-    or another's (a share.Peer)."""
+    """One wavemeter's rows, framed in its colour under its name while there are others about (other PCs', this
+    PC's others): one of this PC's (meter: a meters.Meter, its engine's rows), or another PC's (peer: a
+    share.Peer)."""
 
     WORDS = {"off": "off", "error": "unlocked", "engaging": "locking", "recovering": "recentering",
              "asking": "waiting for you", "ref": "reference", "ref-hold": "reference on hold",
              "ref-moved": "reference moved"}
 
-    def __init__(self, win: "MainWindow", peer=None):
+    def __init__(self, win: "MainWindow", peer=None, meter=None):
         super().__init__()
-        self.win, self.peer = win, peer
+        self.win, self.peer, self.meter = win, peer, meter
+        self.engine = meter.engine if meter is not None else None
         self.rows, self.row_list = {}, []
         self.folded = False
         self.framed = None
@@ -709,7 +715,22 @@ class Panel(QtWidgets.QFrame):
         self.rows_box = QtWidgets.QVBoxLayout()
         self.rows_box.setSpacing(6)
         lay.addLayout(self.rows_box)
+        self.placeholder = None
+        if meter is not None:
+            viewer = getattr(self.engine.source, "viewer", False)
+            self.placeholder = Text("no wavemeter on this PC: the other PCs' show here once found" if viewer else
+                                    "waiting for the wavemeter…", "dim")
+            self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.placeholder.setMinimumHeight(60)
+            lay.addWidget(self.placeholder)
         self.set_framed(peer is not None)
+
+    @property
+    def label(self) -> str:
+        """Its wavemeter's name."""
+        if self.peer is not None:
+            return self.peer.label or self.peer.host
+        return self.meter.label
 
     def set_framed(self, framed: bool):
         if framed == self.framed:
@@ -717,6 +738,8 @@ class Panel(QtWidgets.QFrame):
         self.framed = framed
         self.header.setVisible(framed)
         self.layout().setContentsMargins(*((8, 4, 8, 8) if framed else (0, 0, 0, 0)))
+        if not framed and self.folded:
+            self.fold(False)
         self.update()
 
     def set_label(self, label: str):
@@ -742,38 +765,53 @@ class Panel(QtWidgets.QFrame):
         m.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._menu = m
         p = self.peer
-        if p is not None:
+        if self.framed:
             m.addAction("Unfold" if self.folded else "Fold away", lambda: self.fold(not self.folded))
+        if p is not None:
             if p.status(time.monotonic()) in ("lost", "closed"):
                 m.addAction(f"Forget {p.label}", lambda: self.win.share.forget(p.id))
+        else:  # this PC's: its settings with another of this PC's wavemeters, or hidden
+            for other in self.win.locals:
+                if other is not self:
+                    m.addAction(f"Swap settings with {other.label}…", functools.partial(self.win.swap, self, other))
+            if self is not self.win.local and self.win.meters is not None:
+                m.addAction("Hide this wavemeter…", functools.partial(self.win.hide_meter, self))
+        if not m.isEmpty():
             m.addSeparator()
-        m.addAction("Network…", self.win.share_dialog)
+        m.addAction("Network…", functools.partial(self.win.share_dialog, self.meter.share if self.meter else None))
         m.popup(self.header.mapToGlobal(pos))
 
-    # ------------------------------------------------------- another PC's
     def fold(self, folded: bool):
-        """Fold its rows away (or back): it sends this PC its rows every few seconds only, meanwhile."""
+        """Fold its rows away (or back); another PC's sends this PC its rows every few seconds only, meanwhile."""
         self.folded = folded
         for row in self.row_list:
             row.setVisible(not folded)
-        label = self.peer.label
+        if self.placeholder is not None:
+            self.placeholder.setVisible(not folded and not self.row_list)
+        label = self.label
         names = self.win.gui.setdefault("folded", [])
         if folded and label not in names:
             names.append(label)
         elif not folded and label in names:
             names.remove(label)
         self.win.engine.dirty = True
-        self.win.want(self)
+        if self.peer is not None:
+            self.win.want(self)
         self.win.fit_later()
 
     def refresh(self, now: float):
+        if self.peer is None:
+            self._refresh_local(now)
+            return
         p = self.peer
         if p.layout != self._layout:
             self._rebuild()
-        self.set_label(p.label or p.host)
+        self.set_label(self.label)
         h = self.header
         h.arrow.paint("▸" if self.folded else "▾", "dim")
         where = p.host + (f"  {p.addr[0]}" if p.addr else "") + ("" if p.control else "   watch only")
+        if self.win.share is not None and p.host == self.win.share.host:
+            where = "this PC, another copy of the program" + ("" if p.control else "   watch only")
         h.detail.paint(f"{where}   {self.summary()}" if self.folded else where, "dim")
         h.status.paint(*self._status(now))
         if not self.folded:
@@ -796,20 +834,26 @@ class Panel(QtWidgets.QFrame):
 
     def summary(self) -> str:
         """Its rows in a line: how many locked, watched, off..."""
+        if self.peer is None:
+            views = [view.row(self.engine, n, time.monotonic()) for n in self.engine.rows()]
+        else:
+            views = [self.peer.views.get(n) or {} for n in self.peer.rows]
         counts = {}
-        for n in self.peer.rows:
-            v = self.peer.views.get(n) or {}
+        for v in views:
             state = v.get("state") or "off"
             word = ("watching" if v.get("relock") else "locked") if state == "on" else self.WORDS.get(state, state)
             counts[word] = counts.get(word, 0) + 1
-        k = len(self.peer.rows)
+        k = len(views)
         return f"{k} channel{'s' if k != 1 else ''}" + (": " + ", ".join(f"{c} {w}" for w, c in counts.items())
                                                         if counts else "")
 
     def _rebuild(self):
         p = self.peer
         self._layout = p.layout
-        wanted = list(p.rows)
+        self._place(list(p.rows), lambda n: RemoteRow(self.win, self, n))
+
+    def _place(self, wanted: list, make):
+        """Rows for the channels wanted, in that order: those there already kept, the others made."""
         for n in list(self.rows):
             if n not in wanted:
                 row = self.rows.pop(n)
@@ -819,11 +863,48 @@ class Panel(QtWidgets.QFrame):
             self.rows_box.removeWidget(row)
         for n in wanted:
             if n not in self.rows:
-                self.rows[n] = RemoteRow(self.win, self, n)
+                self.rows[n] = make(n)
             self.rows_box.addWidget(self.rows[n])
             self.rows[n].setVisible(not self.folded)
         self.row_list = [self.rows[n] for n in wanted]
         self.win.fit_later()
+
+    # ------------------------------------------------------- this PC's
+    def rebuild_rows(self):
+        """A row for each channel its engine shows."""
+        e = self.engine
+        with e.lock:
+            self._layout = e.layout_version
+            wanted = e.rows()
+        self._place(wanted, lambda n: ChannelRow(self.win, n, e))
+        self.placeholder.setVisible(not wanted and not self.folded)
+
+    def _refresh_local(self, now: float):
+        e = self.engine
+        if e.layout_version != self._layout:
+            self.rebuild_rows()
+        if not self.folded and not self.win.isMinimized():
+            for row in self.row_list:
+                row.refresh(now)
+
+    def paint_header(self, several: bool):
+        """Its name, 'this PC', and how its wavemeter is read (with others of this PC's about)."""
+        e, share = self.engine, self.meter.share
+        h = self.header
+        h.arrow.paint("▸" if self.folded else "▾", "dim")
+        self.set_label(self.label)
+        where = "this PC" + ("" if share is None or share.control else "   the others may only watch")
+        h.detail.paint(f"{where}   {self.summary()}" if self.folded else where, "dim")
+        if not several:
+            h.status.paint("", "dim")
+        elif getattr(e.source, "viewer", False):
+            h.status.paint("no wavemeter", "dim")
+        elif e.source_ok:
+            name = getattr(e.source, "name", "")
+            name = "" if name in self.label else name + "   "  # (its name says what it is already, unless named)
+            h.status.paint(f"● {name}{e.rate:.0f} readings/s", "dim")
+        else:
+            h.status.paint(f"● {e.source_msg}", "err")
 
 
 class LinkDialog(QtWidgets.QDialog):
@@ -1681,10 +1762,10 @@ class ReferenceDialog(QtWidgets.QDialog):
 class ShareDialog(QtWidgets.QDialog):
     """Network: this PC's wavemeter shared with the other PCs on the LAN, theirs shown here (share.py)."""
 
-    def __init__(self, parent, share):
+    def __init__(self, parent, share, title: str = "Network"):
         super().__init__(parent)
         self.share = share
-        self.setWindowTitle("Network")
+        self.setWindowTitle(title)
         s = share.settings
         form = QtWidgets.QFormLayout(self)
 
@@ -1783,10 +1864,12 @@ class Scroll(QtWidgets.QScrollArea):
 
 
 class MainWindow(QtWidgets.QWidget):
-    def __init__(self, engine: Engine, save, share=None):
-        """share: a share.Share, to show the other PCs' wavemeters too (None: this PC's alone)."""
+    def __init__(self, engine: Engine, save, share=None, meters=None):
+        """share: a share.Share, to show the other PCs' wavemeters too (None: this PC's alone); meters: this PC's
+        wavemeters (meters.Meters, the first of them engine's and share's), each framed under its name (None:
+        engine's alone)."""
         super().__init__()
-        self.engine, self.save, self.share = engine, save, share
+        self.engine, self.save, self.share, self.meters = engine, save, share, meters
         self.gui = engine.config.setdefault("gui", {})
         self.digits = int(self.gui.get("digits", 9))
         self.setWindowTitle("Wavemeter Lock")
@@ -1803,14 +1886,9 @@ class MainWindow(QtWidgets.QWidget):
         self.panels_box = QtWidgets.QVBoxLayout(inner)
         self.panels_box.setContentsMargins(0, 0, 0, 0)
         self.panels_box.setSpacing(10)
-        self.local = Panel(self)  # this PC's wavemeter
-        self.rows_box = self.local.rows_box
-        viewer = getattr(engine.source, "viewer", False)
-        self.placeholder = Text("no wavemeter on this PC: the other PCs' show here once found" if viewer else
-                                "waiting for the wavemeter…", "dim")
-        self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.placeholder.setMinimumHeight(60)
-        self.local.layout().addWidget(self.placeholder)
+        self.local = Panel(self, meter=meters.items[0] if meters is not None else Meter(engine, share))
+        self.locals = [self.local]  # this PC's wavemeters (the first: the settings', engine's)
+        self.placeholder = self.local.placeholder
         self.panels_box.addWidget(self.local)
         self.panels_box.addStretch(1)
         self.area.setWidget(inner)
@@ -1830,14 +1908,12 @@ class MainWindow(QtWidgets.QWidget):
         status.addWidget(self.st_lan)
         v.addLayout(status)
 
-        self.rows = {}
-        self.row_list = []
         self.panels = {}       # another PC's id -> the Panel of its wavemeter
         self.panel_list = []
         self.colors = {}       # a wavemeter's name -> the colour of its frame
         self._peer_ids = None
+        self._meters_version = None
         self._fit_at = 0.0
-        self._layout_version = None
         self._slow_at = 0.0
         self._saved_at = time.monotonic()
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1870,21 +1946,33 @@ class MainWindow(QtWidgets.QWidget):
         self.engine.dirty = True
         self.fit_later()
 
+    @property
+    def rows(self) -> dict:
+        """The first wavemeter's rows (this PC's, the settings'), by channel."""
+        return self.local.rows
+
+    @property
+    def row_list(self) -> list:
+        return self.local.row_list
+
     def all_rows(self) -> list:
         """This PC's rows and the other PCs'."""
-        return self.row_list + [row for panel in self.panel_list for row in panel.row_list]
+        return [row for panel in self.locals + self.panel_list for row in panel.row_list]
+
+    @property
+    def several(self) -> bool:
+        """This PC reads more than one wavemeter."""
+        return len(self.locals) > 1
 
     # ------------------------------------------------------------- refresh
     def refresh(self):
-        e = self.engine
-        if e.layout_version != self._layout_version:
-            self._rebuild()
         now = time.monotonic()
+        self._sync_locals()
+        for panel in self.locals:
+            panel.refresh(now)
         if self.share is not None:
             self._sync_panels()
         if not self.isMinimized():
-            for row in self.row_list:
-                row.refresh(now)
             for panel in self.panel_list:
                 panel.refresh(now)
         if self._fit_at and now >= self._fit_at:
@@ -1894,27 +1982,45 @@ class MainWindow(QtWidgets.QWidget):
             self._slow(now)
 
     def _slow(self, now: float):
-        e = self.engine
-        e.update_rate()
-        e.tick()
-        if e.rows() != [row.n for row in self.row_list]:  # (a channel switched off, watched no more)
-            self._rebuild()
-        ref = e.reference
-        if ref is None:
+        if self.meters is not None and self.meters.poll():  # (another wavemeter of this PC's found)
+            self._sync_locals()
+        for panel in self.locals:
+            e = panel.engine
+            e.update_rate()
+            e.tick()
+            if e.rows() != [row.n for row in panel.row_list]:  # (a channel switched off, watched no more)
+                panel.rebuild_rows()
+        refs = [(panel, panel.engine.reference) for panel in self.locals if panel.engine.reference is not None]
+        if not refs:
             self.st_ref.paint("", "dim")
         else:
-            text = {TRACKING: f"ref ch{ref.channel}  wavemeter {ref.error:+.1f} MHz",
-                    HOLD: f"ref ch{ref.channel}  hold {fmt_duration(now - ref.since)}",
-                    MOVED: f"ref ch{ref.channel}  moved: right-click it",
-                    ACQUIRING: f"ref ch{ref.channel}  acquiring"}[ref.state]
-            self.st_ref.paint(text, {TRACKING: "accent", MOVED: "err"}.get(ref.state, "warn"))
-        if getattr(e.source, "viewer", False):
+            texts, colors = [], []
+            for panel, ref in refs:
+                text = {TRACKING: f"ref ch{ref.channel}  wavemeter {ref.error:+.1f} MHz",
+                        HOLD: f"ref ch{ref.channel}  hold {fmt_duration(now - ref.since)}",
+                        MOVED: f"ref ch{ref.channel}  moved: right-click it",
+                        ACQUIRING: f"ref ch{ref.channel}  acquiring"}[ref.state]
+                texts.append(f"{panel.label}: {text}" if self.several else text)
+                colors.append({TRACKING: "accent", MOVED: "err"}.get(ref.state, "warn"))
+            worst = next((c for c in ("err", "warn") if c in colors), colors[0])
+            self.st_ref.paint("    ".join(texts), worst)
+        e = self.engine
+        if self.several:
+            ok = sum(1 for panel in self.locals if panel.engine.source_ok)
+            rows = sum(len(panel.row_list) for panel in self.locals)
+            rate = sum(panel.engine.rate for panel in self.locals)
+            self.st_wlm.paint(f"● {len(self.locals)} wavemeters   {rows} ch   {rate:.0f} readings/s",
+                              "dim" if ok == len(self.locals) else "err")
+        elif getattr(e.source, "viewer", False):
             self.st_wlm.paint("no wavemeter on this PC", "dim")
         elif e.source_ok:
-            label = getattr(e.source, "label", "")
+            label = getattr(e.source, "name", "") or getattr(e.source, "label", "")
             self.st_wlm.paint(f"● {label}   {len(self.row_list)} ch   {e.rate:.0f} readings/s", "dim")
         else:
             self.st_wlm.paint(f"● {e.source_msg}", "err")
+        for panel in self.locals:
+            if panel.framed:
+                panel.paint_header(self.several)
         if e.scanning:
             self.st_lan.paint("scanning LAN…", "dim")
         else:
@@ -1924,28 +2030,95 @@ class MainWindow(QtWidgets.QWidget):
             self._slow_share(now)
         for row in self.all_rows():
             row.update_tooltip()
-        if (e.dirty and now - self._saved_at > 1.0) or (ref is not None and now - self._saved_at > 300):
+        dirty = any(panel.engine.dirty for panel in self.locals) or (self.meters is not None and self.meters.dirty)
+        if (dirty and now - self._saved_at > 1.0) or (refs and now - self._saved_at > 300):
             self._save()  # the reference's estimate too, now and then
 
-    def _rebuild(self):
-        e = self.engine
-        with e.lock:
-            self._layout_version = e.layout_version
-            wanted = e.rows()
-        for n in list(self.rows):
-            if n not in wanted:
-                row = self.rows.pop(n)
-                row.hide()
-                row.deleteLater()
-        for row in self.rows.values():
-            self.rows_box.removeWidget(row)
-        for n in wanted:
-            if n not in self.rows:
-                self.rows[n] = ChannelRow(self, n)
-            self.rows_box.addWidget(self.rows[n])
-        self.row_list = [self.rows[n] for n in wanted]
-        self.placeholder.setVisible(not wanted)
+    # ------------------------------------------------------- this PC's wavemeters
+    def _sync_locals(self):
+        """A panel for each of this PC's wavemeters (meters.py), in order, at the top."""
+        m = self.meters
+        if m is None or m.version == self._meters_version:
+            return
+        self._meters_version = m.version
+        have = {id(panel.meter): panel for panel in self.locals}
+        locals_ = [have.get(id(meter)) or Panel(self, meter=meter) for meter in m.items]
+        for panel in self.locals:
+            if panel not in locals_:
+                panel.hide()
+                panel.deleteLater()
+        folded = self.gui.get("folded") or []
+        for k, panel in enumerate(locals_):
+            if panel not in self.locals and panel.label in folded:
+                panel.fold(True)
+            self.panels_box.insertWidget(k, panel)
+        self.locals = locals_
+        self._peer_ids = None  # (the other PCs' panels after these)
+        self._frame_locals()
         self.fit_later()
+
+    def _frame_locals(self):
+        framed = self.several or bool(self.panel_list)
+        for panel in self.locals:
+            panel.set_framed(framed)
+            if framed:
+                panel.paint_header(self.several)
+
+    def mark_dirty(self):
+        self.engine.dirty = True
+
+    def swap(self, a: Panel, b: Panel):
+        """The settings under a's wavemeter (its channels, lasers, reference...) go with b's, and b's with a's."""
+        if self.meters is None:
+            return
+        busy = [panel.label for panel in (a, b) if not panel.meter.idle()]
+        if busy:
+            QtWidgets.QMessageBox.information(
+                self, "Swap settings", f"First unlock every laser of {' and '.join(busy)} (Lock, Relock, "
+                                       f"Recentering: off).")
+            return
+        na, nb = a.meter.name or a.label, b.meter.name or b.label
+        if self.confirm("Swap settings",
+                        f"The channels, lasers, names and reference laser set up under {a.label} go with wavemeter "
+                        f"{nb}, and those under {b.label} with {na}: for settings that were given the wrong "
+                        f"wavemeter (each laser shown on another's channel). Swap them?"):
+            self.meters.swap(a.meter, b.meter)
+
+    def hide_meter(self, panel: Panel):
+        """One of this PC's wavemeters (not the first) neither shown nor read any more; its settings kept."""
+        if self.meters is None or panel is self.local:
+            return
+        if not panel.meter.idle():
+            QtWidgets.QMessageBox.information(self, "Hide this wavemeter",
+                                              f"First unlock every laser of {panel.label}.")
+            return
+        if self.confirm("Hide this wavemeter",
+                        f"Hide {panel.label} ({panel.meter.name}), and stop reading it? Its settings are kept: "
+                        f"right-click empty space › Show wavemeter brings it back."):
+            self.meters.hide(panel.meter)
+
+    def show_meter(self, serial: int):
+        if self.meters is not None:
+            self.meters.show(serial)
+
+    def may_link(self, engine, key: str, laser: int, ff_ao=None) -> bool:
+        """Link a channel of engine to that laser (or analog output, and the one it feeds forward): fine, unless a
+        channel of another of this PC's wavemeters drives it too, and you would rather not."""
+        if self.meters is None:
+            return True
+        mine = {laser} | ({ff_ao} if ff_ao is not None else set())
+        for panel in self.locals:
+            e = panel.engine
+            if e is engine:
+                continue
+            with e.lock:
+                clash = next((ch for ch in e.channels.values() if ch.device == key and mine & (
+                    {ch.laser} | ({ch.ff_ao} if ch.ff_ao is not None else set()))), None)
+            if clash is not None:
+                what = e.where(clash)
+                return self.confirm("Link laser", f"Channel {clash.n} of {panel.label} drives it already ({what}): "
+                                                  f"two locks would fight over it. Link it here too?")
+        return True
 
     # --------------------------------------------------------- the other PCs
     def _sync_panels(self):
@@ -1970,29 +2143,36 @@ class MainWindow(QtWidgets.QWidget):
                 panel = self.panels[p.id] = Panel(self, p)
                 if p.label in folded:
                     panel.fold(True)
-            self.panels_box.insertWidget(1 + k, panel)
+            self.panels_box.insertWidget(len(self.locals) + k, panel)
         self.panel_list = [self.panels[pid] for pid in ids]
-        self.local.set_framed(bool(peers))
+        self._frame_locals()
         self.local.setVisible(not (peers and getattr(self.engine.source, "viewer", False)))
         self._slow_share(time.monotonic())
         self.fit_later()
 
     def _slow_share(self, now: float):
         share = self.share
+        shares = [panel.meter.share for panel in self.locals if panel.meter.share is not None]
         if not share.on:
             self.st_net.paint("", "dim")
         elif share.error:
             self.st_net.paint(f"⇄ {share.error}", "err")
         else:
-            k = sum(1 for panel in self.panel_list if panel.peer.status(now) in ("live", "late"))
-            self.st_net.paint(f"⇄ {k} other PC{'s' if k != 1 else ''} · {(share.rate_out + share.rate_in) / 1e3:.1f} "
-                              f"kB/s", "warn" if share.port_note else "dim")
+            live = [panel.peer for panel in self.panel_list if panel.peer.status(now) in ("live", "late")]
+            pcs = len({p.host for p in live})
+            rate = sum(sh.rate_out + sh.rate_in for sh in shares)
+            self.st_net.paint(f"⇄ {pcs} other PC{'s' if pcs != 1 else ''}"
+                              + (f" ({len(live)} wavemeters)" if len(live) != pcs else "")
+                              + f" · {rate / 1e3:.1f} kB/s", "warn" if share.port_note else "dim")
             self.st_net.setToolTip(share.port_note or "The other PCs found on the LAN, and the traffic to and from "
                                                       "them: right-click › Network…")
-        self.colors = panel_colors([share.label] + [panel.peer.label for panel in self.panel_list])
-        self.local.set_label(share.label)
-        self.local.header.detail.paint("this PC" + ("" if share.control else "   the others may only watch"), "dim")
-        title = f"Wavemeter Lock · {share.label}" if self.panel_list else "Wavemeter Lock"
+        self.colors = panel_colors([panel.label for panel in self.locals] + [panel.label for panel in self.panel_list])
+        for panel in self.locals:
+            panel.set_label(panel.label)
+        if self.several:
+            title = f"Wavemeter Lock · {share.host}"
+        else:
+            title = f"Wavemeter Lock · {share.label}" if self.panel_list else "Wavemeter Lock"
         if self.windowTitle() != title:
             self.setWindowTitle(title)
         for panel in self.panel_list:
@@ -2027,13 +2207,17 @@ class MainWindow(QtWidgets.QWidget):
             if frame.top() + height + extra > avail.bottom():
                 self.move(frame.left(), max(avail.top(), avail.bottom() - height - extra))
 
-    def share_dialog(self):
-        if self.share is None:
+    def share_dialog(self, share=None):
+        """The network settings, and the name of a wavemeter of this PC's (share's; the first's if None)."""
+        share = share or self.share
+        if share is None:
             return
-        d = ShareDialog(self, self.share)
+        d = ShareDialog(self, share, f"Network · {share.label}" if self.several else "Network")
         if d.exec():
-            self.share.settings.update(d.values())
-            self.share.configure()
+            share.settings.update(d.values())
+            for panel in self.locals:  # (the network's settings are all of theirs)
+                if panel.meter.share is not None:
+                    panel.meter.share.configure()
             self.engine.dirty = True
 
     def _save(self):
@@ -2045,94 +2229,119 @@ class MainWindow(QtWidgets.QWidget):
             self.st_lan.paint(f"cannot save settings: {exc}", "err")
 
     # ------------------------------------------------------------- actions
+    def rescan(self):
+        for panel in self.locals:
+            panel.engine.start_discovery()
+
     def show_menu(self, pos):
-        e = self.engine
         m = QtWidgets.QMenu(self)
         m.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        m.addAction("Rescan LAN   F5", e.start_discovery)
+        m.addAction("Rescan LAN   F5", self.rescan)
         if self.share is not None:
             m.addAction("Network…", self.share_dialog)
-        hidden = [ch for n, ch in sorted(e.channels.items()) if ch.hidden and n in e.active]
+        hidden = [(panel, ch) for panel in self.locals for n, ch in sorted(panel.engine.channels.items())
+                  if ch.hidden and n in panel.engine.active]
         if hidden:
             sub = m.addMenu("Show hidden channel")
-            for ch in hidden:
-                sub.addAction(f"{ch.n}  {ch.name}", functools.partial(e.set_hidden, ch.n, False))
+            for panel, ch in hidden:
+                where = f"{panel.label}: " if self.several else ""
+                sub.addAction(f"{where}{ch.n}  {ch.name}", functools.partial(panel.engine.set_hidden, ch.n, False))
+        if self.meters is not None and self.meters.hidden():
+            sub = m.addMenu("Show wavemeter")
+            for serial, name in self.meters.hidden():
+                sub.addAction(name, functools.partial(self.show_meter, serial))
         a = m.addAction("Always on top")
         a.setCheckable(True)
         a.setChecked(bool(self.gui.get("on_top")))
         a.toggled.connect(self.set_on_top)
         m.addAction("Larger digits   Ctrl +", lambda: self.set_font_size(self.gui["font_pt"] + 2))
         m.addAction("Smaller digits   Ctrl −", lambda: self.set_font_size(self.gui["font_pt"] - 2))
-        laser = getattr(e.source, "cavity_laser", lambda: None)()
-        if laser is not None:  # --sim only: try the reference and mode-hop logic out
+        sims = [panel for panel in self.locals if hasattr(panel.engine.source, "lasers")]
+        if sims:  # --sim only: try the reference and mode-hop logic out
             sim = m.addMenu("Simulate a fault")
-            sim.addAction("Reference mode hop +1.5 GHz for 30 s", lambda: laser.mode_hop(1500, 30))
-            sim.addAction("Reference mode hop +1.5 GHz, stays", lambda: laser.mode_hop(1500))
-            sim.addAction("Reference cavity unlocked for 20 s", lambda: laser.unlock(20))
-            sim.addAction("Reference light blocked for 15 s", lambda: laser.dark(15))
-            sim.addAction("Wavemeter jumps +20 MHz", lambda: e.source.wavemeter.jump(20e-6 / laser.f0))
-            sim.addSeparator()
-            for las in e.source.lasers:
-                if las.ecdl is None:
-                    continue
-                name = e.channels[las.ch].name if las.ch in e.channels else ""
-                who = f"Channel {las.ch}" + (f" {name}" if name else "")
-                sim.addAction(f"{who}: mode hop up", functools.partial(las.hop_mode, 1))
-                sim.addAction(f"{who}: mode hop down", functools.partial(las.hop_mode, -1))
-                if las.ecdl.i_stop is not None:
-                    sim.addAction(f"{who}: stops lasing", functools.partial(las.stop_lasing, 0.0))
-                    sim.addAction(f"{who}: stops lasing, its seed power hardly drops (broadband)",
-                                  functools.partial(las.stop_lasing, 0.7))
-                if e.source.use.get(las.ch, True):
-                    sim.addAction(f"{who}: someone unticks it on the wavemeter", functools.partial(e.source.untick,
-                                                                                                    las.ch))
-                else:
-                    sim.addAction(f"{who}: someone ticks it again on the wavemeter", functools.partial(e.source.tick,
-                                                                                                        las.ch))
-                if las.lock is not None:
-                    sim.addAction(f"{who}: cavity lock jumps a peak", functools.partial(las.lock.jump, 1))
-                    sim.addAction(f"{who}: cavity lock jumps 60 MHz", functools.partial(las.lock.jump, 0.04))
-                    sim.addAction(f"{who}: cavity lock knocked out, ReLock catches the same peak",
-                                  functools.partial(las.lock.knock, 1.5))
-                    sim.addAction(f"{who}: cavity lock drops out for 3 ms", functools.partial(las.lock.blip, 0.003))
-                    sim.addAction(f"{who}: goes multimode, without a hop (its cavity lock keeps losing it)",
-                                  functools.partial(las.go_multimode, 1))
-                    sim.addAction(f"{who}: error signal DC drifts +20 mV",
-                                  functools.partial(setattr, las.lock, "pdh_dc", las.lock.pdh_dc + 0.02))
+            ref = next(((p.engine, p.engine.source.cavity_laser()) for p in sims if p.engine.source.cavity_laser()),
+                       None)
+            if ref is not None:
+                re_, laser = ref
+                sim.addAction("Reference mode hop +1.5 GHz for 30 s", lambda: laser.mode_hop(1500, 30))
+                sim.addAction("Reference mode hop +1.5 GHz, stays", lambda: laser.mode_hop(1500))
+                sim.addAction("Reference cavity unlocked for 20 s", lambda: laser.unlock(20))
+                sim.addAction("Reference light blocked for 15 s", lambda: laser.dark(15))
+                sim.addAction("Wavemeter jumps +20 MHz", lambda: re_.source.wavemeter.jump(20e-6 / laser.f0))
+            for panel in sims:  # (each of this PC's simulated wavemeters' lasers)
+                sim.addSeparator()
+                if self.several:
+                    sim.addAction(panel.label).setEnabled(False)
+                self._sim_laser_actions(sim, panel.engine)
         self._menu = m
         m.popup(self.mapToGlobal(pos))
+
+    @staticmethod
+    def _sim_laser_actions(sim, e):
+        """--sim: the faults its simulated lasers can be given."""
+        for las in e.source.lasers:
+            if las.ecdl is None:
+                continue
+            name = e.channels[las.ch].name if las.ch in e.channels else ""
+            who = f"Channel {las.ch}" + (f" {name}" if name else "")
+            sim.addAction(f"{who}: mode hop up", functools.partial(las.hop_mode, 1))
+            sim.addAction(f"{who}: mode hop down", functools.partial(las.hop_mode, -1))
+            if las.ecdl.i_stop is not None:
+                sim.addAction(f"{who}: stops lasing", functools.partial(las.stop_lasing, 0.0))
+                sim.addAction(f"{who}: stops lasing, its seed power hardly drops (broadband)",
+                              functools.partial(las.stop_lasing, 0.7))
+            if e.source.use.get(las.ch, True):
+                sim.addAction(f"{who}: someone unticks it on the wavemeter", functools.partial(e.source.untick,
+                                                                                                las.ch))
+            else:
+                sim.addAction(f"{who}: someone ticks it again on the wavemeter", functools.partial(e.source.tick,
+                                                                                                    las.ch))
+            if las.lock is not None:
+                sim.addAction(f"{who}: cavity lock jumps a peak", functools.partial(las.lock.jump, 1))
+                sim.addAction(f"{who}: cavity lock jumps 60 MHz", functools.partial(las.lock.jump, 0.04))
+                sim.addAction(f"{who}: cavity lock knocked out, ReLock catches the same peak",
+                              functools.partial(las.lock.knock, 1.5))
+                sim.addAction(f"{who}: cavity lock drops out for 3 ms", functools.partial(las.lock.blip, 0.003))
+                sim.addAction(f"{who}: goes multimode, without a hop (its cavity lock keeps losing it)",
+                              functools.partial(las.go_multimode, 1))
+                sim.addAction(f"{who}: error signal DC drifts +20 mV",
+                              functools.partial(setattr, las.lock, "pdh_dc", las.lock.pdh_dc + 0.02))
 
     def confirm(self, title: str, text: str) -> bool:
         box = QtWidgets.QMessageBox.question(self, title, text)
         return box == QtWidgets.QMessageBox.StandardButton.Yes
 
-    def use_as_reference(self, n: int):
-        if self.engine.channels[n].state != "off" and not self.confirm(
+    def use_as_reference(self, n: int, engine: Engine | None = None):
+        e = engine or self.engine
+        if e.channels[n].state != "off" and not self.confirm(
                 "Reference laser", f"Channel {n} is locked to the wavemeter. Make it the reference and unlock it?"):
             return
-        self.engine.set_reference(n)
+        e.set_reference(n)
 
-    def stop_reference(self):
-        shift = self.engine.locked_shift_mhz(lambda f: f)
+    def stop_reference(self, engine: Engine | None = None):
+        e = engine or self.engine
+        shift = e.locked_shift_mhz(lambda f: f)
         if shift > 1.0 and not self.confirm(
                 "Stop referencing", f"Without the reference the wavemeter's own drift comes back:\n"
                                     f"locked lasers will move by up to {shift:.1f} MHz. Stop referencing?"):
             return
-        self.engine.clear_reference()
+        e.clear_reference()
 
-    def accept_drift(self):
-        ref = self.engine.reference
+    def accept_drift(self, engine: Engine | None = None):
+        e = engine or self.engine
+        ref = e.reference
         if ref is None or ref.state != MOVED:
             return
-        shift = self.engine.locked_shift_mhz(lambda f: ref.preview(f, accept=True))
+        shift = e.locked_shift_mhz(lambda f: ref.preview(f, accept=True))
         if self.confirm("Wavemeter moved?",
                         f"Treat the reference's {ref.offset:+.1f} MHz as wavemeter drift?\n"
                         f"Only right if the reference laser is still on the same cavity mode.\n"
                         f"Locked lasers will move by up to {shift:.1f} MHz."):
-            self.engine.reference_accept_drift()
+            e.reference_accept_drift()
 
-    def reference_dialog(self):
-        ref = self.engine.reference
+    def reference_dialog(self, engine: Engine | None = None):
+        e = engine or self.engine
+        ref = e.reference
         if ref is None:
             return
         d = ReferenceDialog(self, ref)
@@ -2140,14 +2349,14 @@ class MainWindow(QtWidgets.QWidget):
             return
         params, thz = d.params(), d.new_anchor_thz()
         if thz is not None or params.scale != ref.p.scale:
-            shift = self.engine.locked_shift_mhz(lambda f: ref.preview(f, params.scale, thz))
+            shift = e.locked_shift_mhz(lambda f: ref.preview(f, params.scale, thz))
             if shift > 1.0 and not self.confirm(
                     "Reference", f"Locked lasers keep their setpoints in the new frame:\n"
                                  f"they will move by up to {shift:.1f} MHz. Continue?"):
                 return
-        self.engine.set_reference_params(params)
+        e.set_reference_params(params)
         if thz is not None:
-            self.engine.set_reference_anchor(thz)
+            e.set_reference_anchor(thz)
 
     def set_on_top(self, on: bool):
         self.gui["on_top"] = on
@@ -2162,32 +2371,50 @@ class MainWindow(QtWidgets.QWidget):
         elif ctrl and ev.key() == Qt.Key.Key_Minus:
             self.set_font_size(self.gui["font_pt"] - 2)
         elif ev.key() == Qt.Key.Key_F5:
-            self.engine.start_discovery()
+            self.rescan()
         else:
             super().keyPressEvent(ev)
 
     def closeEvent(self, ev):
         self.timer.stop()
         self._save()
-        if self.share is not None:  # (first: no adjustments from the others while it closes)
-            self.share.stop()
-            self.share.join(1.0)
-        self.engine.stop()
+        if self.meters is not None:
+            self.meters.stop()
+        else:
+            if self.share is not None:  # (first: no adjustments from the others while it closes)
+                self.share.stop()
+                self.share.join(1.0)
+            self.engine.stop()
         super().closeEvent(ev)
 
 
-def run(engine: Engine, save, share=None) -> int:
+def refuse(title: str, text: str) -> int:
+    """Say why the program does not start (in a message box too: it may have no console)."""
+    print(text, file=sys.stderr)
+    try:
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
+        app.setApplicationName("Wavemeter Lock")
+        QtWidgets.QMessageBox.warning(None, title, text)
+    except Exception:  # (no display, say: the console has it)
+        pass
+    return 1
+
+
+def run(engine: Engine, save, share=None, meters=None) -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
     app.setApplicationName("Wavemeter Lock")
     app.setStyle("Fusion")
     app.setPalette(dark_palette())
     app.setStyleSheet(QSS)
-    win = MainWindow(engine, save, share)
+    win = MainWindow(engine, save, share, meters)
     for sig in (signal.SIGINT, signal.SIGTERM):  # Ctrl+C / kill: close cleanly, settings saved
         signal.signal(sig, lambda *_: win.close())
-    engine.start()
-    if share is not None:
-        share.start()
+    if meters is not None:
+        meters.start()
+    else:
+        engine.start()
+        if share is not None:
+            share.start()
     win.show()
     code = app.exec()
     win.deleteLater()  # the window gone before the interpreter takes Qt down (else PySide6 may crash on exit)

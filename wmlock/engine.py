@@ -92,6 +92,7 @@ from .reference import Reference, RefParams
 from .wavemeter import C_NM_THZ, NAN
 
 log = logging.getLogger(__name__)
+meter_log = logging.getLogger("wmlock.meters")  # (which wavemeter each one's settings are for: said at INFO)
 
 ACTUATOR = "scan:offset"  # the DLC pro parameter the lock writes, below laserN:
 CURRENT = "dl:cc:current-set"
@@ -478,6 +479,48 @@ class Engine:
     # ------------------------------------------- source callbacks (its thread)
     def on_state(self, ok: bool, msg: str):
         self.source_ok, self.source_msg = ok, msg
+
+    @property
+    def meter(self) -> dict:
+        """The wavemeter these settings are for, as kept in them: {'serial': 1234, 'model': 'WS7'} ({}: none yet)."""
+        m = self.config.get("wavemeter")
+        return m if isinstance(m, dict) else {}
+
+    def on_wavemeter(self, model: str, serial: int):
+        """The source reads that wavemeter from now on: these settings are kept as its (the source keeps to it,
+        also on a PC with several). Another one than before (swapped): nothing read from the one before counts,
+        nothing stays locked."""
+        with self.lock:
+            old = self.meter.get("serial")
+            if not serial or (old == serial and self.meter.get("model") == model):
+                return
+            self.config["wavemeter"] = {"serial": int(serial), "model": model}
+            self.dirty = True
+            if old and old != serial:
+                for ch in self.channels.values():
+                    if ch.state != "off":
+                        self._disengage(ch, "unlocked: another wavemeter reads this channel now")
+                    ch.freq = ch.raw = NAN
+                    ch.status, ch.t = "no data", 0.0
+                ref = self.reference
+                if ref is not None:  # (the cavity is where it was; the wavemeter's error is another's)
+                    self.reference = Reference(ref.channel, ref.p, ref.anchor)
+        if old and old != serial:
+            meter_log.warning("settings for wavemeter %s %s now (they were for %s)", model, serial, old)
+        else:
+            meter_log.info("reading wavemeter %s %s", model, serial)
+
+    def choose_wavemeter(self, cands):
+        """Of several wavemeters, the one these settings are for (a source given none asks): cands [(Found,
+        {channel: THz})]. The one whose channels read near (10 GHz) the setpoints here on the most channels; None if
+        none does, or two as many."""
+        with self.lock:
+            sets = {n: ch.f_set for n, ch in self.channels.items() if ch.f_set > 0}
+        scores = sorted(((sum(1 for n, thz in freqs.items() if n in sets and abs(thz - sets[n]) < 0.01), k)
+                         for k, (_, freqs) in enumerate(cands)), reverse=True)
+        if not scores or scores[0][0] == 0 or (len(scores) > 1 and scores[1][0] == scores[0][0]):
+            return None
+        return cands[scores[0][1]][0]
 
     def on_active(self, chans, off=()):
         """chans: the channels the wavemeter measures; off: those switched off ('Use' unticked), which the source

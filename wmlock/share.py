@@ -3,7 +3,9 @@ them, and any of them can adjust the others' (where those allow it).
 
 Each copy of this program (an instance) owns its wavemeter and the lasers it locks. It sends what its rows show
 (view.py) to the others, and applies the adjustments they ask for through its engine, as if clicked there: nothing
-is ever written to a wavemeter or a laser but by the PC that owns it.
+is ever written to a wavemeter or a laser but by the PC that owns it. A PC with several wavemeters has an instance
+for each (meters.py), all in one program: siblings, which ignore each other (the window shows them as its own), and
+only the first of which asks the others for their rows.
 
 UDP, two sockets per instance:
   the group port (PORT; shared by every instance on a PC, SO_REUSEADDR) hears the others' hellos, broadcast on the
@@ -46,6 +48,7 @@ import zlib
 
 from . import view
 from .dlcpro import broadcast_addresses
+from .wavemeter import meter_name
 
 log = logging.getLogger(__name__)
 
@@ -191,7 +194,7 @@ class Peer:
         self.want = ""            # what it wants of this instance: fast | slow ('' nothing)...
         self.sub_until = 0.0      # ...until then
         self.needs_full = False   # all of it at once (it has just asked)
-        self.wanted = "fast"      # what this instance wants of it (the window says)
+        self.wanted = "fast" if share.subscribe else ""  # what this instance wants of it (the window says)
         self.feedback = {}        # n -> (text, until): an adjustment of it that was not done, and why
 
     def age(self, now: float) -> float:
@@ -203,6 +206,38 @@ class Peer:
             return "closed"
         quiet = now - self.heard
         return "live" if quiet < self.share.LATE_S else "late" if quiet < self.share.LOST_S else "lost"
+
+
+class Settings:
+    """A sibling's settings (a PC's second wavemeter, and on): its name (label) its own, the network's those of the
+    first's."""
+
+    OWN = ("label",)
+
+    def __init__(self, own: dict, shared: dict):
+        self.own, self.shared = own, shared
+
+    def _of(self, key) -> dict:
+        return self.own if key in self.OWN else self.shared
+
+    def get(self, key, default=None):
+        return self._of(key).get(key, default)
+
+    def __getitem__(self, key):
+        return self._of(key)[key]
+
+    def __setitem__(self, key, value):
+        self._of(key)[key] = value
+
+    def __contains__(self, key) -> bool:
+        return key in self._of(key)
+
+    def setdefault(self, key, default=None):
+        return self._of(key).setdefault(key, default)
+
+    def update(self, other=(), **kw):
+        for key, value in dict(other, **kw).items():
+            self[key] = value
 
 
 class _Cmd:
@@ -230,14 +265,19 @@ class Share:
     GOSSIP_S = 30.0   # s: an address heard of is said hello to at most this often
     RESOLVE_S = 60.0  # s: the listed addresses are looked up again this often
 
-    def __init__(self, engine, settings: dict, model: str = ""):
+    def __init__(self, engine, settings: dict, model: str = "", siblings: set | None = None, subscribe: bool = True):
         """settings: the 'share' part of the settings file (kept, and changed by configure): on, label, group, key,
-        peers (also talk to: 'host' or 'host:port'), control (let others adjust), port, lan (False: this PC only).
-        model: what the wavemeter is, for its default name."""
+        peers (also talk to: 'host' or 'host:port'), control (let others adjust), port, lan (False: this PC only);
+        a sibling's: Settings. model: what the wavemeter is, for its default name. siblings: the ids of the
+        instances of this program (a PC's wavemeters), shared by them: they ignore each other. subscribe: ask the
+        others for their rows (False: a sibling's, the first asks)."""
         self.engine = engine
         self.settings = settings
         self.model = model
+        self.subscribe = subscribe
         self.id = os.urandom(6).hex()
+        self.siblings = siblings if siblings is not None else set()
+        self.siblings.add(self.id)
         self.host = socket.gethostname()
         self.lock = threading.RLock()
         self.peers = {}           # id -> Peer
@@ -288,8 +328,9 @@ class Share:
 
     @property
     def default_label(self) -> str:
-        """Its wavemeter's name, if none is set: what it is, and the PC's."""
-        model = self.model or getattr(self.engine.source, "model", "")
+        """Its wavemeter's name, if none is set: what it is (its serial number too, if it says), and the PC's."""
+        src = self.engine.source
+        model = meter_name(self.model or getattr(src, "model", ""), getattr(src, "serial", None))
         return f"{model} · {self.host}" if model else self.host
 
     @property
@@ -355,7 +396,7 @@ class Share:
 
     def stop(self):
         """Close (saying so to the others), at once."""
-        self._stop_ev.set()
+        self._stop_ev.set()  # (its id stays among its siblings': its last datagrams, ignored too)
 
     def join(self, timeout=None):
         if self._thread is not None:
@@ -508,8 +549,8 @@ class Share:
                 return
             self.bytes_in += len(data)
             msg = decode(data, self._key)
-            if msg is None or msg.get("id") == self.id or msg.get("g", "") != self.group:
-                continue
+            if msg is None or msg.get("id") in self.siblings or msg.get("g", "") != self.group:
+                continue  # (its own, or a sibling's: shown as its own by the window)
             try:
                 self._handle(msg, addr, time.monotonic())
             except Exception:  # (a datagram that is not what it should be: never the end of this thread)

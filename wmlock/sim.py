@@ -20,7 +20,7 @@ import time
 
 from . import dac as daclib
 from .dlcpro import DISCOVERY_PORT
-from .wavemeter import C_NM_THZ, Source
+from .wavemeter import C_NM_THZ, Found, Source
 
 
 def _decop(value) -> str:
@@ -1275,7 +1275,9 @@ class SimSource(Source):
     model = "simulated WS7"
     switchable = True
 
-    def __init__(self, sink, lasers, exposure=0.02, wavemeter=None):
+    def __init__(self, sink, lasers, exposure=0.02, wavemeter=None, serial=None, model=None, demo=None):
+        """serial, model: the simulated wavemeter's (serial None: it does not say); demo: where select() finds
+        another one's lasers (Demo.meter)."""
         super().__init__(sink, exposure)
         self.lasers = lasers
         self.wavemeter = wavemeter or SimWavemeter()
@@ -1283,6 +1285,24 @@ class SimSource(Source):
         self.switched = []   # (ch, on): what switch() did, in order
         self._shown = {}     # ch -> the value it shows (kept while it is not measured)
         self._again = set()  # ticked again: shows its old value once more, then is measured
+        self.wanted, self._model, self.demo = serial, model or type(self).model, demo
+        self._selects = []   # another simulated wavemeter to read (select), on this thread
+
+    def select(self, serial):
+        """Read that simulated wavemeter (of the demo's) from now on, in a moment."""
+        self._selects.append(serial)
+
+    def _select_now(self):
+        serial = self._selects.pop()
+        self._selects.clear()
+        found = self.demo.meter(serial) if self.demo is not None else None
+        if found is None or serial == self.wanted:
+            return
+        self.wanted, self._model, self.lasers, self.wavemeter = serial, *found
+        self.use = {laser.ch: True for laser in self.lasers}
+        self._shown, self._again = {}, set()
+        self._last, self._stale, self._active, self._off = {}, {}, None, None
+        self._set_meter(self._model, serial)
 
     def cavity_laser(self):
         return next((laser for laser in self.lasers if laser.cavity), None)
@@ -1313,10 +1333,14 @@ class SimSource(Source):
         return used
 
     def run(self):
+        if self.wanted:
+            self._set_meter(self._model, self.wanted)
         self._channels()
         self._set_state(True)
         i = 0
         while not self._stop_ev.wait(self.interval):
+            if self._selects:
+                self._select_now()
             self._do_switches(self._use)
             used = self._channels()
             if not used:
@@ -1356,14 +1380,26 @@ class Demo:
     SHG = 7  # cavity-locked by its DLC pro: try the mode-hop recovery on it
     DAC = 8  # with dac=True: a laser without a digital controller, on a simulated analog output board
     DAC_LASER = (8, 935.17976, 8.0, 2, 3, 0.4, "935 (DAC)")  # ch, nm, GHz/V, output, feed-forward output, GHz/V, name
+    SECOND = [  # meters=2: a second wavemeter on the same PC, with lasers of its own (controller 3: a fourth DLC pro)
+        (1, 369.524540, +0.30, 3, 1, "369 Yb"),
+        (2, 398.910750, +0.30, 3, 2, "399 Yb"),
+        (3, 638.610400, +0.40, None, 0, "638"),
+    ]
+    MODELS = ("simulated WS7", "simulated WS6")
 
-    def __init__(self, discovery_port=DISCOVERY_PORT, wavemeter=None, exposure=0.02, dac=False):
+    def __init__(self, discovery_port=DISCOVERY_PORT, wavemeter=None, exposure=0.02, dac=False, meters=1,
+                 serials=None):
+        """meters: 2, a second simulated wavemeter on this PC (SECOND); serials: the simulated wavemeters' serial
+        numbers (else 1001, 1002)."""
         self.dlcs = [
             FakeDLCPro("SIM-000123", "Ca+ blue", {1: {"product": "DL pro 397"}, 2: {"product": "DL pro 866"}}),
             FakeDLCPro("SIM-000456", "Ca+ red", {1: {"product": "DL pro 854"}, 2: {"product": "DL pro 423"}}),
             FakeDLCPro("SIM-000789", "Yb+ SHG", {1: {"product": "TA-SHG pro 739", "scan": True,
                                                     "feedforward": -0.006}}),  # measured 0.42 mA below set
         ]
+        if meters > 1:
+            self.dlcs.append(FakeDLCPro("SIM-000999", "Yb+ cooling", {1: {"product": "DL pro 369"},
+                                                                      2: {"product": "DL pro 399"}}))
         try:
             self.responder = FakeDiscovery(self.dlcs, port=discovery_port)
         except OSError:  # port taken: the GUI gets the devices directly instead
@@ -1394,9 +1430,38 @@ class Demo:
             ch, nm, ghz, ao, ff, ff_ghz, name = self.DAC_LASER
             self.lasers.append(SimLaser(ch, nm, ghz, offset0=0.3, drift=3.0, dac=(self.board, ao, ff, ff_ghz)))
             self.names[ch] = name
+        self.serials = list(serials or [1001 + k for k in range(meters)])[:meters]
+        self.meters = {self.serials[0]: (self.MODELS[0], self.lasers, self.wavemeter)}
+        self.second_names = {}
+        if meters > 1:  # (its own drift: another wavemeter)
+            lasers = [SimLaser(ch, wl, k, self.dlcs[c] if c is not None else None, n, drift=3.0)
+                      for ch, wl, k, c, n, _ in self.SECOND]
+            self.meters[self.serials[1]] = (self.MODELS[1], lasers, SimWavemeter())
+            self.second_names = {ch: name for ch, *_, name in self.SECOND}
 
-    def make_source(self, sink):
-        return SimSource(sink, self.lasers, self.exposure, self.wavemeter)
+    def make_source(self, sink, serial=None, model="", interval=None, channels=None):
+        """A source for the sink: of the first simulated wavemeter, or of the one with that serial number."""
+        serial = serial if serial in self.meters else self.serials[0]
+        model, lasers, wavemeter = self.meters[serial]
+        return SimSource(sink, lasers, self.exposure, wavemeter, serial=serial, model=model, demo=self)
+
+    def meter(self, serial):
+        """A simulated wavemeter's (model, lasers, its error), or None."""
+        return self.meters.get(serial)
+
+    def scan(self) -> list:
+        """The simulated wavemeters of this simulated PC (as WlmHub.scan)."""
+        return [Found(k, self.meters[s][0], s) for k, s in enumerate(self.serials)]
+
+    @staticmethod
+    def free(serial) -> bool:
+        return True
+
+    @staticmethod
+    def swap(a, b):
+        wa, wb = a.wanted, b.wanted
+        a.select(wb)
+        b.select(wa)
 
     def laser(self, ch: int) -> SimLaser:
         return next(laser for laser in self.lasers if laser.ch == ch)
