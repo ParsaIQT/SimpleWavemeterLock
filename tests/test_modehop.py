@@ -1893,3 +1893,133 @@ def test_monte_carlo_catches_over_random_lasers_with_near_modes():
         feasible += can
         right += can and laser.m == 0
     assert feasible >= 30 and right >= 0.95 * feasible, (right, feasible)
+
+
+# ------------------------------------------- the catch with nothing but the wavemeter (a plain DL pro)
+WM_CATCH = HopParams(enabled=True, i_nom=I0, method="catch")
+
+
+def plain_near(by=1.6, seed=40, **ecdl):
+    """A DL pro with nothing but the wavemeter to tell how it is (no cavity, no SHG stage, no photodiode), a bit mode
+    hoppy: its modes 2.2 GHz apart, going multimode near their edges. Its filter drifts by `by` GHz from the middle of
+    its target mode: it hops to the next mode (up for by > 0)."""
+    kw = dict(fsr=2.2, hysteresis=0.3, multimode=0.4, mm_noise=0.004)
+    kw.update(ecdl)
+    laser = ECDL(400.0, seed=seed, **kw)
+    target = laser.freq(V0, I0)
+    laser.nudge(by)
+    laser.freq(V0, I0)
+    return laser, target
+
+
+def test_a_dl_pro_with_only_the_wavemeter_is_caught_back_and_parked_in_the_middle_of_its_mode():
+    """As the SHG catch, by hand: the current up, then down a step at a time until it is on the right mode. With no
+    SHG sweep to say where the mode is at its best, that is where it hopped onto it: its edge (left there, it would
+    hop again with the next drift). So, by the wavemeter alone, where the mode holds is found: on down until it hops
+    off, back up until it hops onto it again (the other mode holds on a while), and it is parked in the middle of
+    where it is alone, from below; then the piezo onto the target. Nothing else is touched."""
+    laser, target = plain_near()
+    assert laser.m == 1
+    b, rec, r = recover(laser, target, WM_CATCH)
+    assert r.state == "done", r.error
+    assert laser.m == 0 and abs(b.off_mhz()) < 5  # the right mode, on target
+    assert b.margin() > 0.4  # (alone 0.46 mA either way of its middle at most)
+    notes = "\n".join(rec.notes)
+    assert re.search(r"caught the right mode at 151\.30 mA, 70\.00 V \(go 1\)", notes), notes
+    assert re.search(r"the mode it was caught on: alone 150\.\d\d–151\.30 mA; parked at 150\.\d\d mA, from below "
+                     r"\(0\.\d\d mA from where it ends", notes), notes
+    assert re.match(r"caught the right mode at 151\.30 mA \(1 go up and down\), walked the piezo 70\.00 → 70\.5\d V, "
+                    r"current 150\.00 → 150\.\d\d mA measured \(\d\d readings\); parked 0\.[34]\d mA inside its mode",
+                    r.result.summary), r.result.summary
+    c = r.result.record["center"]
+    assert c["edge"] and c["off"] and c["back"] < c["op"] < c["top"] == pytest.approx(151.3)
+    currents = b.writes("dl:cc:current-set")
+    top = currents.index(max(currents))
+    assert max(currents) == pytest.approx(I0 + 2.0) and currents[:top] == sorted(currents[:top])  # up quickly...
+    low = currents.index(min(currents))
+    assert all(0.09 < x - y < 0.11 for x, y in zip(currents[top:low], currents[top + 1:low + 1]))  # ...down steps
+    assert min(currents) < c["back"] - 0.3  # (it hopped off going down...)
+    assert {n for n, _ in b.dlc.log} == {"laser1:dl:cc:current-set", "laser1:scan:offset"}  # (...nothing but these)
+
+
+def test_left_where_it_was_caught_a_mode_hoppy_laser_would_sit_at_its_edge():
+    """Why it is parked: where the catch found it, the laser is at the edge of the mode (hardly any margin), and
+    the map, sweeping the whole window both ways, parks it short of the middle."""
+    laser, target = plain_near()
+    b, rec, r = recover(laser, target, HopParams.from_dict({**WM_CATCH.to_dict(), "method": "map"}), learned=False)
+    assert r.state == "done" and laser.m == 0 and 0.2 < b.margin() < 0.4 and rec.readings > 80, r.error
+    laser, target = plain_near()
+    b, rec, r = recover(laser, target, WM_CATCH)
+    assert b.margin() > 0.4 and rec.readings < 60  # (the catch: a better place, in fewer readings)
+    edge = laser.margins(b.V, rec.caught[1])[0]  # (where it was caught, as the catch found it)
+    assert edge < 0.1
+
+
+def test_too_little_of_the_right_mode_in_the_window_has_the_modes_mapped_instead():
+    """It drifted the other way: the right mode comes back only at the bottom of the window, too little of it for any
+    margin. Caught again it would only be the same: the modes are mapped instead, and the one that holds best is put
+    on the target, as the map does."""
+    laser, target = plain_near(by=-2.2)
+    b, rec, r = recover(laser, target, WM_CATCH)
+    assert r.state == "done", r.error
+    assert rec.narrow.startswith("the right mode is lasing on it 149.00–149.20 mA, the window's bottom on: too little "
+                                 "of it for a margin of 0.15 mA either way"), rec.narrow
+    assert rec.tries == 1 and rec.maps >= 1 and abs(b.off_mhz()) < 5 and b.margin() > 0.1
+    assert r.result.summary.startswith("the right mode not caught, mapped instead: recentered 150.00 → "), \
+        r.result.summary
+
+
+def test_recenter_now_puts_a_laser_on_its_mode_in_the_middle_of_it():
+    """On its right mode and on target, but near the edge of the mode (where it drifted to, locked): Recenter now looks
+    at where it is in the mode too, by the wavemeter, and parks it in the middle (else only the piezo would move)."""
+    laser = ECDL(400.0, seed=40, fsr=2.2, hysteresis=0.3, multimode=0.4, mm_noise=0.004)
+    laser.nudge(0.7)  # (0.1 GHz short of where another mode could lase)
+    target = laser.freq(V0, I0)
+    b = Bench(laser, target, seed=40)
+    assert laser.m == 0 and b.margin() < 0.1
+    b, rec, r = recover(laser, target, WM_CATCH, quick=False, bench=b)
+    assert r.state == "done", r.error
+    assert laser.m == 0 and abs(b.off_mhz()) < 5 and b.margin() > 0.35
+    assert "on the right mode: Recenter now, so where it is in the mode is looked at too, by the wavemeter" in rec.notes
+
+
+def near_case(seed):
+    """A random plain laser with near modes (1.8 to 3 GHz apart), on its target mode, that has hopped one mode either
+    way."""
+    rng = random.Random(9000 + seed)
+    fsr = rng.uniform(1.8, 3.0)
+    laser = ECDL(400.0, fsr=fsr, hysteresis=rng.uniform(0.05, 0.3) * fsr, multimode=rng.uniform(0.1, 0.25) * fsr,
+                 ki=rng.uniform(-0.4, -0.15), ksi=rng.uniform(-3.0, -1.5), ksv=rng.uniform(0.28, 0.36),
+                 mm_noise=rng.choice([0.004, 0.03]), seed=seed)
+    laser.nudge(rng.uniform(-0.15, 0.15) * fsr)
+    laser.m = 0
+    target = laser.freq(V0, I0)
+    lo, hi = laser.limits()
+    a, margin = laser.misalignment(laser.m, V0, I0), rng.uniform(0.02, 0.3) * fsr
+    laser.nudge((a - lo + margin) if rng.random() < 0.5 else -(hi - a + margin))
+    laser.freq(V0, I0)
+    return laser, target, rng.choice([0.3, 1.0, 3.0])
+
+
+def test_monte_carlo_catches_by_the_wavemeter_alone():
+    """Random plain lasers, mode hoppy (modes 1.8 to 3 GHz apart), hopping one mode either way: caught back on the
+    right mode and parked well inside it wherever that can be had; else mapped. Never left at the edge of a mode,
+    and in half the readings the map takes."""
+    p = HopParams.from_dict({**WM_CATCH.to_dict(), "i_below": 2.0})
+    right = feasible = inside = 0
+    readings = []
+    for seed in range(40):
+        laser, target, noise = near_case(seed)
+        best = best_margin(laser, p)
+        b, rec, r = recover(laser, target, p, noise=noise, seed=seed)
+        assert r.state == "done", (seed, r.error)
+        assert abs(b.off_mhz()) < 5 + 3 * noise, seed
+        m = b.margin()
+        assert m > -0.15, seed  # never on the edge of a mode
+        inside += m > 0.1
+        readings.append(rec.readings)
+        if best >= 0.3:
+            feasible += 1
+            right += laser.m == 0
+    assert feasible >= 25 and right >= 0.95 * feasible, (right, feasible)
+    assert inside >= 36 and sorted(readings)[20] < 80, (inside, sorted(readings))

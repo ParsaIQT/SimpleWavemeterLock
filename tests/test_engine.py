@@ -1,5 +1,6 @@
 import math
 import re
+import time
 
 import pytest
 
@@ -83,6 +84,70 @@ def test_engage_refuses_offset_outside_limits(engine, demo):
     ch = engine.channels[1]
     assert wait_for(lambda: ch.state == "off" and ch.message, 2)
     assert "outside" in ch.message
+
+
+def test_a_ta_shg_pro_whose_scan_drives_its_current_is_locked_by_its_piezo(engine, demo):
+    """As the lab's second TA-SHG pro: its scan generator drives its current, so its scan offset is its current, 160 mA,
+    and its piezo, at 41.3 V, is set by dl:pc:voltage-set. Taken for the piezo, 160 was outside 0 … 140 V and nothing
+    would lock ("the offset, 160.00 V, is outside 0 … 140 V"): its piezo is locked instead, its current left alone."""
+    dlc, ch = demo.dlcs[1], engine.channels[4]  # (the demo's 423 nm laser: its scan drives its current)
+    dlc.params["laser2:scan:offset"], dlc.params["laser2:dl:pc:voltage-set"] = 160.0, 41.3
+    t = time.monotonic()
+    assert wait_for(lambda: ch.t > t, 2)  # (read as it is now)
+    engine.link(4, dlc.key, 2)
+    assert wait_for(lambda: ch.scan_out == 51 and ch.offset == pytest.approx(41.3), 2)  # shown: its piezo
+    assert (ch.piezo, ch.cc, ch.unit) == ("dl:pc:voltage-set", "scan:offset", "V")
+    engine.set_setpoint(4, detune(ch, 80))
+    engine.engage(4)
+    assert wait_for(lambda: ch.state == "on", 2), ch.message
+    assert wait_for(lambda: abs(ch.error_mhz) < 5, 8)
+    assert dlc.piezo(2) > 41.5 and dlc.written("laser2:dl:pc:voltage-set")  # tuning is positive: up
+    assert dlc.written("laser2:scan:offset") == [] and dlc.current(2) == 160.0  # its current: never touched
+    engine.disengage(4)
+    engine.set_params(4, LockParams(v_min=0, v_max=40))
+    engine.engage(4)
+    assert wait_for(lambda: ch.state == "off" and ch.message, 2)
+    assert ch.message.startswith("piezo voltage (dl:pc:voltage-set) 41.") and ch.message.endswith("outside 0 … 40")
+
+
+def test_a_scan_offset_not_in_volts_is_never_taken_for_the_piezo(engine, demo):
+    """A controller that does not say what its scan drives (scan:output-channel refused), its scan offset in mA: not
+    locked (the lock would write piezo volts into its current), and it says why."""
+    dlc, ch = demo.dlcs[1], engine.channels[4]
+    dlc.busy_checks.append(lambda kind, name: name == "laser2:scan:output-channel")
+    engine.link(4, dlc.key, 2)
+    engine.setpoint_to_current(4)
+    engine.engage(4)
+    assert wait_for(lambda: ch.state == "off" and ch.message, 2)
+    assert ch.message == ("cannot lock: its scan offset is 150.000 mA, not the piezo (see Scan › Output channel at the "
+                          "DLC pro)")
+    assert ch.scan_out is None and ch.piezo == "scan:offset" and dlc.written("laser2:scan:offset") == []
+
+
+def test_its_scan_switched_to_its_current_while_locked_unlocks_it(engine, demo):
+    """Switched at the DLC pro, by hand, while it is locked: what the lock writes, the scan offset, would set the
+    current from then on. It is unlocked within a poll, and its piezo is dl:pc:voltage-set from then on."""
+    dlc = demo.dlcs[0]
+    engine.link(1, dlc.key, 1)
+    ch = engine.channels[1]
+    engine.setpoint_to_current(1)
+    engine.engage(1)
+    assert wait_for(lambda: ch.state == "on" and dlc.written("laser1:scan:offset"), 2)
+    n = len(dlc.log)
+    dlc.execute("(param-set! 'laser1:scan:output-channel 51)")
+    assert wait_for(lambda: ch.state == "off", 2)
+    assert ch.message == "unlocked: its scan now drives the current: the piezo is dl:pc:voltage-set"
+    assert (ch.piezo, ch.cc) == ("dl:pc:voltage-set", "scan:offset")
+    late = [v for name, v in dlc.log[n:] if name == "laser1:scan:offset"]
+    assert len(late) <= 8  # (the lock's writes until the next poll: none after it)
+    dlc.execute("(param-set! 'laser1:scan:offset 150.0)")  # (its current set back by hand)
+    t = time.monotonic()
+    assert wait_for(lambda: ch.t > t, 2)  # (read as it is now)
+    engine.set_setpoint(1, detune(ch, 50))
+    engine.engage(1)
+    assert wait_for(lambda: ch.state == "on", 2), ch.message
+    assert wait_for(lambda: abs(ch.error_mhz) < 5, 8)
+    assert dlc.written("laser1:dl:pc:voltage-set") and dlc.current(1) == 150.0
 
 
 def test_a_laser_is_linked_to_one_channel_only(engine, demo):
@@ -287,6 +352,33 @@ def test_wavemeter_locked_laser_recovers_from_a_mode_hop(quiet_demo):
         assert_gentle(currents_written(dlc, 1), 148.0, 152.0)
         cfg = e.to_config()["channels"]["1"]["hop"]
         assert cfg["enabled"] and cfg["kv"] == ch.hop.kv  # what it learned is kept
+    finally:
+        e.stop()
+
+
+def test_a_laser_whose_scan_drives_its_current_recovers_by_its_scan_offset(quiet_demo):
+    """The demo's 423 nm laser, its scan on its current (as on the lab's TA-SHG pro): a recovery sets its current by
+    the scan's offset (its current-set drives nothing there), its piezo by dl:pc:voltage-set; the setup check says
+    which is which."""
+    demo, dlc = quiet_demo, quiet_demo.dlcs[1]
+    e, ch = hop_engine(demo, 4, dlc.key, 2, dict(enabled=True, step=0.2))
+    try:
+        e.engage(4)
+        assert wait_for(lambda: ch.state == "on" and ch.guard.armed and ch.hop.i_nom == 150.0, 5)
+        demo.laser(4).hop_mode(+1)
+        assert wait_for(lambda: ch.state == "recovering", 3)
+        assert wait_for(lambda: ch.state == "on", 30), ch.message
+        assert wait_for(lambda: abs(ch.error_mhz) < 3, 5)
+        assert demo.laser(4).ecdl.m == 0 and dlc.current(2) > 151.0  # back on its mode, by the current
+        assert_gentle([150.0] + dlc.written("laser2:scan:offset"), 148.0, 152.0)
+        assert dlc.written("laser2:dl:cc:current-set") == [] and dlc.written("laser2:dl:pc:voltage-set")
+        e.check_setup(4)
+        assert wait_for(lambda: ch.setup is not None, 5)
+        text = "\n".join(t for _, t in ch.setup)
+        assert ("its scan drives the current (scan:output-channel 51), not the piezo: the lock moves the piezo's own "
+                "set value, dl:pc:voltage-set, and recoveries the current by the scan's offset, now 15") in text
+        assert "set 15" in text and "(the scan's offset: its scan drives the current)" in text
+        assert not [lvl for lvl, _ in ch.setup if lvl == "error"], ch.setup
     finally:
         e.stop()
 

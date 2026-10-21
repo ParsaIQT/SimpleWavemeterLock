@@ -119,6 +119,15 @@ offset = offset_at_engage − (P·e + I·Σe)
   runs away, negate the gains in *Lock settings…*. In the `--sim` demo the
   866 nm laser is deliberately built the other way round, so you can watch the
   lock catch it.
+* **What it moves**: the piezo, by the scan offset (`laserN:scan:offset`), where the DLC pro's
+  scan generator drives the piezo, as it does on most. Where it drives something else (*Scan ›
+  Output channel*: the current, say, as on our second TA-SHG pro, whose scan offset is its current,
+  160 mA, its piezo at 41.3 V), the lock moves the piezo's own set value (`laserN:dl:pc:voltage-set`)
+  instead, and a recovery sets the current by the scan's offset (`dl:cc:current-set` drives nothing
+  there). Which it is, is read whenever the laser is locked or recovered, and watched: switched at the
+  DLC pro while the laser is locked, the laser is unlocked within a second (what the lock writes would
+  set something else from then on): switch it with the lock off. *Check setup…* says which it uses.
+  In `--sim`, the 423 nm laser's scan drives its current.
 * The lock is bumpless: it reads the present offset when you engage. Each reading
   moves the offset by at most *Max step* (0.25 V). The lock unlocks itself and
   says why if any of these happens:
@@ -374,8 +383,9 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   used. On the reference laser itself, the target is where the reference says it should read.
 * **Method**: how it finds a mode on target. **Catch** (the default with an SHG stage), as you
   would by hand: back onto the right mode, the one it was on target on before it hopped, by the
-  current (up, then down a step at a time until its SHG peak is back), then the piezo onto the
-  target. **Walk**: single mode first, then the piezo slowly onto the target on whatever mode that
+  current (up, then down a step at a time until its SHG peak is back; for a laser with nothing but
+  the wavemeter to go by, until it is on it, and then parked in the middle of where the mode holds:
+  see *The catch with the wavemeter alone*), then the piezo onto the target. **Walk**: single mode first, then the piezo slowly onto the target on whatever mode that
   is, keeping an eye on the mode in the SHG cavity and trimming the current when it gets worse
   (the catch falls back on it when the right mode cannot be had). **Map** (the default without
   an SHG stage): sweep the current over its window, up and down, and pick the mode that holds
@@ -624,6 +634,35 @@ the signal locked is learned at every relock (*SHG peak in a sweep … of the si
 1), and the sweep's peaks are compared as the signal locked would show them: a scope on another
 scale than the photodiode is found out at the first relock (if the catch could not catch it for
 that, the walk's relock).
+
+**The catch with the wavemeter alone**: for a DL pro with nothing else to tell how it is (no SHG
+stage, no cavity, no photodiode), a bit mode-hoppy, say. Choose *Catch* in its *Mode-hop recovery…*
+(the default there is the map).
+
+1. **Catch it**, as above: the current up to the top of its window, quickly, then down **0.1 mA at
+   a time**, a reading each, until the laser is on the right mode. A reading that says it is on
+   another mode is read three times first: on two modes at once, the wavemeter now and then reads
+   nonsense.
+2. **Find where the mode holds.** Where it was caught, coming down, is where it hopped onto the
+   mode: the mode's edge, where the next drift would make it hop again (left there, a mode-hoppy
+   laser in the simulator sat 0.03 mA from it). So, as the map would but on this mode only, the
+   current goes on down a step at a time until the laser hops off it, then back up until it hops
+   onto it again: the other mode holds on a while (hysteresis), and the mode is alone between there
+   and where it was caught. Caught where it lased already (at the top of the window), the mode goes
+   on beyond the window: it is taken to go on half as far as the other mode held on.
+3. **Park in the middle** of where it holds, the current coming up to it (the laser stays on the
+   mode), then the piezo onto the target. The note says how far it is parked from where the mode
+   ends (*parked 0.40 mA inside its mode*), the log where the mode holds: a mode that holds over
+   little of the window is worth a look by hand (its temperature, its current).
+4. **Too little of it** within the window for 0.15 mA either way (it comes back only at the window's
+   edge), or not caught at all: the modes are **mapped** instead, and the one that holds best is put
+   on the target, as the map does (not walked: there is no SHG sweep to walk by).
+
+*Recenter now* on such a laser, on its mode, looks at where it is in the mode too (down until it hops
+off and back, up until it hops off and back) and parks it in the middle (after a hop, a laser found
+still on its right mode only has its piezo moved). In the simulator, over random mode-hoppy lasers (modes 1.8 to 3 GHz apart,
+hopping one mode either way), this puts them back on their own mode with as much room as the map
+leaves (0.3 mA either way, the median), in half the readings (50 to 60, against 105 to 130).
 
 **The walk**, as you would by hand (the catch's fallback):
 
@@ -1010,6 +1049,13 @@ Things to know:
   with…* (see *Several wavemeters on one PC*).
 * **Lock runs away straight after engaging**: the gain sign is wrong for that
   laser; negate P and I.
+* **`offset 160.000 outside 0 … 140`, or `the offset, 160.00 V, is outside 0 … 140 V`, on a laser whose
+  scan drives its current** (a TA-SHG pro, say): from a version before this one, which took the scan
+  offset for the piezo; this one moves the piezo's own set value there (see *The lock*). *piezo voltage
+  (dl:pc:voltage-set) … outside*: the piezo itself is outside the lock's limits (*Lock settings…*).
+  *cannot lock: its scan offset is 160.000 mA, not the piezo*: its controller does not say what its scan
+  drives (`scan:output-channel`), so it is not locked by the scan offset; set the scan's output channel to
+  the piezo at the DLC pro, or update its firmware.
 
 ## Wavemeter server (optional)
 
@@ -1094,4 +1140,9 @@ never a reading of one passed to the other (the tests fail if the DLL is not set
 the readings' wavemeter not checked after); a channel switched on its own wavemeter; one not running
 not stood in for; the settings given the wavemeter their setpoints know; two copies of the program
 kept off each other's; swapped; through server.py; and in the window and on another PC, each framed
-under its own name and adjusted from there.
+under its own name and adjusted from there. The fake controllers' scan generator drives the piezo, or
+the current (as on the TA-SHG pro that read 160 mA there), and switching it by hand keeps every output
+where it was: the lock moves the piezo either way, a recovery the current, nothing else is written,
+and switching it while locked unlocks it. The catch with the wavemeter alone runs against mode-hoppy
+lasers (a Monte Carlo too): caught back on the right mode and parked in the middle of where it holds,
+mapped instead when too little of it is in the window, centered by *Recenter now*.

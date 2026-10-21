@@ -35,7 +35,8 @@ import statistics
 
 from . import cavity
 from . import modehop as mh
-from .dlcpro import IO_VALUE, SHG_INTRA, DecopError, float_arrays, lock_points, signal_name
+from .dlcpro import (IO_VALUE, OUT_CC, SCAN_OFFSET, SCAN_OUT, SHG_INTRA, DecopError, drives, float_arrays, lock_points,
+                     output_name, signal_name)
 
 LOCK = "dl:lock:lock-enabled"
 SCAN = "scan:enabled"
@@ -919,14 +920,19 @@ def setup_report(client, laser: int, hop, lp) -> list:
     except ValueError:
         fw = None
 
-    g = get("dl:cc:current-set", "dl:cc:current-act", "dl:cc:current-clip", "dl:cc:current-offset",
+    out_ch = get(SCAN_OUT)[SCAN_OUT]  # what its scan drives: which parameters set its piezo and its current
+    out_ch = int(out_ch) if _num(out_ch) else None
+    piezo, cc = drives(out_ch)
+    g = get(cc, "dl:cc:current-act", "dl:cc:current-clip", "dl:cc:current-offset",
             "dl:cc:feedforward-enabled", "dl:cc:feedforward-factor", "dl:cc:output-filter:slew-rate-enabled",
             "dl:cc:output-filter:slew-rate")
     add("head", "Current")
-    i, act, clip = g["dl:cc:current-set"], g["dl:cc:current-act"], g["dl:cc:current-clip"]
+    i, act, clip = g[cc], g["dl:cc:current-act"], g["dl:cc:current-clip"]
     off = act - i if _num(i) and _num(act) else None
     add("ok" if _num(i) and _num(act) else "error",
-        f"measured {fmt(act, ' mA')}, set {fmt(i, ' mA')}" + (f" ({off:+.3f} mA apart)" if off is not None else "")
+        f"measured {fmt(act, ' mA')}, set {fmt(i, ' mA')}" + (" (the scan's offset: its scan drives the current)"
+                                                             if cc == SCAN_OFFSET else "")
+        + (f" ({off:+.3f} mA apart)" if off is not None else "")
         + f", limit (current-clip, on the set current) {fmt(clip, ' mA')}")
     ff, factor = g["dl:cc:feedforward-enabled"], g["dl:cc:feedforward-factor"]
     add("info", f"current offset {fmt(g['dl:cc:current-offset'], ' mA')}; feedforward from the piezo "
@@ -997,20 +1003,34 @@ def setup_report(client, laser: int, hop, lp) -> list:
                 add("info", "a master that does not lase may still send its TA much of its power as broadband "
                             "light: the SHG sweep has the last word (flat, it does not lase; see SHG below)")
 
-    g = get("scan:offset", "scan:enabled", "scan:amplitude", "scan:frequency", "scan:unit")
+    g = get(*dict.fromkeys((piezo, SCAN_OFFSET, "scan:enabled", "scan:amplitude", "scan:frequency", "scan:unit")))
     add("head", "Piezo and scan")
-    v = g["scan:offset"]
+    v, unit = g[piezo], g["scan:unit"] or "V"
     inside = _num(v) and lp.v_min <= v <= lp.v_max
-    add("ok" if inside else "error", f"offset {fmt(v, ' V')} (lock limits {lp.v_min:g} … {lp.v_max:g} V); "
+    what = "offset" if piezo == SCAN_OFFSET else f"piezo voltage ({piezo})"
+    add("ok" if inside else "error", f"{what} {fmt(v, ' V')} (lock limits {lp.v_min:g} … {lp.v_max:g} V); "
                                      f"recoveries move it at most ±{hop.v_window:g} V"
                                      + (f" (the catch's tries: the optimum's ±{hop.pc_try:g} V)"
                                         if hop.how() == "catch" and hop.pc_try > 0 else ""))
-    add("ok", f"scan {fmt(g['scan:enabled'])}, amplitude {fmt(g['scan:amplitude'], ' V')}, "
-              f"{fmt(g['scan:frequency'], ' Hz', 1)}")
+    if out_ch is None:
+        add("info", f"what its scan drives is not known ({SCAN_OUT} cannot be read): its offset is taken for the piezo")
+    elif piezo == SCAN_OFFSET:
+        add("ok", f"its scan drives the piezo ({SCAN_OUT} {out_ch}): the lock moves the scan's offset")
+    else:
+        add("info", f"its scan drives {output_name(out_ch)} ({SCAN_OUT} {out_ch}), not the piezo: the lock moves the "
+                    f"piezo's own set value, {piezo}" + (f", and recoveries the current by the scan's offset, now "
+                                                        f"{fmt(g[SCAN_OFFSET], ' ' + unit)}" if out_ch == OUT_CC
+                                                        else ""))
+    scanning = g["scan:enabled"] is True and out_ch == OUT_CC
+    add("warn" if scanning else "ok", f"scan {fmt(g['scan:enabled'])}, amplitude {fmt(g['scan:amplitude'], ' ' + unit)}"
+                                      f", {fmt(g['scan:frequency'], ' Hz', 1)}"
+                                      + (": it sweeps the current while it runs, which no lock holds through: "
+                                         "switch it off" if scanning else ""))
     amp = g["scan:amplitude"]
     if hop.kv:
         add("info", f"measured piezo tuning {hop.kv / 1e3:+.3f} GHz/V"
-                    + (f": the scan spans {abs(hop.kv) * amp / 1e3:.2f} GHz" if _num(amp) else "")
+                    + (f": the scan spans {abs(hop.kv) * amp / 1e3:.2f} GHz" if _num(amp) and piezo == SCAN_OFFSET
+                       else "")
                     + (f", modes {hop.spacing / 1e3:.2f} GHz apart" if hop.spacing else ""))
 
     if hop.cavity:
@@ -1206,9 +1226,14 @@ def setup_report(client, laser: int, hop, lp) -> list:
                     f"+ and - {hop.pc_try:g} V; then the piezo onto the target in {hop.walk_step:g} V steps, the "
                     f"current parked high in the mode every 4. A laser on the right mode and as good as that is only "
                     f"relocked. Not to be had at all: the mode it is on walked onto the target instead (walk)")
+        if not hop.shg:
+            add("info", f"with nothing but the wavemeter (no SHG stage): caught where it is on the right mode coming "
+                        f"down, it is at the mode's edge; so the current goes on down until it hops off and back up "
+                        f"until it is on it again, {hop.step:g} mA at a time, and it is parked in the middle of where "
+                        f"the mode holds. Too little of it in the window, or not caught: the modes are mapped instead")
         if hop.optimum:
-            g = get("scan:offset", "dl:cc:current-act")
-            v, act = g["scan:offset"], g["dl:cc:current-act"]
+            g = get(piezo, "dl:cc:current-act")
+            v, act = g[piezo], g["dl:cc:current-act"]
             add("ok", f"the optimum, taken {hop.opt_t or 'by hand'}: {hop.opt_i:.2f} mA, {hop.opt_v:.2f} V"
                       + (f", SHG {hop.opt_shg:.3f} V locked" if hop.opt_shg else "")
                       + (f" (now {act:.2f} mA, {v:.2f} V)" if _num(v) and _num(act) else ""))

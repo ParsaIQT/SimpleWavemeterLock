@@ -216,7 +216,7 @@ class Row(QtWidgets.QFrame):
                   "below its level locked);\n"
                   "if it is not locked on target now, relock it now. It does nothing else: the piezo\n"
                   "is its lock's. Watching: click to stop watching.")
-    LOCK_TIP = "Lock to the wavemeter: the scan offset follows the reading onto the setpoint."
+    LOCK_TIP = "Lock to the wavemeter: the piezo (its scan offset, as a rule) follows the reading onto the setpoint."
 
     def __init__(self, win: "MainWindow", n: int):
         super().__init__()
@@ -1114,8 +1114,9 @@ class HopDialog(QtWidgets.QDialog):
               ("lockpoint", "pick the right peak and select it as the lockpoint, as by hand"),
               ("plain", "re-enable the lock and let it find its resonance"))
     METHOD = (("auto", "catch with an SHG stage, else map"),
-              ("catch", "catch: back onto its own mode by the current (up, then down until its SHG peak is back), "
-                        "then the piezo onto the target"),
+              ("catch", "catch: back onto its own mode by the current (up, then down until it is on it: its SHG peak "
+                        "back; with the wavemeter alone, parked in the middle of where its mode holds), then the "
+                        "piezo onto the target"),
               ("walk", "walk: single mode first, then the piezo slowly onto the target, as by hand"),
               ("map", "map: sweep the current over the window, up and down, and pick the best mode"))
 
@@ -1594,9 +1595,11 @@ class RecoveryDialog(QtWidgets.QDialog):
         last = c["points"][-1] if c["points"] else None
         end = (f"caught at {last[0]:.2f} mA" + (f", its SHG peak {last[2]:.2f} of the optimum's" if last[2] is not None
                                                 else "")) if c.get("caught") and last else "not caught"
+        shg = any(p[2] is not None for p in c["points"])
         return self._box(f"go {c.get('go', '?')} at {c.get('v', 0):.2f} V: frequency from the target against the "
-                         f"current, coming down from the top of the window; the right mode shaded; green its SHG peak "
-                         f"within {100 * (1 - least):.0f} % of the optimum's, × not, grey not looked at: {end}", plot)
+                         f"current, coming down from the top of the window; the right mode shaded; "
+                         + (f"green its SHG peak within {100 * (1 - least):.0f} % of the optimum's, × not, grey not "
+                            f"looked at: " if shg else "by the wavemeter alone: ") + end, plot)
 
     def _walk(self, pts):
         """The walk: frequency from the target against the scan offset, the mode as the SHG sweep had

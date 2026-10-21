@@ -19,7 +19,7 @@ import threading
 import time
 
 from . import dac as daclib
-from .dlcpro import DISCOVERY_PORT
+from .dlcpro import CURRENT_SET, DISCOVERY_PORT, OUT_CC, OUT_PC, PIEZO_SET, SCAN_OFFSET, SCAN_OUT
 from .wavemeter import C_NM_THZ, Found, Source
 
 
@@ -48,7 +48,14 @@ class FakeDLCPro:
 
     A laser's measured current (current-act) is its set current plus current-offset, plus the
     feedforward from the piezo (feedforward-factor mA/V times the scan offset, when enabled), plus
-    a fixed bias (its config's "act_offset", mA): set and measured current differ, as they do."""
+    a fixed bias (its config's "act_offset", mA): set and measured current differ, as they do.
+
+    Its scan generator drives the piezo (scan:output-channel 50), or with "scan_out" in its config
+    something else: 51 the current. The scan's offset is then that output's set value (the current,
+    in mA, within current-clip), and the piezo is set by dl:pc:voltage-set, as by hand; whatever
+    else is set (current-set, voltage-set while the scan drives the piezo) is kept but drives
+    nothing. Switched to another output, the scan's offset takes that output's value: nothing
+    jumps."""
 
     _REF = re.compile(r"\(param-ref '([\w:-]+)\)$")
     _SET = re.compile(r"\(param-set! '([\w:-]+) (\S+)\)$")
@@ -64,12 +71,15 @@ class FakeDLCPro:
         }
         for n, d in lasers.items():
             p = f"laser{n}:"
+            out = int(d.get("scan_out", OUT_PC))
             self.params.update({
                 p + "product-name": f'"{d.get("product", "DL pro")}"', p + "type": '"DL pro"',
-                p + "label": f'"{d.get("label", "")}"', p + "scan:unit": '"V"',
-                p + "scan:enabled": bool(d.get("scan", False)), p + "scan:offset": float(d.get("offset", 70.0)),
+                p + "label": f'"{d.get("label", "")}"', p + "scan:unit": '"mA"' if out == OUT_CC else '"V"',
+                p + "scan:enabled": bool(d.get("scan", False)), p + SCAN_OUT: out,
+                p + SCAN_OFFSET: float(d.get("current", 150.0) if out == OUT_CC else d.get("offset", 70.0)),
                 p + "scan:amplitude": float(d.get("amplitude", 2.5)), p + "scan:frequency": 20.0,
                 p + "emission": True,
+                p + PIEZO_SET: float(d.get("offset", 70.0)),
                 p + "dl:cc:current-set": float(d.get("current", 150.0)),
                 p + "dl:cc:current-act": lambda n=n: self.current_act(n),
                 p + "dl:cc:current-offset": 0.0,
@@ -82,7 +92,8 @@ class FakeDLCPro:
         self.bias = {n: float(d.get("act_offset", 0.0)) for n, d in lasers.items()}
         self.sets = 0
         self.log = []  # every accepted write: (parameter, value); every command: (name, args)
-        self.on_set = {}
+        self._drove = {}  # laser -> (piezo, current) when its scan was last switched to another output
+        self.on_set = {f"laser{n}:{SCAN_OUT}": lambda out, n=n: self._scan_moved(n) for n in lasers}
         self.commands = {}
         self.busy_checks = []  # (kind 'get' | 'set' | 'exec', name) -> True: refused now as busy (decop -1032)
         self.mutex = threading.RLock()  # held while a command line is executed
@@ -99,19 +110,38 @@ class FakeDLCPro:
     def key(self) -> str:
         return f"{self.host}:{self.port}"
 
+    def drives(self, n: int) -> tuple:
+        """(piezo, current): the parameters that set laser n's piezo voltage and current, by what its scan drives."""
+        out = self.params[f"laser{n}:{SCAN_OUT}"]
+        return (SCAN_OFFSET if out == OUT_PC else PIEZO_SET), (SCAN_OFFSET if out == OUT_CC else CURRENT_SET)
+
     def offset(self, n: int) -> float:
-        return self.params[f"laser{n}:scan:offset"]
+        """Its piezo voltage (V): the scan's offset, as a rule."""
+        return self.params[f"laser{n}:{self.drives(n)[0]}"]
+
+    piezo = offset
 
     def current(self, n: int) -> float:
-        return self.params[f"laser{n}:dl:cc:current-set"]
+        """Its set current (mA)."""
+        return self.params[f"laser{n}:{self.drives(n)[1]}"]
 
     def current_act(self, n: int) -> float:
         """The diode current, as measured: what the laser runs at."""
         p, d = f"laser{n}:", self.params
-        i = d[p + "dl:cc:current-set"] + d[p + "dl:cc:current-offset"] + self.bias.get(n, 0.0)
+        i = self.current(n) + d[p + "dl:cc:current-offset"] + self.bias.get(n, 0.0)
         if d[p + "dl:cc:feedforward-enabled"]:
-            i += d[p + "dl:cc:feedforward-factor"] * d[p + "scan:offset"]
+            i += d[p + "dl:cc:feedforward-factor"] * self.offset(n)
         return i
+
+    def _scan_moved(self, n: int):
+        """Its scan was switched to another output: its offset takes that output's value, and the one it left keeps its
+        own (nothing jumps)."""
+        p, d = f"laser{n}:", self.params
+        was_v, was_i = self._drove[n]
+        out = d[p + SCAN_OUT]
+        d[p + PIEZO_SET], d[p + CURRENT_SET] = was_v, was_i
+        d[p + SCAN_OFFSET] = was_i if out == OUT_CC else was_v if out == OUT_PC else d[p + SCAN_OFFSET]
+        d[p + "scan:unit"] = '"mA"' if out == OUT_CC else '"V"'
 
     def written(self, param: str) -> list:
         """Values written to `param`, oldest first."""
@@ -209,8 +239,13 @@ class FakeDLCPro:
                     return "-3"
             else:
                 return f"Error: -14 cannot set '{name}'"
-            if name.endswith("dl:cc:current-set") and new > self.params[name[:-3] + "clip"]:
-                return "Error: -21 above current-clip"
+            head, _, rest = name.partition(":")
+            n = int(head[5:]) if head.startswith("laser") and head[5:].isdigit() else None
+            if n is not None and f"{head}:{SCAN_OUT}" in self.params:
+                if rest == self.drives(n)[1] and new > self.params[f"{head}:dl:cc:current-clip"]:
+                    return "Error: -21 above current-clip"
+                if rest == SCAN_OUT:  # (where the outputs were, for _scan_moved)
+                    self._drove[n] = (self.offset(n), self.current(n))
             self.params[name] = new
             hook = self.on_set.get(name)
             if hook is not None:
@@ -647,7 +682,7 @@ class SimLocked:
         return not self._get("dl:lock:lock-without-lockpoint")
 
     def _vi(self):
-        return self._get("scan:offset"), self.dlc.current_act(self.n)
+        return self.dlc.piezo(self.n), self.dlc.current_act(self.n)
 
     def dc(self) -> float:
         """The error signal's DC level as the FALC sees it: its own offset plus the input offset."""
@@ -1174,7 +1209,7 @@ class SimLaser:
         self._mutex = threading.Lock()
         if dlc is not None:
             self.ecdl = ECDL(self.f0, kv=tuning, v0=offset0, i0=dlc.current_act(n), seed=seed)
-            for name in ("dl:cc:current-set", "scan:offset"):
+            for name in (CURRENT_SET, SCAN_OFFSET, PIEZO_SET):
                 dlc.on_set[f"laser{n}:{name}"] = self._settle
 
     def _settle(self, _value):
@@ -1215,8 +1250,7 @@ class SimLaser:
                 return self.f0 + ghz * 1e-3 + wobble * 1e-6
             if self.ecdl is None:
                 return self.f0 + wobble * 1e-6
-            p, params = f"laser{self.n}:", self.dlc.params
-            v, i = params[p + "scan:offset"], self.dlc.current_act(self.n)
+            v, i = self.dlc.piezo(self.n), self.dlc.current_act(self.n)
             f = self.ecdl.freq(v, i, wobble) if self.lock is None else self.lock.frequency(wobble)
             return f if math.isfinite(f) else None  # not lasing
 
@@ -1249,8 +1283,7 @@ class SimLaser:
             e.nudge(a - direction * (edge + 0.66 * (full - edge)))
 
     def _vi(self):
-        p = f"laser{self.n}:"
-        v = self.dlc.params[p + "scan:offset"] + (self.lock.dv if self.lock is not None else 0.0)
+        v = self.dlc.piezo(self.n) + (self.lock.dv if self.lock is not None else 0.0)
         return v, self.dlc.current_act(self.n)
 
     # faults of the reference laser (cavity=True)
@@ -1359,7 +1392,8 @@ class SimSource(Source):
 
 
 class Demo:
-    """Three fake controllers: two with two DL pros each, wavemeter-locked; one with a TA-SHG pro
+    """Three fake controllers: two with two DL pros each, wavemeter-locked (the 423 nm one's scan generator drives its
+    current, as on the lab's second TA-SHG pro: its piezo is set by dl:pc:voltage-set); one with a TA-SHG pro
     whose DLC pro locks its master to a reference cavity (lockpoint selected by hand, PDH through
     a FALC pro) and its SHG cavity to the master, and feeds its piezo forward to its current (the
     measured current is 0.42 mA below the set one); its master stops lasing 1.3 mA below its
@@ -1393,7 +1427,8 @@ class Demo:
         numbers (else 1001, 1002)."""
         self.dlcs = [
             FakeDLCPro("SIM-000123", "Ca+ blue", {1: {"product": "DL pro 397"}, 2: {"product": "DL pro 866"}}),
-            FakeDLCPro("SIM-000456", "Ca+ red", {1: {"product": "DL pro 854"}, 2: {"product": "DL pro 423"}}),
+            FakeDLCPro("SIM-000456", "Ca+ red", {1: {"product": "DL pro 854"},
+                                                 2: {"product": "DL pro 423", "scan_out": OUT_CC}}),
             FakeDLCPro("SIM-000789", "Yb+ SHG", {1: {"product": "TA-SHG pro 739", "scan": True,
                                                     "feedforward": -0.006}}),  # measured 0.42 mA below set
         ]

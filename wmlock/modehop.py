@@ -36,6 +36,11 @@ Three ways to a mode on target (HopParams.method):
         trimmed back), the current parked high in the mode every REPARK_EVERY steps (up while the peak
         stays at its best, then back). The right mode not to be had at all: the walk, from where it
         began, on the mode it is on there.
+        With nothing but the wavemeter (no SHG sweep: a plain DL pro), caught where it is on the
+        right mode, coming down: that is its edge, where it hopped onto it. So where the mode holds
+        is found as the map would, on this mode only (center): on down until it hops off, back up
+        until it hops onto it again (the mode is alone above there); parked in the middle of where
+        it holds, from below. Too little of it in the window, or not caught: the map instead.
   walk  as by hand (the catch's fallback). Single mode first: the SHG cavity scanned,
         its sweep looked at, the current trimmed a step at a time (up first) while the sweep gets
         no worse, until it is single-mode. Within `reach` of the target (else hop to a mode that
@@ -732,6 +737,8 @@ class Recenter(CavitySteps):
         self.fell_back = ""                 # the right mode not caught (why): walked the mode it was on instead
         self.seen_right = 0                 # goes that saw the right mode
         self.q_right = 0.0                  # ...its best SHG peak on them
+        self.parked_room = None             # mA: parked by the wavemeter alone (center), how far from where it ends
+        self.narrow = ""                    # ...the right mode alone over too little of the window for that (why)
         CavitySteps.__init__(self, p.shg if shg is None else shg)
 
     # ---------------------------------------------------------------- helpers
@@ -1938,6 +1945,14 @@ class Recenter(CavitySteps):
                 if not (yield from self.catch()):
                     yield from self.fall_back(self.not_caught())
                     return
+            elif rnd == 0 and self.caught is None and not self.quick and not self.shg_ok:
+                self.note("on the right mode: Recenter now, so where it is in the mode is looked at too, by the "
+                          "wavemeter")  # (else only the piezo would move)
+                if not (yield from self.center(False)):
+                    if self.narrow:
+                        yield from self.fall_back(self.narrow)
+                        return
+                    continue  # (it hopped off the mode: caught again)
             elif rnd == 0 and self.caught is None:
                 self.note("on the right mode" + (f", its SHG peak {self.q:.2f} of the optimum's" if self.q is not None
                                                  else "") + ": only the piezo onto the target")
@@ -1967,13 +1982,15 @@ class Recenter(CavitySteps):
     def fall_back(self, why: str):
         """The right mode cannot be had on target: better locked on another mode than not at all (its modes far
         apart, say, the right one beyond the window). Back where it began, and the mode it is on there walked onto
-        the target, as the walk does."""
+        the target, as the walk does; with nothing but the wavemeter to tell how a mode is (no SHG sweep), the modes
+        mapped instead, and the one that holds best put on the target, as the map does."""
         self.fell_back = why
-        self.note(f"{why}: back where it began, and the mode it is on there walked onto the target instead, as the "
-                  f"walk does")
-        self.method = "walk"
+        self.method = "walk" if self.shg_ok else "map"
+        self.note(f"{why}: back where it began, and " + (
+            "the mode it is on there walked onto the target instead, as the walk does" if self.shg_ok else
+            "the modes mapped instead, and the one that holds best put on the target, as the map does"))
         yield from self.go_back()
-        yield from self.walk()
+        yield from (self.walk() if self.shg_ok else self.find())
 
     def off_right(self) -> float:
         """MHz from where the right mode would be, here: on target where the laser was before it hopped (ref), moved
@@ -2092,6 +2109,8 @@ class Recenter(CavitySteps):
                     return False
                 if (yield from self.sweep_down()):
                     return True
+                if self.narrow:
+                    return False  # (the same again would not do better)
         return False
 
     def sweep_down(self):
@@ -2111,9 +2130,13 @@ class Recenter(CavitySteps):
         yield from self.arrive()
         self.stage = f"catching the right mode ({self.tries}): sweeping down"
         yield from self.read()
-        pts, seen, caught, best = [], False, False, None
+        pts, seen, caught, best, above = [], False, False, None, False
         while True:
             on, q = self.right_mode(), None
+            if not on and not above and not seen and not self.shg_ok and math.isfinite(self.e):
+                yield from self.steady()  # (on another mode up there? one odd reading does not say so: the
+                on = self.right_mode()    # wavemeter reads nonsense now and then where the laser is on two)
+                above = not on and math.isfinite(self.e)  # (where it is caught is then where it hopped onto it)
             if on:
                 seen = True
                 q = yield from self.quality("catching")
@@ -2148,13 +2171,123 @@ class Recenter(CavitySteps):
             self.note(f"caught the right mode at {self.mA(self.I):.2f} mA, {self.V:.2f} V (go {self.tries}): "
                       f"{self.e / 1e3:+.3f} GHz from the target" + (f", its SHG peak {self.q:.2f} of the optimum's"
                                                                    if self.q is not None else ""))
-            yield from self.settle_top()
+            if self.shg_ok:
+                yield from self.settle_top()
+            elif not (yield from self.center(above)):
+                self.caught = None
+                return False
         else:
             self.note(f"go {self.tries} at {self.V:.2f} V: " + (
                 "not on the right mode anywhere down to " if not seen else
                 (f"on the right mode, but its SHG peak no more than {best:.2f} of the optimum's, down to "
                  if best is not None else "on the right mode, not for long, down to ")) + f"{self.mA(self.I):.2f} mA")
         return caught
+
+    def center(self, edge: bool):
+        """On the right mode with nothing but the wavemeter to tell how the mode is (no SHG sweep), where the mode
+        holds is found, as the map finds it, on this mode only, at this piezo voltage: the current on down a step at
+        a time, a reading each, until it hops off the mode (or the window ends), then back up until it hops onto it
+        again (hysteresis: the other mode holds on a while; the mode is alone above there). edge: it was caught coming
+        down, where it hopped onto the mode (its top edge); else, unless that is the window's top, the same upwards
+        (Recenter now). Parked, the way that keeps it on the mode, in the middle of where it holds: from where it
+        hops off going down to as far above where it hopped onto it as the other mode held on going up (caught where
+        it lased already, at the window's top, half that: beyond it, how far it goes on is not known); with no hop
+        below (the window's bottom), a margin below its top edge. True once parked; False if it did not come back onto
+        the right mode (it is caught again), or if the mode is alone over too little of the window for MIN_MARGIN
+        either way (self.narrow says so: the modes are mapped instead)."""
+        p = self.p
+        top = self.I
+        self.stage = "finding where the mode it was caught on ends"
+        yield from self.ask(f"Find where the mode ends: the current down {p.step:g} mA at a time from "
+                            f"{self.mA(top):.2f} mA until it hops off it, then up until it is back on it, and park "
+                            f"in the middle")
+        lowest, off, e = top, None, self.e
+        while True:
+            i0 = self.I
+            if not (yield from self.trim(-1)):
+                break  # (the bottom of the window: it lases on it down there)
+            if self._hop and (yield from self.hopped(e, self.I - i0)):
+                self.hop_seen(e, self.e, self.I - i0)
+                off = self.I
+                break
+            lowest, e = self.I, self.e
+        back = lowest
+        if off is not None:  # (back up onto it: hysteresis keeps it on the other mode a while)
+            self.stage = "back up onto the mode it was caught on"
+            back = None
+            while self.I < top - 1e-9 and (yield from self.trim(+1)):
+                if self.right_mode():
+                    yield from self.steady()  # (one odd reading does not count)
+                    if self.right_mode():
+                        back = self.I
+                        break
+            if back is None:
+                self.note(f"the mode it was caught on lases coming down to {self.mA(lowest):.2f} mA, and going up "
+                          f"from there it did not come back onto it by {self.mA(self.I):.2f} mA: caught again")
+                return False
+        if not edge and top < self.i_hi - p.step / 2:  # (where it began is not where it hopped onto it, and the window
+            self.stage = "finding where the mode ends above"  # goes on: up until it hops off there too, and back)
+            highest, up, e = self.I, None, self.e
+            while True:
+                i0 = self.I
+                if not (yield from self.trim(+1)):
+                    break  # (the top of the window: it lases on it up there)
+                if self._hop and (yield from self.hopped(e, self.I - i0)):
+                    self.hop_seen(e, self.e, self.I - i0)
+                    up = self.I
+                    break
+                highest, e = self.I, self.e
+            top = highest
+            if up is not None:  # (back down onto it: as far below as the other mode holds on)
+                self.stage = "back down onto the mode"
+                again = None
+                while self.I > back + 1e-9 and (yield from self.trim(-1)):
+                    if self.right_mode():
+                        yield from self.steady()
+                        if self.right_mode():
+                            again = self.I
+                            break
+                if again is None:
+                    self.note(f"the mode lases going up to {self.mA(highest):.2f} mA, and coming down from there it "
+                              f"did not come back onto it by {self.mA(self.I):.2f} mA: caught again")
+                    return False
+                top, edge = again, True
+        if off is not None:  # the middle of where it holds: from where it hops off going down to where it hops off
+            lo = 0.5 * (lowest + off)  # going up, as much above where it hopped on as the other mode held on going
+            held = back - lo           # up (held); caught where it lased already, at the window's top, half that
+            op = 0.5 * (lo + top + (held if edge else 0.5 * held))  # (between what could be and the least it is)
+        elif edge:  # (alone just below where it hopped on: how far, the window does not show)
+            op = top - min(p.margin, 0.5 * (top - lowest))
+        else:
+            op = 0.5 * (lowest + top)
+        a, z = back + self.MIN_MARGIN, top - (self.MIN_MARGIN if edge else 0.0)
+        op = min(max(op, a), z) if a <= z else 0.5 * (back + top)
+        room = min(op - back, top - op) if edge else op - back
+        where = (f"alone {self.mA(back):.2f}–{self.mA(top):.2f} mA" if off is not None and edge else
+                 f"alone from {self.mA(back):.2f} mA up to the window's top, {self.mA(top):.2f} mA, at least"
+                 if off is not None else f"lasing on it {self.mA(lowest):.2f}–{self.mA(top):.2f} mA, the window's "
+                                         "bottom on")
+        self.record["center"] = {"v": round(self.V, 3), "top": round(self.mA(top), 3), "edge": edge,
+                                 "lowest": round(self.mA(lowest), 3), "off": off is not None,
+                                 "back": round(self.mA(back), 3), "op": round(self.mA(op), 3), "room": round(room, 3)}
+        if room < self.MIN_MARGIN - 1e-9:
+            self.narrow = (f"the right mode is {where}: too little of it for a margin of {self.MIN_MARGIN:g} mA "
+                           f"either way")
+            self.note(self.narrow)
+            return False
+        way = "below" if op > self.I else "above"
+        if abs(op - self.I) > 1e-9:
+            yield from self.move(current=op)
+        if not self.right_mode():
+            yield from self.steady()
+        if not self.right_mode():
+            self.note(f"parking on the mode it was caught on, at {self.mA(op):.2f} mA, it was off it "
+                      f"({self.e / 1e3:+.3f} GHz from the target): caught again")
+            return False
+        self.parked_room = room
+        self.note(f"the mode it was caught on: {where}; parked at {self.mA(op):.2f} mA, from {way} "
+                  f"({room:.2f} mA from where it ends, the nearer way, or the window's edge)")
+        return True
 
     def settle_top(self):
         """Caught coming down, it is at the top edge of the mode: on down while its SHG peak grows, to where the mode is
@@ -2205,6 +2338,8 @@ class Recenter(CavitySteps):
         """Why the catch failed, for its message."""
         p = self.p
         where = f"in {self.mA(self.i_lo):.2f} … {self.mA(self.i_hi):.2f} mA"
+        if self.narrow:
+            return self.narrow
         if not self.seen_right:
             return (f"the right mode ({self.right_text()}) did not come, going up and sweeping down {self.tries} "
                     f"times, {where}")
@@ -2407,7 +2542,10 @@ class Recenter(CavitySteps):
         else:
             summary = f"the laser itself was fine; piezo {self.V0:.2f} → {self.V:.2f} V"
         if self.fell_back:
-            summary = "the right mode not caught, walked the mode it was on instead: " + summary
+            summary = ("the right mode not caught, " + ("mapped instead: " if self.method == "map" else
+                                                         "walked the mode it was on instead: ") + summary)
+        elif self.parked_room is not None:  # (by the wavemeter alone: where its mode ends, the nearer way)
+            summary += f"; parked {self.parked_room:.2f} mA inside its mode"
         if self.panics:
             summary = (f"stopped lasing{f' {self.panics} times' if self.panics > 1 else ''}, lasing again; "
                        + summary)
@@ -2798,9 +2936,10 @@ class Runner:
             self._waiting, self.prompt = None, ""
             self._send(True)
 
-    def cancel(self, why: str = "cancelled"):
+    def cancel(self, why: str = "cancelled", keep: bool = False):
+        """Stop, and put things back (keep: but current and offset, which stay where they are)."""
         if self.state == "running":
-            self._fail(why)
+            self._fail(why, keep=keep)
 
     # -------------------------------------------------------------------- ends
     def _fail(self, why: str, keep: bool = False):

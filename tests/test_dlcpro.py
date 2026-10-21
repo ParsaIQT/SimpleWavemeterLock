@@ -152,3 +152,33 @@ def test_decode_and_bad_binary_data():
     with pytest.raises(DecopError):
         data_blocks(b"xab\x00abc")  # bad length
     assert data_blocks(b"") == []
+
+
+def test_which_parameters_set_the_piezo_and_the_current_is_what_the_scan_drives():
+    """The scan's offset is the DC level of whatever its scan generator drives: the piezo, as a rule; on the lab's
+    TA-SHG pro, the current (160 mA there, its piezo at 41.3 V on its own set value)."""
+    from wmlock.dlcpro import drives, output_name, scan_output
+
+    assert drives(50) == drives(None) == ("scan:offset", "dl:cc:current-set")  # (not known: as on most)
+    assert drives(51) == ("dl:pc:voltage-set", "scan:offset")
+    assert drives(20) == ("dl:pc:voltage-set", "dl:cc:current-set")  # (Out A: neither)
+    assert output_name(51) == "the current" and output_name(21) == "Out B" and output_name(77) == "output channel 77"
+    fake = FakeDLCPro("SN-2", "TA-SHG", {1: {"product": "TA-SHG pro", "scan_out": 51, "current": 160.0,
+                                              "offset": 41.3}})
+    try:
+        c = DLCPro("127.0.0.1", fake.port)
+        assert scan_output(c, 1) == 51 and c.get_float("laser1:scan:offset") == 160.0
+        assert c.get_str("laser1:scan:unit") == "mA" and c.get_float("laser1:dl:pc:voltage-set") == 41.3
+        assert fake.piezo(1) == 41.3 and fake.current(1) == 160.0
+        assert c.set("laser1:scan:offset", 160.2) == 0 and fake.current_act(1) == pytest.approx(160.2)
+        assert c.set("laser1:dl:cc:current-set", 150.0) == 0 and fake.current(1) == 160.2  # (it drives nothing)
+        with pytest.raises(DecopError, match="current-clip"):
+            c.set("laser1:scan:offset", 250.0)
+        assert c.set("laser1:scan:output-channel", 50) == 0  # switched by hand to the piezo: nothing jumps
+        assert fake.piezo(1) == 41.3 and fake.current(1) == pytest.approx(160.2)
+        assert c.get_float("laser1:scan:offset") == 41.3 and c.get_str("laser1:scan:unit") == "V"
+        del fake.params["laser1:scan:output-channel"]
+        assert scan_output(c, 1) is None  # (a controller that does not say)
+        c.close()
+    finally:
+        fake.close()

@@ -82,7 +82,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 from . import dac
-from .dlcpro import DLCPro, DecopError, Device, discover, probe
+from .dlcpro import SCAN_OUT, DLCPro, DecopError, Device, discover, drives, output_name, probe, scan_output
 from .dropouts import Monitor as DropoutMonitor
 from .dropouts import log as drop_log
 from .lock import Lock, LockParams
@@ -94,13 +94,13 @@ from .wavemeter import C_NM_THZ, NAN
 log = logging.getLogger(__name__)
 meter_log = logging.getLogger("wmlock.meters")  # (which wavemeter each one's settings are for: said at INFO)
 
-ACTUATOR = "scan:offset"  # the DLC pro parameter the lock writes, below laserN:
-CURRENT = "dl:cc:current-set"
+ACTUATOR = "scan:offset"  # the DLC pro parameter the lock writes, below laserN: (where its scan drives the piezo, as
+CURRENT = "dl:cc:current-set"  # it does on most; else Channel.piezo, and the current Channel.cc: dlcpro.drives)
 CURRENT_ACT = "dl:cc:current-act"
 CAVITY_LOCK = "dl:lock:lock-enabled"
 SHG_STATE = "nlo:shg:lock:state-txt"
 SHG_INTRA = "nlo:pd:shg-int:photodiode"
-WATCHED = (ACTUATOR, CURRENT, CURRENT_ACT, CAVITY_LOCK, "dl:lock:state-txt", SHG_STATE, SHG_INTRA)
+WATCHED = (CURRENT_ACT, CAVITY_LOCK, "dl:lock:state-txt", SHG_STATE, SHG_INTRA, SCAN_OUT)  # (and its piezo, current)
 FINE_N = 600   # polls: a level locked as usual is the median of the last this many running as it should...
 FINE_MIN = 10  # ...once there are this many (until then, the one learned before)
 DAC_LOCK = dict(kp=0.0, ki=0.01, max_step=0.02, v_min=-1.2, v_max=1.2, excursion=0.8)  # a laser on an analog output:
@@ -145,8 +145,11 @@ class Channel:
         self.t = 0.0          # monotonic time of the last new reading
         self.state = "off"    # off | engaging | on (locked, or for a cavity-locked laser: watched) | recovering
         self.message = ""     # why the lock is off, or what to do
-        self.offset = None    # last known scan offset
+        self.offset = None    # last known scan offset (its piezo's set value)
         self.unit = "V"
+        self.piezo = ACTUATOR  # the parameters, below laserN:, that set its piezo voltage and its current, by what
+        self.cc = CURRENT      # its scan generator drives (dlcpro.drives: read when it is locked or recovered, watched)
+        self.scan_out = None   # that: scan:output-channel (None: not known)
         self.token = 0        # bumped on every engage/disengage; late callbacks compare it
         # mode-hop recovery
         self.guard = Guard()
@@ -205,7 +208,7 @@ class Channel:
 
     @property
     def param(self) -> str:
-        return f"laser{self.laser}:{ACTUATOR}"
+        return f"laser{self.laser}:{self.piezo}"
 
     @property
     def error_mhz(self) -> float:
@@ -366,11 +369,13 @@ class Controller(threading.Thread):
 class _HopIO:
     """A recovery's operations, through the laser's controller thread; the callbacks come back
     under the engine's lock. Current and offset go through the controller's coalescing writes,
-    everything else runs as a job (modehop.perform)."""
+    everything else runs as a job (modehop.perform). The procedure's current and scan offset are the
+    laser's current and piezo, whichever parameters set them (Channel.cc, Channel.piezo)."""
 
     def __init__(self, engine: "Engine", ch: Channel, controller: Controller):
         self.engine, self.ch, self.ctrl = engine, ch, controller
         self.laser = ch.laser
+        self.names = {CURRENT: ch.cc, ACTUATOR: ch.piezo}
 
     def do(self, op, done, failed):
         e, ch = self.engine, self.ch
@@ -388,10 +393,12 @@ class _HopIO:
                 failed(exc)
 
         if op[0] == "set" and op[1] in (CURRENT, ACTUATOR):
-            self.ctrl.set(f"laser{self.laser}:{op[1]}", op[2], on_error=err, on_done=ok)
+            self.ctrl.set(f"laser{self.laser}:{self.names[op[1]]}", op[2], on_error=err, on_done=ok)
             return
-        laser = self.laser
-        self.ctrl.submit(lambda client: ok(perform(client, laser, op)), err)
+        laser, wire = self.laser, op
+        if op[0] == "get":
+            wire = ("get", tuple(self.names.get(name, name) for name in op[1]))
+        self.ctrl.submit(lambda client: ok(perform(client, laser, wire)), err)
 
 
 class Engine:
@@ -785,22 +792,33 @@ class Engine:
             ch.state, ch.message = "engaging", ""
             ch.token += 1
             ch.guard.reset()
-            tok, laser, params = ch.token, ch.laser, ch.lock.p
+            tok, key, laser, params, on_dac = ch.token, ch.device, ch.laser, ch.lock.p, ch.dac
             ff_ao = ch.ff_ao if ch.dac and ch.ff_ratio else None
 
             def job(client):
-                v = client.get_float(f"laser{laser}:{ACTUATOR}")  # (an analog output never set: not known, an error)
+                piezo = ACTUATOR if on_dac else self._drives(ch, client, key, laser)[0]  # (what its scan drives now)
+                v = client.get_float(f"laser{laser}:{piezo}")  # (an analog output never set: not known, an error)
                 try:
-                    unit = client.get_str(f"laser{laser}:scan:unit") or "V"
+                    unit = (client.get_str(f"laser{laser}:scan:unit") or "V") if piezo == ACTUATOR else "V"
                 except DecopError:
                     unit = "V"
                 ff0 = client.get_float(f"laser{ff_ao}:{ACTUATOR}") if ff_ao is not None else None
                 with self.lock:
                     if ch.token != tok:
                         return
+                    if ch.piezo != piezo and not on_dac:  # (its scan switched to another output meanwhile)
+                        ch.state, ch.message = "off", f"cannot lock: its scan now drives {output_name(ch.scan_out)}"
+                        ch.token += 1
+                        return
+                    if unit.strip().lower() not in ("v", ""):  # (its scan drives something else, which it does not say)
+                        ch.state, ch.message = "off", (f"cannot lock: its scan offset is {v:.3f} {unit}, not the piezo "
+                                                       f"(see Scan › Output channel at the DLC pro)")
+                        ch.token += 1
+                        return
                     ch.offset, ch.unit, ch.ff0 = v, unit, ff0
                     if not params.v_min <= v <= params.v_max:
-                        ch.state, ch.message = "off", f"offset {v:.3f} outside {params.v_min:g} … {params.v_max:g}"
+                        what = "offset" if piezo == ACTUATOR else f"piezo voltage ({piezo})"
+                        ch.state, ch.message = "off", f"{what} {v:.3f} outside {params.v_min:g} … {params.v_max:g}"
                         ch.token += 1
                         return
                     ch.lock.engage(v)
@@ -945,13 +963,14 @@ class Engine:
             self._disengage(ch, "")
         c = self.controllers.get(ch.device)
         if c is not None:
-            for param in WATCHED + ((ch.seed_name,) if ch.seed_name else ()):
+            for param in WATCHED + (ch.piezo, ch.cc) + ((ch.seed_name,) if ch.seed_name else ()):
                 c.unwatch(f"laser{ch.laser}:{param}")
         self._unwatch_trans(ch)
         m = self.monitors.pop(ch.n, None)
         if m is not None:
             m.stop()
         ch.device, ch.offset, ch.message = None, None, ""
+        ch.piezo, ch.cc, ch.scan_out, ch.unit = ACTUATOR, CURRENT, None, "V"
         ch.ff_ao, ch.ff_ratio, ch.ff0 = None, 0.0, None
         ch.current = ch.current_set = ch.cavity_on = ch.seed = ch.lasing = ch.shg_level = None
         ch.cavity_txt = ch.shg_txt = ch.seed_name = ""
@@ -959,31 +978,88 @@ class Engine:
         ch.shg_fine.clear()
 
     def _watch(self, ch: Channel):
-        """Poll the offset of the linked laser for display, and read its unit once."""
+        """Poll the offset of the linked laser (its piezo's set value) for display, and what its scan generator
+        drives (which parameters set its piezo and its current, _take_drives); read its unit once."""
         key, laser = ch.device, ch.laser
         c = self._controller(key)
 
-        def on_offset(v):
-            with self.lock:
-                if ch.device == key and ch.laser == laser:
-                    if ch.state == "off":
-                        ch.offset = v
-                    if ch.current_set is not None and self._running_fine(ch):
-                        ch.fine_at = (time.monotonic(), v, ch.current_set)  # (a cavity lock moves the offset)
+        def mine():
+            return ch.device == key and ch.laser == laser
 
         def read_unit(client):
+            out = None if ch.dac else scan_output(client, laser)
             unit = client.get_str(f"laser{laser}:scan:unit") or "V"
             with self.lock:
-                if ch.device == key and ch.laser == laser:
-                    ch.unit = unit
+                if mine():
+                    self._take_drives(ch, out)
+                    ch.unit = unit if ch.piezo == ACTUATOR else "V"
 
-        c.watch(f"laser{laser}:{ACTUATOR}", on_offset)
+        def on_scan_out(v):
+            with self.lock:
+                if mine():
+                    self._take_drives(ch, int(v) if _num(v) else None)
+
+        self._watch_offset(ch)
         c.submit(read_unit)
         if ch.dac:  # (its outputs set back to where this program left them whenever the board is opened: dac.py)
             for ao in (laser, ch.ff_ao):
                 if ao is not None:
                     c.client.use(ao)
             return  # (nothing else to watch on an output)
+        c.watch(f"laser{laser}:{SCAN_OUT}", on_scan_out)
+        self._watch_hop(ch)
+
+    def _watch_offset(self, ch: Channel):
+        """Poll its piezo's set value (Channel.piezo: the scan offset, as a rule), for display and for where it was on
+        target as it should be."""
+        key, laser, name = ch.device, ch.laser, ch.piezo
+
+        def on_offset(v):
+            with self.lock:
+                if ch.device == key and ch.laser == laser and ch.piezo == name:
+                    if ch.state == "off":
+                        ch.offset = v
+                    if ch.current_set is not None and self._running_fine(ch):
+                        ch.fine_at = (time.monotonic(), v, ch.current_set)  # (a cavity lock moves the offset)
+
+        self._controller(key).watch(f"laser{laser}:{name}", on_offset)
+
+    def _drives(self, ch: Channel, client, key: str, laser: int) -> tuple:
+        """In a job (the controller's thread): what its scan generator drives now, taken on (_take_drives); returns the
+        parameters that set its piezo and its current."""
+        out = scan_output(client, laser)
+        with self.lock:
+            if ch.device == key and ch.laser == laser:
+                self._take_drives(ch, out)
+                return ch.piezo, ch.cc
+        return drives(out)
+
+    def _take_drives(self, ch: Channel, out):
+        """Its scan generator drives `out` (scan:output-channel; None: it does not say, nothing changes): the parameters
+        that set its piezo and its current follow (dlcpro.drives: the scan's offset sets that one), and so does what is
+        watched. Changed while it is locked (at the DLC pro, by hand), it is unlocked: what the lock writes would set
+        something else now; a recovery stops, leaving current and piezo where they are."""
+        if out is None:
+            return
+        ch.scan_out = out
+        piezo, cc = drives(out)
+        if (piezo, cc) == (ch.piezo, ch.cc):
+            return
+        log.info("channel %d: its scan drives %s: its piezo is set by %s, its current by %s", ch.n, output_name(out),
+                 piezo, cc)
+        why = f"its scan now drives {output_name(out)}: the piezo is {piezo}"
+        if ch.runner is not None:
+            ch.resume = False
+            ch.runner.cancel(why, keep=True)
+        elif ch.state == "on" and not ch.relock:
+            self._disengage(ch, f"unlocked: {why}")
+        c = self.controllers.get(ch.device)
+        if c is not None:
+            for name in (ch.piezo, ch.cc):
+                c.unwatch(f"laser{ch.laser}:{name}")
+        ch.piezo, ch.cc, ch.unit, ch.offset = piezo, cc, "V", None
+        ch.current_set = ch.fine_at = None
+        self._watch_offset(ch)
         self._watch_hop(ch)
 
     def _watch_hop(self, ch: Channel):
@@ -1033,7 +1109,7 @@ class Engine:
                     self._shg(ch, v)
 
         hop = ch.hop
-        for param, cb, kind, on in ((CURRENT, on_current_set, "float", hop.enabled),
+        for param, cb, kind, on in ((ch.cc, on_current_set, "float", hop.enabled),
                                     (CURRENT_ACT, on_current, "float", hop.enabled),
                                     (CAVITY_LOCK, on_cavity, "bool", hop.enabled and hop.cavity),
                                     ("dl:lock:state-txt", on_txt, "str", hop.enabled and hop.cavity),
@@ -1542,10 +1618,10 @@ class Engine:
 
     def _take_optimum(self, ch: Channel):
         key, laser, shg = ch.device, ch.laser, ch.hop.shg
-        names = (CURRENT_ACT, ACTUATOR) + ((SHG_STATE, SHG_INTRA) if shg else ())
 
         def job(client):
-            got = perform(client, laser, ("get", names))
+            piezo, _ = self._drives(ch, client, key, laser)
+            got = perform(client, laser, ("get", (CURRENT_ACT, piezo) + ((SHG_STATE, SHG_INTRA) if shg else ())))
             with self.lock:
                 if ch.device != key or ch.laser != laser:
                     return
@@ -1658,15 +1734,16 @@ class Engine:
         if ch.off:  # no readings: its wavemeter channel on first
             ch.borrowed = True
             self._switch(ch, True)
-        tok, laser, cavity = ch.token, ch.laser, hop.cavity
+        tok, key, laser, cavity = ch.token, ch.device, ch.laser, hop.cavity
         log.info("channel %d: %s, recovering", ch.n, why or "recenter")
 
         def job(client):
             p = f"laser{laser}:"
-            i0 = client.get_float(p + CURRENT)
+            piezo, cc = self._drives(ch, client, key, laser)  # (what its scan drives now)
+            i0 = client.get_float(p + cc)
             a0 = client.get_float(p + CURRENT_ACT)
             clip = client.get_float(p + "dl:cc:current-clip")
-            v0 = client.get_float(p + ACTUATOR)
+            v0 = client.get_float(p + piezo)
             locked = cavity and (relock or client.get_bool(p + CAVITY_LOCK))
             with self.lock:
                 if ch.token == tok:
@@ -1727,7 +1804,8 @@ class Engine:
                                       f"Mode-hop recovery…")
             return
         if not v_lo <= v0 <= v_hi:
-            self._recovery_failed(ch, f"the offset, {v0:.2f} V, is outside {lp.v_min:g} … {lp.v_max:g} V")
+            what = "the offset" if ch.piezo == ACTUATOR else f"its piezo voltage ({ch.piezo})"
+            self._recovery_failed(ch, f"{what}, {v0:.2f} V, is outside {lp.v_min:g} … {lp.v_max:g} V")
             return
         rec = Recenter(hop, i0, v0, i_lo, i_hi, v_lo, v_hi, cavity=locked, quick=quick, shg=hop.shg, act_offset=off,
                        i_top=i_top, i_clip=clip, ref=ref)

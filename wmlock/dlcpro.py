@@ -324,6 +324,42 @@ def signal_name(sig) -> str:
     return SIGNALS.get(sig, f"signal {sig}") if isinstance(sig, int) else str(sig)
 
 
+# What a laser's scan generator drives (laserN:scan:output-channel), in TOPTICA's numbers (its FAQ): the scan's offset
+# is the DC level of that output.
+SCAN_OUT = "scan:output-channel"
+SCAN_OFFSET = "scan:offset"
+PIEZO_SET = "dl:pc:voltage-set"
+CURRENT_SET = "dl:cc:current-set"
+OUT_PC, OUT_CC = 50, 51
+OUTPUTS = {20: "Out A", 21: "Out B", OUT_PC: "the piezo", OUT_CC: "the current", 90: "the SHG cavity's piezo",
+           101: "the SC output"}
+
+
+def drives(out) -> tuple:
+    """(piezo, current): the parameters, below laserN:, that set its piezo voltage and its diode current, by what its
+    scan generator drives (out: scan:output-channel; None: not known, taken to be the piezo, as on most): the scan's
+    offset sets that one, its set value the other (a TA-SHG pro's scan on its current: 160 mA there, its piezo at
+    41.3 V on voltage-set)."""
+    if out == OUT_CC:
+        return PIEZO_SET, SCAN_OFFSET
+    if out is None or out == OUT_PC:
+        return SCAN_OFFSET, CURRENT_SET
+    return PIEZO_SET, CURRENT_SET
+
+
+def output_name(out) -> str:
+    return OUTPUTS.get(out, f"output channel {out}") if out is not None else "an output it does not say"
+
+
+def scan_output(client, laser: int):
+    """What laserN's scan generator drives (scan:output-channel), or None if the controller does not say."""
+    try:
+        out = client.get_value(f"laser{laser}:{SCAN_OUT}")
+    except DecopError:
+        return None
+    return int(out) if isinstance(out, (int, float)) and not isinstance(out, bool) else None
+
+
 # --------------------------------------------------------------------- discovery
 @dataclass
 class Device:
