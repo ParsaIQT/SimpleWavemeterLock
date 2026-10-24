@@ -10,12 +10,14 @@ same view.py that paints the rows here) and adjusted by asking them.
 from __future__ import annotations
 
 import functools
+import html
 import math
 import signal
 import sys
 import time
 import types
 import zlib
+from pathlib import Path
 
 from . import dac, view
 from .engine import DAC_LOCK, Engine
@@ -2249,10 +2251,15 @@ class MapWindow(QtWidgets.QWidget):
         self.stop.clicked.connect(self._stop)
         self.folder = QtWidgets.QPushButton("Open folder")
         self.folder.clicked.connect(self._open)
+        self.laser = QtWidgets.QPushButton("The laser…")
+        self.laser.setToolTip("What the laser's model, fitted to the map at its end, says of it")
+        self.laser.clicked.connect(self._laser)
+        self.laser.setEnabled(False)
         close = QtWidgets.QPushButton("Close")
         close.clicked.connect(self.close)
         bb.addWidget(self.stop)
         bb.addStretch(1)
+        bb.addWidget(self.laser)
         bb.addWidget(self.folder)
         bb.addWidget(close)
         v.addLayout(bb)
@@ -2334,6 +2341,10 @@ class MapWindow(QtWidgets.QWidget):
         else:
             self.head.paint(ch.map_note or r.error or r.result, "ok" if r.state == "done" else "err")
         self.stop.setEnabled(running)
+        self.laser.setEnabled(m.model is not None)
+        self.laser.setText("The laser…" if m.model is not None or not m.model_note else
+                           "Fitting its model…" if m.model_note.startswith("fitting") else "No model")
+        self.laser.setToolTip(m.model_note or "What the laser's model, fitted to the map at its end, says of it")
         view = self.view
         if view is not None and (view, view.version) != self._shown:
             self._shown = (view, view.version)
@@ -2380,11 +2391,34 @@ class MapWindow(QtWidgets.QWidget):
                                             "stays in its file."):
             self.engine.stop_map(self.n)
 
+    def _laser(self):
+        r = self.runner()
+        if r is not None and r.mapper.model is not None:
+            ModelDialog(self, r.mapper.model, r.mapper.out.path if r.mapper.out is not None else None).show()
+
     def _open(self):
         r = self.runner()
         path = r.mapper.out.path.parent if r is not None and r.mapper.out is not None else \
             (self.engine.channels[self.n].map_plan.folder or FOLDER)
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+
+
+class ModelDialog(QtWidgets.QDialog):
+    """What a laser's model (lasermodel.LaserModel, fitted to its map) says of it, fact by fact."""
+
+    def __init__(self, parent, model, path=None):
+        super().__init__(parent)
+        self.setWindowTitle("The laser, as its model has it" + (f" · {Path(path).name}" if path else ""))
+        self.resize(760, 620)
+        v = QtWidgets.QVBoxLayout(self)
+        browser = QtWidgets.QTextBrowser()
+        items = "".join(f"<li style='margin-bottom:6px'>{html.escape(fact)}</li>" for fact in model.facts())
+        head = f"{model.f_ref:.6f} THz" + (f" · kept in {html.escape(Path(path).name)}" if path else "")
+        browser.setHtml(f"<p style='color:{C['dim']}'>{head}</p><ul>{items}</ul>")
+        v.addWidget(browser, 1)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
 
 
 class SetupDialog(QtWidgets.QDialog):

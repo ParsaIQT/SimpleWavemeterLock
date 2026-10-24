@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Minimal, fast wavemeter lock for TOPTICA DLC pro lasers"
 readme = "README.md"
 requires-python = ">=3.8"
-dependencies = ["PySide6>=6.4", "ifaddr>=0.2"]
+dependencies = ["PySide6>=6.4", "ifaddr>=0.2", "numpy", "scipy>=1.9"]
 
 [project.optional-dependencies]
 server = ["fastapi", "uvicorn"]

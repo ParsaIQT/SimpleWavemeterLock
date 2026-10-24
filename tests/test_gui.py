@@ -817,6 +817,19 @@ def test_a_laser_map_from_its_dialog_to_its_window_and_picture(app, demo, tmp_pa
         w.grab()  # (painted with each, without trouble)
         with load(ch.map_last.mapper.out.path) as f:
             assert len(f.points) > 40
+        m = ch.map_last.mapper
+        assert m.model is None and not w.laser.isEnabled()  # (too few points for the laser's model)
+        lasermodel = pytest.importorskip("wmlock.lasermodel")
+        m.model = lasermodel.LaserModel(384.2, 150.0, 70.0, 0.0, lasermodel.Comb(6.0, p_i=-0.25, p_v=0.4),
+                                        lasermodel.Comb(0.0, p_i=-2.0, p_v=0.32), right=0.9, points=500)
+        m.model_note = "its model: right mode at 90% of the points"
+        spin(app, 0.7)
+        assert w.laser.isEnabled() and w.laser.text() == "The laser…"
+        w._laser()
+        shown = w.findChildren(gui.ModelDialog)
+        assert shown and "its external cavity's modes are 6.0000 GHz apart" in \
+            shown[0].findChild(QtWidgets.QTextBrowser).toPlainText()
+        shown[0].close()
         acts = {a.text() for a in _menu_actions(row)}
         assert "Last laser map…" in acts and "Laser map…" in acts
     finally:

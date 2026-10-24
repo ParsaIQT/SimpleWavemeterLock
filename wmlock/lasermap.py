@@ -113,6 +113,7 @@ RAMP_V = 5.0   # V: ...and the piezo
 STEP_I = 5.0   # mA: the largest step a plan may have, and so any write
 STEP_V = 10.0  # V
 MAX_POINTS = 5_000_000
+MODEL_MIN = 200  # points that lased, the fewest the laser's model is fitted to
 PATTERN_KINDS = {0: "interferometers", 1: "wide interferometer or grating", 2: "interferometers, 2nd pulse",
                  3: "wide interferometer, 2nd pulse", 4: "analysis x", 5: "analysis y"}
 
@@ -169,6 +170,7 @@ class MapPlan:
     every: int = 10         # ...at every this many points besides (0: not)
     record: str = ""        # more DLC pro parameters read at each point: names below laserN:, comma-separated
     repeat: bool = True     # the first line swept again at the end (how far things moved meanwhile)
+    model: bool = True      # the laser's model fitted to it at the end (lasermodel.py)
     ff_end: str = "back"    # its feedforward at the end: back (as it was) | fitted (the ideal one the map finds)
     folder: str = ""        # where the file goes ('': ~/laser-maps)
 
@@ -1002,6 +1004,8 @@ class Mapper:
         self.points = self.lasing = self.kept = 0
         self.hops = {1: 0, 2: 0}   # seen sweeping up, down
         self.notes = []            # [(s, text)]
+        self.model = None          # the laser's model, fitted at the end (lasermodel.LaserModel; engine's thread)
+        self.model_note = ""       # how that went
         self.views = []            # MapView, a map each
         self.view = None           # the one filling
         self.line_no = (0, 0)      # (line, of how many) of the map filling
@@ -2135,6 +2139,10 @@ def describe(m: LaserMap) -> str:
     end = meta.get("end", {})
     if end:
         out.append(f"  ended: {end.get('outcome', '?')}")
+    facts = meta.get("model_facts")
+    if facts:
+        out.append("  the laser, as its model has it (kept in the file):")
+        out += [f"   - {fact}" for fact in facts]
     return "\n".join(out)
 
 
@@ -2154,6 +2162,14 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m wmlock.lasermap", description="What a laser map's file holds.")
     ap.add_argument("files", nargs="+", metavar="FILE")
     ap.add_argument("--csv", action="store_true", help="write each one's points as FILE.csv")
+    ap.add_argument("--model", action="store_true",
+                    help="fit the laser's model to it (lasermodel.py; needs numpy and scipy) and say its facts")
+    ap.add_argument("--save-model", action="store_true", help="with --model: keep the model in the file")
+    ap.add_argument("--map", type=int, default=0, metavar="N",
+                    help="with --model: which of its maps (1, 2...; 0: the last)")
+    ap.add_argument("--current", choices=("act", "set", "plan"), default="act",
+                    help="with --model: the current as read at each point (act), else set (set: files from before "
+                         "it was read), or as planned")
     args = ap.parse_args(argv)
     for name in args.files:
         with load(name) as m:
@@ -2161,6 +2177,17 @@ def main(argv=None) -> int:
             if args.csv:
                 out = Path(name).with_suffix(".csv")
                 print(f"  {export_csv(m, out):,} points written to {out}")
+            if args.model:
+                from . import lasermodel
+
+                model = lasermodel.fit(m, args.current, args.map - 1 if args.map > 0 else None,
+                                       log=lambda text: print(f"  model: {text}", flush=True))
+                print("  the laser, as its model has it:")
+                for fact in model.facts():
+                    print(f"   - {fact}")
+        if args.model and args.save_model:
+            lasermodel.save(name, model)
+            print(f"  kept in {name}")
     return 0
 
 

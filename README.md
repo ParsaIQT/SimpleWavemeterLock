@@ -56,8 +56,10 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
 Python ≥ 3.8 and one Qt binding (PySide6 preferred; PyQt5 and PyQt6 also work):
 
 ```
-pip install PySide6 ifaddr
+pip install PySide6 ifaddr numpy scipy
 ```
+
+numpy and scipy are for the laser's model, fitted to its maps (*Laser maps*): the rest runs without them.
 
 For lasers on an analog output board (*Lasers on an analog output*), also `pip install mcculw`, with
 MCC's InstaCal installed (Windows).
@@ -1256,6 +1258,108 @@ average; on a mode it tunes −1.6 GHz/mA, and +2.2 GHz/V along the ideal feedfo
 the power at the wavemeter 0.52 µW per mA above a threshold of about 30 mA. Its boundaries move 1.2 mA
 from one 2 V line to the next, nearly as far as from one hop to the next: 0.5 V piezo steps next time.
 
+### The laser's model
+
+At the end of a map (one with 200 points or more that lased), a physical model of the laser is fitted to
+it, in a thread of its own once its file is written (two minutes or so for a map of 4,000 points; the
+laser is free meanwhile). It is kept in the file (`meta` `model`, and its facts, as sentences,
+`model_facts`), its facts are said in the map's notes, and **The laser…** in the map's window lists them.
+`python -m wmlock.lasermap FILE --model` fits it to any map's file and says its facts (`--save-model`
+keeps it there; `--map N` for a file with several maps; `--current set` for one made before the current
+was read at each point).
+
+The model (`wmlock/lasermodel.py`) is a Littrow ECDL as two combs of modes and the rule that picks which of
+them lases:
+
+* **The external cavity's modes**, from the chip's back facet to the grating: a comb whose spacing gives the
+  cavity's optical length (c / 2 × spacing), moved by the current, by the piezo (not quite linearly: the
+  grating pushed along the cavity) and by drift.
+* **The chip's own modes**, if its front facet reflects (an anti-reflection coating that is not perfect):
+  a comb of their own, whose spacing gives the chip's optical length, moved fast by the current (the chip
+  heats) and hardly by the piezo. The external modes near the middle of a chip mode lase most easily, so
+  the chip's modes decide which external mode lases and where it hops. Without them, one broad selection
+  filter (the grating's and the gain's) does: the same rule with one resonance.
+* **A window** (the grating's feedback and the gain together) outside which it does not lase.
+* **The rule**: the external mode nearest its chip mode's best place lases, and goes on lasing until another
+  is better by a hysteresis of its own. That best place lags the current's heating (the chip's temperature
+  follows the current with a time constant: ahead sweeping up, behind sweeping down), and the mode lasing
+  pulls it toward itself, part of the way (a mode, once lasing, holds on).
+
+Sweeping the current the two combs slide past each other, and the best aligned pair steps from one chip
+mode to the next: a vernier (the chip's spacing is not a whole number of external modes), which is why the
+laser hops by one chip mode one way, then another, then two the other way, wrapping around at the window's
+edges. Sweeping the piezo the external comb slides alone. Along the ideal feedforward the two stay aligned.
+
+How it is fitted, each part from what the map shows most directly:
+
+1. how a mode tunes along the swept axis (consecutive points on one mode);
+2. the combs' spacings: the frequencies, that tuning taken off, bunch at whole multiples of each, line by
+   line (each line's own offset absorbs the piezo and the drift, so these cannot bias them; the largest
+   spacing that bunches nearly as well as the best: they bunch at its halves, thirds... too); the chip's
+   first guessed from the sizes of the hops;
+3. each comb's offset line by line, unwrapped from line to line, then fitted by least squares as quadratic
+   in the current and the piezo, linear in time, the external one offset by the way it was swept. The
+   first line swept again at the end tells drift from the piezo, but only to whole modes: each number of
+   modes of drift that could be is fitted, the best kept, and those the residuals cannot tell from it
+   kept as well (and said);
+4. the rule, and the chip comb's spacing and current tuning again (from where it hops: where the
+   frequencies lie on the chip's modes misleads near the window's edges, where a mode lases only on their
+   inner side): every sweep simulated from its first point, scored by how many of its points the model
+   puts on the mode the laser was on (differential evolution, every candidate and every sweep at once).
+   It starts from the rule that makes what the laser did likeliest, a point at a time (smooth, and every
+   hop counts), and is searched twice: once where the hysteresis of its own does most of the holding,
+   once where the pull does (a search settles on one or the other as it goes);
+5. the power at the wavemeter: linear in the current above a threshold, and how it changes along a mode.
+
+Fitted to a map of a laser made of a model (the simulator's `ModelLaser`), it gives back its chip's mode
+spacing to 0.1 %, its tunings to a few %, its window to a few GHz and its lag to 10 %, and puts nearly 90 %
+of the points on the right mode.
+
+**The lab's 493 nm DL pro**, from its first map (with the set current, as above), as the model has it:
+
+* its external cavity's modes are 8.262 GHz apart: an optical length of 18.14 mm from the chip's back
+  facet to the grating;
+* its chip's own modes are 87.25 GHz apart (n_g·L 1.718 mm: about 0.66 mm of chip at a group index of
+  2.6), 10.56 external modes to a chip mode: its front facet reflects (its anti-reflection coating is poor,
+  or there is none), so the light goes some 16.4 mm through air and lens from the chip to the grating;
+* the current moves the chip's modes −4.19 GHz/mA (+3.4 pm/mA: the chip heating), the external modes
+  −1.71 GHz/mA; the piezo moves the external modes +1.37 GHz/V as the map went (27 s a volt), +0.018
+  GHz/V more per volt, the grating some 40 nm nearer the chip per volt, and the chip's modes next to
+  nothing (−0.12 GHz/V);
+* it lases only within −93 … +180 GHz of 607.4237 THz (272 GHz about 493.512 nm), the piezo not moving
+  that window;
+* the combs slide past each other −2.48 GHz/mA and the alignment changes by 3.63 GHz from one chip mode
+  to the next, so it hops every 1.46 mA sweeping the current, every 2.6 V sweeping the piezo; the ideal
+  feedforward −0.565 mA/V (the map's boundaries say −0.58), along which it would tune +2.25 GHz/V;
+* sweeping up and back down at the map's pace (0.79 mA/s) it is on different modes over 98 % of the
+  range: sweeping down, its modes come 1.80 mA lower (the boundaries say 1.8 mA). In the model, the chip's
+  temperature lags the current by 0.21 s, the mode lasing pulls its chip mode 46 % of the way to itself,
+  and it lases on 0.05 GHz past where another lines up as well sweeping up, 0.50 GHz sweeping down;
+* the power at the wavemeter: 0.51 µW per mA above 28 mA; along a mode it falls (−0.34 µW/mA, against
+  +0.51 across modes: −0.63 µW for each GHz the mode sits higher on its chip mode) and jumps back at the
+  hops;
+* the model puts 77 % of the map's 4,259 points on the mode the laser was on, each sweep simulated from
+  its first point; 97 % of the rest are within two points of a hop (it hops a point or two early or late).
+
+Two things this map could not tell. **Its drift**: its first line, swept again 19 minutes later, was where
++1.8 GHz of drift per 10 minutes puts it, but just as much where −2.6 or +6.2 do (a whole external mode
+more or less by then), and with them the piezo's own tuning (1.29, 1.48 or 1.09 GHz/V; together, as the
+map went, 1.37 either way). Sweep the first line again sooner, or more often, to tell. **Heat as what holds
+a mode**: the light it gives off cools it, so a mode giving less light heats the chip, and its chip modes
+move down (the current's heat moves them down 4.2 GHz/mA). A mode loses light as it moves up its chip mode
+(above), so its heat would move that chip mode away from it: that would push it on to the next mode sooner,
+not hold it. The map shows the opposite, a pull toward the mode lasing (with heat in it, the rest is
+stronger still): more likely the light's own effect on the chip, through its gain and its refractive
+index. What heat does show is the lag: sweeping 0.79 mA/s, the chip is as warm as 0.16 mA behind the
+current. A map swept at a quarter of the speed would tell the lag from the rest: its part shrinks with the
+speed, the pull's does not. Either way, coming down onto a mode from above (as the recovery does) is what
+puts it reproducibly on the same one: up and down, it is on different modes nearly everywhere.
+
+**The simulator's lasers** can be made of a model: `sim.ModelLaser(model, clock)` lases as the model says
+(`LaserModel.step`, a point after another, its chip lagging and pulled as fitted), with the model's
+threshold and power; `LaserModel.simulate` predicts the frequency along any path of current, piezo and
+time.
+
 At the end, **or when you stop it** (the row's *Mapping* button, or *Stop map* in its window), the
 laser goes back where it began: the temperature (at the end it waits for it to settle; stopped, it sets
 it back and goes on), then the piezo, its feedforward (on again, stepped as above; stopped, the same with
@@ -1283,7 +1387,7 @@ next to the file (`.png`). The row says how far it is and how long it has to go.
 
 | table      | a row is | columns |
 |------------|----------|---------|
-| `meta`     | a key, its value as JSON | `plan`, `laser` (channel, name, controller, what drives its piezo and current), `wavemeter` (model, serial), `start` (set and measured current, piezo, temperature, current-clip, feedforward, limits, scan), `recorded`, `program`, `began`, `units`, `feedforward` (as it began, what it added at rest, from where it is reckoned, the steps of its factor and what each did, how it ended), `fits` (the ideal feedforward of each map, its hysteresis, hop spacing, tuning), `end` (outcome, points, patterns kept, the frequency back where it began, the notes, the patterns' size, the fits) |
+| `meta`     | a key, its value as JSON | `plan`, `laser` (channel, name, controller, what drives its piezo and current), `wavemeter` (model, serial), `start` (set and measured current, piezo, temperature, current-clip, feedforward, limits, scan), `recorded`, `program`, `began`, `units`, `feedforward` (as it began, what it added at rest, from where it is reckoned, the steps of its factor and what each did, how it ended), `fits` (the ideal feedforward of each map, its hysteresis, hop spacing, tuning), `end` (outcome, points, patterns kept, the frequency back where it began, the notes, the patterns' size, the fits), `model` and `model_facts` (the laser's model, and what it says, once fitted) |
 | `lines`    | a line | `map` (which map), `axis` (what it sweeps), `line`, `slow` (the other axis there), `temp`, `repeat` (the first line again), `t0`, `t1` |
 | `points`   | a point | `line_id`, `leg` (1 up, 2 down, 0 a descent), `k` (its step), `t` (s since the map began), `i` (mA measured, as planned), `i_set`, `i_act` (mA measured, as read there), `v`, `v_act` (V, as read there), `temp`, `f` (THz: the median of its valid readings; empty if none), `f_lo`, `f_hi`, `n`, `bad` (invalid readings), `status`, `how` (`done`, `dark` (by its photodiode), `quiet` (the wavemeter said no light, then nothing), `invalid`, `timeout`), `wait`, `power` (µW, the wavemeter's), `exp1`, `exp2` (ms), `amin1` … `aavg2` (fringe amplitudes), `vals` (the parameters read, JSON), `event` (`hop`, `dark`, `lasing`, `invalid`, `spread`, `fade`) |
 | `readings` | a reading | `point_id`, `t`, `f`, `status`, `power` |
@@ -1306,8 +1410,8 @@ with load("map_2026-10-24_171230_ch3_854.sqlite") as m:
 ```
 
 `python -m wmlock.lasermap FILE…` says what a map holds (its plan, where it began, how many points,
-lasing, hops each way, its feedforward, the ideal one each map found, how it ended); `--csv` writes its
-points as `FILE.csv` too.
+lasing, hops each way, its feedforward, the ideal one each map found, how it ended, its model's facts if
+kept); `--csv` writes its points as `FILE.csv` too, `--model` fits the laser's model to it (above).
 
 **How long, how big**: a point takes the settling time, a round trip to the DLC pro and its readings.
 With 2 ms exposures that's about 70 ms with the defaults; where the laser is dim, much longer. 100 mA
@@ -1410,6 +1514,7 @@ wmlock/modehop.py    mode-hop recovery: lasing watch and panic, the catch, the w
 wmlock/relock.py     taking over and handing back a DLC pro's cavity and SHG locks; setup check
 wmlock/dropouts.py   lock dropouts: the DLC pro's recorder (or polling) read, dropouts found
 wmlock/lasermap.py   laser maps: the plan, the sweeps both ways, the file (SQLite), reading it back; python -m wmlock.lasermap
+wmlock/lasermodel.py the laser's model from its map: two combs and a rule, fitted (numpy, scipy), its facts
 wmlock/cavity.py     reading SHG sweeps, cavity scans and error signals, pure maths
 wmlock/engine.py     threads and state: source → lock → per-controller workers
 wmlock/meters.py     this PC's wavemeters, an engine each: found, settings kept, swapped, hidden
@@ -1498,4 +1603,8 @@ waiting its exposure); its hysteresis shown by the modes changing later sweeping
 swept; the feedforward taken into account; the temperature stepped, settled and put back; stopped, or the
 wavemeter falling silent, everything put back; a TA on, a cavity lock on or a current-clip too low: nothing
 written. End to end through the engine, its window and the fake controllers, and through stand-ins for
-wlmData and server.py (details, patterns exported and no longer).
+wlmData and server.py (details, patterns exported and no longer). The laser's model is fitted to a map of a
+laser made of a model (a chip with modes of its own: its spacings, tunings, window and pull come back) and
+to one of the simulator's ECDL (one selection filter: its mode spacing, tunings and ideal feedforward come
+back); its facts, a drift the map cannot tell, its file, the command line and the engine's fit after a
+map are tested too (numpy and scipy: without them those tests are skipped).

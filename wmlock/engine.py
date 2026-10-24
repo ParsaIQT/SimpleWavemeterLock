@@ -49,7 +49,9 @@ of what they were over the last few minutes while it ran as it should
 Laser maps (lasermap.py): a channel's laser, unlocked, can be mapped (start_map): its current and piezo swept all
 over, both ways, everything recorded in a file. Its state is 'mapping' meanwhile: its readings go to the map
 (MapRunner, through the laser's controller as a recovery's do), in detail (Source.detail), and nothing else
-touches it; stopped (stop_map, or the program closing), it goes back where it began.
+touches it; stopped (stop_map, or the program closing), it goes back where it began. Once its file is written, a
+thread of its own fits the laser's model to it (lasermodel.py, a minute or two; the laser is free meanwhile): kept
+in the file, its facts said in the map's notes (Mapper.model).
 
 Lock dropouts (dropouts.py): for each laser its DLC pro locks to a cavity, a monitor of its own watches the
 transmission for the lock losing the laser even for a couple of milliseconds (HopParams.drop_ms between
@@ -92,7 +94,7 @@ from . import dac
 from .dlcpro import SCAN_OUT, DLCPro, DecopError, Device, discover, drives, output_name, probe, scan_output
 from .dropouts import Monitor as DropoutMonitor
 from .dropouts import log as drop_log
-from .lasermap import FOLDER, LOOK, MapFile, MapPlan, Mapper, MapRunner, file_name, fmt_time
+from .lasermap import FOLDER, LOOK, MODEL_MIN, MapFile, MapPlan, Mapper, MapRunner, file_name, fmt_time
 from .lock import Lock, LockParams
 from .modehop import SEED_FLOOR, Guard, HopParams, Recenter, Runner, perform
 from .relock import TRANS, says_locked, setup_report, transmission_input, transmission_signal, usable_zero, volts
@@ -1778,10 +1780,40 @@ class Engine:
                              "fits": m.fits, "feedforward": m.ff_state(),
                              "pattern_info": {str(k): v for k, v in (getattr(self.source, "pattern_info", {}) or
                                                                      {}).items()}})
-            threading.Thread(target=out.close, daemon=True, name="map file close").start()
+            closing = threading.Thread(target=out.close, daemon=True, name="map file close")
+            closing.start()
             text += f"; saved to {out.path}"
+            if m.plan.model and m.lasing >= MODEL_MIN:
+                m.model_note = "fitting the laser's model…"
+                threading.Thread(target=self._model_of, args=(m, out.path, closing), daemon=True,
+                                 name="laser model").start()
         ch.map_note, ch.message = text, "" if ok else text
         (log.info if ok else log.warning)("channel %d: %s", ch.n, text)
+
+    def _model_of(self, m: Mapper, path: Path, closing: threading.Thread):
+        """The laser's model from its map's file, once that is written (lasermodel.py): kept in the file, its facts
+        in the map's notes (Mapper.model; model_note: how it went)."""
+        closing.join()
+        try:
+            from . import lasermodel
+            from .lasermap import load
+
+            with load(path) as f:
+                model = lasermodel.fit(f)
+            lasermodel.save(path, model)
+        except ImportError as exc:
+            m.model_note = f"no model of the laser: it needs numpy and scipy ({exc})"
+        except Exception as exc:  # (whatever the map: never in the way)
+            log.exception("laser model of %s", path)
+            m.model_note = f"no model of the laser: {exc or type(exc).__name__}"
+        else:
+            m.notes.append((None, "the laser, as its model has it:"))
+            m.notes.extend((None, "  " + fact) for fact in model.facts())
+            m.model, m.model_note = model, f"its model: right mode at {model.right:.0%} of the points"
+            log.info("map %s: %s", path, m.model_note)
+            return
+        m.notes.append((None, m.model_note))
+        log.warning("map %s: %s", path, m.model_note)
 
     # ------------------------------------------------------- mode-hop recovery
     def set_hop_params(self, n: int, params: HopParams):

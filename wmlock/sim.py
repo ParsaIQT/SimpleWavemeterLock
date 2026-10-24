@@ -542,6 +542,62 @@ class ECDL:
         self.lasing = False
 
 
+class ModelLaser:
+    """A laser as a model fitted to a map has it (lasermodel.LaserModel): which of its external cavity's modes lases
+    at each current and piezo voltage (LaserModel.step: the one lasing kept until another is better by its
+    hysteresis, its chip lagging the current's heat and pulled by the mode lasing), not lasing below its threshold,
+    its power above (how its mode sits on its chip resonance in it); the interface of ECDL that SimLaser and a map's
+    bench use (lase, freq, components, power, photodiode, T, f0, lasing). clock: s, for the model's drift (from the
+    model's t0 when made) and its chip's lag (None: no drift, the lag by the monotonic clock). Needs numpy."""
+
+    def __init__(self, model, clock=None, seed=None):
+        self.model, self.clock = model, clock
+        self.f0 = model.f_ref
+        self.T = 0.0
+        self.lasing = True
+        self.ase = 0.0
+        self.rng = random.Random(seed)
+        self.i_th = model.i_th if model.i_th is not None else -math.inf
+        self.slope_uw = model.slope if model.slope else 1.0  # µW at the wavemeter per mA (SimCCD: 10 µW a mW)
+        self._began = clock() if clock is not None else 0.0
+        self._state = None
+        self._ghz = 0.0
+        self._delta = 0.0
+
+    def lase(self, v: float, i: float):
+        """Settle which mode lases at (v, i); returns its frequency (GHz from f0), None not lasing."""
+        if i < self.i_th:
+            self.lasing, self._state = False, None
+            return None
+        self.lasing = True
+        now = self.clock() if self.clock is not None else time.monotonic()
+        t = self.model.t0 + (now - self._began if self.clock is not None else 0.0)
+        self._ghz, self._delta, self._state = self.model.step(i, v, t, self._state, clock=now)
+        return self._ghz
+
+    def freq(self, v: float, i: float, extra_mhz: float = 0.0) -> float:
+        """THz, as a wavemeter would see it (NaN: not lasing)."""
+        if self.lase(v, i) is None:
+            return math.nan
+        return self.f0 + (self._ghz + extra_mhz * 1e-3) * 1e-3
+
+    def components(self, v: float, i: float):
+        return [(1.0, self._ghz)] if self.lasing else []
+
+    def power(self, i: float) -> float:
+        """mW it sends on (SimCCD: a hundredth of it reaches the wavemeter): its model's at the wavemeter, with how
+        its mode sits on its chip resonance."""
+        if not math.isfinite(self.i_th):
+            return self.slope_uw / 10.0 if self.lasing else 0.3
+        uw = self.slope_uw * (i - self.i_th) + (self.model.power_dp or 0.0) * self._delta
+        p = max(uw, 0.0) / 10.0
+        return p if self.lasing else max(self.ase * p, 0.3)
+
+    def photodiode(self, i: float) -> float:
+        """µA from its own photodiode: its power lasing, and the spontaneous light of its chip."""
+        return 0.05 * max(i, 0.0) + (40.0 * self.power(i) if self.lasing else 0.0)
+
+
 class SimCCD:
     """The wavemeter's view of one laser, measured with all a source's details say (wavemeter.Source.detail): the
     power reaching it (µW: `coupling` of the laser's mW; a laser that does not lase, its spontaneous light), its
