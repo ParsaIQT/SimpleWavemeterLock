@@ -19,6 +19,8 @@ import zlib
 
 from . import dac, view
 from .engine import DAC_LOCK, Engine
+from .lasermap import (CLIP, FF, FF_ON, FOLDER, LOCK_ON, PC_MAX, PC_MIN, PD_NAMES, STEP_I, STEP_V, TA_ON, TEMP_MAX,
+                       TEMP_MIN, TEMP_SET, MapPlan, fmt_bytes)
 from .lock import LockParams
 from .meters import Meter
 from .modehop import HopParams
@@ -45,6 +47,7 @@ QFrame#row[state="ref-hold"] {{ border-left-color: {C['warn']}; }}
 QFrame#row[state="ref-moved"] {{ border-left-color: {C['err']}; }}
 QFrame#row[state="recovering"] {{ border-left-color: {C['warn']}; }}
 QFrame#row[state="asking"] {{ border-left-color: {C['accent']}; }}
+QFrame#row[state="mapping"] {{ border-left-color: {C['accent']}; }}
 QPushButton#lock {{ min-width: 78px; min-height: 30px; border-radius: 5px; font-weight: 600;
     border: 1px solid {C['line']}; background: #2a2d33; }}
 QPushButton#lock:hover {{ border-color: {C['accent']}; }}
@@ -55,6 +58,7 @@ QPushButton#lock[state="ref-hold"] {{ border-color: {C['warn']}; color: {C['warn
 QPushButton#lock[state="ref-moved"] {{ border-color: {C['err']}; color: {C['err']}; }}
 QPushButton#lock[state="recovering"] {{ background: #6b5418; border-color: {C['warn']}; }}
 QPushButton#lock[state="asking"] {{ background: #1d4f80; border-color: {C['accent']}; }}
+QPushButton#lock[state="mapping"] {{ background: #1d4f80; border-color: {C['accent']}; }}
 QMenu {{ background: #24262b; border: 1px solid {C['line']}; padding: 4px; }}
 QMenu::item {{ padding: 4px 22px 4px 18px; }}
 QMenu::item:selected {{ background: #363940; }}
@@ -339,6 +343,8 @@ class Row(QtWidgets.QFrame):
             w.style().polish(w)
         if state.startswith("ref"):
             label = "Ref"
+        elif state == "mapping":
+            label = "Mapping"
         elif self._relock:
             label = {"on": "Watching", "recovering": "Recentering", "asking": "Continue"}.get(state, "Relock")
         else:
@@ -386,7 +392,12 @@ class ChannelRow(Row):
 
     def _clicked(self):
         ch = self.engine.channels[self.n]
-        if ch.state == "recovering" and ch.hop_prompt:
+        if ch.state == "mapping":
+            self.win.map_window(self.engine, self.n)
+            if self.win.confirm("Stop the map", "Stop the laser map? The laser goes back where it began; what it "
+                                                "mapped so far stays in its file."):
+                self.engine.stop_map(self.n)
+        elif ch.state == "recovering" and ch.hop_prompt:
             self.engine.confirm_step(self.n)
         elif ch.state == "recovering":
             self.engine.cancel_recovery(self.n)
@@ -476,6 +487,13 @@ class ChannelRow(Row):
             m.addAction("Recenter now", lambda: self.engine.recenter(self.n)).setEnabled(
                 bool(ch.device) and ch.state != "engaging")
         m.addAction("Check setup…", self.setup_dialog).setEnabled(bool(ch.device))
+        if ch.state == "mapping":
+            m.addAction("Laser map (going on)…", lambda: self.win.map_window(self.engine, self.n))
+            m.addAction("Stop the laser map", lambda: self.engine.stop_map(self.n))
+        else:
+            m.addAction("Laser map…", self.map_dialog).setEnabled(bool(ch.device) and ch.state == "off")
+            if ch.map_last is not None:
+                m.addAction("Last laser map…", lambda: self.win.map_window(self.engine, self.n))
         if ch.hop.enabled and ch.hop.shg:
             m.addAction("Take the optimum now (as set by hand)", lambda: self.engine.take_optimum(self.n)).setEnabled(
                 bool(ch.device) and ch.state != "recovering")
@@ -526,6 +544,11 @@ class ChannelRow(Row):
         d = SetupDialog(self, self.engine, self.n)
         d.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         d.show()
+
+    def map_dialog(self):
+        d = MapDialog(self, self.engine, self.n)
+        if d.exec():
+            self.win.map_window(self.engine, self.n)
 
     def last_dialog(self):
         last = self.engine.channels[self.n].last
@@ -1591,7 +1614,7 @@ class RecoveryDialog(QtWidgets.QDialog):
         label = Text(title, "dim")
         label.setWordWrap(True)
         lay.addWidget(label)
-        lay.addWidget(plot)
+        lay.addWidget(plot, 1)
         return w
 
     def _map(self, m, rec):
@@ -1684,6 +1707,605 @@ class RecoveryDialog(QtWidgets.QDialog):
                 after += f" in {f.get('steps', 0)} steps (the offset moves it {f['gain']:+.3g} V/V)"
         return self._box(f"the error signal over the scan before nulling, close up on its baseline: DC level "
                          f"{f['dc0'] * 1e3:+.1f} mV (amber){after}", plot)
+
+
+# ------------------------------------------------------------------ laser maps
+def _oklab(hexcolor: str):
+    r, g, b = (int(hexcolor[k:k + 2], 16) / 255.0 for k in (1, 3, 5))
+    r, g, b = ((c / 12.92) if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in (r, g, b))
+    lms = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b, 0.2119034982 * r + 0.6806995451 * g
+           + 0.1073969566 * b, 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+    l_, m_, s_ = (math.copysign(abs(x) ** (1 / 3), x) for x in lms)
+    return (0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+            1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_)
+
+
+def _srgb(lab) -> tuple:
+    L, a, b = lab
+    l_, m_, s_ = L + 0.3963377774 * a + 0.2158037573 * b, L - 0.1055613458 * a - 0.0638541728 * b, \
+        L - 0.0894841775 * a - 1.2914855480 * b
+    l3, m3, s3 = l_ ** 3, m_ ** 3, s_ ** 3
+    rgb = (4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3,
+           -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3,
+           -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3)
+    return tuple(int(round(255 * min(max((12.92 * c) if c <= 0.0031308 else (1.055 * c ** (1 / 2.4) - 0.055), 0.0),
+                                         1.0))) for c in rgb)
+
+
+def diverging(n: int = 129, cold: str = "#3987e5", mid: str = "#383835", warm: str = "#e66767") -> list:
+    """n colours (r, g, b) from cold through a neutral grey to warm, evenly in OKLab: below and above a baseline."""
+    a, m, b = _oklab(cold), _oklab(mid), _oklab(warm)
+    half = (n - 1) / 2
+    out = []
+    for k in range(n):
+        x = (k - half) / half
+        p, q = (m, b) if x >= 0 else (m, a)
+        out.append(_srgb(tuple(p[c] + (q[c] - p[c]) * abs(x) for c in range(3))))
+    return out
+
+
+class MapImage(QtWidgets.QWidget):
+    """One way of a laser map (lasermap.MapView: sweeping up, or down), as a picture: the fast axis across, the slow
+    one up; each point coloured by its frequency from where the laser began (MapLegend: blue below, red above, grey
+    at it), black where it did not lase, light grey where the wavemeter read nothing valid; nothing where it is not
+    measured yet. Hovered, a point says what it is."""
+
+    LUT = diverging()
+    UNMEASURED, DARK, BAD = (0x1b, 0x1c, 0x20), (0x00, 0x00, 0x00), (0xc3, 0xc2, 0xb7)
+
+    def __init__(self, title: str, up: bool):
+        super().__init__()
+        self.title, self.up = title, up
+        self.view = None
+        self.span = 1.0      # GHz either side of where it began that the colours cover
+        self._rows = {}      # row -> (its version, its bytes)
+        self._image = None
+        self._span_drawn = None
+        self.setMouseTracking(True)
+        self.setMinimumSize(260, 200)
+
+    def show_view(self, view, span: float):
+        if view is not self.view:
+            self.view, self._rows, self._image = view, {}, None
+        if span != self._span_drawn:
+            self._rows, self._span_drawn = {}, span
+        self.span = span
+        if view is None:
+            self.update()
+            return
+        grid, versions = (view.up, view.up_v) if self.up else (view.down, view.down_v)
+        w, changed = len(view.fv), False
+        lut, n = [bytes((c[0], c[1], c[2], 255)) for c in self.LUT], len(self.LUT)
+        none, dark, bad = (bytes((c[0], c[1], c[2], 255)) for c in (self.UNMEASURED, self.DARK, self.BAD))
+        for j, row in enumerate(grid):
+            if self._rows.get(j, (None,))[0] == versions[j]:
+                continue
+            out = []
+            for x in row:
+                if x is None:
+                    out.append(none)
+                elif x != x:
+                    out.append(bad)
+                elif x == -math.inf:
+                    out.append(dark)
+                else:
+                    out.append(lut[min(max(int((x / span + 1) / 2 * (n - 1) + 0.5), 0), n - 1)])
+            self._rows[j] = (versions[j], b"".join(out))
+            changed = True
+        if changed or self._image is None:
+            data = b"".join(self._rows[j][1] for j in range(len(grid) - 1, -1, -1))  # (the slow axis up)
+            self._image = QtGui.QImage(data, w, len(grid), 4 * w, QtGui.QImage.Format.Format_RGBX8888).copy()
+            self.update()
+
+    def _area(self) -> QtCore.QRectF:
+        fm = self.fontMetrics()
+        return QtCore.QRectF(fm.horizontalAdvance("000.0") + 10, fm.height() + 6,
+                             self.width() - fm.horizontalAdvance("000.0") - 16, self.height() - 2 * fm.height() - 14)
+
+    def paintEvent(self, ev):
+        p = QtGui.QPainter(self)
+        p.fillRect(self.rect(), QtGui.QColor(C["bg"]))
+        r, v = self._area(), self.view
+        fm = p.fontMetrics()
+        p.setPen(QtGui.QColor(C["fg"]))
+        p.drawText(QtCore.QRectF(0, 0, self.width(), fm.height() + 2), Qt.AlignmentFlag.AlignHCenter, self.title)
+        if v is None or self._image is None:
+            p.setPen(QtGui.QColor(C["dim"]))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, "nothing yet")
+            return
+        p.drawImage(r, self._image)
+        p.setPen(QtGui.QPen(QtGui.QColor(C["line"]), 1))
+        p.drawRect(r)
+        p.setPen(QtGui.QColor(C["dim"]))
+        fast, slow = ("mA", "V") if v.fast == "current" else ("V", "mA")
+        bottom = QtCore.QRectF(r.left(), r.bottom() + 2, r.width(), fm.height())
+        p.drawText(bottom, Qt.AlignmentFlag.AlignLeft, f"{v.fv[0]:g}")
+        p.drawText(bottom, Qt.AlignmentFlag.AlignRight, f"{v.fv[-1]:g}")
+        p.drawText(bottom, Qt.AlignmentFlag.AlignHCenter, f"{v.fast} ({fast}) →")
+        left = r.left() - 4
+        p.drawText(QtCore.QRectF(0, r.top() - 2, left, fm.height()), Qt.AlignmentFlag.AlignRight, f"{v.sv[-1]:g}")
+        p.drawText(QtCore.QRectF(0, r.bottom() - fm.height() + 2, left, fm.height()), Qt.AlignmentFlag.AlignRight,
+                   f"{v.sv[0]:g}")
+        p.drawText(QtCore.QRectF(0, r.center().y() - fm.height() / 2, left, fm.height()), Qt.AlignmentFlag.AlignRight,
+                   slow)
+
+    def cell(self, pos):
+        """(line, point) under pos, or None."""
+        v, r = self.view, self._area()
+        if v is None or not r.contains(QtCore.QPointF(pos)):
+            return None
+        k = min(int((pos.x() - r.left()) / r.width() * len(v.fv)), len(v.fv) - 1)
+        j = len(v.sv) - 1 - min(int((pos.y() - r.top()) / r.height() * len(v.sv)), len(v.sv) - 1)
+        return j, k
+
+    def mouseMoveEvent(self, ev):
+        c = self.cell(event_pos(ev))
+        if c is None:
+            QtWidgets.QToolTip.hideText()
+            return
+        v, (j, k) = self.view, c
+        x = (v.up if self.up else v.down)[j][k]
+        i, piezo = (v.fv[k], v.sv[j]) if v.fast == "current" else (v.sv[j], v.fv[k])
+        what = ("not measured yet" if x is None else "no valid reading" if x != x else "not lasing"
+                if x == -math.inf else f"{x:+.3f} GHz from where it began")
+        QtWidgets.QToolTip.showText(self.mapToGlobal(event_pos(ev)),
+                                    f"{i:.3f} mA, {piezo:.3f} V, sweeping {'up' if self.up else 'down'}: {what}", self)
+
+
+class MapLegend(QtWidgets.QWidget):
+    """The colours of MapImage: GHz from where the laser began, and the points that are not a frequency."""
+
+    def __init__(self):
+        super().__init__()
+        self.span = 1.0
+        self.setMinimumHeight(2 * self.fontMetrics().height() + 12)
+
+    def paintEvent(self, ev):
+        p = QtGui.QPainter(self)
+        p.fillRect(self.rect(), QtGui.QColor(C["bg"]))
+        fm = p.fontMetrics()
+        bar = QtCore.QRectF(8, 4, min(320.0, self.width() * 0.45), fm.height() * 0.8)
+        lut = MapImage.LUT
+        for k, c in enumerate(lut):
+            p.fillRect(QtCore.QRectF(bar.left() + bar.width() * k / len(lut), bar.top(), bar.width() / len(lut) + 1,
+                                     bar.height()), QtGui.QColor(*c))
+        p.setPen(QtGui.QColor(C["dim"]))
+        under = QtCore.QRectF(bar.left(), bar.bottom() + 2, bar.width(), fm.height())
+        p.drawText(under, Qt.AlignmentFlag.AlignLeft, f"−{self.span:.3g} GHz")
+        p.drawText(under, Qt.AlignmentFlag.AlignHCenter, "where it began")
+        p.drawText(under, Qt.AlignmentFlag.AlignRight, f"+{self.span:.3g} GHz")
+        x = bar.right() + 24
+        for color, text in ((MapImage.DARK, "not lasing"), (MapImage.BAD, "no valid reading"),
+                            (MapImage.UNMEASURED, "not measured yet")):
+            p.fillRect(QtCore.QRectF(x, bar.top(), bar.height(), bar.height()), QtGui.QColor(*color))
+            p.setPen(QtGui.QColor(C["line"]))
+            p.drawRect(QtCore.QRectF(x, bar.top(), bar.height(), bar.height()))
+            p.setPen(QtGui.QColor(C["fg"]))
+            p.drawText(QtCore.QPointF(x + bar.height() + 6, bar.bottom()), text)
+            x += bar.height() + 14 + fm.horizontalAdvance(text)
+
+
+class MapDialog(QtWidgets.QDialog):
+    """A laser map's plan (lasermap.MapPlan), as you give it: what to sweep and how, with what the map would take and
+    what is wrong with it; Start begins it (Engine.start_map)."""
+
+    SWEEP = (("current", "the current, up and down at each piezo voltage"),
+             ("piezo", "the piezo, up and down at each current"),
+             ("both", "both: a map each, the current's first"))
+    PATTERNS = (("hops", "around hops, the dark and fading fringes, and at every Nth point"),
+                ("all", "at every point (a large file)"), ("off", "never"))
+
+    def __init__(self, parent, engine: Engine, n: int):
+        super().__init__(parent)
+        self.engine, self.n = engine, n
+        ch = engine.channels[n]
+        self.setWindowTitle(f"Laser map · channel {n}" + (f" ({ch.name})" if ch.name else ""))
+        p = ch.map_plan or MapPlan()
+        self._filled = ch.map_plan is not None
+        self.resize(780, 720)
+        outer = QtWidgets.QVBoxLayout(self)
+        inner = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(inner)
+        area = QtWidgets.QScrollArea()  # (it may not all fit on the screen)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        area.setWidget(inner)
+        outer.addWidget(area, 1)
+
+        def row(*widgets):
+            box = QtWidgets.QHBoxLayout()
+            for w in widgets:
+                box.addWidget(Text(w, "dim") if isinstance(w, str) else w)
+            box.addStretch(1)
+            return box
+
+        def number(value, lo, hi, dec, step=None):
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setLocale(QtCore.QLocale.c())
+            sb.setRange(lo, hi)
+            sb.setDecimals(dec)
+            if step:
+                sb.setSingleStep(step)
+            sb.setValue(value)
+            sb.valueChanged.connect(self.check)
+            return sb
+
+        def heading(text):
+            label = Text(text, "accent")
+            label.setContentsMargins(0, 8, 0, 0)
+            form.addRow(label)
+
+        self.now = Text("reading the laser…", "dim")
+        self.now.setWordWrap(True)
+        form.addRow(self.now)
+        heading("Current (measured, as its DLC pro shows it)")
+        self.i_lo = number(p.i_lo, 0.0, 10000.0, 2, 1.0)
+        self.i_hi = number(p.i_hi, 0.0, 10000.0, 2, 1.0)
+        self.i_step = number(p.i_step, 0.001, STEP_I, 3, 0.05)
+        form.addRow("From", row(self.i_lo, "mA to", self.i_hi, "mA (the most it ever gets) in steps of", self.i_step,
+                                "mA"))
+        self.dark = QtWidgets.QSpinBox()
+        self.dark.setRange(0, 50)
+        self.dark.setValue(p.dark)
+        self.dark.valueChanged.connect(self.check)
+        form.addRow("Below threshold", row("a sweep down ends after", self.dark, "points in a row without lasing "
+                                           "(0: never, down to the lowest)"))
+        heading("Piezo")
+        self.v_lo = number(p.v_lo, -1000.0, 1000.0, 2, 1.0)
+        self.v_hi = number(p.v_hi, -1000.0, 1000.0, 2, 1.0)
+        self.v_step = number(p.v_step, 0.001, STEP_V, 3, 0.1)
+        form.addRow("From", row(self.v_lo, "V to", self.v_hi, "V in steps of", self.v_step, "V"))
+        heading("Sweeping")
+        self.sweep = QtWidgets.QComboBox()
+        self.sweep.addItems([label for _, label in self.SWEEP])
+        self.sweep.setCurrentIndex(next((k for k, (key, _) in enumerate(self.SWEEP) if key == p.sweep), 0))
+        self.sweep.currentIndexChanged.connect(self.check)
+        form.addRow("Sweep", self.sweep)
+        self.settle = number(p.settle, 0.0, 60.0, 3, 0.01)
+        self.reads = QtWidgets.QSpinBox()
+        self.reads.setRange(1, 50)
+        self.reads.setValue(p.reads)
+        self.reads.valueChanged.connect(self.check)
+        form.addRow("Each point", row(self.settle, "s after the step, then", self.reads,
+                                      "readings that began after it"))
+        self.repeat = QtWidgets.QCheckBox("The first line swept again at the end (how far it drifted meanwhile)")
+        self.repeat.setChecked(p.repeat)
+        self.repeat.toggled.connect(self.check)
+        form.addRow(self.repeat)
+        heading("Temperature")
+        self.temp_on = QtWidgets.QCheckBox("Step the temperature too: a whole map at each")
+        self.temp_on.setChecked(p.t_step > 0)
+        self.temp_on.toggled.connect(self.check)
+        form.addRow(self.temp_on)
+        self.t_lo = number(p.t_lo, -50.0, 100.0, 3, 0.1)
+        self.t_hi = number(p.t_hi, -50.0, 100.0, 3, 0.1)
+        self.t_step = number(p.t_step or 0.5, 0.001, 20.0, 3, 0.1)
+        form.addRow("From", row(self.t_lo, "°C to", self.t_hi, "°C in steps of", self.t_step, "K"))
+        self.t_tol = number(p.t_tol, 0.001, 1.0, 3, 0.005)
+        self.t_hold = number(p.t_hold, 0.0, 3600.0, 0, 5.0)
+        self.t_wait = number(p.t_wait, 1.0, 36000.0, 0, 30.0)
+        form.addRow("Settled", row("within", self.t_tol, "K for", self.t_hold, "s, waiting", self.t_wait,
+                                   "s at most"))
+        heading("Recorded")
+        self.patterns = QtWidgets.QComboBox()
+        self.patterns.addItems([label for _, label in self.PATTERNS])
+        self.patterns.setCurrentIndex(next((k for k, (key, _) in enumerate(self.PATTERNS) if key == p.patterns), 0))
+        self.patterns.currentIndexChanged.connect(self.check)
+        self.every = QtWidgets.QSpinBox()
+        self.every.setRange(0, 100000)
+        self.every.setValue(p.every)
+        self.every.valueChanged.connect(self.check)
+        form.addRow("Wavemeter patterns", row(self.patterns, "N", self.every))
+        self.patterns.setToolTip("The wavemeter's interference patterns, as its window shows them: where a second\n"
+                                 "mode begins its fringes beat or fade. They take most of the file.")
+        self.record = QtWidgets.QLineEdit(p.record)
+        self.record.setPlaceholderText("e.g. dl:pd:power, dl:tc:current-act")
+        self.record.textChanged.connect(self.check)
+        form.addRow("Also read at each point", self.record)
+        self.record.setToolTip("DLC pro parameters below laserN:, comma-separated. Its own photodiode\n"
+                               "(dl:pd:photodiode) is read at each point anyway, if it has one.")
+        folder = QtWidgets.QHBoxLayout()
+        self.folder = QtWidgets.QLineEdit(p.folder or str(FOLDER))
+        browse = QtWidgets.QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        folder.addWidget(self.folder, 1)
+        folder.addWidget(browse)
+        form.addRow("Saved in", folder)
+        note = Text("Unlock it first; a TA off, its DLC pro's cavity lock off. Its scan is switched off for the map "
+                    "and on again after. Stopped, or done, it goes back where it began (another mode, perhaps: "
+                    "hysteresis). Untick the other channels in the WLM software for a faster map; with the exposure "
+                    "on auto it slows where the laser is dim.", "dim")
+        note.setWordWrap(True)
+        form.addRow(note)
+        self.estimate = Text("", "fg")
+        self.estimate.setWordWrap(True)
+        outer.addWidget(self.estimate)
+        self.problems = Text("", "err")
+        self.problems.setWordWrap(True)
+        outer.addWidget(self.problems)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        self.start = bb.addButton("Start map", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
+        bb.accepted.connect(self._start)
+        bb.rejected.connect(self.reject)
+        outer.addWidget(bb)
+        self._info = object()
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._read)
+        self.timer.start(150)
+        engine.map_look(n)
+        self.check()
+
+    def plan(self) -> MapPlan:
+        return MapPlan(i_lo=self.i_lo.value(), i_hi=self.i_hi.value(), i_step=self.i_step.value(),
+                       v_lo=self.v_lo.value(), v_hi=self.v_hi.value(), v_step=self.v_step.value(),
+                       sweep=self.SWEEP[self.sweep.currentIndex()][0], t_lo=self.t_lo.value(),
+                       t_hi=self.t_hi.value(), t_step=self.t_step.value() if self.temp_on.isChecked() else 0.0,
+                       t_tol=self.t_tol.value(), t_hold=self.t_hold.value(), t_wait=self.t_wait.value(),
+                       settle=self.settle.value(), reads=self.reads.value(), dark=self.dark.value(),
+                       patterns=self.PATTERNS[self.patterns.currentIndex()][0], every=self.every.value(),
+                       record=self.record.text().strip(), repeat=self.repeat.isChecked(),
+                       folder=self.folder.text().strip())
+
+    def limits(self):
+        """What take_over would read, from what map_look read (None: not yet)."""
+        info = self.engine.channels[self.n].map_info
+        if not info or "error" in info:
+            return None
+        act, i_set, v = info.get("current_act"), info.get("current_set"), info.get("piezo")
+        if not all(isinstance(x, (int, float)) for x in (act, i_set, v)):
+            return None
+
+        def pair(a, b):
+            lo, hi = info.get(a), info.get(b)
+            return (lo, hi) if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and lo < hi else None
+
+        ff = info.get(FF_ON) is True and isinstance(info.get(FF), (int, float))
+        t0 = info.get(TEMP_SET)
+        return {"clip": info.get(CLIP) if isinstance(info.get(CLIP), (int, float)) else math.inf,
+                "offset": act - i_set, "ff": info[FF] if ff else 0.0, "v0": v,
+                "pc": pair(PC_MIN, PC_MAX) or (-math.inf, math.inf), "tc": pair(TEMP_MIN, TEMP_MAX) or
+                (-math.inf, math.inf), "t0": t0 if isinstance(t0, (int, float)) else None}
+
+    def _read(self):
+        info = self.engine.channels[self.n].map_info
+        if info is self._info:
+            return
+        self._info = info
+        if info is None:
+            return
+        if "error" in info or not info:
+            self.now.paint(f"cannot read the laser: {info.get('error', 'not a DLC pro')}", "err")
+            self.check()
+            return
+        act, v, t = info.get("current_act"), info.get("piezo"), info.get(TEMP_SET)
+        parts = []
+        if isinstance(act, (int, float)):
+            parts.append(f"now {act:.3f} mA")
+        if isinstance(info.get(CLIP), (int, float)):
+            parts.append(f"current-clip {info[CLIP]:.1f} mA set")
+        if isinstance(v, (int, float)):
+            pc = (f", its limits {info[PC_MIN]:g} … {info[PC_MAX]:g} V" if isinstance(info.get(PC_MIN), (int, float))
+                  and isinstance(info.get(PC_MAX), (int, float)) else "")
+            parts.append(f"piezo {v:.3f} V{pc}")
+        if isinstance(t, (int, float)):
+            parts.append(f"{t:.3f} °C set")
+        if info.get(FF_ON) is True and isinstance(info.get(FF), (int, float)):
+            parts.append(f"feedforward {info[FF]:+.4f} mA/V (taken into account)")
+        pd = next((name for name in PD_NAMES if isinstance(info.get(name), (int, float))), "")
+        parts.append(f"its photodiode ({pd}) read at each point" if pd else "no photodiode of its own read")
+        warn = []
+        if info.get(TA_ON) is True:
+            warn.append("its TA is on: switch it off first")
+        if info.get(LOCK_ON) is True:
+            warn.append("its DLC pro's cavity lock is on: switch it off first")
+        self.now.paint(" · ".join(parts) + (" — " + "; ".join(warn) if warn else ""), "err" if warn else "dim")
+        if not self._filled and isinstance(act, (int, float)) and isinstance(v, (int, float)):
+            self._filled = True  # (a first map of this laser: around where it is)
+            self.i_lo.setValue(max(round(act - 30.0), 0.0))
+            pc = (info.get(PC_MIN), info.get(PC_MAX))
+            if all(isinstance(x, (int, float)) for x in pc) and pc[0] < pc[1]:
+                self.v_lo.setValue(max(pc[0], v - 30.0))
+                self.v_hi.setValue(min(pc[1], v + 30.0))
+            else:
+                self.v_lo.setValue(v - 30.0)
+                self.v_hi.setValue(v + 30.0)
+            if isinstance(t, (int, float)):
+                self.t_lo.setValue(round(t - 0.5, 3))
+                self.t_hi.setValue(round(t + 0.5, 3))
+        self.check()
+
+    def check(self, *_):
+        p = self.plan()
+        bad = p.problems(self.limits())
+        info = self.engine.channels[self.n].map_info or {}
+        if info.get(TA_ON) is True:
+            bad.append("its TA is on")
+        if info.get(LOCK_ON) is True:
+            bad.append("its cavity lock is on")
+        temp = p.t_step > 0
+        for w in (self.t_lo, self.t_hi, self.t_step, self.t_tol, self.t_hold, self.t_wait):
+            w.setEnabled(temp)
+        self.every.setEnabled(p.patterns == "hops")
+        s, size = self.engine.map_estimate(self.n, p)
+        rate = self.engine.channel_rate(self.n)
+        self.estimate.paint(f"{p.points():,} points at most; about {fmt_duration(s)} at the {rate:.0f} readings a "
+                            f"second the wavemeter gives it now (slower where it is dim); the file about "
+                            f"{fmt_bytes(size)}" if rate else
+                            f"{p.points():,} points at most; the file about {fmt_bytes(size)} (no readings now: "
+                            f"how long it takes is not known)", "fg")
+        self.problems.paint("; ".join(bad), "err")
+        self.start.setEnabled(not bad)
+
+    def _browse(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Save laser maps in", self.folder.text())
+        if d:
+            self.folder.setText(d)
+
+    def _start(self):
+        why = self.engine.start_map(self.n, self.plan())
+        if why:
+            self.problems.paint(why, "err")
+            return
+        self.accept()
+
+
+class MapWindow(QtWidgets.QWidget):
+    """A laser map as it goes, and once it is over: each way as a picture (MapImage), the last two sweeps, the last
+    interference pattern, what it noted; Stop puts the laser back where it began. Done, a picture of it is saved
+    next to its file."""
+
+    def __init__(self, win: "MainWindow", engine: Engine, n: int):
+        super().__init__(win, Qt.WindowType.Window)
+        self.win, self.engine, self.n = win, engine, n
+        self.setWindowTitle(f"Laser map · channel {n}")
+        self.resize(980, 760)
+        v = QtWidgets.QVBoxLayout(self)
+        top = QtWidgets.QHBoxLayout()
+        self.which = QtWidgets.QComboBox()
+        self.which.setMinimumWidth(260)
+        self.which.activated.connect(self._picked)
+        top.addWidget(self.which)
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        top.addWidget(self.bar, 1)
+        v.addLayout(top)
+        self.head = Text("", "fg")
+        self.head.setWordWrap(True)
+        v.addWidget(self.head)
+        self.maps = QtWidgets.QWidget()  # (both ways and their legend: the picture saved)
+        box = QtWidgets.QVBoxLayout(self.maps)
+        box.setContentsMargins(0, 0, 0, 0)
+        both = QtWidgets.QHBoxLayout()
+        self.up_img, self.down_img = MapImage("sweeping up", True), MapImage("sweeping down", False)
+        both.addWidget(self.up_img)
+        both.addWidget(self.down_img)
+        box.addLayout(both, 1)
+        self.legend = MapLegend()
+        box.addWidget(self.legend)
+        v.addWidget(self.maps, 3)
+        lower = QtWidgets.QHBoxLayout()
+        self.sweeps = Plot("", "GHz", 150)
+        self.pattern = Plot("pixel", "counts", 150)
+        self.sweeps_box = RecoveryDialog._box("the last two sweeps: frequency from where it began", self.sweeps)
+        self.pattern_box = RecoveryDialog._box("the last interference pattern the wavemeter gave", self.pattern)
+        lower.addWidget(self.sweeps_box, 1)
+        lower.addWidget(self.pattern_box, 1)
+        v.addLayout(lower, 2)
+        self.notes = QtWidgets.QPlainTextEdit()
+        self.notes.setReadOnly(True)
+        self.notes.setMaximumHeight(110)
+        v.addWidget(self.notes)
+        bb = QtWidgets.QHBoxLayout()
+        self.stop = QtWidgets.QPushButton("Stop map")
+        self.stop.clicked.connect(self._stop)
+        self.folder = QtWidgets.QPushButton("Open folder")
+        self.folder.clicked.connect(self._open)
+        close = QtWidgets.QPushButton("Close")
+        close.clicked.connect(self.close)
+        bb.addWidget(self.stop)
+        bb.addStretch(1)
+        bb.addWidget(self.folder)
+        bb.addWidget(close)
+        v.addLayout(bb)
+        self.follow = True  # show the map filling, until another is picked
+        self.view = None
+        self._views = 0
+        self._shown = (None, -1)
+        self._notes = 0
+        self._saved = None
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(500)
+        self.refresh()
+
+    def runner(self):
+        ch = self.engine.channels[self.n]
+        return ch.mapper or ch.map_last
+
+    def _picked(self, k: int):
+        r = self.runner()
+        if r is not None and 0 <= k < len(r.mapper.views):
+            self.follow = k == len(r.mapper.views) - 1
+            self.view = r.mapper.views[k]
+            self._shown = (None, -1)
+            self.refresh()
+
+    def refresh(self):
+        ch = self.engine.channels[self.n]
+        r = self.runner()
+        if r is None:
+            self.head.paint("laser map: reading its settings…" if ch.state == "mapping" else ch.map_note or "", "dim")
+            return
+        m = r.mapper
+        if len(m.views) != self._views:
+            self._views = len(m.views)
+            self.which.clear()
+            for k, view in enumerate(m.views):
+                what = f"map {k + 1}: the {view.kind} swept" if not view.repeat else f"its first line again ({k + 1})"
+                self.which.addItem(what + (f", {view.temp:.3f} °C" if view.temp is not None else ""))
+        if m.views and (self.follow or self.view is None):
+            self.view = m.view or m.views[-1]
+            self.which.setCurrentIndex(m.views.index(self.view))
+        running = r.busy
+        self.bar.setValue(int(1000 * m.progress))
+        now = time.monotonic()
+        took = (now if running else r.now) - r.started
+        if running:
+            left = f", {fmt_duration(took * (1 - m.progress) / m.progress)} to go" if m.progress > 0.02 else ""
+            self.head.paint(f"{r.stage} · {m.points:,} points ({m.lasing:,} lasing), {fmt_duration(took)} so far{left}"
+                            + (f" · {fmt_bytes(m.out.size)}" if m.out is not None else ""), "accent")
+        else:
+            self.head.paint(ch.map_note or r.error or r.result, "ok" if r.state == "done" else "err")
+        self.stop.setEnabled(running)
+        view = self.view
+        if view is not None and (view, view.version) != self._shown:
+            self._shown = (view, view.version)
+            vals = [abs(x) for grid in (view.up, view.down) for row in grid for x in row
+                    if x is not None and x == x and x != -math.inf]
+            span = max(sorted(vals)[int(0.98 * (len(vals) - 1))] if vals else 1.0, 0.05)
+            span = float(f"{span:.2g}")  # (a round number: the picture redrawn only when it changes much)
+            self.up_img.show_view(view, span)
+            self.down_img.show_view(view, span)
+            self.legend.span = span
+            self.legend.update()
+            self.sweeps.series.clear()
+            for trace, color in ((m.trace_before, "dim"), (m.trace, "accent")):
+                self.sweeps.add([x for x, _ in trace], [g for _, g in trace], color, "dots", 1.5)
+            self.sweeps.xlabel = f"{view.fast} ({'mA' if view.fast == 'current' else 'V'})"
+            legs = {1: "up", 2: "down", 0: "down to the dark"}
+            self.sweeps_box.findChild(QtWidgets.QLabel).setText(
+                f"the last two sweeps: frequency from where it began, now {legs.get(m.trace_legs[0], '')} (blue), "
+                f"before that {legs.get(m.trace_legs[1], '…')} (grey)")
+            self.sweeps.update()
+            self.pattern.series.clear()
+            if m.pattern_now is not None:
+                values = m.pattern_now[1]
+                self.pattern.add(list(range(len(values))), list(values), "ok", "line", 1.0)
+            self.pattern.update()
+        if len(m.notes) != self._notes:
+            self._notes = len(m.notes)
+            self.notes.setPlainText("\n".join(f"{t:8.1f} s  {text}" if t is not None else f"{'':10s}{text}"
+                                              for t, text in m.notes[-60:]))
+            self.notes.verticalScrollBar().setValue(self.notes.verticalScrollBar().maximum())
+        if not running and m.out is not None and self._saved is None:
+            self._saved = m.out.path.with_suffix(".png")
+            try:
+                self.maps.grab().save(str(self._saved))  # (a look at it, next to its file)
+            except Exception:  # (whatever it is: never in the way)
+                pass
+
+    def _stop(self):
+        if self.win.confirm("Stop the map", "Stop the map? The laser goes back where it began; what it mapped so far "
+                                            "stays in its file."):
+            self.engine.stop_map(self.n)
+
+    def _open(self):
+        r = self.runner()
+        path = r.mapper.out.path.parent if r is not None and r.mapper.out is not None else \
+            (self.engine.channels[self.n].map_plan.folder or FOLDER)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
 
 
 class SetupDialog(QtWidgets.QDialog):
@@ -2346,6 +2968,17 @@ class MainWindow(QtWidgets.QWidget):
     def confirm(self, title: str, text: str) -> bool:
         box = QtWidgets.QMessageBox.question(self, title, text)
         return box == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def map_window(self, engine: Engine, n: int) -> "MapWindow":
+        """Channel n's laser map, as it goes or as it ended: its window, shown (one a channel, kept)."""
+        windows = self.__dict__.setdefault("map_windows", {})
+        w = windows.get((id(engine), n))
+        if w is None:
+            w = windows[(id(engine), n)] = MapWindow(self, engine, n)
+        w.show()
+        w.raise_()
+        w.activateWindow()
+        return w
 
     def use_as_reference(self, n: int, engine: Engine | None = None):
         e = engine or self.engine

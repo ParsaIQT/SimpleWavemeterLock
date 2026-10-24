@@ -59,7 +59,7 @@ TAG = 16          # bytes of HMAC-SHA256 kept
 MAX = 1200        # bytes of a datagram at most (no IP fragments)
 RAW_MAX = 1 << 20  # bytes of JSON a datagram may inflate to
 COLORS = ("fg", "dim", "ok", "warn", "err", "accent")
-STATES = ("off", "error", "on", "engaging", "recovering", "asking", "ref", "ref-hold", "ref-moved")
+STATES = ("off", "error", "on", "engaging", "recovering", "asking", "mapping", "ref", "ref-hold", "ref-moved")
 FAST = ("f", "dev")  # what a fast datagram carries (and age: 0, it is new)
 ACTIONS = ("setpoint", "lock", "unlock", "stop", "continue", "setpoint_to_reading", "recenter", "rename",
            "lock_params")

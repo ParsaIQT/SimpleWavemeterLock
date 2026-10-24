@@ -1,3 +1,4 @@
+import base64
 import ctypes
 import importlib
 import json
@@ -6,6 +7,7 @@ import sys
 import threading
 import time
 import types
+from array import array
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -676,5 +678,183 @@ def test_server_serves_each_wavemeter_of_its_pc(monkeypatch):
             assert r.status_code == 404 and "WS7 1234, WS6 5678" in r.json()["detail"]
             assert client.post("/api/v1/channel/4/use?wlm=5678", json={"use": True}).status_code == 200
             assert lib.sets == [(5678, 4, 1)] and 4 not in a.use
+    finally:
+        sys.modules.pop("server", None)
+
+
+# ----------------------------------------------- details (what a laser map reads)
+class DetailLib(FakeLib):
+    """FakeLib with what a laser map reads besides: power, exposure, amplitudes and interference patterns."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.pattern = [1000 + (x * 37) % 3000 for x in range(1024)]
+        self.exported = {}  # kind -> exported (SetPattern)
+        self.exposures = {1: (3, 0), 4: (250, 0)}
+
+    def GetPowerNum(self, ch, _):
+        return 12.5 if self.freqs.get(ch, 0) > 0 else -3.0
+
+    def GetExposureNum(self, ch, arr, _):
+        return self.exposures.get(ch, (0, 0))[arr - 1]
+
+    def GetAmplitudeNum(self, ch, k, _):
+        return 100 * (k + 1) + ch
+
+    def GetPatternItemCount(self, kind):
+        return len(self.pattern) if kind == 0 else 0
+
+    def GetPatternItemSize(self, kind):
+        return 2
+
+    def SetPattern(self, kind, on):
+        self.exported[kind] = bool(on)
+        return 0
+
+    def GetPatternDataNum(self, ch, kind, buf):
+        if kind != 0 or not self.exported.get(kind):
+            return 0
+        for i, v in enumerate(self.pattern):
+            buf[i] = v + ch
+        return 1
+
+
+DETAILS = {"GetPowerNum", "GetExposureNum", "GetAmplitudeNum", "GetPatternItemCount", "GetPatternItemSize",
+           "SetPattern", "GetPatternDataNum"}
+
+
+def test_dll_source_says_a_detailed_channels_readings_in_detail(monkeypatch):
+    lib = DetailLib()
+
+    def make(path):
+        w = fake_wlm(lib)
+        w.has |= DETAILS
+        return w
+
+    monkeypatch.setattr(wavemeter, "WlmDll", make)
+    sink = Sink()
+    src = DllSource(sink, interval=0.001)
+    src.start()
+
+    def last(ch):
+        return [r for r in sink.readings if r.ch == ch][-1]
+
+    try:
+        assert wait_for(lambda: len(sink.readings) >= 3)
+        assert all(r.extra is None for r in sink.readings)  # (none in detail yet)
+        src.detail(1, True)
+        lib.freqs[1] = 755.2
+        assert wait_for(lambda: last(1).freq == 755.2)
+        r = last(1)
+        assert r.extra["power"] == 12.5 and r.extra["exposure"] == [3, 0]
+        assert r.extra["amps"] == [101, 301, 501, 201, 401, 601]  # min1, max1, avg1, min2, max2, avg2
+        code, a = r.extra["patterns"][0]
+        assert code == "H" and list(a) == [v + 1 for v in lib.pattern] and 1 not in r.extra["patterns"]
+        assert lib.exported == {0: True, 1: False} and src.pattern_info == {0: (1024, 2)}
+        assert src.exposure(1) == 0.003 and src.exposure(4) is None
+        lib.freqs[4] = 384.3  # (not in detail)
+        assert wait_for(lambda: last(4).freq == 384.3) and last(4).extra is None
+        src.detail(1, False)  # in detail, without its patterns: no longer exported
+        lib.freqs[1] = 755.3
+        assert wait_for(lambda: last(1).freq == 755.3)
+        assert "patterns" not in last(1).extra and lib.exported[0] is False
+        src.detail(1, None)
+        lib.freqs[1] = 755.4
+        assert wait_for(lambda: last(1).freq == 755.4) and last(1).extra is None
+    finally:
+        src.stop()
+
+
+class DetailHandler(BaseHTTPRequestHandler):
+    """A server.py that says channel 1 in detail (old: one from before, that cannot)."""
+    old = False
+    f = 755.2227
+    asked = []
+
+    def do_GET(self):
+        if "/detail" in self.path:
+            DetailHandler.asked.append(self.path)
+            if DetailHandler.old:
+                body, status = {"detail": "Not Found"}, 404
+            else:
+                data = array("H", [7, 8, 9]).tobytes()
+                body, status = {"channel": 1, "status": "Valid", "is_valid": True, "frequency_thz": DetailHandler.f,
+                                "power_uw": 20.0, "exposure_ms": [5, 0], "amplitudes": [1, 2, 3, 4, 5, 6],
+                                "patterns": {"0": {"type": "H", "data": base64.b64encode(data).decode()}}}, 200
+        else:
+            body, status = {"server_status": "Online", "channels": {"channel_1": channel("Valid", DetailHandler.f),
+                                                                     "channel_2": channel("Valid", 500.0)}}, 200
+        out = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.mark.parametrize("old", [False, True])
+def test_http_source_asks_for_a_detailed_channels_readings_in_detail(old):
+    DetailHandler.protocol_version = "HTTP/1.1"
+    DetailHandler.old, DetailHandler.f, DetailHandler.asked = old, 755.2227, []
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), DetailHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    sink = Sink()
+    src = HttpSource(sink, f"127.0.0.1:{srv.server_port}", interval=0.01)
+    src.detail(1, True)
+    src.start()
+    try:
+        assert wait_for(lambda: any(r.ch == 1 for r in sink.readings))
+        r = next(r for r in sink.readings if r.ch == 1)
+        if old:  # (readings as ever, without their details)
+            assert r.extra is None and src.no_detail and len(DetailHandler.asked) == 1
+        else:
+            assert r.freq == 755.2227 and r.extra["power"] == 20.0 and r.extra["exposure"] == [5, 0]
+            assert r.extra["patterns"][0][0] == "H" and list(r.extra["patterns"][0][1]) == [7, 8, 9]
+            assert DetailHandler.asked == ["/api/v1/channel/1/detail?patterns=1"] and src.exposure(1) == 0.005
+        assert next(r for r in sink.readings if r.ch == 2).extra is None
+    finally:
+        src.stop()
+        srv.shutdown()
+
+
+def test_server_says_a_channel_in_detail(monkeypatch):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    lib = DetailLib(n=4, use=(1, 4))
+    lib.GetTemperature = lambda _: 24.5
+    lib.GetPressure = lambda _: 1001.0
+    lib.GetWavelengthNum = lambda ch, _: C_NM_THZ / lib.GetFrequencyNum(ch, 0) if lib.GetFrequencyNum(ch, 0) else 0
+    wlm_data = types.ModuleType("wlmData")
+    wlm_data.dll = lib
+    wlm_data.LoadDLL = lambda path: None
+    wlm_const = types.ModuleType("wlmConst")
+    for name, value in dict(ErrWlmMissing=-5, ErrNoSignal=-1, ErrBadSignal=-2, ErrLowSignal=-3,
+                            ErrBigSignal=-4, ErrOutOfRange=-14, ErrTemperature=-1000).items():
+        setattr(wlm_const, name, value)
+    monkeypatch.setitem(sys.modules, "wlmData", wlm_data)
+    monkeypatch.setitem(sys.modules, "wlmConst", wlm_const)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "server"))
+    server = importlib.import_module("server")
+    try:
+        with TestClient(server.app) as client:
+            d = client.get("/api/v1/channel/1/detail?patterns=1").json()
+            assert d["frequency_thz"] == 755.1 and d["is_valid"] and d["power_uw"] == 12.5
+            assert d["exposure_ms"] == [3, 0] and d["amplitudes"] == [101, 301, 501, 201, 401, 601]
+            p = d["patterns"]["0"]
+            a = array(p["type"])
+            a.frombytes(base64.b64decode(p["data"]))
+            assert list(a) == [v + 1 for v in lib.pattern] and lib.exported[0] is True
+            assert "patterns" not in client.get("/api/v1/channel/1/detail").json()
+            low = client.get("/api/v1/channel/2/detail").json()
+            assert low["status"] == "Low Signal" and low["power_uw"] is None
+            assert client.get("/api/v1/channel/9/detail").status_code == 404
+            monkeypatch.setattr(server, "EXPORT_S", -1.0)  # (a minute without a request for patterns)
+            client.get("/api/v1/wavelength")
+            assert lib.exported[0] is False and server.EXPORT == {}
     finally:
         sys.modules.pop("server", None)

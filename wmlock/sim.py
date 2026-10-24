@@ -17,6 +17,7 @@ import re
 import socket
 import threading
 import time
+from array import array
 
 from . import dac as daclib
 from .dlcpro import CURRENT_SET, DISCOVERY_PORT, OUT_CC, OUT_PC, PIEZO_SET, SCAN_OFFSET, SCAN_OUT
@@ -55,16 +56,24 @@ class FakeDLCPro:
     in mA, within current-clip), and the piezo is set by dl:pc:voltage-set, as by hand; whatever
     else is set (current-set, voltage-set while the scan drives the piezo) is kept but drives
     nothing. Switched to another output, the scan's offset takes that output's value: nothing
-    jumps."""
+    jumps.
+
+    Its temperature controller: dl:tc:temp-act follows dl:tc:temp-set (its config's "temp", °C) with
+    a time constant of temp_tau s on `clock` (as a TEC would, roughly), within its limits (a write
+    outside them is refused); the piezo's limits are dl:pc:voltage-min and -max."""
 
     _REF = re.compile(r"\(param-ref '([\w:-]+)\)$")
     _SET = re.compile(r"\(param-set! '([\w:-]+) (\S+)\)$")
     _EXEC = re.compile(r"\(exec '([\w:-]+)((?: +\S+)*)\)$")
 
-    def __init__(self, serial, label, lasers, host="127.0.0.1", port=0, eol="\r\n", echo=False, serve=True):
+    def __init__(self, serial, label, lasers, host="127.0.0.1", port=0, eol="\r\n", echo=False, serve=True,
+                 clock=time.monotonic, temp_tau=4.0):
         """serve=False: no TCP server, only execute() (for synchronous tests)."""
         self.serial, self.label, self.host = serial, label, host
         self.eol, self.echo = eol, echo
+        self.clock, self.temp_tau = clock, temp_tau
+        self._temp = {}  # laser -> (temp-act, when, temp-set then): its temperature, as last worked out...
+        self._temp_lock = threading.Lock()  # ...under this (alone: a laser asks for it holding its own lock)
         self.params = {
             "system-type": '"DLCpro"', "serial-number": f'"{serial}"',
             "system-label": f'"{label}"', "fw-ver": '"3.3.3"',
@@ -88,12 +97,20 @@ class FakeDLCPro:
                 p + "dl:cc:current-clip": float(d.get("clip", 200.0)),
                 p + "dl:lock:lock-enabled": bool(d.get("locked", False)),
                 p + "dl:lock:state-txt": '"off"',
+                p + "dl:pc:voltage-min": float(d.get("pc_min", 0.0)),
+                p + "dl:pc:voltage-max": float(d.get("pc_max", 140.0)),
+                p + "dl:tc:temp-set": float(d.get("temp", 20.0)),
+                p + "dl:tc:temp-act": lambda n=n: self.temp_act(n),
+                p + "dl:tc:limits:temp-min": float(d.get("temp_min", 15.0)),
+                p + "dl:tc:limits:temp-max": float(d.get("temp_max", 35.0)),
             })
         self.bias = {n: float(d.get("act_offset", 0.0)) for n, d in lasers.items()}
         self.sets = 0
         self.log = []  # every accepted write: (parameter, value); every command: (name, args)
         self._drove = {}  # laser -> (piezo, current) when its scan was last switched to another output
+        self._was_temp = {}  # laser -> its temperature set before the first write (where it had settled)
         self.on_set = {f"laser{n}:{SCAN_OUT}": lambda out, n=n: self._scan_moved(n) for n in lasers}
+        self.on_set.update({f"laser{n}:dl:tc:temp-set": lambda t, n=n: self._temp_moved(n) for n in lasers})
         self.commands = {}
         self.busy_checks = []  # (kind 'get' | 'set' | 'exec', name) -> True: refused now as busy (decop -1032)
         self.mutex = threading.RLock()  # held while a command line is executed
@@ -132,6 +149,28 @@ class FakeDLCPro:
         if d[p + "dl:cc:feedforward-enabled"]:
             i += d[p + "dl:cc:feedforward-factor"] * self.offset(n)
         return i
+
+    def temp_act(self, n: int) -> float:
+        """°C: its temperature as measured, settling towards the set one."""
+        p = f"laser{n}:dl:tc:temp-set"
+        with self._temp_lock:
+            now = self.clock()
+            act, t, aim = self._temp.get(n, (self.params[p], now, self.params[p]))
+            act = aim + (act - aim) * math.exp(-max(now - t, 0.0) / self.temp_tau)
+            self._temp[n] = (act, now, aim)
+            return act
+
+    def _temp_moved(self, n: int):
+        """Its temperature set anew: settling towards that from now on."""
+        p = f"laser{n}:dl:tc:temp-set"
+        with self._temp_lock:
+            now = self.clock()
+            if n in self._temp:
+                act, t, aim = self._temp[n]
+                act = aim + (act - aim) * math.exp(-max(now - t, 0.0) / self.temp_tau)
+            else:  # (never read: it had settled where it was, kept in _was_temp)
+                act = self._was_temp.get(n, self.params[p])
+            self._temp[n] = (act, now, self.params[p])
 
     def _scan_moved(self, n: int):
         """Its scan was switched to another output: its offset takes that output's value, and the one it left keeps its
@@ -246,6 +285,12 @@ class FakeDLCPro:
                     return "Error: -21 above current-clip"
                 if rest == SCAN_OUT:  # (where the outputs were, for _scan_moved)
                     self._drove[n] = (self.offset(n), self.current(n))
+                if rest == "dl:tc:temp-set":
+                    if not self.params[f"{head}:dl:tc:limits:temp-min"] <= new <= \
+                            self.params[f"{head}:dl:tc:limits:temp-max"]:
+                        return "Error: -21 out of range"
+                    if n not in self._temp:
+                        self._was_temp[n] = old
             self.params[name] = new
             hook = self.on_set.get(name)
             if hook is not None:
@@ -371,12 +416,13 @@ class ECDL:
     lasing, it gives the wavemeter nothing to read and a cavity nothing to resonate with; the TA
     gets hardly any seed (power()), or with `ase` that fraction of its lasing power as broadband
     light (an AR-coated chip without its feedback), which its seed photodiode cannot tell from
-    lasing.
+    lasing. Warmer, it needs more current to lase: kth mA per K, its thresholds and its power's.
+    Its own photodiode (a DL pro's, photodiode()) sees its power, and a little spontaneous light.
     """
 
     def __init__(self, f0, fsr=6.0, kv=0.4, ki=-0.25, ksv=None, ksi=-2.0, kt=-4.0, kst=-1.0,
                  hysteresis=0.6, multimode=0.3, v0=70.0, i0=150.0, seed=None, mm_noise=0.03, skew=0.0,
-                 i_stop=None, i_start=None, dark_v=None):
+                 i_stop=None, i_start=None, dark_v=None, kth=0.0):
         self.f0, self.fsr = f0, fsr
         self.mm_noise = mm_noise  # GHz rms the wavemeter reads where it runs on two modes
         self.kv, self.ki = kv, ki
@@ -394,6 +440,7 @@ class ECDL:
         self.lasing = True
         self.slope_mw, self.i_th = 0.25, i0 - 80.0   # its power: mW per mA above threshold
         self.ase = 0.0     # not lasing, this fraction of that power still goes on (broadband)
+        self.kth = kth     # mA/K: its thresholds move up this much as it warms
 
     def misalignment(self, m: int, v: float, i: float) -> float:
         return (m * self.fsr + (self.kv - self.ksv) * (v - self.v0) + (self.ki - self.ksi) * (i - self.i0)
@@ -423,6 +470,7 @@ class ECDL:
         mode's misalignment (GHz)."""
         start = self.i_start if self.i_start is not None else self.i_stop
         more = self.dark_v[1] * max(v - self.dark_v[0], 0.0) if self.dark_v else 0.0
+        more += self.kth * self.T
         if self.lasing:
             if self.i_stop is not None and i < self.i_stop + more:
                 self.lasing = False
@@ -443,8 +491,16 @@ class ECDL:
     def power(self, i: float) -> float:
         """mW it sends on (to a TA's seed photodiode, say): lasing, above threshold; else a trace, or
         broadband light (ase)."""
-        p = max(self.slope_mw * (i - self.i_th), 0.0)
+        p = max(self.slope_mw * (i - self.i_th - self.kth * self.T), 0.0)
         return p if self.lasing else max(self.ase * p, 0.3)
+
+    def photodiode(self, i: float) -> float:
+        """µA from its own photodiode (a DL pro's, dl:pd:photodiode): its power lasing, else (and besides) the
+        spontaneous light of its chip."""
+        spont = 0.05 * max(i, 0.0)
+        if not self.lasing:
+            return spont + 40.0 * self.ase * max(self.slope_mw * (i - self.i_th - self.kth * self.T), 0.0)
+        return spont + 40.0 * self.power(i)
 
     def freq(self, v: float, i: float, extra_mhz: float = 0.0) -> float:
         """What the laser emits at (v, i), THz, as a wavemeter would see it (NaN: not lasing)."""
@@ -479,6 +535,102 @@ class ECDL:
     def stop(self):
         """It stops lasing (the current dipped for a moment, say): it starts again only above i_start."""
         self.lasing = False
+
+
+class SimCCD:
+    """The wavemeter's view of one laser, measured with all a source's details say (wavemeter.Source.detail): the
+    power reaching it (µW: `coupling` of the laser's mW; a laser that does not lase, its spontaneous light), its
+    exposure on auto (each reading's set from the last, to have its fringes peak at about TARGET counts of FULL; as
+    the light goes it lengthens, up to EXP_MAX, and a reading takes that long), its fringes' amplitudes, and its
+    interference patterns: Fizeau interferometers of free spectral range FSR_GHZ, PIXELS each (kind 0), and a wide
+    one (kind 1), each mode the laser runs on making fringes of its own (two modes: an interferometer whose FSR is
+    near a multiple of their spacing plus a half sees its fringes fade). Under LOW counts the wavemeter says low
+    signal, under FLOOR no signal; over FULL, overexposed."""
+
+    FULL, TARGET, LOW, FLOOR = 4095.0, 2600.0, 250.0, 40.0  # counts
+    EXP_MIN, EXP_MAX = 1.0, 2000.0       # ms
+    FSR_GHZ = (2000.0, 250.0, 40.0, 9.0)  # its interferometers, the finest last
+    PERIODS = (61.0, 47.0, 37.0, 29.0)    # px: the period of their fringes on the CCD
+    WIDE = (8000.0, 83.0)                 # its wide interferometer: FSR (GHz), period (px)
+    PIXELS = 512
+    VISIBILITY = 0.92                     # its fringes' contrast for a single mode
+    DARK_COUNTS = 30.0                    # its CCD's offset
+
+    def __init__(self, coupling: float = 0.01, counts: float = 13.0, spont: float = 0.004, seed=None):
+        """counts: at the fringes' peak, per µW and ms; spont: µW reaching it from a laser that does not lase, per mA
+        of its current."""
+        self.coupling, self.counts, self.spont = coupling, counts, spont
+        self.exp = 2.0  # ms: the exposure it will have next
+        self.rng = random.Random(seed)
+
+    def measure(self, comps, power_mw: float, current: float, freq: float, f0: float = 0.0, patterns: bool = False):
+        """One reading: comps the laser's modes [(power fraction, GHz from f0 THz)] ([]: it does not lase), its power
+        (mW) and current (mA), the frequency the wavemeter would read (THz, NaN: none); returns (the raw value as
+        wlmData's GetFrequencyNum gives it, the reading's extra, ms it took). Without fringes (it does not lase: its
+        spontaneous light is broadband) it says low signal; two modes whose fringes cancel, bad signal."""
+        exp = self.exp
+        uw = self.coupling * power_mw * 1e3 if comps else self.spont * max(current, 0.0)
+        peak = self.counts * uw * exp + self.DARK_COUNTS
+        fringe = min(self._coherence(comps, fsr) for fsr in self.FSR_GHZ) if comps else 0.0
+        v1 = self.VISIBILITY * fringe
+        if peak > self.FULL:
+            value = -4.0
+        elif peak < self.FLOOR + self.DARK_COUNTS:
+            value = -1.0
+        elif peak < self.LOW or not comps:
+            value = -3.0
+        elif v1 < 0.15 or not freq > 0:
+            value = -2.0
+        else:
+            value = freq
+        took = exp + 1.0
+        scale = min(peak, 1.3 * self.FULL) - self.DARK_COUNTS
+        self.exp = min(max(exp * min(max(self.TARGET / max(scale, 1.0), 0.25), 4.0), self.EXP_MIN), self.EXP_MAX)
+        wide = self.VISIBILITY * self._coherence(comps, self.WIDE[0]) if comps else 0.0
+        top, d = min(peak, self.FULL), self.DARK_COUNTS
+        amps = [d + (top - d) * (1 - v1) / (1 + v1), top, d + (top - d) / (1 + v1),
+                d + (top - d) * (1 - wide) / (1 + wide), top, d + (top - d) / (1 + wide)]
+        extra = {"power": uw * (1 + self.rng.gauss(0.0, 0.01)) if value > 0 or value in (-2.0, -3.0) else None,
+                 "exposure": [round(exp, 3), 0.0], "amps": [round(a) for a in amps]}
+        if patterns:
+            ghz = [(pw, f0 * 1e3 + g) for pw, g in comps]
+            base = [self._pattern(ghz, fsr, per, top) for fsr, per in zip(self.FSR_GHZ, self.PERIODS)]
+            extra["patterns"] = {0: ("H", array("H", [x for b in base for x in b])),
+                                 1: ("H", array("H", self._pattern(ghz, *self.WIDE, top)))}
+        return value, extra, took
+
+    @staticmethod
+    def _coherence(comps, fsr: float) -> float:
+        """How much of the fringes' contrast an interferometer of that FSR keeps with the laser on those modes."""
+        if not comps:
+            return 0.0
+        re = sum(p * math.cos(2 * math.pi * g / fsr) for p, g in comps)
+        im = sum(p * math.sin(2 * math.pi * g / fsr) for p, g in comps)
+        return math.hypot(re, im) / max(sum(p for p, _ in comps), 1e-12)
+
+    def _pattern(self, ghz, fsr: float, period: float, top: float) -> list:
+        """One interferometer's fringes on PIXELS pixels: counts, the modes' each (ghz: [(power fraction, GHz)])."""
+        env, cos_x, sin_x = self._tables(period)
+        amp = (top - self.DARK_COUNTS) / (1 + self.VISIBILITY)
+        a = sum(p for p, _ in ghz)
+        b = self.VISIBILITY * sum(p * math.cos(2 * math.pi * g / fsr) for p, g in ghz)
+        c = self.VISIBILITY * sum(p * math.sin(2 * math.pi * g / fsr) for p, g in ghz)
+        k = self.rng.randrange(len(self._noise))
+        noise = self._noise[k:] + self._noise[:k]
+        d, full = self.DARK_COUNTS, int(self.FULL)
+        return [min(max(int(d + amp * (a * e + b * cx - c * sx) + z), 0), full)
+                for e, cx, sx, z in zip(env, cos_x, sin_x, noise)]
+
+    def _tables(self, period: float):
+        tables = self.__dict__.setdefault("_cache", {})
+        if period not in tables:
+            n = self.PIXELS
+            env = [math.exp(-((x - n / 2) / (0.42 * n)) ** 2) for x in range(n)]
+            tables[period] = (env, [e * math.cos(2 * math.pi * x / period) for x, e in enumerate(env)],
+                              [e * math.sin(2 * math.pi * x / period) for x, e in enumerate(env)])
+        if not hasattr(self, "_noise"):
+            self._noise = [self.rng.gauss(0.0, 2.0) for _ in range(self.PIXELS)]
+        return tables[period]
 
 
 class SimTA:
@@ -1199,7 +1351,9 @@ class SimLaser:
     by itself, and optionally locked to a reference cavity by its (simulated) DLC pro lock, with an
     SHG stage (`lock`, a SimLocked, made with lock_it()). cavity=True: the demo's reference laser,
     locked to its cavity by something the program does not see, so a fixed frequency unless a
-    fault is injected."""
+    fault is injected. Its temperature is its controller's (dl:tc:temp-act, from where it was set
+    when this was made: ECDL.T), and its own photodiode is its controller's dl:pd:photodiode.
+    reading() is what the wavemeter reads of it with all its details (SimCCD: `ccd`)."""
 
     def __init__(self, ch, wavelength_nm, tuning=0.4, dlc=None, n=1, offset0=70.0,
                  drift=3.0, signal=True, cavity=False, lock=None, seed=None, dac=None):
@@ -1221,17 +1375,42 @@ class SimLaser:
         self.ecdl = None
         self.lock = lock          # SimLocked: its DLC pro locks it to a cavity
         self._mutex = threading.Lock()
+        self.ccd = SimCCD(seed=seed)  # the wavemeter's view of it, in detail
+        self.t_ref = None         # °C: its controller's temperature when this was made (ECDL.T is from there)
         if dlc is not None:
             self.ecdl = ECDL(self.f0, kv=tuning, v0=offset0, i0=dlc.current_act(n), seed=seed)
             for name in (CURRENT_SET, SCAN_OFFSET, PIEZO_SET):
                 dlc.on_set[f"laser{n}:{name}"] = self._settle
+            self.t_ref = dlc.params.get(f"laser{n}:dl:tc:temp-set")
+            dlc.params[f"laser{n}:dl:pd:photodiode"] = lambda: self.ecdl.photodiode(self.dlc.current_act(self.n))
 
     def _settle(self, _value):
         """At every change of its current or offset, as it is made: the laser follows it, hopping on
         the way as it would (else it would only see where a quick ramp ends up)."""
         with self._mutex:
             if self.lock is None or not self.lock.locked():  # (locked, its lock follows it)
+                self._warm()
                 self.ecdl.lase(*self._vi())
+
+    def _warm(self):
+        """Its temperature, as its controller has it now (K from where it began)."""
+        if self.t_ref is not None:
+            self.ecdl.T = self.dlc.temp_act(self.n) - self.t_ref
+
+    def reading(self, now: float, wavemeter: "SimWavemeter", patterns: bool = False):
+        """What the wavemeter reads of it now, in detail: (the raw value, as wlmData's GetFrequencyNum gives it, the
+        reading's extra, s it took)."""
+        f = self.true_freq(now)
+        with self._mutex:
+            if self.ecdl is None:
+                comps, mw, i, f0 = ([(1.0, 0.0)] if f is not None else []), 10.0, 0.0, self.f0
+            else:
+                v, i = self._vi()
+                comps = self.ecdl.components(v, i) if f is not None else []
+                mw, f0 = self.ecdl.power(i), self.ecdl.f0
+        raw = wavemeter.read(f, now) if f is not None else math.nan
+        value, extra, ms = self.ccd.measure(comps, mw, i, raw, f0, patterns)
+        return value, extra, ms / 1e3
 
     def lock_it(self, **kwargs) -> "SimLocked":
         """Let its DLC pro lock it to a reference cavity with a resonance where it is now; see SimLocked."""
@@ -1265,6 +1444,7 @@ class SimLaser:
             if self.ecdl is None:
                 return self.f0 + wobble * 1e-6
             v, i = self.dlc.piezo(self.n), self.dlc.current_act(self.n)
+            self._warm()
             f = self.ecdl.freq(v, i, wobble) if self.lock is None else self.lock.frequency(wobble)
             return f if math.isfinite(f) else None  # not lasing
 
@@ -1316,11 +1496,13 @@ class SimSource(Source):
     """Cycles through the lasers like a fibre switch, one exposure per channel, skipping those whose 'Use' is
     unticked (use: switch() ticks and unticks it as this program would, untick() and tick() as someone at the
     WLM software would). A channel ticked again shows its old value until it is measured anew, as the WLM's
-    does."""
+    does. A channel said in detail (detail) is measured as SimLaser.reading has it: its exposure on auto, and
+    as long as that takes."""
 
     label = "simulation"
     model = "simulated WS7"
     switchable = True
+    details = True
 
     def __init__(self, sink, lasers, exposure=0.02, wavemeter=None, serial=None, model=None, demo=None):
         """serial, model: the simulated wavemeter's (serial None: it does not say); demo: where select() finds
@@ -1400,6 +1582,17 @@ class SimSource(Source):
                 if laser.ch in self._shown:  # its old value, once more
                     self._push({laser.ch: self._shown[laser.ch]}, now)
                     continue
+            patterns = self._detail.get(laser.ch)
+            if patterns is not None:  # in detail: an exposure as long as auto exposure has it
+                value, extra, took = laser.reading(now, self.wavemeter, patterns)
+                self._exposed(laser.ch, extra)
+                if extra.get("patterns") and not self.pattern_info:
+                    self.pattern_info = {k: (len(a), a.itemsize) for k, (_, a) in extra["patterns"].items()}
+                if self._stop_ev.wait(took):
+                    break
+                self._shown[laser.ch] = value
+                self._push({laser.ch: value}, time.monotonic(), {laser.ch: extra})
+                continue
             f = laser.true_freq(now)
             value = self._shown[laser.ch] = -1.0 if f is None else self.wavemeter.read(f, now)  # -1: no signal
             self._push({laser.ch: value}, now)
@@ -1459,6 +1652,9 @@ class Demo:
                      signal=c is not None or ch == self.REFERENCE, cavity=ch == self.REFERENCE)
             for ch, wl, k, c, n, _ in self.CHANNELS
         ]
+        for laser in self.lasers:  # the DL pros stop lasing 2 mA above their threshold, and start again only 5 mA above
+            if laser.ecdl is not None and laser.ch != self.SHG:  # (where a laser map finds them)
+                laser.ecdl.i_stop, laser.ecdl.i_start = laser.ecdl.i_th + 2.0, laser.ecdl.i_th + 5.0
         shg = self.laser(self.SHG)
         e = shg.ecdl  # a master whose modes go multimode well before they hop, quietly for the wavemeter,
         e.multimode, e.hysteresis, e.mm_noise = 0.9, 0.4, 0.004  # and that stops lasing 1.3 mA below its

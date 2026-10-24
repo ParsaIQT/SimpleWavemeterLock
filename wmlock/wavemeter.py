@@ -32,9 +32,25 @@ nothing is read until it runs again. The DLL addresses one wavemeter at a time
 wavemeters take turns, each setting it to its own before each read, and checking
 whose readings they were after. Claims keep two copies of the program on a PC
 from reading the same one.
+
+detail(ch, patterns) has a source (`details`: the DLL, the HTTP server of
+server/server.py, the simulation) say more of each new reading of a channel
+(a laser map's, lasermap.py), in its extra (Reading.extra, else None):
+
+    power      µW the wavemeter measured (None: it did not say)
+    exposure   [ms, ms]: its two arrays' exposure for that reading (on auto, it
+               lengthens as the light goes, and readings come that much slower)
+    amps       [min1, max1, avg1, min2, max2, avg2]: its fringes' amplitudes
+    patterns   with patterns: {kind: (typecode, array)}, its interference
+               patterns as its window shows them (kind 0: its Fizeau
+               interferometers, or grating; 1: its wide interferometer; with
+               its analysis on, 4 and 5: the spectrum it computes, x and y)
+
+and exposure(ch) says a detailed channel's exposure now, between readings.
 """
 from __future__ import annotations
 
+import base64
 import ctypes
 import http.client
 import json
@@ -42,6 +58,7 @@ import logging
 import sys
 import threading
 import time
+from array import array
 from collections import deque
 from pathlib import Path
 from typing import NamedTuple
@@ -61,6 +78,11 @@ WLM_ERRORS = {
     -10: "channel n/a", -13: "div by 0", -14: "out of range", -15: "unit n/a",
 }
 INF_NOTHING_CHANGED = -7
+AMPS = (0, 2, 4, 1, 3, 5)  # GetAmplitudeNum's cMin1, cMax1, cAvg1, cMin2, cMax2, cAvg2 (wlmConst.py)
+PATTERNS = (0, 1)          # cSignal1Interferometers, cSignal1WideInterferometer (or cSignal1Grating)
+ANALYSIS = (4, 5)          # cSignalAnalysisX, cSignalAnalysisY: the spectrum its analysis computes, if it is on
+ITEM = {2: ("H", ctypes.c_uint16), 4: ("I" if array("I").itemsize == 4 else "L", ctypes.c_uint32),
+        8: ("d", ctypes.c_double)}  # a pattern's item size in bytes: its array typecode, its ctypes type
 # Return codes of SetSwitcherSignalStates (wlmConst.py, ResERR_...)
 WLM_SET_ERRORS = {
     -1: "WLM missing", -2: "could not set", -3: "parameter out of range", -4: "WLM out of resources",
@@ -80,6 +102,7 @@ class Reading(NamedTuple):
     freq: float  # THz, NaN when invalid
     status: str  # '' when valid, else e.g. 'low signal'
     t: float     # time.monotonic() when the new value was seen
+    extra: dict | None = None  # a detailed channel's (Source.detail): power, exposure, amps, patterns
 
 
 def decode_wlm(ch: int, value: float, t: float) -> Reading:
@@ -105,6 +128,7 @@ class Source(threading.Thread):
     model = ""          # what the wavemeter is ('WS7'), if it says
     serial = None       # its serial number, once known
     switchable = False  # it can switch channels on and off (switch)
+    details = False     # it can say more of a channel's readings (detail)
 
     def __init__(self, sink, interval: float):
         super().__init__(daemon=True, name=type(self).__name__)
@@ -117,6 +141,9 @@ class Source(threading.Thread):
         self._off = None
         self._state = None
         self._switches = deque()  # (ch, on) to do, on this thread
+        self._detail = {}         # ch -> its readings said in detail, with their patterns (True) or without
+        self._exposure = {}       # ch -> s, a detailed channel's exposure as last seen
+        self.pattern_info = {}    # kind -> (items, bytes an item) of the patterns it reads, once known
 
     def stop(self):
         self._stop_ev.set()
@@ -134,6 +161,24 @@ class Source(threading.Thread):
         said = getattr(self.sink, "on_wavemeter", None)
         if said is not None:
             said(model, serial)
+
+    def detail(self, ch: int, patterns):
+        """Say more of each new reading of channel ch from now on (its extra: the module's docstring), with its
+        patterns or (patterns False) without; patterns None: no more."""
+        if patterns is None:
+            self._detail.pop(int(ch), None)
+            self._exposure.pop(int(ch), None)
+        else:
+            self._detail[int(ch)] = bool(patterns)
+
+    def exposure(self, ch: int):
+        """s: a detailed channel's exposure now (its arrays' together), as last seen; None: not known."""
+        return self._exposure.get(int(ch))
+
+    def _exposed(self, ch: int, extra):
+        exp = (extra or {}).get("exposure")
+        if exp and all(isinstance(x, (int, float)) and x >= 0 for x in exp):
+            self._exposure[ch] = sum(exp) / 1e3
 
     @property
     def switching(self) -> bool:
@@ -178,9 +223,9 @@ class Source(threading.Thread):
             self._active, self._off = chans, off
             self.sink.on_active(chans, off)
 
-    def _push(self, raw: dict, t: float):
+    def _push(self, raw: dict, t: float, extras=None):
         """raw: ch -> hashable raw value; pushes the channels whose value changed (not a channel's value from
-        before it stopped being measured, until it shows another)."""
+        before it stopped being measured, until it shows another); extras: ch -> its reading's extra (detail)."""
         last, stale = self._last, self._stale
         changed = []
         for ch, v in raw.items():
@@ -193,7 +238,13 @@ class Source(threading.Thread):
         if changed:
             for ch in changed:
                 last[ch] = raw[ch]
-            self.sink.on_readings([self._decode(ch, raw[ch], t) for ch in changed])
+            out = []
+            for ch in changed:
+                r = self._decode(ch, raw[ch], t)
+                if extras and extras.get(ch) is not None:
+                    r = r._replace(extra=extras[ch])
+                out.append(r)
+            self.sink.on_readings(out)
 
     def _decode(self, ch, raw, t) -> Reading:
         return decode_wlm(ch, raw, t)
@@ -222,6 +273,18 @@ class WlmDll:
             ("SetSwitcherSignalStates", [L, L, L], L, False),
             ("GetWLMVersion", [L], L, False),
             ("PresetWLMIndex", [L], L, False),
+            ("GetPowerNum", [L, D], D, False),  # (what a laser map reads besides: detail)
+            ("GetExposureNum", [L, L, L], L, False),
+            ("GetAmplitudeNum", [L, L, L], L, False),
+            ("GetPatternItemSize", [L], L, False),
+            ("GetPatternItemCount", [L], L, False),
+            ("SetPattern", [L, L], L, False),
+            ("GetPatternDataNum", [L, L, ctypes.c_void_p], L, False),
+            ("GetAnalysisMode", [ctypes.c_bool], ctypes.c_bool, False),
+            ("GetAnalysisItemSize", [L], L, False),
+            ("GetAnalysisItemCount", [L], L, False),
+            ("GetAnalysisData", [L, ctypes.c_void_p], L, False),
+            ("SetAnalysis", [L, L], L, False),
         ):
             try:
                 f = getattr(lib, name)
@@ -315,6 +378,66 @@ class WlmDll:
 
     def frequency(self, ch: int) -> float:
         return self.lib.GetFrequencyNum(ch, 0.0)
+
+    def exposure(self, ch: int):
+        """s: channel ch's exposure now, its two arrays' together (None: it does not say)."""
+        if "GetExposureNum" not in self.has:
+            return None
+        ms = [self.lib.GetExposureNum(ch, k, 0) for k in (1, 2)]
+        return sum(max(m, 0) for m in ms) / 1e3 if ms[0] > 0 else None
+
+    def details(self, ch: int, buffers=None) -> dict:
+        """The extra of channel ch's reading now (the module's docstring); buffers (patterns_on's): its patterns
+        too."""
+        lib, has, out = self.lib, self.has, {}
+        if "GetPowerNum" in has:
+            power = lib.GetPowerNum(ch, 0.0)
+            out["power"] = power if power > 0 else None
+        if "GetExposureNum" in has:
+            out["exposure"] = [max(lib.GetExposureNum(ch, k, 0), 0) for k in (1, 2)]
+        if "GetAmplitudeNum" in has:
+            out["amps"] = [lib.GetAmplitudeNum(ch, k, 0) for k in AMPS]
+        if buffers:
+            got = {}
+            for kind, (code, buf) in buffers.items():
+                ok = lib.GetAnalysisData(kind, buf) if kind in ANALYSIS else lib.GetPatternDataNum(ch, kind, buf)
+                if ok > 0:
+                    a = array(code)
+                    a.frombytes(bytes(buf))
+                    got[kind] = (code, a)
+            out["patterns"] = got
+        return out
+
+    def patterns_on(self) -> dict:
+        """Its interference patterns exported from now on (SetPattern; with its analysis on, the spectrum that computes
+        too), and a buffer for each: {kind: (typecode, buffer)} ({}: it cannot)."""
+        lib, has, out = self.lib, self.has, {}
+        if {"SetPattern", "GetPatternItemCount", "GetPatternItemSize", "GetPatternDataNum"} <= has:
+            for kind in PATTERNS:
+                lib.SetPattern(kind, 1)
+                n, size = lib.GetPatternItemCount(kind), lib.GetPatternItemSize(kind)
+                if n > 0 and size in ITEM and n * size <= 1 << 24:
+                    out[kind] = (ITEM[size][0], (ITEM[size][1] * n)())
+                else:
+                    lib.SetPattern(kind, 0)
+        analysis = {"GetAnalysisMode", "SetAnalysis", "GetAnalysisItemCount", "GetAnalysisItemSize", "GetAnalysisData"}
+        if analysis <= has and lib.GetAnalysisMode(False):
+            for kind in ANALYSIS:
+                lib.SetAnalysis(kind, 1)
+                n, size = lib.GetAnalysisItemCount(kind), lib.GetAnalysisItemSize(kind)
+                if n > 0 and size in ITEM and n * size <= 1 << 24:
+                    out[kind] = (ITEM[size][0], (ITEM[size][1] * n)())
+                else:
+                    lib.SetAnalysis(kind, 0)
+        return out
+
+    def patterns_off(self, buffers):
+        """No more patterns exported (those patterns_on began)."""
+        for kind in buffers:
+            if kind in ANALYSIS:
+                self.lib.SetAnalysis(kind, 0)
+            else:
+                self.lib.SetPattern(kind, 0)
 
 
 class Claims:
@@ -441,9 +564,12 @@ class WlmHub:
 class DllSource(Source):
     """Reads wlmData.dll directly (run the GUI on the wavemeter PC). Fastest. With several wavemeters on the PC,
     it reads the one it keeps to (serial): the DLL is set to it before each read, and asked whose the readings were
-    after (another wavemeter in its place, its WLM software restarted: nothing passed on)."""
+    after (another wavemeter in its place, its WLM software restarted: nothing passed on). A detailed channel's new
+    reading has its extra read at once, and its frequency again after: changed meanwhile, the extra is not passed
+    on (it was the next reading's); its patterns are exported (SetPattern) while a detailed channel wants them."""
 
     switchable = True
+    details = True
     CHECK_S = 1.0  # s between looks at which wavemeters run, and at the switch
 
     def __init__(self, sink, path: str | None = None, interval: float = 0.002, channels=None, serial=None,
@@ -463,6 +589,7 @@ class DllSource(Source):
         self.label = path or "wlmData.dll"
         self._index = None       # the DLL's index of the one it reads
         self._selects = deque()  # another wavemeter to read (select), on this thread
+        self._buffers = None     # {kind: (typecode, buffer)} while its patterns are exported (detail)
 
     def select(self, serial):
         """Read that wavemeter from now on (in a moment, on this source's thread)."""
@@ -497,16 +624,18 @@ class DllSource(Source):
                         if aimed:
                             self._set_active(active, off)
                             self._set_state(True)
-                    raw, mine = {}, False
+                    raw, mine, extras = {}, False, None
                     with hub.lock:
                         if self._aim(wlm):
                             for ch in active:
                                 v = wlm.frequency(ch)
                                 if v != INF_NOTHING_CHANGED:
                                     raw[ch] = v
+                            if self._detail or self._buffers:
+                                extras = self._details(wlm, raw)
                             mine = self._aim(wlm, again=True)
                     if mine:
-                        self._push(raw, now)
+                        self._push(raw, now, extras)
                     else:  # (another wavemeter where it was: which run, at once)
                         next_check = min(next_check, now + 0.1)
                 except OSError as e:
@@ -516,7 +645,38 @@ class DllSource(Source):
                     continue
                 self._stop_ev.wait(self.interval)
         finally:
+            if self._buffers:
+                with hub.lock:
+                    try:
+                        if self._aim(hub.dll()):
+                            hub.dll().patterns_off(self._buffers)
+                    except OSError:
+                        pass
             hub.give(self.serial, self)
+
+    def _details(self, wlm, raw: dict) -> dict:
+        """The extras of the detailed channels' new readings (and each one's exposure now); its patterns exported
+        while one wants them, and no longer."""
+        want = any(self._detail.values())
+        if want and self._buffers is None:
+            self._buffers = wlm.patterns_on()
+            self.pattern_info = {k: (len(buf), ctypes.sizeof(buf) // max(len(buf), 1))
+                                 for k, (_, buf) in self._buffers.items()}
+        elif not want and self._buffers is not None:
+            wlm.patterns_off(self._buffers)
+            self._buffers = None
+        out = {}
+        for ch, patterns in list(self._detail.items()):
+            exp = wlm.exposure(ch)
+            if exp is not None:
+                self._exposure[ch] = exp
+            v = raw.get(ch)
+            if v is None or self._last.get(ch, NAN) == v:
+                continue  # (not a new reading)
+            extra = wlm.details(ch, self._buffers if patterns else None)
+            if wlm.frequency(ch) == v:  # (else the next reading came meanwhile: the extra was its)
+                out[ch] = extra
+        return out
 
     def _aim(self, wlm, again: bool = False) -> bool:
         """With several wavemeters on this PC (the DLL has been set to one): set it to the one this source reads
@@ -612,9 +772,12 @@ class NullSource(Source):
 class HttpSource(Source):
     """Polls GET /api/v1/wavelength of server/server.py over one keep-alive connection; switches a channel
     with POST /api/v1/channel/<n>/use (a server.py from before that cannot). On a PC with several wavemeters, it
-    asks for the one it keeps to (?wlm=1234), and checks that the answer is that one's."""
+    asks for the one it keeps to (?wlm=1234), and checks that the answer is that one's. A detailed channel's new
+    reading is asked for again with all its details (GET /api/v1/channel/<n>/detail): that answer's is the reading
+    passed on (it may be a newer one than the poll's), with its extra."""
 
     switchable = True
+    details = True
 
     def __init__(self, sink, url: str, interval: float = 0.02, serial=None, model: str = ""):
         """serial: the wavemeter to read (None: the server's only one, or its first; kept to from then on, if the
@@ -627,10 +790,45 @@ class HttpSource(Source):
         self.wanted = int(serial) if serial else None
         self.wanted_model = model
         self._selects = deque()  # another wavemeter to read (select), on this thread
+        self.no_detail = False   # the server cannot say a reading in detail (a server.py from before)
 
     def select(self, serial):
         """Read that wavemeter of the server's from now on (in a moment, on this source's thread)."""
         self._selects.append(int(serial) if serial else None)
+
+    def _details(self, conn, raw: dict) -> dict:
+        """The extras of the detailed channels' new readings, asked of the server; raw takes the frequency and status
+        of its answer (a newer reading, perhaps, than the poll's)."""
+        out = {}
+        base = self.path.rsplit("/", 1)[0] if self.path.endswith("/wavelength") else "/api/v1"
+        for ch, patterns in list(self._detail.items()):
+            if self.no_detail or ch not in raw or self._last.get(ch, NAN) == raw[ch]:
+                continue
+            q = f"?patterns={int(patterns)}" + (f"&wlm={self.wanted}" if self.wanted is not None else "")
+            conn.request("GET", f"{base}/channel/{ch}/detail{q}")
+            r = conn.getresponse()
+            body = r.read()
+            if r.status in (404, 405) and _detail(body) in ("", "Not Found"):
+                self.no_detail = True  # (a server.py from before: readings without their details)
+                continue
+            if r.status != 200:
+                continue
+            d = json.loads(body)
+            f = d.get("frequency_thz")
+            raw[ch] = (f if d.get("is_valid") and f else None, d.get("status") or "")
+            extra = {"power": d.get("power_uw"), "exposure": d.get("exposure_ms"), "amps": d.get("amplitudes")}
+            if patterns:
+                extra["patterns"] = {}
+                for kind, pat in (d.get("patterns") or {}).items():
+                    a = array(str(pat.get("type") or "H"))
+                    a.frombytes(base64.b64decode(pat.get("data") or ""))
+                    if sys.byteorder != "little":
+                        a.byteswap()
+                    extra["patterns"][int(kind)] = (a.typecode, a)
+                    self.pattern_info.setdefault(int(kind), (len(a), a.itemsize))
+            self._exposed(ch, extra)
+            out[ch] = extra
+        return out
 
     def _query(self) -> str:
         return f"?wlm={self.wanted}" if self.wanted is not None else ""
@@ -700,9 +898,10 @@ class HttpSource(Source):
                     f = c.get("frequency_thz")
                     raw[ch] = (f if c.get("is_valid") and f else None, status)
                     active.append(ch)
+                extras = self._details(conn, raw) if self._detail else None
                 self._set_active(sorted(active), off)
                 self._set_state(True)
-                self._push(raw, t0)
+                self._push(raw, t0, extras)
             except (OSError, http.client.HTTPException, ValueError, AttributeError) as e:
                 if conn is not None:
                     conn.close()

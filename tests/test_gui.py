@@ -747,3 +747,75 @@ def test_a_second_copy_with_the_same_settings_says_so_and_closes(tmp_path, monke
         first.release()
     assert said and said[0].startswith("The program is running already, with these settings")
     assert str(path) in said[0] and not path.exists()  # (nothing written: they are the other's)
+
+
+def test_a_laser_map_from_its_dialog_to_its_window_and_picture(app, demo, tmp_path):
+    from wmlock.lasermap import load
+
+    e = Engine({"channels": {"3": {"name": "854"}}}, demo.make_source, discovery_targets=["127.0.0.1"],
+               extra_devices=[d.key for d in demo.dlcs])
+    win = gui.MainWindow(e, lambda: None)
+    e.start()
+    win.show()
+    try:
+        spin(app, 0.3)
+        e.link(3, demo.dlcs[1].key, 1)
+        for n in (1, 2, 4, 5, 6, 7):
+            e.source.untick(n)
+        assert wait_for(lambda: (app.processEvents(), e.channel_rate(3) > 5)[1], 5)
+        d = gui.MapDialog(win, e, 3)
+        d.show()
+        assert wait_for(lambda: (app.processEvents(), "current-clip 200.0 mA" in d.now.text())[1], 5), d.now.text()
+        assert "dl:pd:photodiode" in d.now.text() and d.i_lo.value() == 120.0  # (a first map: 30 mA below it)
+        d.i_hi.setValue(0.0)
+        assert not d.start.isEnabled() and "highest current" in d.problems.text()
+        d.i_hi.setValue(152.0)
+        d.i_lo.setValue(145.0)
+        d.i_step.setValue(1.0)
+        d.v_lo.setValue(68.0)
+        d.v_hi.setValue(72.0)
+        d.v_step.setValue(2.0)
+        d.reads.setValue(1)
+        d.settle.setValue(0.0)
+        d.repeat.setChecked(False)
+        d.patterns.setCurrentIndex(1)  # (every point)
+        d.folder.setText(str(tmp_path))
+        assert d.start.isEnabled() and d.problems.text() == "" and "points at most" in d.estimate.text()
+        d.i_hi.setValue(250.0)  # (above its current-clip)
+        assert not d.start.isEnabled() and "current-clip" in d.problems.text()
+        d.i_hi.setValue(152.0)
+        p = d.plan()
+        assert (p.i_lo, p.i_hi, p.v_lo, p.v_hi, p.patterns, p.repeat) == (145.0, 152.0, 68.0, 72.0, "all", False)
+        d._start()
+        assert d.result() == QtWidgets.QDialog.DialogCode.Accepted
+        w = win.map_window(e, 3)
+        assert win.map_window(e, 3) is w  # (one a channel)
+        row = win.rows[3]
+        assert wait_for(lambda: (app.processEvents(), row.btn.text() == "Mapping")[1], 5)
+        ch = e.channels[3]
+        assert wait_for(lambda: (app.processEvents(), ch.state == "off")[1], 60), ch.map_note
+        spin(app, 1.2)
+        assert ch.map_note.startswith("map done") and w.head.text().startswith("map done")
+        assert w.up_img._image is not None and w.up_img._image.width() == 8 and w.up_img._image.height() == 3
+        png = ch.map_last.mapper.out.path.with_suffix(".png")
+        assert png.exists() and png.stat().st_size > 1000
+        assert w.which.count() == 1 and not w.stop.isEnabled()
+        assert w.pattern.series and w.sweeps.series
+        with load(ch.map_last.mapper.out.path) as f:
+            assert len(f.points) > 40
+        acts = {a.text() for a in _menu_actions(row)}
+        assert "Last laser map…" in acts and "Laser map…" in acts
+    finally:
+        for w in list(getattr(win, "map_windows", {}).values()):
+            w.close()
+        win.close()
+        e.stop()
+
+
+def _menu_actions(row):
+    """The actions of the row's menu (shown, then closed)."""
+    row.show_menu(QtCore.QPoint(5, 5))
+    m = row._menu
+    acts = [a for a in m.actions()]
+    m.close()
+    return acts

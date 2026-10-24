@@ -46,6 +46,11 @@ levels locked, of the transmission and the intra-cavity signal, are the medians
 of what they were over the last few minutes while it ran as it should
 (HopParams.trans_locked, shg_lock), and what a relock measured until then.
 
+Laser maps (lasermap.py): a channel's laser, unlocked, can be mapped (start_map): its current and piezo swept all
+over, both ways, everything recorded in a file. Its state is 'mapping' meanwhile: its readings go to the map
+(MapRunner, through the laser's controller as a recovery's do), in detail (Source.detail), and nothing else
+touches it; stopped (stop_map, or the program closing), it goes back where it began.
+
 Lock dropouts (dropouts.py): for each laser its DLC pro locks to a cavity, a monitor of its own watches the
 transmission for the lock losing the laser even for a couple of milliseconds (HopParams.drop_ms between
 samples), while its lock is on and no recovery runs (and DROP_SETTLE_S after); each dropout is logged (the
@@ -75,16 +80,19 @@ import dataclasses
 import json
 import logging
 import math
+import sqlite3
 import statistics
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from . import dac
 from .dlcpro import SCAN_OUT, DLCPro, DecopError, Device, discover, drives, output_name, probe, scan_output
 from .dropouts import Monitor as DropoutMonitor
 from .dropouts import log as drop_log
+from .lasermap import FOLDER, LOOK, MapFile, MapPlan, Mapper, MapRunner, file_name, fmt_time
 from .lock import Lock, LockParams
 from .modehop import SEED_FLOOR, Guard, HopParams, Recenter, Runner, perform
 from .relock import TRANS, says_locked, setup_report, transmission_input, transmission_signal, usable_zero, volts
@@ -212,6 +220,14 @@ class Channel:
         self.lock_note = ""
         self.lock_t = 0.0      # monotonic...
         self.lock_wall = 0.0   # ...and time.time(): when
+        # a laser map (lasermap.py)
+        self.mapper = None     # the map going on (a MapRunner)...
+        self.map_last = None   # ...or the last one, over
+        self.map_plan = MapPlan.from_dict(cfg["map"]) if isinstance(cfg.get("map"), dict) else None  # the last plan
+        self.map_note = ""     # how the last map ended
+        self.map_pending = None  # a map about to begin (its Mapper), its laser's settings being read
+        self.map_info = None   # what a map would use of its laser, as last read for the dialog (map_look)
+        self.gaps = deque(maxlen=30)  # s between its readings, of late (how fast the wavemeter reads it)
 
     @property
     def param(self) -> str:
@@ -240,6 +256,8 @@ class Channel:
             d["link"] = {"device": self.device, "laser": self.laser}
         if self.hop != HopParams():
             d["hop"] = self.hop.to_dict()
+        if self.map_plan is not None:
+            d["map"] = self.map_plan.to_dict()
         return d
 
     @property
@@ -467,10 +485,10 @@ class Engine:
             for ch in self.channels.values():
                 if ch.state != "off":
                     self._disengage(ch, "")
-        end = time.monotonic() + 20.0  # a recovery that was cut short puts current and offset back (slowly down)
+        end = time.monotonic() + 20.0  # a recovery (a map) that was cut short puts current and offset back
         while time.monotonic() < end:
             with self.lock:
-                runners = [ch.runner for ch in self.channels.values() if ch.runner is not None]
+                runners = [r for ch in self.channels.values() for r in (ch.runner, ch.mapper) if r is not None]
                 for r in runners:
                     r.tick(time.monotonic())
                 if not runners:
@@ -571,7 +589,10 @@ class Engine:
                 ch.looked, ch.looked_t = text, time.monotonic()
                 return
             ch.borrowed = False  # (it is not on: nothing to switch off again)
-            if ch.runner is not None:
+            if ch.mapper is not None:
+                if ch.off:
+                    ch.mapper.cancel(text)
+            elif ch.runner is not None:
                 if ch.off:
                     ch.runner.cancel(text)
             elif ch.state == "recovering":  # (waiting for readings to begin, or for its settings first)
@@ -601,10 +622,10 @@ class Engine:
         ch.guard.pause()
         if ch.runner is not None:
             ch.runner.blind(True)
-        if ch.state == "recovering" or ch.look_why:
+        if ch.state in ("recovering", "mapping") or ch.look_why:
             if not ch.borrowed:
                 log.info("channel %d: switched off on the wavemeter during a %s: on again", ch.n,
-                         "look" if ch.look_why else "recovery")
+                         "look" if ch.look_why else "laser map" if ch.state == "mapping" else "recovery")
             ch.borrowed = True
             self._switch(ch, True)
         else:
@@ -749,8 +770,13 @@ class Engine:
                 ch = self.channels.get(r.ch)
                 if ch is None:
                     continue
+                if 0.0 < ch.t < r.t:
+                    ch.gaps.append(r.t - ch.t)
                 ch.raw, ch.status, ch.t = r.freq, r.status, r.t
                 ch.freq = r.freq if ref is None or r.ch == ref.channel else ref.correct(r.freq)
+                if ch.mapper is not None:  # (a map has it: nothing else)
+                    ch.mapper.on_reading(r)
+                    continue
                 withheld = self._hop_reading(ch, r.t) if ch.hop.enabled or ch.runner else False
                 if ch.state == "on" and ch.freq > 0 and not withheld and not ch.relock:
                     self._step(ch)
@@ -759,9 +785,11 @@ class Engine:
                     self._begin_recovery(ch, *args)
                 elif ch.look_why and ch.state == "on":
                     self._looking(ch)
-            for ch in self.channels.values():  # a recovery waiting for time to pass
+            for ch in self.channels.values():  # a recovery (a map) waiting for time to pass
                 if ch.runner is not None:
                     ch.runner.tick(readings[-1].t)
+                if ch.mapper is not None:
+                    ch.mapper.tick(readings[-1].t)
             self._timers(readings[-1].t)
 
     def _step(self, ch: Channel):
@@ -900,6 +928,13 @@ class Engine:
         if ch.runner is not None:  # a recovery: it puts current and offset back, then reports
             ch.resume = False
             ch.runner.cancel(message or "stopped")
+            return
+        if ch.mapper is not None:  # a map: likewise
+            ch.mapper.cancel(message or "stopped")
+            return
+        if ch.state == "mapping":  # (one about to begin)
+            m, ch.map_pending = ch.map_pending, None
+            self._map_over(ch, m, f"map {message or 'stopped'} before it began")
             return
         ch.lock.disengage(message)
         ch.state, ch.message = "off", message
@@ -1599,7 +1634,153 @@ class Engine:
             for ch in list(self.channels.values()):
                 if ch.runner is not None:
                     ch.runner.tick(now)
+                if ch.mapper is not None:
+                    ch.mapper.tick(now)
             self._timers(now)
+
+    # ------------------------------------------------------------- laser maps
+    def channel_rate(self, n: int) -> float:
+        """Readings a second the wavemeter gives of channel n, of late (0: none)."""
+        ch = self.channels[n]
+        gaps = sorted(ch.gaps)
+        return 1.0 / gaps[len(gaps) // 2] if gaps and gaps[len(gaps) // 2] > 0 else 0.0
+
+    def map_estimate(self, n: int, plan: MapPlan) -> tuple:
+        """(s, bytes) a map of channel n would take, roughly, at the rate the wavemeter reads it now."""
+        info = getattr(self.source, "pattern_info", {}) or {}
+        raw = sum(count * size for count, size in info.values()) or 8192
+        return plan.estimate(self.channel_rate(n) or 20.0, 0.5 * raw)
+
+    def map_look(self, n: int):
+        """Read what a map would use of channel n's laser (its current, piezo, temperature, their limits, its
+        feedforward, its TA, its lock), for the dialog: Channel.map_info, a dict by name ({} if it cannot be read),
+        None until then."""
+        with self.lock:
+            ch = self.channels[n]
+            ch.map_info = None
+            if not ch.device or ch.dac:
+                ch.map_info = {}
+                return
+            key, laser = ch.device, ch.laser
+
+            def job(client):
+                piezo, cc = self._drives(ch, client, key, laser)
+                names = (CURRENT_ACT, cc, piezo, *LOOK)
+                got = dict(zip(("current_act", "current_set", "piezo", *LOOK), perform(client, laser, ("get", names))))
+                with self.lock:
+                    if ch.device == key and ch.laser == laser:
+                        ch.map_info = got
+
+            def failed(exc):
+                with self.lock:
+                    ch.map_info = {"error": str(exc) or type(exc).__name__}
+
+            self._controller(key).submit(job, failed)
+
+    def start_map(self, n: int, plan: MapPlan) -> str:
+        """Map channel n's laser (lasermap.py): '' if it begins, else why not."""
+        with self.lock:
+            ch = self.channels[n]
+            if not ch.device:
+                return "link a laser first"
+            if ch.dac:
+                return "not a laser on an analog output: a map needs a DLC pro"
+            if self._is_reference(ch):
+                return "not the reference laser"
+            if ch.state != "off":
+                return {"mapping": "it is being mapped already", "recovering": "it is recovering: stop that first"}.get(
+                    ch.state, "unlock it first (or stop watching it)")
+            bad = plan.problems()
+            if bad:
+                return "; ".join(bad)
+            path = Path(plan.folder or FOLDER) / file_name(n, ch.name)
+            try:
+                out = MapFile(path)
+            except (OSError, sqlite3.Error) as e:
+                return f"cannot write {path}: {e}"
+            dev = self.devices.get(ch.device)
+            info = {"laser": {"channel": n, "name": ch.name, "device": ch.device, "laser": ch.laser,
+                              "controller": dev.title() if dev else ch.device, "piezo": ch.piezo, "current": ch.cc},
+                    "wavemeter": {"model": getattr(self.source, "model", ""),
+                                  "serial": getattr(self.source, "serial", None)}}
+            mapper = Mapper(plan, out, info)
+            ch.map_plan, ch.map_note, ch.map_last, ch.map_pending = plan, "", None, mapper
+            self.dirty = True
+            ch.lock.disengage("")
+            c = self._controller(ch.device)
+            c.cancel(ch.param)
+            ch.state, ch.message = "mapping", ""
+            ch.token += 1
+            ch.guard.reset()
+            ch.look_why = ch.look_due = ""
+            if ch.off:  # no readings: its wavemeter channel on for the map
+                ch.borrowed = True
+                self._switch(ch, True)
+            if getattr(self.source, "details", False):
+                self.source.detail(n, plan.patterns != "off")
+            tok, key, laser = ch.token, ch.device, ch.laser
+            log.info("channel %d: map begins, to %s", n, path)
+
+            def job(client):
+                self._drives(ch, client, key, laser)  # (what its scan drives now: its piezo, its current)
+                with self.lock:
+                    if ch.token == tok:
+                        ch.map_pending = None
+                        runner = MapRunner(mapper, _HopIO(self, ch, c), time.monotonic(),
+                                           finished=lambda r: self._map_done(ch, r),
+                                           exposure=lambda: self.source.exposure(n) if getattr(
+                                               self.source, "details", False) else None)
+                        if runner.busy:
+                            ch.mapper = runner
+
+            def failed(exc):
+                with self.lock:
+                    if ch.token == tok:
+                        ch.map_pending = None
+                        self._map_over(ch, mapper, f"no map, cannot read the laser's settings: {exc}")
+
+            c.submit(job, failed)
+            return ""
+
+    def stop_map(self, n: int, why: str = "stopped"):
+        """Stop channel n's map: it goes back where it began (one about to begin: it does not)."""
+        with self.lock:
+            ch = self.channels[n]
+            if ch.state == "mapping":
+                self._disengage(ch, why)
+
+    def _map_done(self, ch: Channel, r: MapRunner):
+        ch.mapper = None
+        ch.map_last = r
+        m = r.mapper
+        took = fmt_time(r.now - r.started)
+        if r.state == "done":
+            text = f"map done in {took}: {r.result}"
+        else:
+            where = "everything put back" if r.restored else "left as it was when it stopped"
+            text = f"map {'stopped' if r.error == 'stopped' else 'failed, ' + r.error} after {took} ({where})"
+        self._map_over(ch, m, text, r)
+
+    def _map_over(self, ch: Channel, m: Mapper | None, text: str, r: MapRunner | None = None):
+        """The map over (r: its runner, None if it never began): the channel is as before, the file closed."""
+        ok = r is not None and r.state == "done"
+        ch.state = "off"
+        ch.token += 1
+        self._release(ch)
+        if getattr(self.source, "details", False):
+            self.source.detail(ch.n, None)
+        out = m.out if m is not None else None
+        if out is not None:
+            out.meta("end", {"outcome": text, "ok": ok, "error": r.error if r else text,
+                             "restored": r.restored if r else True, "points": m.points, "lasing": m.lasing,
+                             "patterns_kept": m.kept, "f_end": m.f_end, "local": time.strftime("%Y-%m-%d %H:%M:%S"),
+                             "took_s": round(r.now - r.started, 1) if r else 0.0, "notes": m.notes[-200:],
+                             "pattern_info": {str(k): v for k, v in (getattr(self.source, "pattern_info", {}) or
+                                                                     {}).items()}})
+            threading.Thread(target=out.close, daemon=True, name="map file close").start()
+            text += f"; saved to {out.path}"
+        ch.map_note, ch.message = text, "" if ok else text
+        (log.info if ok else log.warning)("channel %d: %s", ch.n, text)
 
     # ------------------------------------------------------- mode-hop recovery
     def set_hop_params(self, n: int, params: HopParams):
@@ -1642,8 +1823,8 @@ class Engine:
                 ch.message = "right-click to link a laser first"
             elif ch.dac:
                 ch.message = "take the optimum: not on an analog output"
-            elif ch.state == "recovering":
-                ch.message = "take the optimum: not while it recovers"
+            elif ch.state in ("recovering", "mapping"):
+                ch.message = f"take the optimum: not while it {'recovers' if ch.state == 'recovering' else 'is mapped'}"
             else:
                 self._take_optimum(ch)
 
@@ -1677,7 +1858,7 @@ class Engine:
         """Recenter now, even without a hop: always maps, so it finds the best mode."""
         with self.lock:
             ch = self.channels[n]
-            if ch.state in ("recovering", "engaging"):
+            if ch.state in ("recovering", "engaging", "mapping"):
                 return
             if not ch.device:
                 ch.message = "right-click to link a laser first"
@@ -2018,6 +2199,8 @@ class Engine:
             ch = self.channels.get(n)
             if ch is None or n not in self.rows():
                 return False, f"no channel {n} shown there"
+            if ch.state == "mapping" and do not in ("rename", "lock_params"):
+                return False, "it is being mapped (stopped there, it goes back where it began)"
             ref = self._is_reference(ch)
             if do == "setpoint":
                 nm = args.get("nm")

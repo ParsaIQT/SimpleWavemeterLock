@@ -12,7 +12,8 @@ row(engine, n, now) is a dict:
   anchor    see sp: None on any other row
   info      the line under the digits, in colour info_c
   prompt    step by step: what the recovery waits to be allowed ('' if nothing)
-  state     the look of the row and its button: off, error, on, engaging, recovering, asking, ref, ref-hold, ref-moved
+  state     the look of the row and its button: off, error, on, engaging, recovering, asking, mapping, ref, ref-hold,
+            ref-moved
   relock    the button relocks a laser its DLC pro locks to a cavity (Relock, Watching), else Lock (Locked)
 Colours are names: fg, dim, ok, warn, err, accent. tip(engine, n, digits) is the tooltip of its digits.
 """
@@ -112,10 +113,27 @@ def _recovery(ch, now: float):
     return " · ".join(p for p in parts if p), "warn", ""
 
 
+def _mapping(ch, now: float):
+    """A laser being mapped (lasermap.py): what the map does, how far it is, how long it has to go."""
+    r = ch.mapper
+    if r is None:
+        return "laser map: reading its settings", "accent", ""
+    m = r.mapper
+    took = max(now - r.started, 0.0)
+    text = f"laser map · {r.stage} · {100 * m.progress:.0f} % · {fmt_duration(took)} so far"
+    if r.state == "running" and m.progress > 0.02:
+        text += f", {fmt_duration(took * (1 - m.progress) / m.progress)} to go"
+    if m.out is not None:
+        text += f" · {m.points:,} points"
+    return text, "accent", ""
+
+
 def _info(e, ch, now: float):
     """(text, colour, prompt) of the line under the digits."""
     if ch.state == "recovering":
         return _recovery(ch, now)
+    if ch.state == "mapping":
+        return _mapping(ch, now)
     if ch.message:
         return ch.message, "err", ""
     if not ch.device:
@@ -257,4 +275,6 @@ def notes(e, n: int) -> str:
     if ch.remote_note:
         at = time.strftime("%H:%M:%S", time.localtime(ch.remote_wall))
         text += f"\nlast adjusted from another PC: {ch.remote_note}, at {at}"
+    if ch.map_note:
+        text += f"\nlast laser map: {ch.map_note}"
     return text

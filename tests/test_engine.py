@@ -1096,3 +1096,85 @@ def test_relock_takes_the_optimum_and_a_hop_to_the_near_mode_is_caught_back(quie
         assert wait_for(lambda: hop.opt_t != "kept", 5) and ch.note.startswith("optimum taken: ")
     finally:
         e.stop()
+
+
+# ------------------------------------------------------------------ laser maps
+def test_a_laser_map_through_the_engine_records_everything_and_puts_the_laser_back(engine, demo, tmp_path):
+    from wmlock import view
+    from wmlock.lasermap import MapPlan, load
+
+    engine.link(3, demo.dlcs[1].key, 1)
+    for n in (1, 2, 4, 5, 6, 7):  # (the switch on its laser alone: a reading every exposure)
+        engine.source.untick(n)
+    ch, dlc = engine.channels[3], demo.dlcs[1]
+    i0, v0 = dlc.current(1), dlc.offset(1)
+    assert engine.start_map(3, MapPlan()).startswith("give the highest current it may have (mA, measured)")
+    plan = MapPlan(i_lo=145.0, i_hi=152.0, i_step=1.0, v_lo=68.0, v_hi=72.0, v_step=2.0, reads=1, settle=0.0,
+                   patterns="all", repeat=False, folder=str(tmp_path))
+    s, size = engine.map_estimate(3, plan)
+    assert 0 < s < 600 and size > 0
+    assert engine.start_map(3, plan) == ""
+    assert ch.state == "mapping" and engine.start_map(3, plan) == "it is being mapped already"
+    assert wait_for(lambda: ch.mapper is not None and ch.mapper.mapper.points > 3, 10)
+    v = view.row(engine, 3, time.monotonic())
+    assert v["state"] == "mapping" and v["info"].startswith("laser map · ") and "points" in v["info"]
+    assert engine.source._detail == {3: True}
+    engine.recenter(3)
+    assert ch.state == "mapping"  # (nothing else touches it meanwhile)
+    assert wait_for(lambda: ch.state == "off", 60), ch.mapper.stage if ch.mapper else ch.map_note
+    assert ch.map_note.startswith("map done in ") and "saved to" in ch.map_note and ch.message == ""
+    assert engine.source._detail == {}
+    assert dlc.current(1) == pytest.approx(i0) and dlc.offset(1) == pytest.approx(v0)
+    assert ch.to_config()["map"]["i_hi"] == 152.0  # (the plan kept, for the next)
+    path = ch.map_last.mapper.out.path
+    assert wait_for(lambda: not ch.map_last.mapper.out._thread.is_alive(), 10)
+    with load(path) as f:
+        legs = [(leg, len(pts)) for _, leg, pts in f.legs()]  # (first down from where it was, 150 mA; then each line
+        assert legs == [(0, 6)] + [(1, 8), (2, 7)] * 3  # up, and back down from below its top)
+        assert {ln["axis"] for ln in f.lines} == {"current"}
+        assert all(q["f"] is not None for q in f.points)
+        assert f.meta["laser"]["channel"] == 3 and f.meta["end"]["ok"] and f.meta["wavemeter"]["model"]
+        n = f.db.execute("SELECT COUNT(*) FROM patterns WHERE kind = 0").fetchone()[0]
+        assert n == len(f.points)
+        assert f.meta["end"]["pattern_info"]["0"][0] > 0
+
+
+def test_a_laser_map_stopped_puts_the_laser_back_and_keeps_what_it_had(engine, demo, tmp_path):
+    from wmlock.lasermap import MapPlan, load
+
+    engine.link(3, demo.dlcs[1].key, 1)
+    for n in (1, 2, 4, 5, 6, 7):
+        engine.source.untick(n)
+    ch, dlc = engine.channels[3], demo.dlcs[1]
+    i0, v0 = dlc.current(1), dlc.offset(1)
+    plan = MapPlan(i_lo=140.0, i_hi=155.0, i_step=0.5, v_lo=60.0, v_hi=80.0, v_step=1.0, reads=2, patterns="off",
+                   folder=str(tmp_path))
+    assert engine.start_map(3, plan) == ""
+    assert wait_for(lambda: ch.mapper is not None and ch.mapper.mapper.points > 10, 10)
+    engine.stop_map(3)
+    assert wait_for(lambda: ch.state == "off", 10)
+    assert ch.message.startswith("map stopped after") and "everything put back" in ch.message
+    assert dlc.current(1) == pytest.approx(i0) and dlc.offset(1) == pytest.approx(v0)
+    out = ch.map_last.mapper.out
+    assert wait_for(lambda: not out._thread.is_alive(), 10)
+    with load(out.path) as f:
+        assert len(f.points) >= 10 and f.meta["end"]["error"] == "stopped" and f.meta["end"]["restored"]
+
+
+def test_a_laser_it_cannot_map_is_not_mapped(engine, demo, tmp_path):
+    from wmlock.lasermap import MapPlan
+
+    plan = MapPlan(i_lo=145.0, i_hi=152.0, v_lo=68.0, v_hi=72.0, folder=str(tmp_path))
+    assert engine.start_map(3, plan) == "link a laser first"
+    engine.link(3, demo.dlcs[1].key, 1)
+    ch = engine.channels[3]
+    engine.setpoint_to_current(3)
+    engine.engage(3)
+    assert wait_for(lambda: ch.state == "on", 2)
+    assert engine.start_map(3, plan) == "unlock it first (or stop watching it)"
+    engine.disengage(3)
+    engine.link(7, demo.dlcs[2].key, 1)  # the TA-SHG pro: its TA is on
+    assert engine.start_map(7, plan) == ""
+    ch7 = engine.channels[7]
+    assert wait_for(lambda: ch7.state == "off", 10)
+    assert "its TA is on" in ch7.message and not list(tmp_path.glob("*.sqlite-journal"))

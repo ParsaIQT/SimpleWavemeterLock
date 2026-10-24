@@ -41,6 +41,10 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
 * **Several wavemeters on one PC**: one copy of the program reads them all, each framed under its
   own name with its own channels, lasers and settings, told apart by their serial numbers (see
   *Several wavemeters on one PC*).
+* **Laser maps**: a laser's current and piezo (and its temperature, if asked) swept over all the
+  ground you give them, both ways, with everything the wavemeter says at every point (its frequency,
+  power, exposure, and its interference patterns: the spectrum, where a second mode shows) and the DLC
+  pro's photodiode, kept in a file to look at the laser afterwards and to model it (see *Laser maps*).
 * Fast by construction: the wavemeter is read in its own thread, all network I/O
   happens in one worker thread per controller (writes are coalesced, Nagle off),
   and the GUI only repaints numbers that changed. Nothing ever blocks the window.
@@ -1129,6 +1133,152 @@ Things to know:
   simulated one offers lockpoint candidates only after `find-candidates`; after a hop its lock
   searches for 1.5 s before it catches a peak again.
 
+## Laser maps
+
+A laser map sweeps a laser's current and piezo, and if you ask its temperature too, over all the ground
+you give them, **both ways**, and keeps everything the wavemeter and its DLC pro say at every step in a
+file. It's for looking at the physical laser afterwards: where each of its modes lases sweeping up and
+sweeping down, where it runs on two at once, where it stops lasing and where it starts again. The maps
+are also what the simulator's lasers (`wmlock/sim.py`) can be fitted to.
+
+Right-click the laser's row › **Laser map…**. The laser must be unlocked (not watched, not recovering).
+A TA pro's TA must be off: without seed it switches itself off, or worse. Its DLC pro's cavity lock
+must be off too. The dialog reads the laser first: its current, piezo, temperature, current-clip, piezo
+and temperature limits, feedforward, and whether it has a photodiode of its own. Then you give:
+
+* **Current**: from, to, step, in mA *as measured* (as the DLC pro shows it: Act). The highest is
+  yours to give, and the map never goes above it (nor above the controller's current-clip). The
+  dialog refuses a highest current that needs a set current above current-clip, with the
+  feedforward taken into account at both ends of the piezo range.
+* **Below threshold**: sweeping the current down, this many points in a row without lasing end the
+  sweep that way (0: always down to the lowest). Below there the laser does not lase, and each point
+  would cost a long exposure.
+* **Piezo**: from, to, step, in V, within the controller's limits (`dl:pc:voltage-min`/`-max`).
+* **Sweep**: *the current, up and down at each piezo voltage* (the default); *the piezo, up and down
+  at each current*; or *both*, one map after the other. Hysteresis makes the two ways differ, so
+  every line is swept up and then back down, and the file keeps the two apart.
+* **Each point**: how long to wait after the step, and how many readings to take that began after it.
+* **The first line swept again at the end**: how far things moved over the map.
+* **Temperature** (optional): from, to, step (`dl:tc:temp-set`). A whole map is made at each
+  temperature once it has settled: within the tolerance for the hold time, or after the longest wait
+  (mapped all the same, and noted). The temperature goes back where it was at the end.
+* **Wavemeter patterns**: the interference patterns the WLM window shows, kept *around hops, the
+  dark and fading fringes, and at every Nth point* (the default), *at every point*, or *never*.
+  Where a second mode begins, its fringes beat or fade: this is the spectrum. Patterns take most of
+  the file. Around hops means the three points either side of each hop, of each change between
+  lasing and dark, and of each point whose fringes fade or whose readings spread. An ECDL swept in
+  fine steps hops every few mA and runs on two modes before many of its hops, so that is about half
+  its points: the half where it is interesting.
+* **Also read at each point**: more DLC pro parameters, comma-separated (below `laserN:`). The DL
+  pro's own photodiode (`dl:pd:photodiode`) is read at every point anyway, if it has one.
+* **Saved in**: a folder (`~/laser-maps` by default).
+
+Under the form, the dialog estimates the number of points, the time (at the reading rate the
+wavemeter gives that laser now) and the file size. Problems are listed in red, and *Start map* stays
+greyed out until there are none. The plan is remembered for that channel.
+
+**At each point**: the step is written, the map waits, and then it takes readings that *began* after
+the step. Each reading's exposure says when it began. Each reading comes with the wavemeter's power,
+exposure (both arrays) and fringe amplitudes, and with its patterns when they are wanted. The DLC
+pro's photodiode is read meanwhile. With the exposure on auto, a dim laser is measured slowly, and the
+map simply waits for it.
+
+Where the laser does not lase, the WLM says *low signal* or *no signal* once and then nothing new,
+while its exposure grows to seconds. The map counts the point as dark once the wavemeter has said no
+light and then nothing new for a little more than two exposures (the one going on and a whole one
+after). Silence after *overexposed* is not dark: its exposure is adapting, coming back out of the dark,
+and the map waits for it. Once the wavemeter has told dark from lasing a few times, the photodiode
+alone settles a dark point, without waiting: below a quarter of the way from what it gives dark to
+what it gives lasing. This is what keeps the threshold region quick.
+
+**A line**, sweeping the current: the piezo to its voltage, then the current to where the last sweep
+down went dark (or the lowest). If the laser lases there, the map first looks down for where it stops
+(a *descent*). Then it sweeps up from the dark to the highest current, so the file shows where the
+laser *starts* lasing again (well above where it stops, as a rule), and back down until it goes dark.
+Sweeping the piezo, each line goes from the lowest voltage to the highest and back; a line dark all the
+way up is not swept back.
+
+**Safety**: the measured current never goes above your highest (or above where it began, if that was
+higher, on the way back). The set current never exceeds current-clip, and the piezo stays within its
+limits and your range. The temperature stays within the controller's limits and your range. Nothing
+else is written but the scan switched off (`scan:enabled`, on again after), and every move is in
+steps: at most 1 mA and 5 V a write for moves, the plan's step for sweeps. With the DLC pro's
+feedforward on, the set current is written so that the measured current is the map's (the feedforward
+moves it ff mA per volt of piezo). During a piezo move, a step that would take the measured current up
+writes the current first, so it never overshoots.
+
+At the end, **or when you stop it** (the row's *Mapping* button, or *Stop map* in its window), the
+laser goes back where it began: the temperature (at the end it waits for it to settle; stopped, it sets
+it back and goes on), then the piezo and the current, then its scan if it was on. At the end it reads
+the frequency there and notes how far it is from where it began.
+Hysteresis may leave it on another mode, so *Recenter now* or lock it again. Closing the program puts it
+back the same way. A map whose wavemeter channel is switched off is switched on again. A map the
+wavemeter stops reading (nothing at all for three points) stops and puts everything back. So does a
+controller that stops answering or a file that cannot be written.
+
+**Its window** (it opens when the map starts; right-click › *Laser map (going on)…* or *Last laser
+map…* opens it again) shows each way as a picture: sweeping up and sweeping down side by side, the
+swept axis across, the other up. Each point is coloured by its frequency from where the laser began
+(blue below, red above, grey at it). It is black where the laser did not lase and light grey where the
+wavemeter read nothing valid; hover over a point to see what it is. Below are the last two sweeps
+(frequency against the swept axis, mode hops as steps), the last interference pattern and the map's
+notes. When it is over, a picture of both ways is saved next to the file (`.png`). The row says how
+far it is and how long it has to go.
+
+![a laser map of the simulated 854 nm DL pro, going on](docs/laser_map.png)
+
+**The file**: `~/laser-maps/map_<date>_<time>_ch<n>_<name>.sqlite`, one per map, written as the map goes
+(a map cut short keeps what it had). It is SQLite, which any language reads:
+
+| table      | a row is | columns |
+|------------|----------|---------|
+| `meta`     | a key, its value as JSON | `plan`, `laser` (channel, name, controller, what drives its piezo and current), `wavemeter` (model, serial), `start` (set and measured current, piezo, temperature, current-clip, feedforward, limits, scan), `recorded`, `program`, `began`, `units`, `end` (outcome, points, patterns kept, the frequency back where it began, the notes, the patterns' size) |
+| `lines`    | a line | `map` (which map), `axis` (what it sweeps), `line`, `slow` (the other axis there), `temp`, `repeat` (the first line again), `t0`, `t1` |
+| `points`   | a point | `line_id`, `leg` (1 up, 2 down, 0 a descent), `k` (its step), `t` (s since the map began), `i` (mA measured), `i_set`, `v`, `temp`, `f` (THz: the median of its valid readings; empty if none), `f_lo`, `f_hi`, `n`, `bad` (invalid readings), `status`, `how` (`done`, `dark` (by its photodiode), `quiet` (the wavemeter said no light, then nothing), `invalid`, `timeout`), `wait`, `power` (µW, the wavemeter's), `exp1`, `exp2` (ms), `amin1` … `aavg2` (fringe amplitudes), `vals` (the parameters read, JSON), `event` (`hop`, `dark`, `lasing`, `invalid`, `spread`, `fade`) |
+| `readings` | a reading | `point_id`, `t`, `f`, `status`, `power` |
+| `patterns` | an interference pattern | `point_id`, `kind` (0 its interferometers, 1 its wide interferometer or grating, 4 and 5 its analysis x and y, if that is on), `dtype`, `n`, `codec`, `data` (lossless: differences from pixel to pixel, zlib) |
+| `events`   | something that happened | `t`, `kind`, `text` |
+| `temps`    | a look at the temperature settling | `t`, `set_c`, `act_c` |
+
+```python
+from wmlock.lasermap import load
+
+with load("map_2026-10-24_171230_ch3_854.sqlite") as m:
+    print(m.meta["plan"], m.meta["start"])
+    for line, leg, points in m.legs():           # sweep by sweep
+        up = leg == 1
+        xs = [p["i"] for p in points]            # mA measured (p["v"]: V)
+        fs = [p["f"] for p in points]            # THz, None: dark or no valid reading
+    patterns = m.patterns(points[0]["id"])       # {kind: [counts, ...]}, where kept
+```
+
+`python -m wmlock.lasermap FILE…` says what a map holds (its plan, where it began, how many points,
+lasing, hops each way, how it ended); `--csv` writes its points as `FILE.csv` too.
+
+**How long, how big**: a point takes the settling time, a round trip to the DLC pro and its readings.
+With 2 ms exposures that's about 70 ms with the defaults; where the laser is dim, much longer. 100 mA
+in 0.2 mA steps over 140 V in 1 V steps is 141 lines of about 500 points each way: two or three hours.
+The file is about 200 bytes a point without patterns, and a few kB more for each point whose patterns
+are kept (3.5 kB with the simulated wavemeter's). So it is tens of MB without patterns, and some
+hundreds of MB with them around hops or at every point, depending on how large the wavemeter's
+patterns are. The dialog estimates it from the size of the patterns the wavemeter has given (a guess
+until a map has read one). Untick the other channels in the WLM software for the map (the switch
+measures them in turn), and start with a small map to see how the laser looks.
+
+**From another PC**: through `server/server.py` (`--http`) a map reads each new reading of its laser
+again with all its details (`GET /api/v1/channel/<n>/detail`), more slowly than wlmData.dll on the
+wavemeter PC. A `server.py` from before gives readings without details: the map works, without
+patterns, power or exposure.
+
+**Before the first map on the real laser**: the wavemeter's details come from HighFinesse's wlmData
+functions (`GetPowerNum`, `GetExposureNum`, `GetAmplitudeNum`, `SetPattern`, `GetPatternItemCount`,
+`GetPatternItemSize`, `GetPatternDataNum`, and `GetAnalysisData` when the WLM's analysis is on), as
+HighFinesse documents them; a WLM program that lacks any of them gives readings without that detail.
+They have not yet been read from a real wavemeter by this program. So make a small map first (a few mA
+at a few piezo voltages, patterns at every point) and open its file: its patterns should look like the
+WLM window's, and the map's exposures like the WLM's. The pattern export is switched on while a map
+wants patterns, and off again after.
+
 ## Troubleshooting
 
 * **No controllers in the menu**: discovery replies are UDP, so allow Python
@@ -1183,9 +1333,11 @@ unticked is reported `"Disabled"` with `"use": false`, and
 it), for a laser whose channel someone switched off (*Its wavemeter channel
 switched off*). On a PC with several wavemeters, each answer says whose it is
 (`"wavemeter": {"model": "WS7", "serial": 1234}`), `?wlm=1234` asks for that
-one (the first without it), and `GET /api/v1/wavemeters` lists them. Same
-endpoint, same JSON otherwise, so other clients keep working. Run it on the
-wavemeter PC next to HighFinesse's `wlmData.py`/`wlmConst.py`:
+one (the first without it), and `GET /api/v1/wavemeters` lists them. For a laser
+map, `GET /api/v1/channel/<n>/detail?patterns=1` gives a channel's reading with
+the power, exposure and fringe amplitudes measured and its interference patterns
+(see *Laser maps*). Same endpoint, same JSON otherwise, so other clients keep
+working. Run it on the wavemeter PC next to HighFinesse's `wlmData.py`/`wlmConst.py`:
 
 ```
 pip install fastapi uvicorn
@@ -1203,6 +1355,7 @@ wmlock/reference.py  wavemeter referencing to a cavity-locked laser, pure maths
 wmlock/modehop.py    mode-hop recovery: lasing watch and panic, the catch, the walk, the current map, driver
 wmlock/relock.py     taking over and handing back a DLC pro's cavity and SHG locks; setup check
 wmlock/dropouts.py   lock dropouts: the DLC pro's recorder (or polling) read, dropouts found
+wmlock/lasermap.py   laser maps: the plan, the sweeps both ways, the file (SQLite), reading it back; python -m wmlock.lasermap
 wmlock/cavity.py     reading SHG sweeps, cavity scans and error signals, pure maths
 wmlock/engine.py     threads and state: source → lock → per-controller workers
 wmlock/meters.py     this PC's wavemeters, an engine each: found, settings kept, swapped, hidden
@@ -1280,4 +1433,15 @@ it until single-mode; without that, a second mode stays; a laser whose SHG signa
 touched. The upkeep runs from below the top and from over it (never more than 0.005 mA a write,
 nothing else written, ending just below the top), with no dip within reach, with its SHG lock lost on
 the way (the current put back) and not locked to begin with (nothing written); and end to end, now
-and then, through the engine and the fake controller.
+and then, through the engine and the fake controller. Laser maps run against a simulated DL pro and
+the wavemeter's detailed view of it: its exposure on auto (long where the laser is dim, overexposed for
+a while as it comes out of the dark), its fringes and their patterns (two modes fading them), a
+photodiode of its own, its temperature controller settling. Synchronously, on the bench's clock: both
+ways at every line, the measured current never above the highest given nor the set current above
+current-clip, every write a step, nothing else written; where the laser stops lasing sweeping down and
+starts again sweeping up, both found (its photodiode settling dark points at once, without it each
+waiting its exposure); its hysteresis shown by the modes changing later sweeping up than down; the piezo
+swept; the feedforward taken into account; the temperature stepped, settled and put back; stopped, or the
+wavemeter falling silent, everything put back; a TA on, a cavity lock on or a current-clip too low: nothing
+written. End to end through the engine, its window and the fake controllers, and through stand-ins for
+wlmData and server.py (details, patterns exported and no longer).
