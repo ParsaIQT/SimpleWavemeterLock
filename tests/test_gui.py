@@ -786,6 +786,10 @@ def test_a_laser_map_from_its_dialog_to_its_window_and_picture(app, demo, tmp_pa
         d.i_hi.setValue(152.0)
         p = d.plan()
         assert (p.i_lo, p.i_hi, p.v_lo, p.v_hi, p.patterns, p.repeat) == (145.0, 152.0, 68.0, 72.0, "all", False)
+        assert p.model and d.model.isChecked()  # (the laser's model at the end, unless unticked)
+        d.model.setChecked(False)
+        assert not d.plan().model
+        d.model.setChecked(True)
         assert p.ff_end == "back"
         d.ff_end.setCurrentIndex(1)
         assert d.plan().ff_end == "fitted" and d.start.isEnabled()

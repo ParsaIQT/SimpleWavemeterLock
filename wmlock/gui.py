@@ -2001,6 +2001,10 @@ class MapDialog(QtWidgets.QDialog):
         self.repeat.setChecked(p.repeat)
         self.repeat.toggled.connect(self.check)
         form.addRow(self.repeat)
+        self.model = QtWidgets.QCheckBox("The laser's model fitted to it at the end, its facts said (a minute or two; "
+                                         "the laser is free meanwhile)")
+        self.model.setChecked(p.model)
+        form.addRow(self.model)
         heading("Feedforward")
         ff_note = Text("Off for the map, so that it is square in the current as measured against the piezo: its "
                        "factor taken to 0 in steps that move the current 1 mA at most, the current read after each "
@@ -2084,7 +2088,7 @@ class MapDialog(QtWidgets.QDialog):
                        t_tol=self.t_tol.value(), t_hold=self.t_hold.value(), t_wait=self.t_wait.value(),
                        settle=self.settle.value(), reads=self.reads.value(), dark=self.dark.value(),
                        patterns=self.PATTERNS[self.patterns.currentIndex()][0], every=self.every.value(),
-                       record=self.record.text().strip(), repeat=self.repeat.isChecked(),
+                       record=self.record.text().strip(), repeat=self.repeat.isChecked(), model=self.model.isChecked(),
                        ff_end=self.FF_END[self.ff_end.currentIndex()][0], folder=self.folder.text().strip())
 
     def limits(self):

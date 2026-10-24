@@ -1163,6 +1163,7 @@ and temperature limits, feedforward, and whether it has a photodiode of its own.
   every line is swept up and then back down, and the file keeps the two apart.
 * **Each point**: how long to wait after the step, and how many readings to take that began after it.
 * **The first line swept again at the end**: how far things moved over the map.
+* **The laser's model fitted to it at the end**: its facts said (*The laser's model*, below).
 * **At the end, its feedforward**: *as it was*, or *the ideal one the map finds, switched on* (below).
 * **Temperature** (optional): from, to, step (`dl:tc:temp-set`). A whole map is made at each
   temperature once it has settled: within the tolerance for the hold time, or after the longest wait
@@ -1260,8 +1261,8 @@ from one 2 V line to the next, nearly as far as from one hop to the next: 0.5 V 
 
 ### The laser's model
 
-At the end of a map (one with 200 points or more that lased), a physical model of the laser is fitted to
-it, in a thread of its own once its file is written (two minutes or so for a map of 4,000 points; the
+At the end of a map (one with 200 points or more that lased, unless unticked in the dialog), a physical
+model of the laser is fitted to it, in a thread of its own once its file is written (two minutes or so for a map of 4,000 points; the
 laser is free meanwhile). It is kept in the file (`meta` `model`, and its facts, as sentences,
 `model_facts`), its facts are said in the map's notes, and **The laser…** in the map's window lists them.
 `python -m wmlock.lasermap FILE --model` fits it to any map's file and says its facts (`--save-model`
