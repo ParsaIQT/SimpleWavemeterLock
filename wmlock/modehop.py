@@ -32,10 +32,13 @@ Three ways to a mode on target (HopParams.method):
         fraction of the optimum's (its intra-cavity signal locked at the optimum, as set by hand:
         HopParams.opt_*); within 1 - catch_min, caught; on into the mode's best and back up to the top
         end of it. Not caught in catch_tries goes: the same from the optimum's piezo voltage +- pc_try.
+        Already on the right mode, its peak as good as that (a relock): the current parked at the top
+        end of where the mode is at its best all the same (up while the peak stays at its best, then
+        back), since the feedforward takes it down as the piezo drifts up, relock after relock.
         Then the piezo walked onto the target, the SHG peak after each step (fallen: the current
-        trimmed back), the current parked high in the mode every REPARK_EVERY steps (up while the peak
-        stays at its best, then back). The right mode not to be had at all: the walk, from where it
-        began, on the mode it is on there.
+        trimmed back), the current parked high in the mode every REPARK_EVERY steps. A sweep reads the
+        peak to a few per cent only: one that falls short is looked at again before it counts. The
+        right mode not to be had at all: the walk, from where it began, on the mode it is on there.
         With nothing but the wavemeter (no SHG sweep: a plain DL pro), caught where it is on the
         right mode, coming down: that is its edge, where it hopped onto it. So where the mode holds
         is found as the map would, on this mode only (center): on down until it hops off, back up
@@ -643,6 +646,7 @@ class Recenter(CavitySteps):
     WORSE = 0.05           # an SHG sweep this much worse (badness) than the best is getting worse
     REPARK = 0.3           # mA: walking, the measured current this much below where it was parked high: again
     PARK_BACK = 2          # trims back from where parking high saw the SHG sweep change (or a hop)
+    FALL = 0.15            # parking at the top end of its best: an SHG peak this much below what it was, fallen
     # the catch
     CATCH_ROUNDS = 6       # caught afresh (after a hop on the way, say), at most...
     GOES = 6               # ...and this many times catch_tries goes up and down in all
@@ -739,6 +743,8 @@ class Recenter(CavitySteps):
         self.q_right = 0.0                  # ...its best SHG peak on them
         self.parked_room = None             # mA: parked by the wavemeter alone (center), how far from where it ends
         self.narrow = ""                    # ...the right mode alone over too little of the window for that (why)
+        self.topped = None                  # (from, to), mA measured: on the right mode, not caught, the current
+        #                                     parked at the top end of where it is at its best (park_top) all the same
         CavitySteps.__init__(self, p.shg if shg is None else shg)
 
     # ---------------------------------------------------------------- helpers
@@ -1930,8 +1936,10 @@ class Recenter(CavitySteps):
         it was on target on before it hopped, by the current (catch: up, then down a step at a time until it is on it,
         its SHG peak within 1 - catch_min of the optimum's; a few goes, then from the optimum's piezo voltage
         +- pc_try); then the piezo walked onto the target, the current parked high in the mode now and then on the way
-        (walk_on). A laser on the right mode and as good as that is left as it is but for the piezo onto the target.
-        A hop on the way: caught again from where it is."""
+        (walk_on). A laser on the right mode and as good as that has its current parked at the top end of where the
+        mode is at its best all the same (park_top: the feedforward takes it down as the piezo drifts up, relock after
+        relock, until the mode is no good there), then the piezo walked; with nothing but the wavemeter, it is left as
+        it is but for the piezo onto the target. A hop on the way: caught again from where it is."""
         self.stage = "looking at the mode"
         if self.shg_ok:
             yield from self.shg_scan(True)
@@ -1953,6 +1961,17 @@ class Recenter(CavitySteps):
                         yield from self.fall_back(self.narrow)
                         return
                     continue  # (it hopped off the mode: caught again)
+            elif rnd == 0 and self.caught is None and self.shg_ok:  # (the current, the feedforward's, may have sunk)
+                yield from self.ask("On the right mode: the current up a step at a time while its SHG peak stays at "
+                                    "its best, then back two steps (the top end of where the mode is at its best), "
+                                    "then the piezo onto the target")
+                i = self.I
+                self.note("on the right mode" + (f", its SHG peak {self.q:.2f} of the optimum's" if self.q is not None
+                                                 else "") + ": the current to the top end of where it is at its best, "
+                          "then the piezo onto the target")
+                if (yield from self.park_top(floor=True)):
+                    continue  # (it hopped going up, and stayed there: caught again)
+                self.topped = (round(self.mA(i), 4), round(self.mA(self.I), 4))
             elif rnd == 0 and self.caught is None:
                 self.note("on the right mode" + (f", its SHG peak {self.q:.2f} of the optimum's" if self.q is not None
                                                  else "") + ": only the piezo onto the target")
@@ -1967,7 +1986,7 @@ class Recenter(CavitySteps):
                 raise Failed(f"the target is {self.e / 1e3:+.2f} GHz away: {need:+.1f} V of piezo, beyond the "
                              f"{self.v_lo:.1f} … {self.v_hi:.1f} V it may use (Piezo moves at most, in Mode-hop "
                              f"recovery…)")
-            outcome = yield from self.walk_on(repark=self.caught is not None)
+            outcome = yield from self.walk_on(repark=self.caught is not None or self.topped is not None)
             if outcome == "ok":
                 if (yield from self.good_here()):
                     return
@@ -2067,10 +2086,10 @@ class Recenter(CavitySteps):
         return q >= self.p.catch_min - 1e-9
 
     def on_right(self, why: str):
-        """On the right mode, its SHG peak as high as it should be?"""
+        """On the right mode, its SHG peak as high as it should be (short of it, looked at once more)?"""
         if not self.right_mode():
             return False
-        return self.good((yield from self.quality(why)))
+        return self.good((yield from self.quality(why))) or self.good((yield from self.quality(why + ", again")))
 
     def catch(self):
         """Onto the right mode by the current, as by hand (sweep_down): catch_tries goes here, then as many from the
@@ -2414,11 +2433,16 @@ class Recenter(CavitySteps):
                 self.stage = "walking the piezo onto the target"
         return "slow"
 
-    def park_top(self):
-        """As by hand: the current up a step at a time while the SHG peak stays at its best (within WORSE of the best
-        seen on the way, and no less than catch_min of the optimum's) and it does not hop, then back PARK_BACK steps:
-        at the top end of where the mode is at its best. True if it hopped and backing off did not bring it back.
-        Nothing without an SHG sweep."""
+    def park_top(self, floor: bool = False):
+        """As by hand: the current up a step at a time while the mode stays at its best (its SHG peak no more than FALL
+        below what it has been on the way, the middle of those, and no less than catch_min of the optimum's;
+        single-mode, once it has been on the way: from below, it may be climbing out of a second mode) and it does not
+        hop, then back PARK_BACK steps: at the top end of where the mode is at its best. With floor, no lower than
+        where it began (a relock parks it so whenever it finds it on its mode: noise must not walk it down relock after
+        relock; walking the piezo, the mode moves, and the current with it). A sweep reads the peak to a few per cent
+        only (the middle of those it has read is the measure, not the best of them, which noise puts too high), and a
+        step that looks worse is looked at again before it counts. True if it hopped and backing off did not bring it
+        back. Nothing without an SHG sweep."""
         if not self.shg_ok:
             return False
         if not (self._looked == (self.I, self.V) and self.q is not None):
@@ -2426,7 +2450,14 @@ class Recenter(CavitySteps):
         if self.q is None or not self.good(self.q):
             return False
         self.stage = "parking the current high"
-        start, best, why = self.I, self.q, "up to the top of its window"
+        start, seen, why = self.I, [self.q], "up to the top of its window"
+        single = self.last_look[0] is not False  # (seen single-mode on the way)
+
+        def worse(q):
+            usual = _median(seen) if len(seen) >= 3 else min(seen)  # (what it has been, robustly)
+            return (q is None or (single and self.last_look[0] is False)
+                    or q < max(self.p.catch_min, (1 - self.FALL) * usual))
+
         e = yield from self.steady()
         while (yield from self.trim(+1)):
             if self._hop:
@@ -2440,13 +2471,19 @@ class Recenter(CavitySteps):
                 why = "short of where the wavemeter saw it hop"
                 break
             q = yield from self.quality("parking high")
-            if q is None or q < max(self.p.catch_min, (1 - self.WORSE) * best):
-                for _ in range(self.PARK_BACK):
+            reads = [q]
+            if worse(q):
+                q = yield from self.quality("parking high, again")
+                reads.append(q)
+            if worse(q):
+                why = ("short of where it went multimode" if q is not None and single and self.last_look[0] is False
+                       else "short of where its SHG peak fell")
+                for _ in range(min(self.PARK_BACK, round((self.I - start) / self.p.step)) if floor else self.PARK_BACK):
                     yield from self.trim(-1)
-                why = "short of where its SHG peak fell"
                 break
-            best = max(best, q)
-        self.q_best = max(self.q_best, best)
+            seen += [x for x in reads if x is not None]  # (both, if looked at twice: the one that passed alone is high)
+            single = single or self.last_look[0] is not False
+        self.q_best = max(self.q_best, *seen)
         if abs(self.I - start) > 1e-9:
             self.note(f"parked the current high: {self.mA(start):.2f} → {self.mA(self.I):.2f} mA, {why}")
         return False
@@ -2493,11 +2530,13 @@ class Recenter(CavitySteps):
 
     def good_here(self):
         """On target: its SHG peak (looked at here, unless the last look was) within 1 - catch_min of the optimum's?
-        How it looks is kept."""
+        Short of it, looked at once more first. How it looks is kept."""
         if not self.shg_ok:
             return True
         if not (self._looked == (self.I, self.V) and self.q is not None):
             yield from self.quality("on target")
+        if not self.good(self.q):
+            yield from self.quality("on target, again")  # (a sweep reads the peak to a few per cent only)
         if not self.good(self.q):
             self.note(f"on target, but its SHG peak is {self.q:.2f} of the optimum's: caught again")
             return False
@@ -2532,6 +2571,11 @@ class Recenter(CavitySteps):
                        + f" ({self.tries} go{'es' if self.tries != 1 else ''} up and down), walked the piezo "
                        f"{self.V0:.2f} → {self.V:.2f} V, current {began:.2f} → {now:.2f} mA measured "
                        f"({self.readings} readings)")
+        elif self.method == "catch" and self.topped is not None:
+            a, b = self.topped
+            summary = (f"on the right mode: the current to the top end of where it is at its best, {a:.2f} → "
+                       f"{b:.2f} mA measured, the piezo {self.V0:.2f} → {self.V:.2f} V (current now {now:.2f} mA, "
+                       f"{self.readings} readings)")
         elif self.method in ("walk", "catch"):
             summary = (f"walked the piezo {self.V0:.2f} → {self.V:.2f} V, current {began:.2f} → "
                        f"{now:.2f} mA measured ({self.trims} trim{'s' if self.trims != 1 else ''}, "
@@ -2560,6 +2604,8 @@ class Recenter(CavitySteps):
         self.record.update({"i0": round(began, 4), "v0": self.V0, "i": round(self.mA(self.I), 4),
                             "v": self.V, "act": self.final_act, "act_offset": round(self.act_offset, 4),
                             "method": self.method, "panics": self.panics, "summary": summary})
+        if self.topped is not None:
+            self.record["topped"] = list(self.topped)
         spacing = self.spacing if self.maps else (min(self.hops) if len(self.hops) >= 2 else 0.0)
         return Result(self.I, self.V, self.kv if self.kv_measured else 0.0, spacing, self.maps, self.readings, summary,
                       dict(self.learned), self.record, self.lock_e if self.cavity else math.nan)
@@ -2581,13 +2627,15 @@ class Runner:
     current by STEP_MAX at most, and nothing else is written but WRITABLE, a FALC pro's input
     offset within falc_max of where it was, and COMMANDS. After a write, SETTLE readings are
     skipped: the exposure may have straddled it. On failure or cancel, everything written goes
-    back where it was (a Set's `restore`; current and offset unless the failure says keep), before
-    current and offset, which go back together in small steps; with the seed power watched (a
-    laser that may stop lasing when its current drops), slowly where the measured current comes
-    down (HopParams.ramp), and if it was not lasing, by way of the top, as a panic would.
-    finished(runner) is called once, when it is over."""
+    back where it was (a Set's `restore`; current and offset unless the failure says keep), the
+    last written first, but the cavity lock first of all (off: a DLC pro would not have its scan
+    switched while its lock was enabled), before current and offset, which go back together in
+    small steps; with the seed power watched (a laser that may stop lasing when its current
+    drops), slowly where the measured current comes down (HopParams.ramp), and if it was not
+    lasing, by way of the top, as a panic would. finished(runner) is called once, when it is over."""
 
     SETTLE = 1
+    FIRST = ("dl:lock:lock-enabled",)  # put back before the rest (see above)
     INVALID = 3          # invalid readings in a row passed over before one is handed on
     ACK_TIMEOUT = 5.0    # s
     READ_TIMEOUT = 10.0  # s
@@ -2846,8 +2894,9 @@ class Runner:
             return
         self._waiting = None
         if self.state == "restoring":
-            if op[0] == "set":  # one setting could not be put back: say so, put back the rest
-                self.trouble.append(op[1])
+            if op[0] == "set":  # one setting could not be put back: say so (and why), put back the rest
+                why = re.sub(r"^set \S+: ", "", str(exc).strip())  # (the name is said already)
+                self.trouble.append(f"{op[1]} ({why or type(exc).__name__})")
                 self._next()
                 return
             self._ops.clear()
@@ -2955,7 +3004,7 @@ class Runner:
     def _restore(self):
         self.state = "restoring"
         self._waiting = None
-        for name, value in reversed(list(self.journal.items())):
+        for name, value in sorted(reversed(list(self.journal.items())), key=lambda kv: kv[0] not in self.FIRST):
             self._ops.append(("set", name, value))
         if not self._keep:
             r = self.rec

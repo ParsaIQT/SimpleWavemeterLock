@@ -122,7 +122,7 @@ def _info(e, ch, now: float):
         return "right-click to link a laser" + remote_text(ch, now), "dim", ""
     ctrl = e.controllers.get(ch.device)
     where = e.where(ch)
-    more = hop_text(ch, now) + remote_text(ch, now)
+    more = hop_text(ch, now) + lock_text(ch, now) + remote_text(ch, now)
     if ctrl is not None and ctrl.online is False:
         return f"{where}   offline" + (f": {ctrl.error}" if ch.dac and ctrl.error else ""), "err", ""
     if ch.lasing is False and ch.hop.enabled:
@@ -142,6 +142,13 @@ def _info(e, ch, now: float):
         return f"{where}   wavemeter channel off: {what}{more}", "dim", ""
     off = "…" if ch.offset is None else f"{ch.offset:.3f} {ch.unit}"
     return f"{where}   {off}{more}", "dim", ""
+
+
+def lock_text(ch, now: float) -> str:
+    """What its wavemeter lock did by itself (it ran away: its gains reversed), for a while."""
+    if ch.lock_note and now - ch.lock_t < NOTE_S:
+        return f"   gains reversed by the lock: it ran away, {fmt_duration(now - ch.lock_t)} ago"
+    return ""
 
 
 def remote_text(ch, now: float) -> str:
@@ -244,6 +251,9 @@ def notes(e, n: int) -> str:
         text += f"\nlast look, its wavemeter channel switched on for it: {ch.looked}"
     if ch.drops_total:
         text += f"\nlock dropouts: {ch.drops_total} since the program started; the last at {ch.drop_last}"
+    if ch.lock_note:
+        at = time.strftime("%H:%M:%S", time.localtime(ch.lock_wall))
+        text += f"\nits lock, at {at}: {ch.lock_note}"
     if ch.remote_note:
         at = time.strftime("%H:%M:%S", time.localtime(ch.remote_wall))
         text += f"\nlast adjusted from another PC: {ch.remote_note}, at {at}"

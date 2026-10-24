@@ -115,9 +115,17 @@ offset = offset_at_engage − (P·e + I·Σe)
   time is. Defaults: P = 0, I = 0.5 V/GHz. With a tuning coefficient K
   (GHz/V), I = 1/K corrects the whole error in one reading; about 0.3/K is a
   robust choice.
-* **Sign**: positive gains assume the frequency rises with the offset. If a lock
-  runs away, negate the gains in *Lock settings…*. In the `--sim` demo the
-  866 nm laser is deliberately built the other way round, so you can watch the
+* **Sign**: positive gains assume the frequency rises with the offset. Gains of the wrong sign for
+  the laser push it away from the setpoint, faster and faster: for its first 100 readings, a lock
+  watches for that (the error, one sign all the while, grown gradually from its smallest by 30 MHz,
+  and by as much as it was then, up to 300 MHz, while the offset moved the way the gains would
+  bring it back; a jump is a hop, not that). Caught at it, it goes back to where the error was
+  smallest, **reverses its gains** (kept: *Lock settings…* shows them) and locks; the row says
+  *gains reversed by the lock: it ran away*, its tooltip and the console how far it went. Running
+  away again with its gains reversed, the laser does not follow that offset as the wavemeter sees
+  it (the channel linked to the wrong laser, say): it is unlocked and put back where it was
+  nearest, its gains as they were. Later on, a lock that runs off is unlocked by its limits, as
+  ever. In the `--sim` demo the 866 nm laser is built the other way round, so you can watch the
   lock catch it.
 * **What it moves**: the piezo, by the scan offset (`laserN:scan:offset`), where the DLC pro's
   scan generator drives the piezo, as it does on most. Where it drives something else (*Scan ›
@@ -597,8 +605,15 @@ mode is close by, 4 pm at 739 nm, and drops onto it):
    Where it should be now is where the laser was last on target as it should be (watched: the
    scan offset and current polled then), moved by the piezo tuning and, within the mode, by the
    current; a mode within 0.4 mode spacings of that is the right one. On it, with its SHG peak
-   within 10 % of the optimum's (a lock that caught a wrong peak, say): nothing but the piezo onto
-   the target, and relocked.
+   within 10 % of the optimum's (a lock that caught a wrong peak, or keeps losing it): its current
+   is **parked at the top end of where the mode is at its best** all the same, as by hand (up 0.1
+   mA at a time while the peak stays at its best, then two steps back, but never lower than it
+   was), then the piezo onto the target (step 4), and relocked. Its feedforward takes the current
+   down as the piezo drifts up, relock after relock: left alone, the current ends up near the
+   bottom of its mode, where the cavity lock will not hold and the SHG looks worse, the laser
+   still on the right mode (the 739 nm one sat at 57.9 mA on 23 October, its optimum 58.24 mA, its
+   mode single up to about 58.2–58.3 mA, multimode above, as the catch's sweeps showed). The note
+   says so: *on the right mode: the current to the top end of where it is at its best, … → … mA*.
 2. **Catch it.** The current goes up to the top of its window, quickly, then down **0.1 mA at a
    time**, a reading each. Where the laser is on the right mode, the SHG cavity's sweep is looked
    at too: its **SHG peak**, the tallest resonance (its true height, between samples: what the
@@ -619,6 +634,12 @@ mode is close by, 4 pm at 739 nm, and drops onto it):
 5. **On target**, its SHG peak within 10 % there: handed back. The SHG cavity's signal locked
    must come within 10 % of the optimum's too; then the error signal's DC level is nulled and
    the cavity locked.
+
+*At its best*, parking high: the SHG peak no more than 15 % below what it read on the way (the
+middle of those readings, not the best, which noise puts too high) nor below 90 % of the
+optimum's, and single-mode. A sweep reads the peak to a few per cent only (±7 % sweep to sweep on
+the 739 nm one): one that falls short is read again before it counts, here and wherever the
+catch compares the peak with the optimum's.
 
 If the right mode cannot be had at all (beyond the window: with modes 6 GHz apart it is 3.4 mA
 of current away), after 3 goes everywhere (18 at most in a recovery), the laser goes back where
@@ -690,7 +711,8 @@ leaves (0.3 mA either way, the median), in half the readings (50 to 60, against 
    change. Whenever the walk has taken it 0.3 mA down from there, it is parked high again.
 4. **On target**, single-mode by the SHG sweep there: handed back.
 
-**A laser that is fine is only relocked.** If it is on target and single-mode when it is taken
+**A laser that is fine is only relocked** (by the walk; the catch parks its current at the top end
+of its mode's best first, above). If it is on target and single-mode when it is taken
 over (its lock was merely off, slipping, or on another peak; or you pressed *Recenter now*),
 nothing is moved but the piezo onto the target, if it is not quite there: the current is never
 touched, not even to look either side of it (a laser close to where it stops lasing could stop),
@@ -893,7 +915,12 @@ Safety:
   caught a wrong peak three times, the laser is left on its new, good operating point with
   the lock off. A setting the controller refused (as busy, say: it is tried again for 3 s first)
   is not "put back": it never changed. (Before, a refused *lock off* as the recovery took the
-  laser over was put back as *off*, which turned off a lock that had been on.)
+  laser over was put back as *off*, which turned off a lock that had been on.) The cavity lock is
+  turned off first when things go back, then the rest, the last changed first: the 739 nm one's
+  DLC pro would not have its scan switched while its lock was enabled (each time it was stopped
+  while trying to lock it said *could not put back scan:enabled*, the lock having gone off last;
+  stopped with the lock already off, never). A setting that cannot be put back is named, with
+  the controller's reason.
 * At most 4 recoveries an hour; beyond that it stops and says so (a laser that stopped lasing
   is recovered all the same). It also does nothing until the laser has been on target again.
 * If the controller stops answering, it stops and says what the current was left at.
@@ -1047,8 +1074,12 @@ Things to know:
 * **`WS7 1234 is not running (this PC has WS6 5678)`**: that wavemeter's WLM program is closed; its
   settings wait for it, never read from the other. Settings given the wrong wavemeter: *Swap settings
   with…* (see *Several wavemeters on one PC*).
-* **Lock runs away straight after engaging**: the gain sign is wrong for that
-  laser; negate P and I.
+* **Lock runs away straight after engaging**: the gain sign is wrong for that laser; the lock reverses it
+  by itself now (*gains reversed by the lock*, above). Settings are kept per wavemeter channel, so a laser
+  moved onto a channel inherits that channel's gains, sign and all: an identical laser on another channel
+  can need the other sign there. *it ran away with its gains either way*: the laser does not follow the
+  offset the lock moves; right-click › *Link laser* (the right controller and laser?) and *Check setup…* (what
+  its scan drives).
 * **`offset 160.000 outside 0 … 140`, or `the offset, 160.00 V, is outside 0 … 140 V`, on a laser whose
   scan drives its current** (a TA-SHG pro, say): from a version before this one, which took the scan
   offset for the piezo; this one moves the piezo's own set value there (see *The lock*). *piezo voltage
@@ -1145,4 +1176,12 @@ the current (as on the TA-SHG pro that read 160 mA there), and switching it by h
 where it was: the lock moves the piezo either way, a recovery the current, nothing else is written,
 and switching it while locked unlocks it. The catch with the wavemeter alone runs against mode-hoppy
 lasers (a Monte Carlo too): caught back on the right mode and parked in the middle of where it holds,
-mapped instead when too little of it is in the window, centered by *Recenter now*.
+mapped instead when too little of it is in the window, centered by *Recenter now*. A relock of an SHG
+laser on its right mode parks its current at the top end of where the mode is at its best: from the
+bottom of the mode (where the feedforward had taken it) and from the top, relock after relock, its
+simulated SHG sweeps reading the peak ±6 % sweep to sweep as the real one does, never left lower than
+it was; step by step, asked first. Stopped while its cavity lock is trying to lock, against a DLC pro
+that will not have its scan switched while its lock is enabled, everything goes back. A wavemeter lock
+whose gains are the wrong sign is caught running away, reversed and locked (through the fake controller
+too, and its row says so); one that runs away either way (its channel linked to the wrong laser) is
+unlocked and put back; a hop or noise is not taken for it, and later on its limits unlock it as ever.

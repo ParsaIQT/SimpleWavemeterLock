@@ -351,8 +351,8 @@ def test_row_asks_before_each_step(app):
         assert any(t.startswith("Continue: Take the laser over") for t in items) and "Stop recentering" in items
         row._menu.close()
         row._clicked()  # Continue
-        assert wait_for(lambda: (app.processEvents(), ch.hop_prompt.startswith(("Walk the piezo onto the target",
-                                                                               "Lock the SHG cavity")))[1], 5)
+        assert wait_for(lambda: (app.processEvents(), ch.hop_prompt.startswith((  # (the current parked high first)
+            "On the right mode: the current up a step at a time while its SHG peak stays at its best",)))[1], 5)
         e.cancel_recovery(7)
         assert wait_for(lambda: (app.processEvents(), ch.state == "off")[1], 5)
         assert "recovery stopped" in ch.message and "cavity lock left off" in ch.message

@@ -26,11 +26,70 @@ def test_integrator_converges_for_either_sign(k, ki):
     assert lock.active
 
 
-def test_wrong_sign_unlocks_at_excursion_limit():
+@pytest.mark.parametrize("err0, max_step", [(5.0, 0.25), (100.0, 0.25), (1000.0, 0.25), (-40.0, 10.0)])
+def test_a_lock_that_runs_away_reverses_its_gains_once_and_locks(err0, max_step):
+    """Its gains of the wrong sign for the laser (its frequency falls as the offset rises): it runs away, faster and
+    faster (or as fast as Max step lets it, from far), and is caught at it: back where the error was smallest, its
+    gains reversed, and locked."""
+    lock = Lock(LockParams(ki=1.0, max_step=max_step, excursion=5.0))
+    u, errs = run_plant(lock, -0.3, err0, 200)
+    assert lock.active and lock.reversed and abs(errs[-1]) < 0.01, lock.message
+    assert (lock.p.kp, lock.p.ki) == (0.0, -1.0)
+    assert max(abs(e) for e in errs) < abs(err0) + max(30.0, min(abs(err0), 300.0)) + 100.0
+    assert lock.note.startswith("it ran away (") and "its gains are reversed (P 0, I -1)" in lock.note
+
+
+def test_negative_gains_where_the_frequency_rises_with_the_offset_are_reversed_too():
+    """A channel's settings stay with the channel: a laser put on one set up for a laser that tuned the other way."""
+    lock = Lock(LockParams(ki=-0.5, max_step=0.25))
+    _, errs = run_plant(lock, 0.4, 3.0, 150)
+    assert lock.reversed and lock.p.ki == 0.5 and abs(errs[-1]) < 0.01
+    assert "its frequency rises as the offset rises, so its gains are reversed (P 0, I 0.5)" in lock.note
+
+
+def test_running_away_with_its_gains_either_way_unlocks_it_where_it_was_nearest():
+    """The laser does not follow the offset (the wrong laser's piezo, say), and drifts away fast: reversed once, it runs
+    away all the same; unlocked, put back where the error was smallest, its gains as they were."""
+    lock = Lock(LockParams(ki=1.0, max_step=0.25))
+    lock.engage(70.0)
+    e, out = 4.0, []
+    while lock.active and len(out) < 100:
+        e *= 1.25  # (whatever the offset does)
+        out.append(lock.update(e))
+    assert not lock.active and lock.message.startswith("unlocked: it ran away with its gains either way")
+    assert lock.p.ki == 1.0 and not lock.reversed
+    assert out[-1] == pytest.approx(lock.u) and 69.5 < out[-1] <= 70.0
+
+
+def test_a_hop_or_noise_is_not_taken_for_running_away():
+    lock = Lock(LockParams(ki=0.5, max_step=0.25, capture=0))
+    _, errs = run_plant(lock, 0.35, 0.0, 30)
+    for k in range(20):  # it hops 250 MHz: one jump, then the lock brings it back
+        e = (250.0 if k < 3 else 250.0 * 0.5 ** (k - 2)) + (-1) ** k * 4.0
+        lock.update(e)
+    assert not lock.reversed and lock.p.ki == 0.5 and lock.active
+    rng = __import__("random").Random(3)
+    lock = Lock(LockParams(ki=0.5))
+    lock.engage(70.0)
+    for _ in range(300):  # noisy readings, the lock holding it
+        lock.update(rng.gauss(0.0, 8.0))
+    assert not lock.reversed and lock.active
+
+
+def test_wrong_sign_past_its_first_readings_unlocks_at_excursion_limit():
+    """Watched for running away only for its first readings after it is engaged: later on, a laser that comes to tune
+    the other way is unlocked at Max excursion, as ever."""
     lock = Lock(LockParams(ki=1.0, max_step=0.25, excursion=2.0, capture=0))
-    u, _ = run_plant(lock, -0.3, 100.0, 200)
-    assert not lock.active
-    assert "would leave" in lock.message
+    lock.engage(70.0)
+    for _ in range(Lock.WATCH_N):
+        lock.update(0.0)
+    u, k = 70.0, -0.3
+    for _ in range(200):
+        new = lock.update(100.0 + k * 1e3 * (u - 70.0))
+        if new is None:
+            break
+        u = new
+    assert not lock.active and "would leave" in lock.message and not lock.reversed
     assert 68.0 <= u <= 72.0
 
 

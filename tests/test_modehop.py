@@ -12,7 +12,7 @@ import pytest
 from wmlock.dlcpro import DecopError, DLCPro, lock_points
 from wmlock.modehop import (BUSY_TRIES, COMMANDS, FALC_OFFSET, STEP_MAX, WRITABLE, Failed, Guard, HopParams, Move,
                             Point, Read, Recenter, Runner, Set, _steps, analyse, perform)
-from wmlock.sim import ECDL, FakeDLCPro, SimLocked
+from wmlock.sim import ECDL, CommandError, FakeDLCPro, SimLocked
 
 I0, V0 = 150.0, 70.0
 
@@ -993,6 +993,50 @@ def test_narrow_peaks_sampled_a_sample_wide_are_told_and_locked():
         assert not any("locking with the lockpoint the DLC pro has" in n for n in rec.notes), seed
 
 
+def stop_when(b, until, then=None):
+    """Relock it, stop it when until(rec) is so (then() first), and let it put things back."""
+    rec = Recenter(optimum(b, kv=400.0), b.I, b.V, I0 - 1.0, I0 + 2.0, b.V - 25.0, b.V + 25.0, cavity=True,
+                   i_top=I0 + 5.0)
+    r = b.run(rec, until=lambda r: until(rec))
+    assert r.busy
+    if then is not None:
+        then()
+    r.cancel("stopped")
+    while r.busy:
+        if b.pending:
+            b.pending.pop(0)()
+        else:
+            r.on_reading(*b.reading())
+    return r
+
+
+@pytest.mark.parametrize("owned", [True, False])
+def test_stopped_while_its_cavity_lock_tries_to_lock_everything_goes_back(owned):
+    """The 739 nm one, 23 October: stopped by hand while its cavity lock was enabled, trying to lock, its scan could
+    not be put back (its DLC pro does not let its scan be switched while its lock is enabled, and the lock was put back,
+    off, last). The cavity lock goes off first now."""
+    b, lock = near_bench(seed=48)
+    lock.scan_owned = owned
+    lock._engage = lambda near=None: None  # (enabled, it never locks)
+    lock.jump(1)
+    d = b.dlc.params
+    r = stop_when(b, lambda rec: d["laser1:dl:lock:lock-enabled"] and rec.stage == "locking the cavity")
+    assert r.state == "failed" and r.error == "stopped" and not r.trouble, (r.error, r.trouble)
+    assert d["laser1:dl:lock:lock-enabled"] is False and d["laser1:scan:enabled"] is True
+    assert (b.I, b.V) == pytest.approx((I0, V0))
+
+
+def test_a_setting_that_cannot_be_put_back_is_named_with_the_reason():
+    b, lock = near_bench(seed=48)
+
+    def refuse(_on):
+        raise CommandError("-9 no (simulated)")
+
+    r = stop_when(b, lambda rec: rec.stage.startswith(("into", "parking")),
+                  then=lambda: b.dlc.on_set.update({"laser1:nlo:shg:scan:enabled": refuse}))
+    assert r.error == "stopped; could not put back nlo:shg:scan:enabled (Error: -9 no (simulated))", r.error
+
+
 def test_a_relock_that_fails_with_the_offset_moved_goes_back_to_it():
     """The cavity lock would not take with the input offset nulled (whatever the reason): the next try puts it back
     where it was when the recovery began, with which it was locked before, as you would by hand."""
@@ -1756,15 +1800,91 @@ def test_not_caught_where_it_is_it_is_caught_from_the_optimum_piezo_voltage_and_
                     r"piezo 70\.00 → 70\.\d\d V", r.result.summary), r.result.summary
 
 
-def test_a_laser_that_is_fine_is_left_alone_by_the_catch_too():
+def below_second_mode(b, lock) -> float:
+    """mA from where it runs up to where a second mode starts to lase with it (negative: it has)."""
+    las = b.laser
+    v = b.V + lock.dv
+    las.lase(v, b.act)
+    return (las.zone(1.0)[0] - las.misalignment(las.m, v, b.act)) / (las.ki - las.ksi)
+
+
+def test_a_laser_on_its_mode_has_its_current_parked_at_the_top_end_of_its_best_all_the_same():
+    """Its lock caught the next cavity peak, 1.5 GHz off: the laser is on its mode, its SHG peak as good as it should
+    be. Its current goes to the top end of where the mode is at its best all the same, as by hand (up a step at a time
+    while its SHG peak stays at its best, then two back), then the piezo onto the target, and it is relocked."""
     b, lock = near_bench(seed=41)
-    lock.jump(1)  # its lock caught the next cavity peak, 1.5 GHz off: the laser is on its mode
+    lock.jump(1)
     b, rec, r = recover(b.laser, b.target, optimum(b, kv=400.0), cavity=True, bench=b)
-    assert r.state == "done" and b.writes("dl:cc:current-set") == [], r.error
-    assert "the laser itself was fine" in r.result.summary and lock.locked()
-    assert lock.peak == pytest.approx(b.target, abs=1e-12)
-    assert any(re.match(r"on the right mode, its SHG peak (0\.9\d|1\.0\d) of the optimum's: only the piezo", n)
-               for n in rec.notes), rec.notes
+    assert r.state == "done", r.error
+    currents = b.writes("dl:cc:current-set")
+    top = currents.index(max(currents))
+    assert currents[:top + 1] == pytest.approx([I0 + 0.1 * k for k in range(1, top + 2)])  # up a step at a time...
+    assert currents[top + 1:] == pytest.approx([currents[top] - 0.1, currents[top] - 0.2])  # ...then two back
+    assert b.I > I0 + 0.2 and 0 <= below_second_mode(b, lock) < 0.25 and b.single_mode()
+    assert lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12)
+    assert any(re.match(r"on the right mode, its SHG peak (0\.9\d|1\.0\d) of the optimum's: the current to the top "
+                        r"end of where it is at its best, then the piezo onto the target", n) for n in rec.notes)
+    assert re.match(r"relocked, on the right mode: the current to the top end of where it is at its best, 150\.00 → "
+                    r"150\.\d0 mA measured, the piezo 70\.00 → 70\.\d\d V", r.result.summary), r.result.summary
+
+
+def test_a_relock_brings_a_current_the_feedforward_sank_back_up_to_the_top_end_of_its_best():
+    """The 739 nm TA-SHG of 23 October: relock after relock its piezo drifted up, and its feedforward took the current
+    down with it, to near the bottom of its mode (there its cavity lock would not hold, and its SHG looked worse), but
+    still on the right mode, its SHG peak within 10 % of the optimum's: each relock moved nothing but the piezo. Now the
+    current goes back up to the top end of where the mode is at its best first; relock after relock it stays there."""
+    b, lock = near_bench(seed=47, ff=-0.145)
+    b.laser.nudge(+0.6)  # (0.06 mA above where a second mode starts below it, 0.74 mA below the one above)
+    assert 0.7 < below_second_mode(b, lock) < 0.8 and b.single_mode()
+    p = optimum(b, kv=400.0)
+    for k in range(3):
+        lock.jump(1 if k % 2 == 0 else -1)
+        b, rec, r = recover(b.laser, b.target, p, cavity=True, bench=b, seed=k)
+        assert r.state == "done", r.error
+        assert b.laser.m == 0 and lock.locked() and abs(b.off_mhz()) < 1 and b.single_mode()
+        assert 0 <= below_second_mode(b, lock) < 0.25 and b.act > I0 + 0.45, (k, b.act)
+    assert sum(n.startswith("parked the current high") for n in rec.notes) <= 1
+
+
+def test_step_by_step_the_catch_asks_before_it_parks_the_current_high():
+    b, lock = near_bench(seed=41)
+    lock.jump(1)
+    p = optimum(b, kv=400.0, confirm=True)
+    rec = Recenter(p, b.I, b.V, I0 - 1.0, I0 + 2.0, b.V - 25.0, b.V + 25.0, cavity=True, i_top=I0 + 5.0)
+    runner, asked = Runner(rec, b, b.t), []
+    while runner.busy:
+        if b.pending:
+            b.pending.pop(0)()
+        elif runner.asking:
+            asked.append(runner.asking)
+            runner.confirm()
+        else:
+            runner.on_reading(*b.reading())
+    assert runner.state == "done", runner.error
+    assert asked[0].startswith("Take the laser over") and asked[1] == (
+        "On the right mode: the current up a step at a time while its SHG peak stays at its best, then back two steps "
+        "(the top end of where the mode is at its best), then the piezo onto the target")
+    assert any(a.startswith("Lock the SHG cavity") for a in asked[2:]), asked
+
+
+def test_parking_high_looks_twice_at_a_peak_that_falls_and_never_lowers_the_current():
+    """A sweep reads the SHG peak to a few per cent only (±7 % on the 739 nm one, sweep to sweep): one that reads low
+    must not stop it short of the top end of the mode's best (it is looked at again first, and compared with the
+    middle of what it read on the way, not the best, which noise puts too high); and a relock never leaves the current
+    lower than it found it, or noise would walk it down relock after relock. From near the bottom of its mode, and
+    from near the top."""
+    ends = []
+    for seed in range(40, 52):
+        for nudge in (+0.6, -0.5):
+            b, lock = near_bench(seed=seed)
+            lock.shg_jitter = 0.06
+            b.laser.nudge(nudge)
+            lock.jump(1)
+            b, rec, r = recover(b.laser, b.target, optimum(b, kv=400.0), cavity=True, bench=b, seed=seed)
+            assert r.state == "done" and lock.locked() and b.laser.m == 0, (seed, nudge, r.error)
+            assert b.act >= I0 - 1e-9, (seed, nudge, b.act)
+            ends.append(below_second_mode(b, lock))
+    assert sum(0 <= x < 0.25 for x in ends) >= 0.9 * len(ends), ends
 
 
 def test_its_right_mode_beyond_the_window_the_mode_it_is_on_is_walked_onto_the_target():

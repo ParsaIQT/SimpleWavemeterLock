@@ -1224,8 +1224,12 @@ def setup_report(client, laser: int, hop, lp) -> list:
                     f"{100 * (1 - hop.catch_min):.0f} % of the optimum's; on into the mode's best and back up to the "
                     f"top end of it. Not caught in {hop.catch_tries} goes, the same from the optimum's piezo voltage "
                     f"+ and - {hop.pc_try:g} V; then the piezo onto the target in {hop.walk_step:g} V steps, the "
-                    f"current parked high in the mode every 4. A laser on the right mode and as good as that is only "
-                    f"relocked. Not to be had at all: the mode it is on walked onto the target instead (walk)")
+                    f"current parked high in the mode every 4. A laser on the right mode and as good as that has its "
+                    f"current parked at the top end of where the mode is at its best all the same (up {hop.step:g} mA "
+                    f"at a time while its SHG peak stays at its best, then two back, no lower than it was: the "
+                    f"feedforward takes it down as the piezo drifts up, relock after relock), then the piezo onto the "
+                    f"target, and relocked. Not to be had at all: the mode it is on walked onto the target instead "
+                    f"(walk)")
         if not hop.shg:
             add("info", f"with nothing but the wavemeter (no SHG stage): caught where it is on the right mode coming "
                         f"down, it is at the mode's edge; so the current goes on down until it hops off and back up "

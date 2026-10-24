@@ -39,16 +39,43 @@ def test_lock_pulls_in_and_holds(engine, demo):
     assert wait_for(lambda: abs(ch.offset - demo.dlcs[0].offset(1)) < 1e-6, 2)
 
 
-def test_wrong_sign_unlocks_itself(engine, demo):
-    engine.link(2, demo.dlcs[0].key, 2)  # the 866 laser tunes the other way
+def test_a_lock_that_runs_away_reverses_its_gains_and_locks(engine, demo):
+    """The 866 laser tunes the other way: with positive gains, its lock pushes it away from the setpoint, faster and
+    faster. Caught at it: back where it was nearest, its gains reversed (and kept), locked; the row says so."""
+    engine.link(2, demo.dlcs[0].key, 2)
     engine.set_params(2, LockParams(ki=1.0, max_step=0.5, excursion=1.0))
     ch = engine.channels[2]
     engine.set_setpoint(2, detune(ch, 30))
+    engine.dirty = False
     engine.engage(2)
     assert wait_for(lambda: ch.state == "on", 2)
-    assert wait_for(lambda: ch.state == "off", 5)
-    assert ch.message.startswith("unlocked")
+    assert wait_for(lambda: ch.lock.reversed and abs(ch.error_mhz) < 5, 8), (ch.state, ch.message, ch.error_mhz)
+    assert ch.state == "on" and ch.lock.p.ki == -1.0 and engine.dirty
+    assert ch.to_config()["lock"]["ki"] == -1.0
+    assert ch.lock_note.startswith("it ran away (") and "its gains are reversed (P 0, I -1)" in ch.lock_note
     assert 69.0 <= demo.dlcs[0].offset(2) <= 71.0  # never left the excursion window
+    from wmlock import view
+    assert "gains reversed by the lock: it ran away" in view.row(engine, 2, time.monotonic())["info"]
+    assert "its lock, at " in view.tip(engine, 2)
+
+
+def test_a_lock_that_runs_away_either_way_is_unlocked_and_put_back(engine, demo):
+    """Linked to the wrong laser (the 397's piezo for the 866's channel), the lock moves something that does not move
+    it, while it drifts away faster and faster: reversed once, it runs away all the same; unlocked, the offset it moved
+    put back where the error was smallest, its gains as they were."""
+    engine.link(2, demo.dlcs[0].key, 1)
+    engine.set_params(2, LockParams(ki=1.0, max_step=0.5, excursion=2.0))
+    ch = engine.channels[2]
+    laser, t0 = demo.lasers[1], time.monotonic()
+    real = laser.true_freq
+    laser.true_freq = lambda now: real(now) + 3e-6 * math.exp((now - t0) / 0.7)  # (THz: away, faster and faster)
+    engine.setpoint_to_current(2)
+    v0 = demo.dlcs[0].offset(1)
+    engine.engage(2)
+    assert wait_for(lambda: ch.state == "off", 10), (ch.state, ch.error_mhz)
+    assert ch.message.startswith("unlocked: it ran away with its gains either way"), ch.message
+    assert ch.lock.p.ki == 1.0 and "the right laser, the right channel?" in ch.message
+    assert wait_for(lambda: abs(demo.dlcs[0].offset(1) - v0) < 0.05, 2), demo.dlcs[0].offset(1)
 
 
 def test_lost_controller_unlocks(engine, demo):
@@ -394,8 +421,9 @@ def test_shg_laser_put_back_on_the_right_peak(quiet_demo, tmp_path):
         assert wait_for(lambda: ch.cavity_on is True and ch.guard.armed and ch.shg_txt == "locked", 5)
         shg.lock.jump(1)  # 'locked', one free spectral range off
         assert wait_for(lambda: ch.state == "recovering", 5)
-        assert wait_for(lambda: ch.state == "on" and shg.lock.locked() and "fine" in ch.note, 20), ch.message
-        assert abs(ch.error_mhz) < 3 and "laser itself was fine" in ch.note and not ch.message
+        assert wait_for(lambda: ch.state == "on" and shg.lock.locked() and "top end" in ch.note, 20), ch.message
+        assert abs(ch.error_mhz) < 3 and not ch.message  # on its mode: its current parked high in it all the same
+        assert "on the right mode: the current to the top end of where it is at its best" in ch.note, ch.note
         assert shg.lock.peak == pytest.approx(shg.lock.f_res, abs=1e-12) and shg.lock.shg_state()[0] == 5
         assert dlc.written("laser1:dl:lock:lock-enabled") == [False, True]
         assert ch.hop.lp_code == ord("t") and ch.hop.falc_sign == 1  # learned

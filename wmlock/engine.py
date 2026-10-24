@@ -205,6 +205,10 @@ class Channel:
         self.remote_note = ""  # what, and from where
         self.remote_t = 0.0    # monotonic...
         self.remote_wall = 0.0  # ...and time.time(): when
+        # what its wavemeter lock last did by itself (it ran away: its gains reversed)
+        self.lock_note = ""
+        self.lock_t = 0.0      # monotonic...
+        self.lock_wall = 0.0   # ...and time.time(): when
 
     @property
     def param(self) -> str:
@@ -742,7 +746,16 @@ class Engine:
             self._timers(readings[-1].t)
 
     def _step(self, ch: Channel):
+        gains = (ch.lock.p.kp, ch.lock.p.ki)
         u = ch.lock.update(ch.error_mhz)
+        if (ch.lock.p.kp, ch.lock.p.ki) != gains:  # it ran away: its gains reversed by the lock (or put back)
+            self.dirty = True
+            note, ch.lock.note = ch.lock.note, ""
+            if note:
+                ch.lock_note, ch.lock_t, ch.lock_wall = note, time.monotonic(), time.time()
+                log.warning("channel %d: %s", ch.n, note)
+        if not ch.lock.active:  # (first: unlocking drops the lock's writes on their way, not the one it puts back)
+            self._disengage(ch, ch.lock.message)
         if u is not None:
             ch.offset = u
             tok = ch.token
@@ -752,8 +765,6 @@ class Engine:
                 p = ch.lock.p
                 ff = min(max(ch.ff0 + (u - ch.lock.u0) / ch.ff_ratio, p.v_min), p.v_max)
                 c.set(f"laser{ch.ff_ao}:{ACTUATOR}", ff, lambda e: self._comm_failed(ch, tok, e))
-        if not ch.lock.active:
-            self._disengage(ch, ch.lock.message)
 
     def _comm_failed(self, ch: Channel, tok: int, exc: Exception):
         with self.lock:

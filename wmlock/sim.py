@@ -626,6 +626,8 @@ class SimLocked:
         self.shg_tem = ((0.31, 0.06), (0.62, 0.035))
         self.shg_h, self.shg_floor = 1.2, 0.03
         self.shg_phase = self.rng.random()
+        self.shg_jitter = 0.0   # rms: each sweep shows its resonances this much taller or shorter (a real one, ±7 %)
+        self.scan_owned = False  # its lock enabled, it refuses its scan being switched (as the 739 nm one's seemed to)
         d = dlc.params
         d.update({
             p + "dl:lock:lock-without-lockpoint": not lockpoints,
@@ -668,7 +670,7 @@ class SimLocked:
         if shg if ta is None else ta:
             self.ta = SimTA(dlc, n, ecdl, clock=clock, seed=seed)
         dlc.on_set[p + "dl:lock:lock-enabled"] = self._lock_enabled
-        dlc.on_set[p + "scan:enabled"] = lambda on: self._lose_selection()
+        dlc.on_set[p + "scan:enabled"] = self._scan_enabled
         dlc.commands[p + "dl:lock:select-lockpoint"] = self._select
         dlc.commands[p + "dl:lock:find-candidates"] = self._find_candidates
 
@@ -804,6 +806,11 @@ class SimLocked:
                 self._engage(near=self._free(self.lockpoint[0], i))
             else:
                 self._engage()
+
+    def _scan_enabled(self, _on: bool):
+        if self.scan_owned and self._get("dl:lock:lock-enabled"):
+            raise CommandError("-5 laser1:scan:enabled: not while the lock is enabled (simulated)")
+        self._lose_selection()
 
     def _lose_selection(self):
         pass  # the DLC pro keeps the selected lockpoint across scans
@@ -1021,10 +1028,13 @@ class SimLocked:
             s0, amp = self._get("nlo:shg:scan:offset"), self._get("nlo:shg:scan:amplitude")
             scanning = self._get("nlo:shg:scan:enabled") and self.shg_state()[0] != 5
             rows = []
+            g = 1.0 + self.rng.gauss(0.0, self.shg_jitter) if self.shg_jitter else 1.0
             for k in range(self.N):
                 t = k / self.N
                 s = s0 + amp * ((2 * t if t < 0.5 else 2 - 2 * t) - 0.5) if scanning else s0
-                rows.append((s, self._intra(s, comps) + self.rng.gauss(0.0, 0.003)))
+                y = self._intra(s, comps)
+                rows.append((s, (y if g == 1.0 else self.shg_floor + g * (y - self.shg_floor))
+                             + self.rng.gauss(0.0, 0.003)))
             if self.shg_state()[0] == 5:
                 level = self._intra_now()
                 rows = [(s0, level + self.rng.gauss(0.0, 0.003)) for _ in range(self.N)]

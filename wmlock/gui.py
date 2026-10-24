@@ -1096,8 +1096,9 @@ class LockDialog(QtWidgets.QDialog):
             form.addRow(label, row)
             self.boxes[key] = sb
         note = Text("Each new reading moves the scan offset by −(P·e + I·Σe), e in GHz.\n"
-                    "Positive gains if the frequency rises with the offset: flip the sign\n"
-                    "if the lock runs away. I ≈ 0.3 / tuning (GHz/V) is a good start.", "dim")
+                    "Positive gains if the frequency rises with the offset: a lock that runs\n"
+                    "away straight after it is engaged reverses them by itself (and says so).\n"
+                    "I ≈ 0.3 / tuning (GHz/V) is a good start.", "dim")
         form.addRow(note)
         bb = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
@@ -1115,8 +1116,9 @@ class HopDialog(QtWidgets.QDialog):
               ("plain", "re-enable the lock and let it find its resonance"))
     METHOD = (("auto", "catch with an SHG stage, else map"),
               ("catch", "catch: back onto its own mode by the current (up, then down until it is on it: its SHG peak "
-                        "back; with the wavemeter alone, parked in the middle of where its mode holds), then the "
-                        "piezo onto the target"),
+                        "back; already on it, its current to the top end of where the mode is at its best; with the "
+                        "wavemeter alone, parked in the middle of where its mode holds), then the piezo onto the "
+                        "target"),
               ("walk", "walk: single mode first, then the piezo slowly onto the target, as by hand"),
               ("map", "map: sweep the current over the window, up and down, and pick the best mode"))
 
