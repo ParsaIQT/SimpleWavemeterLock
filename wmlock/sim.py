@@ -48,8 +48,10 @@ class FakeDLCPro:
     and returns its output, or raises CommandError.
 
     A laser's measured current (current-act) is its set current plus current-offset, plus the
-    feedforward from the piezo (feedforward-factor mA/V times the scan offset, when enabled), plus
-    a fixed bias (its config's "act_offset", mA): set and measured current differ, as they do.
+    feedforward from the piezo (feedforward-factor mA/V times the scan offset less its config's
+    "ff_from", 0 V unless given, when enabled; "ff_from" None: nothing, as a DL pro moved by its
+    scan's offset, its scan off, has it: its feedforward follows the scan alone), plus a fixed bias
+    (its config's "act_offset", mA): set and measured current differ, as they do.
 
     Its scan generator drives the piezo (scan:output-channel 50), or with "scan_out" in its config
     something else: 51 the current. The scan's offset is then that output's set value (the current,
@@ -89,6 +91,7 @@ class FakeDLCPro:
                 p + "scan:amplitude": float(d.get("amplitude", 2.5)), p + "scan:frequency": 20.0,
                 p + "emission": True,
                 p + PIEZO_SET: float(d.get("offset", 70.0)),
+                p + "dl:pc:voltage-act": lambda n=n: self.offset(n),
                 p + "dl:cc:current-set": float(d.get("current", 150.0)),
                 p + "dl:cc:current-act": lambda n=n: self.current_act(n),
                 p + "dl:cc:current-offset": 0.0,
@@ -105,6 +108,7 @@ class FakeDLCPro:
                 p + "dl:tc:limits:temp-max": float(d.get("temp_max", 35.0)),
             })
         self.bias = {n: float(d.get("act_offset", 0.0)) for n, d in lasers.items()}
+        self.ff_from = {n: d.get("ff_from", 0.0) for n, d in lasers.items()}  # V (None: it adds nothing at rest)
         self.sets = 0
         self.log = []  # every accepted write: (parameter, value); every command: (name, args)
         self._drove = {}  # laser -> (piezo, current) when its scan was last switched to another output
@@ -146,8 +150,9 @@ class FakeDLCPro:
         """The diode current, as measured: what the laser runs at."""
         p, d = f"laser{n}:", self.params
         i = self.current(n) + d[p + "dl:cc:current-offset"] + self.bias.get(n, 0.0)
-        if d[p + "dl:cc:feedforward-enabled"]:
-            i += d[p + "dl:cc:feedforward-factor"] * self.offset(n)
+        ref = self.ff_from.get(n, 0.0)
+        if d[p + "dl:cc:feedforward-enabled"] and ref is not None:
+            i += d[p + "dl:cc:feedforward-factor"] * (self.offset(n) - ref)
         return i
 
     def temp_act(self, n: int) -> float:

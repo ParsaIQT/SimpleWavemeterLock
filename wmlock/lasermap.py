@@ -12,10 +12,11 @@ has settled.
 
 At each point: the step written, `settle` s, then `reads` readings that began after that (each reading's exposure
 says when it began), with each the wavemeter's power, exposure and fringe amplitudes and its interference patterns
-(the spectrum its window shows: below), and the DLC pro's own photodiode and whatever else `record` names, read
-meanwhile. The exposure is on auto: where the laser is dim the wavemeter measures slowly, and the map waits for it;
-where it gives nothing to read (the laser does not lase), it waits only as long as the exposure says a reading would
-take, and once its photodiode tells dark from lasing, not even that.
+(the spectrum its window shows: below), and from the DLC pro its current and piezo voltage as measured, its own
+photodiode and whatever else `record` names, read meanwhile. The exposure is on auto: where the laser is dim the
+wavemeter measures slowly, and the map waits for it; where it gives nothing to read (the laser does not lase), it
+waits only as long as the exposure says a reading would take, and once its photodiode tells dark from lasing, not
+even that.
 
 Dark. Sweeping the current down, `dark` points in a row without lasing end the sweep that way: below there it does
 not lase, and every point would cost a long exposure. The next line starts there, at its own piezo voltage: lasing
@@ -34,16 +35,31 @@ points (a row a point: where, what it read, how its sample ended), readings (eac
 (compressed, losslessly), events (a hop, the dark, a temperature settled...), temps (each temperature's settling).
 load(path) reads one back; python -m wmlock.lasermap FILE says what is in it (--csv: its points as CSV).
 
+Its feedforward (the DLC pro's: the current moved factor mA per volt of piezo) is off for the map: the map is of
+the current as measured against the piezo, a square; with the feedforward on, a square of set current and piezo is a
+slanted band of measured current, above the highest current at one corner and below threshold at another. Switching
+it off takes the current up by what it added (the factor times the piezo voltage, as the DLC pro reckons it: tens of
+mA at 70 V, with a factor of a few tenths), so the current is first lowered by as much as that could be (the factor
+times the piezo's distance from 0 V or from its farther limit), the feedforward switched off and the current read
+back (what switching it off did tells from where the DLC pro reckons it). At the end it goes back on the same way:
+from a current low enough that switching it on cannot take the current above where it began.
+
+The ideal feedforward (fit_feedforward): the boundaries between the laser's modes, where it hops, lie along lines of
+constant misalignment between its external cavity's mode and its grating; their slope, dI/dV, is the feedforward that
+keeps it on one mode as the piezo moves. It is fitted at the end of each map, with the hysteresis (how much later it
+hops sweeping up than back sweeping down), how far apart the modes are and how fast it tunes along it, kept in the
+file and said; with ff_end 'fitted' its feedforward is set to it at the end (switched on, if it was off).
+
 The procedure (Mapper.run, a generator, as modehop's Recenter) yields Go (a move, in steps), Sample (a point), Get,
 Set and Wait; MapRunner carries them out through the laser's controller, to the safety rules: the measured current
 never above i_hi (nor above where it began, if that was higher: on the way back), the set current never above the
 controller's current-clip, the piezo within the controller's limits and the plan's, the temperature within the
-controller's limits and the plan's, nothing else written but its scan switched off, and every move in steps. With
-the DLC pro's feedforward on, the set current is written so that the measured current is what the map says (the
-feedforward moves it ff mA per volt of piezo). A laser its DLC pro locks to a cavity, or with its TA on, is not
-mapped: that lock off first; the TA off first (without seed it switches itself off, or worse). At the end, or when
-stopped, it goes back where it began: the temperature, then the piezo and the current, and its scan on again if it
-was; there the frequency is read and compared with where it began (hysteresis may leave it on another mode).
+controller's limits and the plan's, nothing else written but its scan and its feedforward (switching the feedforward
+refused where it could take the current too high, its factor written only while it is off), and every move in
+steps. A laser its DLC pro locks to a cavity, or with its TA on, is not mapped: that lock off first; the TA off first
+(without seed it switches itself off, or worse). At the end, or when stopped, it goes back where it began: the
+temperature, its feedforward, then the piezo and the current, and its scan on again if it was; there the frequency
+is read and compared with where it began (hysteresis may leave it on another mode).
 """
 from __future__ import annotations
 
@@ -70,17 +86,23 @@ from .modehop import CURRENT, OFFSET, Failed, Get, Set, Wait
 log = logging.getLogger(__name__)
 
 CURRENT_ACT = "dl:cc:current-act"
+PIEZO_ACT = "dl:pc:voltage-act"
 CLIP = "dl:cc:current-clip"
 FF_ON, FF = "dl:cc:feedforward-enabled", "dl:cc:feedforward-factor"
 PC_MIN, PC_MAX = "dl:pc:voltage-min", "dl:pc:voltage-max"
 TEMP_SET, TEMP_ACT = "dl:tc:temp-set", "dl:tc:temp-act"
 TEMP_MIN, TEMP_MAX = "dl:tc:limits:temp-min", "dl:tc:limits:temp-max"
 PD_NAMES = ("dl:pd:photodiode", "dl:pd:power")  # the DL pro's own photodiode, as firmwares name it (the first there)
+PD_UNITS = {"dl:pd:photodiode": "µA", "dl:pd:power": "mW"}
 SCAN_ON = "scan:enabled"
 LOCK_ON = "dl:lock:lock-enabled"
 TA_ON = "amp:cc:enabled"
 ABOUT = ("product-name", "label", "type", "emission")  # kept with the map, as the controller says them
-WRITABLE = {SCAN_ON: bool}  # what a map writes besides current, piezo and temperature
+WRITABLE = {SCAN_ON: bool, FF_ON: bool, FF: float}  # what a map writes besides current, piezo and temperature
+FF_MAX = 2.0     # mA/V: the most a feedforward set from a map may be
+FF_SETTLE = 0.3  # s after a step of its feedforward before its current is read
+FF_NOISE = 0.03  # mA: how much the DLC pro's reading of its current (current-act) scatters, at most
+FF_STEP = 0.95   # mA: the most a step of its feedforward's factor may move the current, by what is known of it
 LOOK = (CLIP, FF_ON, FF, PC_MIN, PC_MAX, TEMP_SET, TEMP_ACT, TEMP_MIN, TEMP_MAX, SCAN_ON, LOCK_ON, TA_ON,
         *PD_NAMES)  # what the map dialog shows of a laser before it begins (Engine.map_look)
 DARK = ("no signal", "low signal")  # what the wavemeter says when there is next to no light
@@ -147,6 +169,7 @@ class MapPlan:
     every: int = 10         # ...at every this many points besides (0: not)
     record: str = ""        # more DLC pro parameters read at each point: names below laserN:, comma-separated
     repeat: bool = True     # the first line swept again at the end (how far things moved meanwhile)
+    ff_end: str = "back"    # its feedforward at the end: back (as it was) | fitted (the ideal one the map finds)
     folder: str = ""        # where the file goes ('': ~/laser-maps)
 
     @classmethod
@@ -221,6 +244,8 @@ class MapPlan:
             out.append(f"sweep what? {self.sweep!r}")
         if self.patterns not in ("all", "hops", "off"):
             out.append(f"which patterns? {self.patterns!r}")
+        if self.ff_end not in ("back", "fitted"):
+            out.append(f"its feedforward at the end: {self.ff_end!r}?")
         if self.t_step > 0 and not self.t_lo < self.t_hi:
             out.append("the lowest temperature must be below the highest")
         if self.t_step < 0 or self.t_tol <= 0 or self.t_hold < 0 or self.t_wait <= 0:
@@ -351,7 +376,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE lines (id INTEGER PRIMARY KEY, map INTEGER, axis TEXT, line INTEGER, slow REAL, temp REAL,
                     repeat INTEGER, t0 REAL, t1 REAL);
 CREATE TABLE points (id INTEGER PRIMARY KEY, line_id INTEGER, leg INTEGER, k INTEGER, t REAL,
-                     i REAL, i_set REAL, v REAL, temp REAL,
+                     i REAL, i_set REAL, i_act REAL, v REAL, v_act REAL, temp REAL,
                      f REAL, f_lo REAL, f_hi REAL, n INTEGER, bad INTEGER, status TEXT, how TEXT, wait REAL,
                      power REAL, exp1 REAL, exp2 REAL,
                      amin1 REAL, amax1 REAL, aavg1 REAL, amin2 REAL, amax2 REAL, aavg2 REAL,
@@ -364,9 +389,10 @@ CREATE INDEX points_by_line ON points (line_id, leg, k);
 CREATE INDEX readings_by_point ON readings (point_id);
 CREATE INDEX patterns_by_point ON patterns (point_id);
 """
-POINT_COLUMNS = ("id", "line_id", "leg", "k", "t", "i", "i_set", "v", "temp", "f", "f_lo", "f_hi", "n", "bad",
-                 "status", "how", "wait", "power", "exp1", "exp2", "amin1", "amax1", "aavg1", "amin2", "amax2", "aavg2",
-                 "vals", "event")
+POINT_COLUMNS = ("id", "line_id", "leg", "k", "t", "i", "i_set", "i_act", "v", "v_act", "temp", "f", "f_lo", "f_hi",
+                 "n", "bad",
+                 "status", "how", "wait", "power", "exp1", "exp2", "amin1", "amax1", "aavg1", "amin2", "amax2",
+                 "aavg2", "vals", "event")
 
 
 class MapFile:
@@ -525,6 +551,69 @@ class LaserMap:
         return {r["kind"]: unpack(r["codec"], r["dtype"], r["data"]) for r in
                 self.db.execute("SELECT kind, dtype, codec, data FROM patterns WHERE point_id = ?", (point_id,))}
 
+    def views(self) -> list:
+        """The maps as the window had them (MapView: the frequency from the first that lased), to look at or fit
+        (fit_feedforward) as the map did."""
+        p, out, by_id = self.plan, [], {}
+        pd = (self.meta.get("recorded") or {}).get("photodiode") or ""
+        f_ref = next((q["f"] for q in self.points if q["f"] is not None), None)
+        for line in self.lines:
+            n = line["map"]
+            if n >= len(out):
+                fast, slow = ("current", "piezo") if line["axis"] == "current" else ("piezo", "current")
+                sv = p.grid(slow)
+                out.append(MapView(n, line["axis"], line["temp"], p.grid(fast), sv[:1] if line["repeat"] else sv,
+                                   bool(line["repeat"])))
+            by_id[line["id"]] = (out[n], line["line"])
+        for q in self.points:
+            if q["line_id"] not in by_id:
+                continue
+            view, j = by_id[q["line_id"]]
+            if not 0 <= q["k"] < len(view.fv) or not 0 <= j < len(view.sv):
+                continue
+            dark = q["f"] is None and (q["how"] in ("dark", "quiet") or q["status"] in DARK)
+            ghz = (q["f"] - f_ref) * 1e3 if q["f"] is not None else MapView.DARK if dark else MapView.BAD
+            power = q["power"] if q["power"] is not None else MapView.DARK if dark else MapView.BAD
+            x = q["vals"].get(pd) if pd else None
+            view.put(q["leg"], j, q["k"], ghz, power, x if _num(x) else MapView.BAD)
+        return out
+
+    def sweeps(self, current: str = "act") -> list:
+        """Each map's sweeps, for fit_sweeps: [(map, kind, temp, {1: up, 2: down})], each sweep (the slow axis's
+        value, the swept one's values, GHz from the first point that lased or DARK, BAD), the current as measured:
+        'act' as read at each point (i_act), or where it was not read 'set': the set current and what the current
+        was besides where it began (a file from before the current was read at each point, made with the feedforward
+        on: that moved nothing as the piezo moved, not as the map then took it to); 'plan' as the map had it (i)."""
+        start = self.meta.get("start") or {}
+        off = (start.get("current_act") or 0.0) - (start.get("current_set") or 0.0)
+
+        def amps(q):
+            if current == "act" and q.get("i_act") is not None:
+                return q["i_act"]
+            if current in ("act", "set") and q.get("i_set") is not None:
+                return q["i_set"] + off
+            return q["i"]
+
+        f_ref = next((q["f"] for q in self.points if q["f"] is not None), None)
+        maps = {}
+        for line, leg, pts in self.legs():
+            if line.get("repeat") or leg not in (1, 2):
+                continue
+            n, kind = line["map"], line["axis"]
+            key = (n, kind, line["temp"])
+            if kind == "current":
+                xs, y = [amps(q) for q in pts], line["slow"]
+            else:
+                xs, y = [q["v"] for q in pts], statistics.median([amps(q) for q in pts])
+            gs = [(q["f"] - f_ref) * 1e3 if q["f"] is not None else MapView.DARK if q["how"] in ("dark", "quiet")
+                  or q["status"] in DARK else MapView.BAD for q in pts]
+            maps.setdefault(key, {1: [], 2: []})[leg].append((y, xs, gs))
+        return [(n, kind, temp, sw) for (n, kind, temp), sw in sorted(maps.items(), key=lambda kv: kv[0][0])]
+
+    def fits(self, current: str = "act") -> list:
+        """fit_sweeps of each map (those it could), the current as `current` has it (sweeps)."""
+        return [f for f in (fit_sweeps(sw, kind, n, temp) for n, kind, temp, sw in self.sweeps(current)) if f]
+
     def legs(self) -> list:
         """[(line, leg, [points])], sweep by sweep, in order."""
         by_line = {line["id"]: line for line in self.lines}
@@ -593,27 +682,276 @@ class Taken:
 
 # ----------------------------------------------------------------- the window's
 class MapView:
-    """One map as it fills, for the window: at each point, each way (up: leg 1; down: legs 2 and 0), the frequency
-    in GHz from where the laser began, DARK where it did not lase, BAD where the wavemeter said nothing valid, None
-    where not measured yet. repeat: the first line of the map before it, swept again."""
+    """One map as it fills, for the window: at each point, each way (up: leg 1; down: legs 2 and 0), three layers:
+    'f' the frequency in GHz from where the laser began (DARK where it did not lase, BAD where the wavemeter said
+    nothing valid), 'power' the power at the wavemeter in µW (DARK where it did not lase and the wavemeter gave none,
+    BAD where it gave none), 'pd' its photodiode (BAD: not read); None where not measured yet. up and down: the
+    frequency's. repeat: the first line of the map before it, swept again."""
 
     DARK = -math.inf
     BAD = math.nan
+    LAYERS = ("f", "power", "pd")
 
     def __init__(self, n: int, kind: str, temp, fv: list, sv: list, repeat: bool = False):
         self.n, self.kind, self.temp, self.repeat = n, kind, temp, repeat
         self.fast, self.slow = ("current", "piezo") if kind == "current" else ("piezo", "current")
         self.fv, self.sv = fv, sv
-        self.up = [[None] * len(fv) for _ in sv]
-        self.down = [[None] * len(fv) for _ in sv]
+        self.layers = {name: ([[None] * len(fv) for _ in sv], [[None] * len(fv) for _ in sv]) for name in self.LAYERS}
+        self.up, self.down = self.layers["f"]
         self.version = 0  # bumped at every point...
         self.up_v = [0] * len(sv)  # ...and its line's, each way
         self.down_v = [0] * len(sv)
 
-    def put(self, leg: int, j: int, k: int, value):
-        (self.up if leg == 1 else self.down)[j][k] = value
+    def grid(self, layer: str, up: bool) -> list:
+        return self.layers[layer][0 if up else 1]
+
+    def put(self, leg: int, j: int, k: int, value, power=None, pd=None):
+        w = 0 if leg == 1 else 1
+        for name, x in (("f", value), ("power", power), ("pd", pd)):
+            self.layers[name][w][j][k] = x
         (self.up_v if leg == 1 else self.down_v)[j] += 1
         self.version += 1
+
+    def turn(self, j: int, k: int):
+        """Where line j turns (point k): the same both ways."""
+        self.put(2, j, k, *(self.layers[name][0][j][k] for name in self.LAYERS))
+
+
+# ----------------------------------------------------------- the feedforward
+def _runs(xs: list, gs: list, bridge: int = 2) -> list:
+    """A sweep's stretches of lasing, in its order: [[(x, GHz)]], across `bridge` points in a row at most that read
+    nothing valid (two modes at once, say: not dark), broken where it is dark or not measured."""
+    out, run, gap = [], [], 0
+    for x, g in zip(xs, gs):
+        if g is None or g == -math.inf:
+            if run:
+                out.append(run)
+            run, gap = [], 0
+        elif g != g:
+            gap += 1
+            if gap > bridge and run:
+                out.append(run)
+                run = []
+        else:
+            run.append((x, g))
+            gap = 0
+    if run:
+        out.append(run)
+    return out
+
+
+def sweep_hops(xs: list, gs: list, jump: float = 1.0, rate: float = 0.0) -> list:
+    """Where a sweep hops: [(x, sign, GHz before, GHz after)] in its order, x half way between the last point before
+    and the first after: a step of more than `jump` GHz that holds (two points at least either side, each two within
+    `jump` of each other, their medians as far apart: a reading that is nonsense once, two modes at once, is no
+    hop), how it tunes on a mode (rate, GHz per unit of x) taken off first (across points that read nothing valid,
+    it tunes on): GHz before and after, less rate times x, so that one mode reads the same wherever along it."""
+    out = []
+    for run in _runs(xs, gs):
+        r = [g - rate * x for x, g in run]
+        for k in range(2, len(run) - 1):
+            step = r[k] - r[k - 1]
+            if abs(step) <= jump:
+                continue
+            before, after = r[max(k - 3, 0):k], r[k:k + 3]
+            if abs(before[-1] - before[-2]) > jump or abs(after[1] - after[0]) > jump:
+                continue
+            b, a = statistics.median(before), statistics.median(after)
+            if abs(a - b) > jump and (a - b) * step > 0:
+                out.append(((run[k - 1][0] + run[k][0]) / 2, 1 if step > 0 else -1, b, a))
+    return out
+
+
+def fit_feedforward(view: MapView, jump: float | None = None) -> dict | None:
+    """The ideal feedforward from a map as the window has it (fit_sweeps)."""
+    sweeps = {}
+    for leg, up in ((1, True), (2, False)):
+        order = list(range(len(view.fv))) if up else list(range(len(view.fv) - 1, -1, -1))
+        sweeps[leg] = [(view.sv[j], [view.fv[k] for k in order], [row[k] for k in order])
+                       for j, row in enumerate(view.grid("f", up))]
+    return fit_sweeps(sweeps, view.kind, view.n, view.temp, jump)
+
+
+def fit_sweeps(sweeps: dict, kind: str, n: int = 0, temp=None, jump: float | None = None) -> dict | None:
+    """The ideal feedforward from a map's hops (None: too few to tell). sweeps: {1: up, 2: down}, each [(the slow
+    axis's value, the swept one's values in the sweep's order, GHz or DARK, BAD, None)], line by line; kind: what
+    is swept ('current': mA across, V from line to line; 'piezo': the other way round).
+
+    The hops of each sweep (sweep_hops: steps of more than `jump` GHz, how it tunes on a mode taken off; None: 1 GHz,
+    or three times the usual step if more), followed from line to line: the nearest on the next line that hops the
+    same way by about as much (a laser may hop by one mode of its diode chip, or by two: each its own) between the
+    same two modes (their frequencies, its tuning taken off, as far on as one mode goes from line to line), each the
+    other's nearest, no farther than the usual distance between such hops. Its hops repeat along a sweep; by where
+    they are alone, a boundary moving by that distance from line to line would look the same (aliased: alias below):
+    the modes either side tell one boundary from another. The slope of each boundary so followed over three lines
+    at least, pooled (each about its own middle, then once more without the points far off it).
+
+    A dict: ff (mA/V) and err (its standard error), hops and boundaries it rests on; spacing (the usual distance
+    between hops along the swept axis, mA or V); hysteresis (how much later it hops sweeping up than back sweeping
+    down, the same two modes: mA or V) and pairs; df_di (GHz/mA) and df_dv (GHz/V), how it tunes on a mode; tuning
+    (GHz/V) along the ideal feedforward; jump (GHz); alias, how much more or less a boundary may move from line to
+    line and look the same by where it is alone (the widest distance between hops of a kind over the slow axis's
+    step: mA/V, or V/mA with the piezo swept); shift, how far a boundary moves from line to line (mA or V)."""
+    fast_i = kind == "current"
+    pairs_ = [((b - a), (x2 - x1)) for leg in sweeps for _, xs, gs in sweeps[leg]
+              for x1, x2, a, b in zip(xs, xs[1:], gs, gs[1:]) if _num(a) and _num(b) and x2 != x1]
+    if not pairs_:
+        return None
+    rate = statistics.median([dg / dx for dg, dx in pairs_])  # GHz per unit: on a mode, as a rule
+    if jump is None:
+        jump = max(1.0, 3.0 * statistics.median([abs(dg - rate * dx) for dg, dx in pairs_]))
+    step = statistics.median([abs(dx) for _, dx in pairs_])
+    lines = {leg: [(y, sweep_hops(xs, gs, jump, rate)) for y, xs, gs in sweeps[leg]] for leg in sweeps}
+    sizes = [abs(h[3] - h[2]) for leg in lines for _, hops in lines[leg] for h in hops]
+    same = 0.4 * statistics.median(sizes) if sizes else 3 * jump  # GHz: one mode to the next, at least
+    tol = 3 * jump  # GHz: one mode, its tuning taken off (a mode a cycle of hops later is another)
+    spacing = {}  # sign -> the usual distance between such hops along a sweep: between two in a sweep if there are
+    for sign in (1, -1):  # enough of those, else the length swept lasing over how many there were
+        gaps = [abs(b[0] - a[0]) for leg in lines for _, hops in lines[leg]
+                for a, b in zip([h for h in hops if h[1] == sign], [h for h in hops if h[1] == sign][1:])]
+        if len(gaps) >= max(5, 0.3 * sum(len(lines[leg]) for leg in lines)):
+            spacing[sign] = statistics.median(gaps)
+            continue
+        each = []
+        for leg in sweeps:
+            extent = sum(abs(run[-1][0] - run[0][0]) for _, xs, gs in sweeps[leg] for run in _runs(xs, gs))
+            count = sum(1 for _, hops in lines[leg] for h in hops if h[1] == sign)
+            if count:
+                each.append(extent / count)
+        if each:
+            spacing[sign] = min(each)
+
+    rates_fast, rates_slow = [], []
+    for leg in sweeps:
+        for _y, xs, gs in sweeps[leg]:
+            for run in _runs(xs, gs, bridge=0):
+                rates_fast += [(g2 - g1) / (x2 - x1) for (x1, g1), (x2, g2) in zip(run, run[1:])
+                               if abs(g2 - g1) < jump / 2 and x2 != x1]
+        rows = [(y, {round(x / step): g for x, g in zip(xs, gs) if _num(g)}) for y, xs, gs in sweeps[leg]] \
+            if step > 0 else []
+        for (y1, r1), (y2, r2) in zip(rows, rows[1:]):
+            if y2 != y1:
+                rates_slow += [(r2[k] - g) / (y2 - y1) for k, g in r1.items() if k in r2 and abs(r2[k] - g) < same]
+    df_fast = statistics.median(rates_fast) if rates_fast else None
+    df_slow = statistics.median(rates_slow) if rates_slow else 0.0  # GHz per slow unit: one mode, line to line
+    reach = max(spacing.values()) if spacing else 0.0
+
+    def alike(h, g):
+        return h[1] == g[1] and abs((h[3] - h[2]) - (g[3] - g[2])) <= 0.35 * max(abs(h[3] - h[2]), abs(g[3] - g[2]))
+
+    def follow(df_slow):
+        """The boundaries, followed from line to line: [[(slow value, where, GHz before, GHz after)]]."""
+        def same_two(h, g, dy):  # the same two modes (each as far on as the next line moves it): the same boundary
+            drift = df_slow * dy
+            return abs(g[2] - h[2] - drift) + abs(g[3] - h[3] - drift) <= 2 * tol
+
+        chains = []
+        for leg in lines:
+            open_ = {}  # hop index on the line before -> its chain
+            for j, (y, hops) in enumerate(lines[leg]):
+                now = {}
+                if j > 0:
+                    y0, before = lines[leg][j - 1]
+                    for k, h in enumerate(hops):
+                        near = min(((abs(h[0] - g[0]), m) for m, g in enumerate(before)
+                                    if alike(h, g) and same_two(g, h, y - y0)), default=None)
+                        if near is None or near[0] > reach:
+                            continue
+                        back = min((abs(before[near[1]][0] - c[0]), q) for q, c in enumerate(hops)
+                                   if alike(c, h) and same_two(before[near[1]], c, y - y0))
+                        if back[1] == k and near[1] in open_:
+                            now[k] = open_[near[1]]
+                            now[k].append((y, h[0], h[2], h[3]))
+                for k, h in enumerate(hops):
+                    if k not in now:
+                        now[k] = [(y, h[0], h[2], h[3])]
+                        chains.append(now[k])
+                open_ = now
+        return chains
+
+    def drift_of(chains):  # GHz per slow unit: how one mode moves from line to line, along its boundaries
+        each = [(c2[2] - c1[2] + c2[3] - c1[3]) / 2 / (c2[0] - c1[0]) for c in chains for c1, c2 in zip(c, c[1:])
+                if c2[0] != c1[0]]
+        return statistics.median(each) if each else None
+
+    dy_usual = statistics.median([abs(b[0] - a[0]) for leg in lines for a, b in zip(lines[leg], lines[leg][1:])
+                                  if b[0] != a[0]] or [0.0])
+    chains = follow(df_slow)
+    along = drift_of(chains)
+    if along is not None and abs(along - df_slow) * dy_usual > 0.5:  # (followed again, as far on as that)
+        chains = follow(along)
+        along = drift_of(chains) if drift_of(chains) is not None else along
+    chains = [[(y, x) for y, x, _, _ in c] for c in chains]
+    chains = [c for c in chains if len({y for y, _ in c}) >= 3]
+    if len(chains) < 2 or sum(len(c) for c in chains) < 8:
+        return None
+
+    def pooled(points):
+        syy = sum(dy * dy for dy, _ in points)
+        return sum(dy * dx for dy, dx in points) / syy if syy > 0 else None
+
+    def centred(c):
+        my, mx = sum(y for y, _ in c) / len(c), sum(x for _, x in c) / len(c)
+        return [(y - my, x - mx) for y, x in c]
+
+    pts = [q for c in chains for q in centred(c)]
+    slope = pooled(pts)
+    if slope is None:
+        return None
+    res = [dx - slope * dy for dy, dx in pts]
+    sigma = 1.4826 * statistics.median([abs(r) for r in res])
+    keep = [q for q, r in zip(pts, res) if abs(r) <= max(3 * sigma, step)]
+    if 8 <= len(keep) < len(pts):
+        slope = pooled(keep) or slope
+        pts = keep
+    res = [dx - slope * dy for dy, dx in pts]
+    syy = sum(dy * dy for dy, _ in pts)
+    se = math.sqrt(sum(r * r for r in res) / max(len(pts) - len(chains) - 1, 1) / syy) if syy > 0 else math.inf
+    if fast_i:  # dI/dV along a boundary: the feedforward
+        ff, err = slope, se
+    elif abs(slope) > 1e-9:  # dV/dI
+        ff, err = 1.0 / slope, se / slope ** 2
+    else:
+        return None
+    pairs = []  # the same two modes: up, a hop off one; down, the hop back onto it
+    for (_y, ups), (_, downs) in zip(lines.get(1, []), lines.get(2, [])):
+        for x, sign, before, after in ups:
+            near = [(abs(x - xd), x - xd) for xd, sd, bd, ad in downs if sd == -sign and abs(bd - after) < tol
+                    and abs(ad - before) < tol]
+            if near and min(near)[0] <= spacing.get(sign, 0.0):
+                pairs.append(min(near)[1])
+    df_slow = along if along is not None else statistics.median(rates_slow) if rates_slow else None
+    df_di, df_dv = (df_fast, df_slow) if fast_i else (df_slow, df_fast)
+    usual = statistics.median(spacing.values()) if spacing else None
+    dys = [abs(b[0] - a[0]) for leg in lines for a, b in zip(lines[leg], lines[leg][1:]) if b[0] != a[0]]
+    alias = max(spacing.values()) / statistics.median(dys) if spacing and dys else None
+    out = {"map": n, "kind": kind, "temp": temp, "ff": round(ff, 6), "err": round(err, 6), "hops": len(pts),
+           "boundaries": len(chains), "spacing": round(usual, 4) if usual else None,
+           "hysteresis": round(statistics.median(pairs), 4) if pairs else None, "pairs": len(pairs),
+           "df_di": round(df_di, 5) if df_di is not None else None,
+           "df_dv": round(df_dv, 5) if df_dv is not None else None, "jump": round(jump, 3),
+           "alias": round(alias, 4) if alias else None,
+           "shift": round(abs(slope) * statistics.median(dys), 4) if dys else None}
+    out["tuning"] = round(df_dv + df_di * ff, 5) if df_di is not None and df_dv is not None else None
+    return out
+
+
+def say_fit(fit: dict) -> str:
+    """A fit (fit_feedforward), said."""
+    unit = "mA" if fit["kind"] == "current" else "V"
+    out = (f"the ideal feedforward {fit['ff']:+.4f} ± {fit['err']:.4f} mA/V (from {fit['hops']} hops along "
+           f"{fit['boundaries']} mode boundaries")
+    out += f"; with it the laser tunes {fit['tuning']:+.3f} GHz/V on one mode)" if fit.get("tuning") is not None \
+        else ")"
+    if fit.get("hysteresis") is not None:
+        out += f"; hysteresis {fit['hysteresis']:.3f} {unit} ({fit['pairs']} pairs)"
+    if fit.get("spacing"):
+        out += f"; a hop every {fit['spacing']:.3f} {unit}"
+    if fit.get("shift") and fit.get("spacing") and fit["shift"] > 0.4 * fit["spacing"]:
+        slow = "piezo" if fit["kind"] == "current" else "current"
+        out += (f" (its boundaries move {fit['shift']:.2f} {unit} from line to line, nearly as far as from one hop to "
+                f"the next: told apart by the modes either side; smaller steps of the {slow} to be sure)")
+    return out
 
 
 # ----------------------------------------------------------------- procedure
@@ -636,8 +974,19 @@ class Mapper:
         self.t0 = None
         self.I = self.V = None
         self.T = None
-        self.act_offset = 0.0      # mA: measured minus set current, with the piezo at v0...
-        self.ff = 0.0              # mA/V: ...and the feedforward's (0: off)
+        self.act_offset = 0.0      # mA: measured minus set current (the piezo never moves while the feedforward adds)
+        # its feedforward: as it began, and as it is (MapRunner says each write of it as it is acked: ff_switched)
+        self.ff_was = False        # on where it began...
+        self.ff0 = 0.0             # ...with this factor (mA/V; its factor even if off)
+        self.ff_now = False        # on now...
+        self.ff_factor = 0.0       # ...with this factor
+        self.gap = None            # V: what it adds at rest, per mA/V of its factor (ff_learn; None: not known)...
+        self.gap_u = None          # ...to within this
+        self._steps = []           # (mA/V, mA): each step of its factor while on, and what it did to the current
+        self.off_offset = None     # mA: measured minus set current with it adding nothing (off, or its factor 0)
+        self.ff_applied = False    # the ideal one the map found is on (left on, should anything fail after)
+        self.fits = []             # what fit_feedforward told of each map (those it could)
+        self.ff_end = {}           # how its feedforward ended
         self.clip = math.inf       # mA set: the controller's current-clip
         self.pc = (-math.inf, math.inf)  # V: the piezo's limits
         self.tc = (-math.inf, math.inf)  # °C: the temperature's
@@ -657,7 +1006,7 @@ class Mapper:
         self.view = None           # the one filling
         self.line_no = (0, 0)      # (line, of how many) of the map filling
         self.t_last = 0.0          # s: the last point's
-        self.trace = []            # [(fast value, GHz or None)] of the sweep going on...
+        self.trace = []            # [(fast value, GHz, µW, photodiode: each None if not)] of the sweep going on...
         self.trace_before = []     # ...and the one before
         self.trace_legs = (None, None)  # (leg now, leg before): 1 up, 2 down, 0 a descent
         self.pattern_now = None    # the last pattern seen (kind 0, or the first there): (dtype, values)
@@ -674,13 +1023,13 @@ class Mapper:
         """s since the map began, of a monotonic time."""
         return round(t - self.started, 3)
 
-    def mA(self, i_set: float, v: float) -> float:
-        """A set current as measured, with the piezo at v."""
-        return i_set + self.act_offset + self.ff * (v - self.v0)
+    def mA(self, i_set: float, v: float = 0.0) -> float:
+        """A set current as measured (wherever the piezo: it never moves while the feedforward adds anything)."""
+        return i_set + self.act_offset
 
-    def set_for(self, i: float, v: float) -> float:
-        """The set current that has the measured current at i with the piezo at v."""
-        return i - self.act_offset - self.ff * (v - self.v0)
+    def set_for(self, i: float, v: float = 0.0) -> float:
+        """The set current that has the measured current at i."""
+        return i - self.act_offset
 
     def note(self, t, text: str, kind: str = "note"):
         s = self.now(t) if t else None
@@ -690,7 +1039,7 @@ class Mapper:
         log.info("map: %s", text)
 
     def limits(self) -> dict:
-        return {"clip": self.clip, "offset": self.act_offset, "ff": self.ff, "v0": self.v0, "pc": self.pc,
+        return {"clip": self.clip, "offset": self.act_offset, "ff": 0.0, "v0": self.v0, "pc": self.pc,
                 "tc": self.tc, "t0": self.t0}
 
     @property
@@ -707,6 +1056,104 @@ class Mapper:
         dark = sorted(self.pd_dark)[(9 * len(self.pd_dark)) // 10]
         lasing = sorted(self.pd_lasing)[len(self.pd_lasing) // 10]
         return dark + 0.25 * (lasing - dark) if dark < lasing else None
+
+    # ------------------------------------------------------- its feedforward
+    # What a DLC pro's feedforward adds to the current at rest is its factor times a voltage: the piezo's from 0 V,
+    # say, or nothing at all (a DL pro moved by its scan's offset, its scan off: its feedforward follows the scan
+    # alone). Not known beforehand, it is learned as its factor is stepped (ff_learn): until then it could be the
+    # factor times the piezo's distance from 0 V or from its farther limit (ff_most), tens of mA. So its factor is
+    # taken to 0 and back in steps that cannot move the current more than FF_STEP each by what is known so far, the
+    # current read after each (ff_ramp), and it is switched off and on only at a factor of 0, where that does nothing.
+
+    def ff_most(self) -> float:
+        """V: the most what the feedforward adds can be, per mA/V of its factor (the gap learned and its uncertainty;
+        until then the piezo's distance from 0 V or from its farther limit, whichever is farthest)."""
+        if self.gap is not None:
+            return abs(self.gap) + self.gap_u
+        return max(abs(self.v0 - x) for x in (0.0, *(x for x in self.pc if math.isfinite(x))))
+
+    def ff_rise(self, change: float) -> float:
+        """mA: the most a change of `change` mA/V in the feedforward's factor takes the current up (a step of it while
+        it is on; switching it on: its factor; off: minus that)."""
+        return max(self._high(change), 0.0)
+
+    def _high(self, change: float) -> float:
+        """mA: what a change of `change` mA/V in its feedforward's factor does to the current, at the most."""
+        if self.gap is not None:
+            return change * self.gap + abs(change) * self.gap_u
+        return abs(change) * self.ff_most()
+
+    def ff_learn(self, step: float, moved: float):
+        """A step of its factor (mA/V) while on moved the current that much (mA): what it adds, learned (least squares
+        over every step; uncertain by three times what the DLC pro's reading of its current scatters, FF_NOISE, over
+        the steps taken so far, and by 2 % at least)."""
+        self._steps.append((step, moved))
+        sxx = sum(x * x for x, _ in self._steps)
+        if sxx <= 0:
+            return
+        self.gap = sum(x * y for x, y in self._steps) / sxx
+        self.gap_u = max(3 * math.sqrt(2) * FF_NOISE / math.sqrt(sxx), 0.02 * abs(self.gap))
+
+    def ff_switched(self, name: str, value):
+        """Its DLC pro took a write of its feedforward (MapRunner says so as it is acked, whatever the procedure is
+        doing): what its current is reckoned from follows, as high as it could be until it is read; back as it began,
+        as it began exactly."""
+        if name == FF:
+            if self.ff_now:
+                self.act_offset += self._high(value - self.ff_factor)
+            self.ff_factor = value
+        elif value != self.ff_now:
+            self.ff_now = value
+            self.act_offset += self._high(self.ff_factor if value else -self.ff_factor)
+        if self.ff_now and self.ff_was and self.ff_factor == self.ff0:
+            self.act_offset = self.a0 - self.i0
+        elif not self.ff_now or self.ff_factor == 0.0:
+            if self.off_offset is not None:
+                self.act_offset = self.off_offset
+
+    def ff_ramp(self, target: float):
+        """Its factor taken to `target` while it is on (the piezo where it began), in steps that cannot move the
+        current more than FF_STEP each by what is known of what it adds, the current read after each (what it adds
+        learned meanwhile), and kept no higher than where it began (lowered first where a step could take it
+        higher)."""
+        for _ in range(400):
+            want = target - self.ff_factor
+            if abs(want) < 1e-9:
+                if self.ff_now and self.ff_was and self.ff_factor == self.ff0:
+                    self.act_offset = self.a0 - self.i0  # (as it began: back to its set current exactly)
+                return
+            most = self.ff_most()
+            step = want if abs(want) * most <= FF_STEP else math.copysign(FF_STEP / most, want)
+            to = target if abs(want - step) < 1e-9 else round(self.ff_factor + step, 6)  # (as the DLC pro takes it)
+            step = to - self.ff_factor
+            rise = self.ff_rise(step)
+            if self.I + rise > self.a0 + 1e-9:
+                yield from self.go(current=max(self.a0 - rise, self.mA(0.0)))
+            before = self.act_offset
+            yield Set(FF, to)
+            yield Wait(FF_SETTLE)
+            i_set, act = yield Get((CURRENT, CURRENT_ACT))
+            if not (_num(i_set) and _num(act)):
+                raise Failed("cannot read its current while its feedforward is stepped")
+            self.ff_learn(step, act - i_set - before)
+            self.act_offset = act - i_set
+            self.I = act
+            if self.ff_factor == 0.0:
+                self.off_offset = self.act_offset
+        raise Failed(f"its feedforward did not come to {target:+.4f} mA/V in 400 steps")
+
+    def fitted(self):
+        """The ideal feedforward the maps found (fit_feedforward), where it began (its temperature): their
+        estimates weighed by how well each tells it; None if none could."""
+        fits = [f for f in self.fits if f["temp"] is None or self.t0 is None or abs(f["temp"] - self.t0) < 1e-6]
+        if not fits and self.fits:  # (stepped temperatures, none of them where it began: the nearest)
+            near = min(abs(f["temp"] - self.t0) for f in self.fits)
+            fits = [f for f in self.fits if abs(abs(f["temp"] - self.t0) - near) < 1e-6]
+        if not fits:
+            return None
+        w = [1.0 / max(f["err"], 1e-4) ** 2 for f in fits]
+        ff = sum(wk * f["ff"] for wk, f in zip(w, fits)) / sum(w)
+        return {"ff": round(ff, 6), "err": round(1.0 / math.sqrt(sum(w)), 6), "maps": [f["map"] for f in fits]}
 
     def go(self, current=None, piezo=None, temp=None, step_i=RAMP_I, step_v=RAMP_V):
         yield Go(current, piezo, temp, step_i, step_v)
@@ -727,6 +1174,7 @@ class Mapper:
                 yield from self.settle(temp)
             for kind in p.kinds():
                 yield from self.map(kind, temp)
+                self.fit(self.views[-1])
         if p.repeat and self.views:
             view = self.views[-1]
             again = MapView(len(self.views), view.kind, view.temp, view.fv, view.sv[:1], repeat=True)
@@ -739,9 +1187,9 @@ class Mapper:
     def take_over(self):
         p = self.plan
         self.stage = "reading its settings"
-        extra = tuple(n for n in p.names() if n not in PD_NAMES)
-        names = (CURRENT, OFFSET, CURRENT_ACT, CLIP, FF_ON, FF, PC_MIN, PC_MAX, TEMP_SET, TEMP_ACT, TEMP_MIN, TEMP_MAX,
-                 SCAN_ON, LOCK_ON, TA_ON, *ABOUT, *PD_NAMES, *extra)
+        extra = tuple(n for n in p.names() if n not in PD_NAMES + (CURRENT_ACT, PIEZO_ACT))
+        names = (CURRENT, OFFSET, CURRENT_ACT, PIEZO_ACT, CLIP, FF_ON, FF, PC_MIN, PC_MAX, TEMP_SET, TEMP_ACT, TEMP_MIN,
+                 TEMP_MAX, SCAN_ON, LOCK_ON, TA_ON, *ABOUT, *PD_NAMES, *extra)
         got = dict(zip(names, (yield Get(names))))
         i0, v0, a0 = got[CURRENT], got[OFFSET], got[CURRENT_ACT]
         if not (_num(i0) and _num(v0) and _num(a0)):
@@ -753,34 +1201,43 @@ class Mapper:
         self.i0, self.v0, self.a0 = i0, v0, a0
         self.I, self.V = a0, v0
         self.act_offset = a0 - i0
-        self.ff = got[FF] if got[FF_ON] is True and _num(got[FF]) else 0.0
+        self.ff0 = got[FF] if _num(got[FF]) else 0.0
+        self.ff_was = self.ff_now = got[FF_ON] is True
+        self.ff_factor = self.ff0
+        if not self.ff_was or self.ff0 == 0.0:
+            self.off_offset = self.act_offset
         self.clip = got[CLIP] if _num(got[CLIP]) else math.inf
         if _num(got[PC_MIN]) and _num(got[PC_MAX]) and got[PC_MIN] < got[PC_MAX]:
             self.pc = (got[PC_MIN], got[PC_MAX])
         if _num(got[TEMP_MIN]) and _num(got[TEMP_MAX]) and got[TEMP_MIN] < got[TEMP_MAX]:
             self.tc = (got[TEMP_MIN], got[TEMP_MAX])
         self.t0 = self.T = got[TEMP_SET] if _num(got[TEMP_SET]) else None
-        bad = p.problems(self.limits())
+        bad = p.problems(self.limits())  # (as it is; once its feedforward is off, again)
         if bad:
             raise Failed("; ".join(bad))
         self.pd = next((n for n in PD_NAMES if _num(got[n])), "")
-        self.names = tuple(dict.fromkeys(([self.pd] if self.pd else []) + list(extra)))
+        self.names = tuple(dict.fromkeys(([self.pd] if self.pd else []) + [CURRENT_ACT] +
+                                         ([PIEZO_ACT] if _num(got[PIEZO_ACT]) else []) + list(extra)))
         if self.out is not None:
             o = self.out
             o.meta("plan", p.to_dict())
             o.meta("laser", {**self.info.get("laser", {}), **{n: got[n] for n in ABOUT}})
             o.meta("wavemeter", self.info.get("wavemeter", {}))
-            o.meta("start", {"current_set": i0, "current_act": a0, "piezo": v0, "temp_set": self.t0,
-                             "temp_act": got[TEMP_ACT], "clip": self.clip, "feedforward": self.ff,
-                             "feedforward_enabled": got[FF_ON], "piezo_limits": list(self.pc),
-                             "temp_limits": list(self.tc), "scan_enabled": got[SCAN_ON],
+            o.meta("start", {"current_set": i0, "current_act": a0, "piezo": v0, "piezo_act": got[PIEZO_ACT],
+                             "temp_set": self.t0, "temp_act": got[TEMP_ACT], "clip": self.clip,
+                             "feedforward": self.ff0, "feedforward_enabled": got[FF_ON],
+                             "piezo_limits": list(self.pc), "temp_limits": list(self.tc), "scan_enabled": got[SCAN_ON],
                              "act_offset": self.act_offset})
             o.meta("recorded", {"photodiode": self.pd, "names": list(self.names)})
             o.meta("program", {"name": "SimpleWavemeterLock", "version": __version__})
             o.meta("began", {"local": time.strftime("%Y-%m-%d %H:%M:%S"), "unix": time.time()})
-            o.meta("units", {"t": "s since the map began", "i": "mA measured", "i_set": "mA set", "v": "V",
+            o.meta("units", {"t": "s since the map began", "i": "mA measured (as planned: set plus what it is besides, "
+                                                            "its feedforward off)", "i_set": "mA set",
+                             "i_act": "mA measured (read at the point)", "v": "V", "v_act": "V (read at the point)",
                              "temp": "°C set", "f": "THz", "power": "µW, the wavemeter's", "exp": "ms",
-                             "legs": "1 up, 2 down, 0 a descent: the current down to where it stops lasing"})
+                             "legs": "1 up, 2 down, 0 a descent: the current down to where it stops lasing",
+                             "fits": "ff mA/V, err mA/V, spacing and hysteresis mA (the current swept) or V (the "
+                                     "piezo), df_di GHz/mA, df_dv and tuning GHz/V"})
         if got[SCAN_ON] is True:
             self.stage = "its scan switched off"
             yield Set(SCAN_ON, False, restore=True)
@@ -791,8 +1248,59 @@ class Mapper:
         self.f0 = self.f_ref = statistics.median(fs) if fs else None
         self.note(t.t1, f"began at {a0:.3f} mA ({i0:.3f} mA set), {v0:.3f} V" +
                   (f", {self.t0:.3f} °C" if self.t0 is not None else "") +
-                  (f": {self.f0:.6f} THz" if self.f0 else ": no valid reading there") +
-                  (f"; its feedforward, {self.ff:+.4f} mA/V, taken into account" if self.ff else ""), "start")
+                  (f": {self.f0:.6f} THz" if self.f0 else ": no valid reading there"), "start")
+        if self.ff_was and self.ff0 != 0.0:
+            yield from self.ff_off_for_map()
+        elif self.ff_was:  # (on, and its factor 0: it adds nothing)
+            yield Set(FF_ON, False)
+
+    def ff_off_for_map(self):
+        """Its feedforward off for the map: its factor taken to 0 in steps (ff_ramp: what it adds learned as it
+        goes), switched off there (nothing moves), and its factor put back as it was (off, it does nothing: as it
+        was, should the program stop)."""
+        self.stage = "its feedforward taken off"
+        i_set, act = yield Get((CURRENT, CURRENT_ACT))
+        if not (_num(i_set) and _num(act)):
+            raise Failed("cannot read its current")
+        self.act_offset, self.I = act - i_set, act
+        yield from self.ff_ramp(0.0)
+        yield Set(FF_ON, False)
+        yield Set(FF, self.ff0)
+        top = max(self.plan.i_hi, self.a0)
+        if self.I > top + 0.25:
+            raise Failed(f"its feedforward taken off, it runs at {self.I:.3f} mA: above {top:.3f} mA")
+        bad = self.plan.problems(self.limits())
+        if bad:
+            raise Failed("its feedforward off: " + "; ".join(bad))
+        added = (f": it added {self.ff0 * self.gap:+.3f} mA at rest ({self.gap:.2f} ± {self.gap_u:.2f} V per mA/V: "
+                 f"reckoned from {self.v0 - self.gap:.1f} V)" if self.gap is not None else "")
+        self.note(self.started + self.t_last, f"its feedforward ({self.ff0:+.4f} mA/V) off for the map, its factor "
+                                              f"taken to 0 in {len(self._steps)} steps{added}; now {self.I:.3f} mA",
+                  "feedforward")
+        if self.out is not None:
+            self.out.meta("feedforward", self.ff_state())
+
+    def ff_state(self) -> dict:
+        """What the map knows of its feedforward (kept with it): as it began and as it is; what it adds at rest per
+        mA/V of its factor (gap, V: the piezo's distance from where its DLC pro reckons it from), learned from the
+        steps of its factor (mA/V, and what each did to the current, mA)."""
+        return {"was_on": self.ff_was, "factor": self.ff0, "on": self.ff_now, "factor_now": self.ff_factor,
+                "off_offset": self.off_offset, "gap": self.gap, "gap_u": self.gap_u,
+                "adds_at_rest": round(self.ff0 * self.gap, 4) if self.gap is not None else None,
+                "reckoned_from": round(self.v0 - self.gap, 3) if self.gap is not None else None,
+                "steps": [list(x) for x in self._steps], "applied": self.ff_applied, "end": self.ff_end or None}
+
+    def fit(self, view: MapView):
+        """The ideal feedforward from that map (fit_feedforward), said and kept."""
+        f = fit_feedforward(view)
+        if f is None:
+            self.note(self.started + self.t_last, f"map {view.n + 1}: too few hops followed from line to line for "
+                                                  f"the ideal feedforward", "fit")
+            return
+        self.fits.append(f)
+        self.note(self.started + self.t_last, f"map {view.n + 1}: {say_fit(f)}", "fit")
+        if self.out is not None:
+            self.out.meta("fits", self.fits)
 
     def settle(self, temp: float):
         """Wait for the temperature to settle at temp: within t_tol for t_hold, t_wait at most."""
@@ -855,7 +1363,7 @@ class Mapper:
             for n in range(k + 1, top + 1):
                 yield from self.go(current=fv[n], step_i=p.i_step)
                 yield from self.point(view, line_id, j, 1, n)
-            view.put(2, j, top, view.up[j][top])  # (where it turns: the same both ways)
+            view.turn(j, top)
             run = 0
             for k in range(top - 1, -1, -1):
                 yield from self.go(current=fv[k], step_i=p.i_step)
@@ -875,7 +1383,7 @@ class Mapper:
                 yield from self.go(piezo=fv[k], step_v=p.v_step)
                 t = yield from self.point(view, line_id, j, 1, k)
                 dark = dark and self.is_dark(t)
-            view.put(2, j, top, view.up[j][top])
+            view.turn(j, top)
             if dark:
                 self.note(t.t1, f"no lasing all the way up at {s:.3f} mA: not swept back", "turn")
             else:
@@ -932,26 +1440,33 @@ class Mapper:
             self.pd_lasing.append(pd)
         elif _num(pd) and dark and t.how != "dark":  # (dark as the wavemeter said, not as the photodiode did)
             self.pd_dark.append(pd)
+        powers = [r[3]["power"] for r in t.readings if r[3] and _num(r[3].get("power"))]
+        power = statistics.median(powers) if powers else None
         self.points += 1
         self.lasing += f is not None
         self.t_last = self.now(t.t1)
         if f is not None and self.f_ref is None:
             self.f_ref = f  # (no valid reading where it began: from the first)
         ghz = (f - self.f_ref) * 1e3 if f is not None else None
-        view.put(leg, j, k, ghz if f is not None else MapView.DARK if dark else MapView.BAD)
-        self.trace.append((x, ghz))
+        view.put(leg, j, k, ghz if f is not None else MapView.DARK if dark else MapView.BAD,
+                 power if power is not None else MapView.DARK if dark else MapView.BAD,
+                 pd if _num(pd) else MapView.BAD)
+        self.trace.append((x, ghz, power, pd if _num(pd) else None))
         patterns = {kind: pv for kind, pv in (last.get("patterns") or {}).items() if pv and len(pv[1])}
         if patterns:
             self.pattern_now = patterns.get(0) or next(iter(patterns.values()))
         if self.out is None:
             return
+        i_act, v_act = t.values.get(CURRENT_ACT), t.values.get(PIEZO_ACT)
+        vals = {name: value for name, value in t.values.items() if name not in (CURRENT_ACT, PIEZO_ACT)}
         row = {"line_id": line_id, "leg": leg, "k": k, "t": self.t_last, "i": i, "i_set": round(self.set_for(i, v), 6),
-               "v": v, "temp": self.T, "f": f, "f_lo": min(fs) if len(fs) > 1 else None,
+               "i_act": i_act if _num(i_act) else None, "v": v, "v_act": v_act if _num(v_act) else None,
+               "temp": self.T, "f": f, "f_lo": min(fs) if len(fs) > 1 else None,
                "f_hi": max(fs) if len(fs) > 1 else None, "n": len(fs), "bad": len(bad),
                "status": bad[-1][2] if bad else "", "how": t.how, "wait": round(t.t1 - t.t0, 4),
-               "power": last.get("power"), "exp1": exp[0] if exp else None,
+               "power": power, "exp1": exp[0] if exp else None,
                "exp2": exp[1] if exp and len(exp) > 1 else None, "event": event,
-               "vals": json.dumps(t.values, default=str) if t.values else None}
+               "vals": json.dumps(vals, default=str) if vals else None}
         for name, a in zip(("amin1", "amax1", "aavg1", "amin2", "amax2", "aavg2"), amps or ()):
             row[name] = a
         pid = self.out.point(row)
@@ -996,12 +1511,14 @@ class Mapper:
         self.kept += 1
 
     def go_home(self):
-        """Back where it began: the temperature, then the piezo and the current; its scan on again if it was."""
+        """Back where it began: the temperature, then its feedforward (on again as it was, or on with the ideal one the
+        map found: ff_end), the piezo and the current; its scan on again if it was."""
         self.stage = "back where it began"
         if self.t0 is not None and self.T is not None and abs(self.T - self.t0) > 1e-9:
             yield from self.go(temp=self.t0)
             yield from self.settle(self.t0)
         self.stage = "back where it began"
+        yield from self.ff_home()
         yield from self.go(current=self.a0, piezo=self.v0)
         t = yield Sample(self.plan.reads, max(self.plan.settle, 0.2), self.names)
         fs = [r[1] for r in t.readings if r[1] > 0]
@@ -1014,6 +1531,45 @@ class Mapper:
         if self.scan_was:
             yield Set(SCAN_ON, True)
 
+    def ff_home(self):
+        """Its feedforward as it ends: on again as it was, or (ff_end 'fitted') on with the ideal one the maps found:
+        the piezo where it began first (while the feedforward adds nothing, the piezo moves alone), switched on at a
+        factor of 0, its factor taken there in steps (ff_ramp: the current kept no higher than where it began)."""
+        on, factor, why = self.ff_was, self.ff0, ""
+        if self.plan.ff_end == "fitted":
+            best = self.fitted()
+            if best is None:
+                why = "no ideal feedforward found in the map"
+            elif not abs(best["ff"]) <= FF_MAX:
+                why = f"the ideal feedforward found, {best['ff']:+.4f} mA/V, is more than {FF_MAX:g} mA/V"
+            elif best["err"] > 0.25 * abs(best["ff"]) + 1e-3:
+                why = f"the ideal feedforward found, {best['ff']:+.4f} ± {best['err']:.4f} mA/V, is too uncertain"
+            else:
+                on, factor = True, best["ff"]
+            if why:
+                self.note(self.started + self.t_last, f"{why}: its own back as it was", "feedforward")
+        if not on or (self.ff_now and self.ff_factor == factor):
+            self.ff_end = {"on": self.ff_now, "factor": self.ff_factor, "fitted": False}
+            return
+        self.stage = "its feedforward on again" if factor == self.ff0 and self.ff_was else \
+            f"its feedforward on, {factor:+.4f} mA/V"
+        yield from self.go(current=min(self.I, self.a0), piezo=self.v0)
+        if not self.ff_now:
+            if self.ff_factor != 0.0:
+                yield Set(FF, 0.0)
+            yield Set(FF_ON, True)
+        yield from self.ff_ramp(factor)
+        self.ff_applied = not (self.ff_was and factor == self.ff0)
+        self.ff_end = {"on": True, "factor": factor, "fitted": self.ff_applied}
+        if self.ff_applied:
+            was = f"{self.ff0:+.4f} mA/V, {'on' if self.ff_was else 'off'}"
+            self.note(self.started + self.t_last, f"its feedforward set to the ideal one the map found, "
+                                                  f"{factor:+.4f} mA/V, and on (it was {was})", "feedforward")
+        else:
+            self.note(self.started + self.t_last, f"its feedforward on again ({factor:+.4f} mA/V)", "feedforward")
+        if self.out is not None:
+            self.out.meta("feedforward", self.ff_state())
+
     def summary(self) -> str:
         p = self.plan
         maps = "; ".join(f"the {v.kind} swept over {len(v.fv)} steps at {len(v.sv)} "
@@ -1023,6 +1579,10 @@ class Mapper:
         self.result = (f"{self.points:,} points, {self.lasing:,} lasing: {maps}; hops seen {self.hops[1]:,} sweeping "
                        f"up, {self.hops[2]:,} down; patterns kept at {self.kept:,} points" +
                        (f" ({p.patterns})" if p.patterns != "off" else ""))
+        best = self.fitted()
+        if best is not None:
+            self.result += (f"; the ideal feedforward {best['ff']:+.4f} ± {best['err']:.4f} mA/V" +
+                            (" (set)" if self.ff_applied else ""))
         if self.notes and self.notes[-1][1].startswith("back at"):
             self.result += f"; {self.notes[-1][1]}"
         return self.result
@@ -1173,10 +1733,10 @@ class MapRunner:
         for k in range(1, n + 1):
             v_k = v_from + (v_to - v_from) * k / n
             i_k = m.set_for(i_from + (i_to - i_from) * k / n, v_k)
-            ops = [("piezo", v_k)] if abs(v_k - v) > 1e-12 else []
+            if abs(v_k - v) > 1e-12:
+                self._ops.append(("piezo", v_k))
             if abs(i_k - i_set) > 1e-12:
-                ops.insert(0 if m.ff * (v_k - v) > 0 else len(ops), ("current", i_k))
-            self._ops.extend(ops)
+                self._ops.append(("current", i_k))
             i_set, v = i_k, v_k
 
     def _ops_value(self, kind: str, written):
@@ -1190,13 +1750,13 @@ class MapRunner:
         m, kind = self.mapper, op[0]
         i_max, (v_lo, v_hi), (t_lo, t_hi) = self._limits()
         if kind == "current":
-            v = self.v_written if self.v_written is not None else m.v0
             last = self.i_written if self.i_written is not None else m.i0
-            if (0.0 <= op[1] <= m.clip + 1e-9 and m.mA(op[1], v) <= i_max + 1e-6
-                    and abs(op[1] - last) <= STEP_I + 1e-6):
+            if 0.0 <= op[1] <= m.clip + 1e-9 and m.mA(op[1]) <= i_max + 1e-6 and abs(op[1] - last) <= STEP_I + 1e-6:
                 return ""
-            return f"refused to set {op[1]:.3f} mA ({m.mA(op[1], v):.3f} mA measured; from {last:.3f} mA)"
+            return f"refused to set {op[1]:.3f} mA ({m.mA(op[1]):.3f} mA measured; from {last:.3f} mA)"
         if kind == "piezo":
+            if m.ff_now and m.ff_factor != 0.0:  # (what the feedforward adds as the piezo moves: not known)
+                return f"refused to move the piezo to {op[1]:.3f} V while its feedforward adds to the current"
             last = self.v_written if self.v_written is not None else m.v0
             i = self.i_written if self.i_written is not None else m.i0
             if v_lo - 1e-9 <= op[1] <= v_hi + 1e-9 and abs(op[1] - last) <= STEP_V + 1e-6 and \
@@ -1209,9 +1769,21 @@ class MapRunner:
             return f"refused to set the temperature to {op[1]:.3f} °C"
         if kind == "set":
             want = WRITABLE.get(op[1])
-            if want is not None and type(op[2]) is want:  # noqa: E721
-                return ""
-            return f"refused to set {op[1]} to {op[2]!r}"
+            if want is None or type(op[2]) is not want:  # noqa: E721
+                return f"refused to set {op[1]} to {op[2]!r}"
+            change = None  # mA/V: what the write changes in what the feedforward adds
+            if op[1] == FF:
+                if not (abs(op[2]) <= FF_MAX or op[2] == m.ff0):  # (its own, as it was, whatever it was)
+                    return f"refused to set its feedforward to {op[2]:+.4f} mA/V"
+                change = op[2] - m.ff_factor if m.ff_now else 0.0
+            elif op[1] == FF_ON and op[2] != m.ff_now:
+                change = m.ff_factor if op[2] else -m.ff_factor
+            if change:
+                now = m.mA(self.i_written if self.i_written is not None else m.i0)
+                if abs(change) * m.ff_most() > STEP_I + 1e-6 or now + m.ff_rise(change) > i_max + 1e-6:
+                    return (f"refused to set {op[1]} to {op[2]!r} at {now:.3f} mA: it could take the current "
+                            f"{m.ff_rise(change):.3f} mA up, {abs(change) * m.ff_most():.3f} mA either way")
+            return ""
         return ""
 
     def _next(self):
@@ -1221,6 +1793,8 @@ class MapRunner:
                 self.restored = not self.trouble
                 self._end("failed", self.error + ("; could not put back " + ", ".join(self.trouble)
                                                   if self.trouble else ""))
+            elif then == "home":  # (its feedforward on again: home as that has it)
+                self._home()
             else:
                 self._send(None)
             return
@@ -1254,6 +1828,8 @@ class MapRunner:
             self.v_written = op[1]
         elif kind == "temp":
             self.t_written = op[1]
+        elif kind == "set" and op[1] in (FF_ON, FF):
+            self.mapper.ff_switched(op[1], op[2])
         if kind in ("current", "piezo", "temp", "set"):
             self._written_at = self.now
         self._waiting = None
@@ -1270,11 +1846,23 @@ class MapRunner:
             return
         self._waiting = None
         if self.state == "restoring":
-            if op[0] == "set":
+            if op[0] == "set" and op[1] not in (FF_ON, FF):
                 self.trouble.append(f"{op[1]} ({exc or type(exc).__name__})")
                 self._next()
                 return
             self._ops.clear()
+            m = self.mapper
+            if op[0] == "set":  # its feedforward: left as it is now, the current where it is (lowered for it)
+                factor = m.ff_factor if m.ff_applied else m.ff0
+                if not m.ff_now and m.ff_factor != factor:  # (its factor back as it was: off, that does nothing)
+                    self._ops.append(("set", FF, factor))
+                what = "switch it on again" if op[1] == FF_ON else f"step its factor to {op[2]:+.4f} mA/V"
+                now = m.mA(self.i_written if self.i_written is not None else m.i0)
+                self.trouble.append(f"its feedforward (could not {what}: {exc or type(exc).__name__}; left at "
+                                    f"{now:.3f} mA, its feedforward {'on' if m.ff_now else 'off'})")
+                self._then = "restored"
+                self._next()
+                return
             self._end("failed", f"{self.error}; could not put it back: {exc}")
         elif isinstance(exc, OSError):  # the connection is gone: nothing more to be done
             self._ops.clear()
@@ -1436,9 +2024,49 @@ class MapRunner:
         m = self.mapper
         if m.t0 is not None and self.t_written is not None and abs(self.t_written - m.t0) > 1e-9:
             self._ops.append(("temp", m.t0))
+        on, factor = (m.ff_now, m.ff_factor) if m.ff_applied else (m.ff_was, m.ff0)  # (the ideal one on: left so)
+        if m.ff_now != on or (m.ff_factor != factor):
+            self._ff_back(on, factor)
+            self._then = "home"
+            self._next()
+            return
+        self._home()
+
+    def _ff_back(self, on: bool, factor: float):
+        """The ops that put its feedforward back (on or off, its factor), with nothing read: the piezo where it began
+        first (while the feedforward adds nothing; else it is there), the current lowered by as much as the rest
+        could take it up, switched only at a factor of 0, its factor stepped as ff_ramp would (each step moving the
+        current FF_STEP at most by what is known of what it adds)."""
+        m = self.mapper
+        if self.v_written is not None and abs(self.v_written - m.v0) > 1e-9:
+            self._go(Go(None, m.v0))
+        f_from, f_to = (m.ff_factor if m.ff_now else 0.0), (factor if on else 0.0)
+        rise = m.ff_rise(f_to - f_from)
+        i_set = self._ops_value("current", self.i_written)
+        now = m.mA(m.i0 if i_set is None else i_set)
+        if now + rise > m.a0 + 1e-9:
+            self._go(Go(max(m.a0 - rise, m.mA(0.0)), None))
+        if on and not m.ff_now:
+            if m.ff_factor != 0.0:
+                self._ops.append(("set", FF, 0.0))
+            self._ops.append(("set", FF_ON, True))
+        most, f = m.ff_most(), f_from
+        while abs(f_to - f) > 1e-9:
+            want = f_to - f
+            f = f_to if abs(want) * most <= FF_STEP else round(f + math.copysign(FF_STEP / most, want), 6)
+            self._ops.append(("set", FF, f))
+        if m.ff_now and not on:
+            self._ops.append(("set", FF_ON, False))
+        if not on and factor != f_to:  # (off: it does nothing)
+            self._ops.append(("set", FF, factor))
+
+    def _home(self):
+        """The rest of the way back: the piezo and the current where they were, then what the journal says (its
+        scan on again once the piezo is back)."""
+        m = self.mapper
         if self.i_written is not None or self.v_written is not None:
             self._go(Go(m.a0, m.v0))
-        for name, value in reversed(list(self.journal.items())):  # (its scan on again once the piezo is back)
+        for name, value in reversed(list(self.journal.items())):
             self._ops.append(("set", name, value))
         if not self._ops:
             self.restored = True
@@ -1491,6 +2119,19 @@ def describe(m: LaserMap) -> str:
         if q["event"] == "hop":
             hops[q["leg"]] = hops.get(q["leg"], 0) + 1
     out.append(f"  hops: {hops[1]:,} sweeping up, {hops[2] + hops[0]:,} down")
+    ff = meta.get("feedforward") or {}
+    if ff.get("was_on"):
+        out.append(f"  its feedforward ({ff.get('factor', 0):+.4f} mA/V) off for the map" +
+                   (f": {ff['jump']:+.3f} mA from switching it off" if ff.get("jump") is not None else "") +
+                   (f", reckoned from {ff['reckoned_from']:.1f} V" if ff.get("reckoned_from") is not None else ""))
+    fits = meta.get("fits")
+    if fits is None:  # (a file from before fits were kept, or cut short: fitted now)
+        fits = m.fits()
+    for f in fits:
+        out.append(f"  map {f['map'] + 1} ({f['kind']} swept" + (f", {f['temp']:.3f} °C" if f.get("temp") is not None
+                                                                else "") + f"): {say_fit(f)}")
+    if (ff.get("end") or {}).get("fitted"):
+        out.append(f"  its feedforward set to {ff['end']['factor']:+.4f} mA/V at the end")
     end = meta.get("end", {})
     if end:
         out.append(f"  ended: {end.get('outcome', '?')}")

@@ -19,8 +19,8 @@ import zlib
 
 from . import dac, view
 from .engine import DAC_LOCK, Engine
-from .lasermap import (CLIP, FF, FF_ON, FOLDER, LOCK_ON, PC_MAX, PC_MIN, PD_NAMES, STEP_I, STEP_V, TA_ON, TEMP_MAX,
-                       TEMP_MIN, TEMP_SET, MapPlan, fmt_bytes)
+from .lasermap import (CLIP, FF, FF_ON, FOLDER, LOCK_ON, PC_MAX, PC_MIN, PD_NAMES, PD_UNITS, STEP_I, STEP_V, TA_ON,
+                       TEMP_MAX, TEMP_MIN, TEMP_SET, MapPlan, fmt_bytes)
 from .lock import LockParams
 from .meters import Meter
 from .modehop import HopParams
@@ -1745,39 +1745,51 @@ def diverging(n: int = 129, cold: str = "#3987e5", mid: str = "#383835", warm: s
     return out
 
 
+def sequential(n: int = 129, low: str = "#0d366b", high: str = "#cde2fb") -> list:
+    """n colours (r, g, b) of one hue, evenly in OKLab: the least dark (near the background), the most light."""
+    a, b = _oklab(low), _oklab(high)
+    return [_srgb(tuple(a[c] + (b[c] - a[c]) * k / (n - 1) for c in range(3))) for k in range(n)]
+
+
 class MapImage(QtWidgets.QWidget):
     """One way of a laser map (lasermap.MapView: sweeping up, or down), as a picture: the fast axis across, the slow
-    one up; each point coloured by its frequency from where the laser began (MapLegend: blue below, red above, grey
-    at it), black where it did not lase, light grey where the wavemeter read nothing valid; nothing where it is not
-    measured yet. Hovered, a point says what it is."""
+    one up; each point coloured by one of its layers (MapLegend): its frequency from where the laser began (blue
+    below, red above, grey at it), or the power at the wavemeter, or its photodiode (dark blue the least, light the
+    most); black where it did not lase, light grey where nothing was read; nothing where it is not measured yet.
+    Hovered, a point says what it is."""
 
     LUT = diverging()
+    SEQ = sequential()
     UNMEASURED, DARK, BAD = (0x1b, 0x1c, 0x20), (0x00, 0x00, 0x00), (0xc3, 0xc2, 0xb7)
 
     def __init__(self, title: str, up: bool):
         super().__init__()
         self.title, self.up = title, up
         self.view = None
-        self.span = 1.0      # GHz either side of where it began that the colours cover
+        self.layer = "f"     # what the colours show (MapView.LAYERS)...
+        self.scale = 1.0     # ...over: GHz either side of where it began, or (lowest, highest)
         self._rows = {}      # row -> (its version, its bytes)
         self._image = None
-        self._span_drawn = None
+        self._drawn = None
         self.setMouseTracking(True)
         self.setMinimumSize(260, 200)
 
-    def show_view(self, view, span: float):
+    def show_view(self, view, scale, layer: str = "f"):
         if view is not self.view:
             self.view, self._rows, self._image = view, {}, None
-        if span != self._span_drawn:
-            self._rows, self._span_drawn = {}, span
-        self.span = span
+        if (layer, scale) != self._drawn:
+            self._rows, self._drawn = {}, (layer, scale)
+        self.layer, self.scale = layer, scale
         if view is None:
             self.update()
             return
-        grid, versions = (view.up, view.up_v) if self.up else (view.down, view.down_v)
+        grid, versions = view.grid(layer, self.up), view.up_v if self.up else view.down_v
         w, changed = len(view.fv), False
-        lut, n = [bytes((c[0], c[1], c[2], 255)) for c in self.LUT], len(self.LUT)
+        lut = [bytes((c[0], c[1], c[2], 255)) for c in (self.LUT if layer == "f" else self.SEQ)]
+        n = len(lut)
         none, dark, bad = (bytes((c[0], c[1], c[2], 255)) for c in (self.UNMEASURED, self.DARK, self.BAD))
+        lo, hi = (-scale, scale) if layer == "f" else scale
+        width = (hi - lo) or 1.0
         for j, row in enumerate(grid):
             if self._rows.get(j, (None,))[0] == versions[j]:
                 continue
@@ -1790,7 +1802,7 @@ class MapImage(QtWidgets.QWidget):
                 elif x == -math.inf:
                     out.append(dark)
                 else:
-                    out.append(lut[min(max(int((x / span + 1) / 2 * (n - 1) + 0.5), 0), n - 1)])
+                    out.append(lut[min(max(int((x - lo) / width * (n - 1) + 0.5), 0), n - 1)])
             self._rows[j] = (versions[j], b"".join(out))
             changed = True
         if changed or self._image is None:
@@ -1845,20 +1857,26 @@ class MapImage(QtWidgets.QWidget):
             QtWidgets.QToolTip.hideText()
             return
         v, (j, k) = self.view, c
-        x = (v.up if self.up else v.down)[j][k]
+        x = v.grid("f", self.up)[j][k]
         i, piezo = (v.fv[k], v.sv[j]) if v.fast == "current" else (v.sv[j], v.fv[k])
         what = ("not measured yet" if x is None else "no valid reading" if x != x else "not lasing"
                 if x == -math.inf else f"{x:+.3f} GHz from where it began")
+        power, pd = v.grid("power", self.up)[j][k], v.grid("pd", self.up)[j][k]
+        if isinstance(power, (int, float)) and math.isfinite(power):
+            what += f"; {power:.3g} µW at the wavemeter"
+        if isinstance(pd, (int, float)) and math.isfinite(pd):
+            what += f"; its photodiode {pd:.4g}"
         QtWidgets.QToolTip.showText(self.mapToGlobal(event_pos(ev)),
                                     f"{i:.3f} mA, {piezo:.3f} V, sweeping {'up' if self.up else 'down'}: {what}", self)
 
 
 class MapLegend(QtWidgets.QWidget):
-    """The colours of MapImage: GHz from where the laser began, and the points that are not a frequency."""
+    """The colours of MapImage: what its layer shows (GHz from where the laser began, µW at the wavemeter, its
+    photodiode), and the points that are not that."""
 
     def __init__(self):
         super().__init__()
-        self.span = 1.0
+        self.layer, self.scale, self.unit = "f", 1.0, ""
         self.setMinimumHeight(2 * self.fontMetrics().height() + 12)
 
     def paintEvent(self, ev):
@@ -1866,15 +1884,22 @@ class MapLegend(QtWidgets.QWidget):
         p.fillRect(self.rect(), QtGui.QColor(C["bg"]))
         fm = p.fontMetrics()
         bar = QtCore.QRectF(8, 4, min(320.0, self.width() * 0.45), fm.height() * 0.8)
-        lut = MapImage.LUT
+        lut = MapImage.LUT if self.layer == "f" else MapImage.SEQ
         for k, c in enumerate(lut):
             p.fillRect(QtCore.QRectF(bar.left() + bar.width() * k / len(lut), bar.top(), bar.width() / len(lut) + 1,
                                      bar.height()), QtGui.QColor(*c))
         p.setPen(QtGui.QColor(C["dim"]))
         under = QtCore.QRectF(bar.left(), bar.bottom() + 2, bar.width(), fm.height())
-        p.drawText(under, Qt.AlignmentFlag.AlignLeft, f"−{self.span:.3g} GHz")
-        p.drawText(under, Qt.AlignmentFlag.AlignHCenter, "where it began")
-        p.drawText(under, Qt.AlignmentFlag.AlignRight, f"+{self.span:.3g} GHz")
+        if self.layer == "f":
+            p.drawText(under, Qt.AlignmentFlag.AlignLeft, f"−{self.scale:.3g} GHz")
+            p.drawText(under, Qt.AlignmentFlag.AlignHCenter, "where it began")
+            p.drawText(under, Qt.AlignmentFlag.AlignRight, f"+{self.scale:.3g} GHz")
+        else:
+            lo, hi = self.scale
+            p.drawText(under, Qt.AlignmentFlag.AlignLeft, f"{lo:.3g} {self.unit}".rstrip())
+            p.drawText(under, Qt.AlignmentFlag.AlignHCenter, "at the wavemeter" if self.layer == "power"
+                       else "its photodiode")
+            p.drawText(under, Qt.AlignmentFlag.AlignRight, f"{hi:.3g} {self.unit}".rstrip())
         x = bar.right() + 24
         for color, text in ((MapImage.DARK, "not lasing"), (MapImage.BAD, "no valid reading"),
                             (MapImage.UNMEASURED, "not measured yet")):
@@ -1895,6 +1920,7 @@ class MapDialog(QtWidgets.QDialog):
              ("both", "both: a map each, the current's first"))
     PATTERNS = (("hops", "around hops, the dark and fading fringes, and at every Nth point"),
                 ("all", "at every point (a large file)"), ("off", "never"))
+    FF_END = (("back", "as it was"), ("fitted", "the ideal one the map finds, switched on"))
 
     def __init__(self, parent, engine: Engine, n: int):
         super().__init__(parent)
@@ -1973,6 +1999,18 @@ class MapDialog(QtWidgets.QDialog):
         self.repeat.setChecked(p.repeat)
         self.repeat.toggled.connect(self.check)
         form.addRow(self.repeat)
+        heading("Feedforward")
+        ff_note = Text("Off for the map, so that it is square in the current as measured against the piezo: its "
+                       "factor taken to 0 in steps that move the current 1 mA at most, the current read after each "
+                       "(what it adds learned as it goes), switched off there, and on again the same way after. "
+                       "Each map fits the ideal one from where the laser hops.", "dim")
+        ff_note.setWordWrap(True)
+        form.addRow(ff_note)
+        self.ff_end = QtWidgets.QComboBox()
+        self.ff_end.addItems([label for _, label in self.FF_END])
+        self.ff_end.setCurrentIndex(next((k for k, (key, _) in enumerate(self.FF_END) if key == p.ff_end), 0))
+        self.ff_end.currentIndexChanged.connect(self.check)
+        form.addRow("At the end, its feedforward", self.ff_end)
         heading("Temperature")
         self.temp_on = QtWidgets.QCheckBox("Step the temperature too: a whole map at each")
         self.temp_on.setChecked(p.t_step > 0)
@@ -2045,7 +2083,7 @@ class MapDialog(QtWidgets.QDialog):
                        settle=self.settle.value(), reads=self.reads.value(), dark=self.dark.value(),
                        patterns=self.PATTERNS[self.patterns.currentIndex()][0], every=self.every.value(),
                        record=self.record.text().strip(), repeat=self.repeat.isChecked(),
-                       folder=self.folder.text().strip())
+                       ff_end=self.FF_END[self.ff_end.currentIndex()][0], folder=self.folder.text().strip())
 
     def limits(self):
         """What take_over would read, from what map_look read (None: not yet)."""
@@ -2060,10 +2098,9 @@ class MapDialog(QtWidgets.QDialog):
             lo, hi = info.get(a), info.get(b)
             return (lo, hi) if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and lo < hi else None
 
-        ff = info.get(FF_ON) is True and isinstance(info.get(FF), (int, float))
-        t0 = info.get(TEMP_SET)
+        t0 = info.get(TEMP_SET)  # (its feedforward off for the map: read again once off, the map checks again)
         return {"clip": info.get(CLIP) if isinstance(info.get(CLIP), (int, float)) else math.inf,
-                "offset": act - i_set, "ff": info[FF] if ff else 0.0, "v0": v,
+                "offset": act - i_set, "ff": 0.0, "v0": v,
                 "pc": pair(PC_MIN, PC_MAX) or (-math.inf, math.inf), "tc": pair(TEMP_MIN, TEMP_MAX) or
                 (-math.inf, math.inf), "t0": t0 if isinstance(t0, (int, float)) else None}
 
@@ -2091,7 +2128,9 @@ class MapDialog(QtWidgets.QDialog):
         if isinstance(t, (int, float)):
             parts.append(f"{t:.3f} °C set")
         if info.get(FF_ON) is True and isinstance(info.get(FF), (int, float)):
-            parts.append(f"feedforward {info[FF]:+.4f} mA/V (taken into account)")
+            parts.append(f"feedforward {info[FF]:+.4f} mA/V (off for the map)")
+        elif isinstance(info.get(FF), (int, float)):
+            parts.append(f"feedforward off ({info[FF]:+.4f} mA/V when on)")
         pd = next((name for name in PD_NAMES if isinstance(info.get(name), (int, float))), "")
         parts.append(f"its photodiode ({pd}) read at each point" if pd else "no photodiode of its own read")
         warn = []
@@ -2151,9 +2190,12 @@ class MapDialog(QtWidgets.QDialog):
 
 
 class MapWindow(QtWidgets.QWidget):
-    """A laser map as it goes, and once it is over: each way as a picture (MapImage), the last two sweeps, the last
-    interference pattern, what it noted; Stop puts the laser back where it began. Done, a picture of it is saved
-    next to its file."""
+    """A laser map as it goes, and once it is over: each way as a picture (MapImage) of what Show picks (its
+    frequency, the power at the wavemeter, its photodiode), the last two sweeps of the same, the last interference
+    pattern, what it noted (the ideal feedforward each map found among it); Stop puts the laser back where it began.
+    Done, a picture of it is saved next to its file."""
+
+    LAYERS = (("f", "frequency"), ("power", "power at the wavemeter"), ("pd", "its photodiode"))
 
     def __init__(self, win: "MainWindow", engine: Engine, n: int):
         super().__init__(win, Qt.WindowType.Window)
@@ -2166,6 +2208,11 @@ class MapWindow(QtWidgets.QWidget):
         self.which.setMinimumWidth(260)
         self.which.activated.connect(self._picked)
         top.addWidget(self.which)
+        top.addWidget(Text("Show", "dim"))
+        self.show_what = QtWidgets.QComboBox()
+        self.show_what.addItems([label for _, label in self.LAYERS])
+        self.show_what.activated.connect(self._layer)
+        top.addWidget(self.show_what)
         self.bar = QtWidgets.QProgressBar()
         self.bar.setRange(0, 1000)
         self.bar.setTextVisible(False)
@@ -2224,6 +2271,34 @@ class MapWindow(QtWidgets.QWidget):
         ch = self.engine.channels[self.n]
         return ch.mapper or ch.map_last
 
+    @property
+    def layer(self) -> str:
+        return self.LAYERS[max(self.show_what.currentIndex(), 0)][0]
+
+    def _layer(self, _k: int):
+        self._shown = (None, -1)
+        self.refresh()
+
+    def _unit(self, layer: str, m) -> str:
+        return {"f": "GHz", "power": "µW"}.get(layer) or PD_UNITS.get(m.pd, "")
+
+    def _scale(self, view, layer: str):
+        """What the colours cover: GHz either side of where it began (most of it), or (lowest, highest) (most of
+        those): a round number, so that the picture is drawn again only when it changes much."""
+        vals = [x for up in (True, False) for row in view.grid(layer, up) for x in row
+                if x is not None and x == x and x != -math.inf]
+        if layer == "f":
+            vals = sorted(abs(x) for x in vals)
+            span = max(vals[int(0.98 * (len(vals) - 1))] if vals else 1.0, 0.05)
+            return float(f"{span:.2g}")
+        vals.sort()
+        if not vals:
+            return (0.0, 1.0)
+        lo = 0.0 if layer == "power" else vals[int(0.02 * (len(vals) - 1))]
+        hi = vals[int(0.98 * (len(vals) - 1))]
+        lo, hi = float(f"{lo:.2g}"), float(f"{hi:.2g}")
+        return (lo, hi if hi > lo else lo + 1.0)
+
     def _picked(self, k: int):
         r = self.runner()
         if r is not None and 0 <= k < len(r.mapper.views):
@@ -2262,21 +2337,25 @@ class MapWindow(QtWidgets.QWidget):
         view = self.view
         if view is not None and (view, view.version) != self._shown:
             self._shown = (view, view.version)
-            vals = [abs(x) for grid in (view.up, view.down) for row in grid for x in row
-                    if x is not None and x == x and x != -math.inf]
-            span = max(sorted(vals)[int(0.98 * (len(vals) - 1))] if vals else 1.0, 0.05)
-            span = float(f"{span:.2g}")  # (a round number: the picture redrawn only when it changes much)
-            self.up_img.show_view(view, span)
-            self.down_img.show_view(view, span)
-            self.legend.span = span
+            layer = self.layer
+            if layer == "pd" and not m.pd:
+                layer = "f"
+            scale = self._scale(view, layer)
+            self.up_img.show_view(view, scale, layer)
+            self.down_img.show_view(view, scale, layer)
+            self.legend.layer, self.legend.scale, self.legend.unit = layer, scale, self._unit(layer, m)
             self.legend.update()
             self.sweeps.series.clear()
+            col = {"f": 1, "power": 2, "pd": 3}[layer]
             for trace, color in ((m.trace_before, "dim"), (m.trace, "accent")):
-                self.sweeps.add([x for x, _ in trace], [g for _, g in trace], color, "dots", 1.5)
+                self.sweeps.add([t[0] for t in trace], [t[col] for t in trace], color, "dots", 1.5)
             self.sweeps.xlabel = f"{view.fast} ({'mA' if view.fast == 'current' else 'V'})"
+            self.sweeps.ylabel = self._unit(layer, m)
             legs = {1: "up", 2: "down", 0: "down to the dark"}
+            what = {"f": "frequency from where it began", "power": "power at the wavemeter",
+                    "pd": "its photodiode"}[layer]
             self.sweeps_box.findChild(QtWidgets.QLabel).setText(
-                f"the last two sweeps: frequency from where it began, now {legs.get(m.trace_legs[0], '')} (blue), "
+                f"the last two sweeps: {what}, now {legs.get(m.trace_legs[0], '')} (blue), "
                 f"before that {legs.get(m.trace_legs[1], '…')} (grey)")
             self.sweeps.update()
             self.pattern.series.clear()

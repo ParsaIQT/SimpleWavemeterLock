@@ -786,6 +786,10 @@ def test_a_laser_map_from_its_dialog_to_its_window_and_picture(app, demo, tmp_pa
         d.i_hi.setValue(152.0)
         p = d.plan()
         assert (p.i_lo, p.i_hi, p.v_lo, p.v_hi, p.patterns, p.repeat) == (145.0, 152.0, 68.0, 72.0, "all", False)
+        assert p.ff_end == "back"
+        d.ff_end.setCurrentIndex(1)
+        assert d.plan().ff_end == "fitted" and d.start.isEnabled()
+        d.ff_end.setCurrentIndex(0)
         d._start()
         assert d.result() == QtWidgets.QDialog.DialogCode.Accepted
         w = win.map_window(e, 3)
@@ -801,6 +805,16 @@ def test_a_laser_map_from_its_dialog_to_its_window_and_picture(app, demo, tmp_pa
         assert png.exists() and png.stat().st_size > 1000
         assert w.which.count() == 1 and not w.stop.isEnabled()
         assert w.pattern.series and w.sweeps.series
+        drawn = w.up_img._image.copy()
+        w.show_what.setCurrentIndex(1)  # the power at the wavemeter
+        w._layer(1)
+        assert w.up_img.layer == "power" and w.legend.layer == "power" and w.legend.unit == "µW"
+        lo, hi = w.legend.scale
+        assert lo == 0.0 and hi > 0 and w.sweeps.ylabel == "µW" and w.up_img._image != drawn
+        w.show_what.setCurrentIndex(2)  # its photodiode
+        w._layer(2)
+        assert w.up_img.layer == "pd" and w.legend.unit == "µA" and w.legend.scale[1] > w.legend.scale[0]
+        w.grab()  # (painted with each, without trouble)
         with load(ch.map_last.mapper.out.path) as f:
             assert len(f.points) > 40
         acts = {a.text() for a in _menu_actions(row)}

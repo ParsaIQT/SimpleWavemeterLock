@@ -1775,6 +1775,7 @@ class Engine:
                              "restored": r.restored if r else True, "points": m.points, "lasing": m.lasing,
                              "patterns_kept": m.kept, "f_end": m.f_end, "local": time.strftime("%Y-%m-%d %H:%M:%S"),
                              "took_s": round(r.now - r.started, 1) if r else 0.0, "notes": m.notes[-200:],
+                             "fits": m.fits, "feedforward": m.ff_state(),
                              "pattern_info": {str(k): v for k, v in (getattr(self.source, "pattern_info", {}) or
                                                                      {}).items()}})
             threading.Thread(target=out.close, daemon=True, name="map file close").start()

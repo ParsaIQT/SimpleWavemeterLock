@@ -42,9 +42,11 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
   own name with its own channels, lasers and settings, told apart by their serial numbers (see
   *Several wavemeters on one PC*).
 * **Laser maps**: a laser's current and piezo (and its temperature, if asked) swept over all the
-  ground you give them, both ways, with everything the wavemeter says at every point (its frequency,
-  power, exposure, and its interference patterns: the spectrum, where a second mode shows) and the DLC
-  pro's photodiode, kept in a file to look at the laser afterwards and to model it (see *Laser maps*).
+  ground you give them, both ways, its feedforward off (a square in the current as measured), with
+  everything the wavemeter says at every point (its frequency, power, exposure, and its interference
+  patterns: the spectrum, where a second mode shows) and what the DLC pro measures, kept in a file to look
+  at the laser afterwards and to model it; the ideal feedforward fitted from where it hops, and set if you
+  like (see *Laser maps*).
 * Fast by construction: the wavemeter is read in its own thread, all network I/O
   happens in one worker thread per controller (writes are coalesced, Nagle off),
   and the GUI only repaints numbers that changed. Nothing ever blocks the window.
@@ -1148,8 +1150,8 @@ and temperature limits, feedforward, and whether it has a photodiode of its own.
 
 * **Current**: from, to, step, in mA *as measured* (as the DLC pro shows it: Act). The highest is
   yours to give, and the map never goes above it (nor above the controller's current-clip). The
-  dialog refuses a highest current that needs a set current above current-clip, with the
-  feedforward taken into account at both ends of the piezo range.
+  dialog refuses a highest current that needs a set current above current-clip. Its feedforward is
+  off for the map (below), so the map is a square in the measured current against the piezo.
 * **Below threshold**: sweeping the current down, this many points in a row without lasing end the
   sweep that way (0: always down to the lowest). Below there the laser does not lase, and each point
   would cost a long exposure.
@@ -1159,6 +1161,7 @@ and temperature limits, feedforward, and whether it has a photodiode of its own.
   every line is swept up and then back down, and the file keeps the two apart.
 * **Each point**: how long to wait after the step, and how many readings to take that began after it.
 * **The first line swept again at the end**: how far things moved over the map.
+* **At the end, its feedforward**: *as it was*, or *the ideal one the map finds, switched on* (below).
 * **Temperature** (optional): from, to, step (`dl:tc:temp-set`). A whole map is made at each
   temperature once it has settled: within the tolerance for the hold time, or after the longest wait
   (mapped all the same, and noted). The temperature goes back where it was at the end.
@@ -1180,8 +1183,9 @@ greyed out until there are none. The plan is remembered for that channel.
 **At each point**: the step is written, the map waits, and then it takes readings that *began* after
 the step. Each reading's exposure says when it began. Each reading comes with the wavemeter's power,
 exposure (both arrays) and fringe amplitudes, and with its patterns when they are wanted. The DLC
-pro's photodiode is read meanwhile. With the exposure on auto, a dim laser is measured slowly, and the
-map simply waits for it.
+pro's current and piezo voltage as measured (`dl:cc:current-act`, `dl:pc:voltage-act`) and its
+photodiode are read meanwhile. With the exposure on auto, a dim laser is measured slowly, and the map
+simply waits for it.
 
 Where the laser does not lase, the WLM says *low signal* or *no signal* once and then nothing new,
 while its exposure grows to seconds. The map counts the point as dark once the wavemeter has said no
@@ -1198,19 +1202,65 @@ laser *starts* lasing again (well above where it stops, as a rule), and back dow
 Sweeping the piezo, each line goes from the lowest voltage to the highest and back; a line dark all the
 way up is not swept back.
 
+**Its feedforward is off for the map.** With the DLC pro's feedforward on, a square of set current
+and piezo is a slanted band of measured current: above your highest current at one corner and below
+threshold at another. What the feedforward adds at rest is its factor times a voltage, and the program
+cannot know which beforehand: from 0 V it would be tens of mA at a 70 V piezo, but on the lab's
+493 nm DL pro (its piezo moved by its scan's offset, its scan off) it adds nothing at all (its
+feedforward follows the scan alone). So the factor is taken to 0 in steps that cannot move the current
+more than 0.95 mA each by what is known so far, the current is read after each (what it adds is learned
+as it goes: the first step is small, the next as large as that allows), and the current is lowered first
+wherever a step could take it above where it began. Then the feedforward is switched off at a factor of
+0, where that does nothing, and its factor is written back as it was (off, it does nothing). At the end
+it is switched on at 0 and its factor stepped back the same way. On the lab's DL pro (−0.6 mA/V) that
+would be three steps: the current lowered 0.95 mA for the first (a small one, from which nothing is known
+yet), and then hardly moving. The file keeps what it learned (`meta` `feedforward`: what it added at
+rest, from where the DLC pro reckons it, each step).
+
+> A map made before this (the program's version of 24 October) wrote the set current so that the
+> feedforward, as it thought it worked (from 0 V), gave the planned current. On the lab's DL pro the
+> feedforward did no such thing, so the measured current was the set one: the planned current plus
+> 0.6 mA per volt above where it began (up to 12 mA above its highest at the top of a 40 V piezo
+> range). The power at the wavemeter shows it (it grows with the piezo 0.66 times as fast as with the
+> current). Read such a file with the set current (`i_set` plus what the current was besides where it
+> began: `LaserMap.sweeps("set")`, as the reader does when the current was not read at each point).
+
 **Safety**: the measured current never goes above your highest (or above where it began, if that was
 higher, on the way back). The set current never exceeds current-clip, and the piezo stays within its
 limits and your range. The temperature stays within the controller's limits and your range. Nothing
-else is written but the scan switched off (`scan:enabled`, on again after), and every move is in
-steps: at most 1 mA and 5 V a write for moves, the plan's step for sweeps. With the DLC pro's
-feedforward on, the set current is written so that the measured current is the map's (the feedforward
-moves it ff mA per volt of piezo). During a piezo move, a step that would take the measured current up
-writes the current first, so it never overshoots.
+else is written but the scan switched off (`scan:enabled`, on again after) and its feedforward as above,
+and every move is in steps: at most 1 mA and 5 V a write for moves, the plan's step for sweeps. Its
+driver refuses a step of the feedforward's factor that could move the current more than 5 mA or take it
+above your highest, switching the feedforward where its factor is not 0 (unless what it adds is known to
+be next to nothing), and moving the piezo while the feedforward adds anything.
+
+**The ideal feedforward**: an ECDL hops where the misalignment between its external cavity's mode and
+its grating (or its diode chip's modes) reaches its limit; the boundaries between its modes lie along
+lines of constant misalignment, and their slope in the current against the piezo, dI/dV, is the
+feedforward that keeps it on one mode as the piezo moves. At the end of each map the boundaries are
+followed from line to line: a hop on the next line that goes the same way by about as much (a laser may
+hop by one mode of its chip, or two), between the same two modes (their frequencies, its tuning taken
+off), and their slope pooled. It is said in the notes and kept in the file (`meta` `fits`), with the
+hysteresis (how much later it hops sweeping up than back sweeping down), how far apart its hops are, how
+it tunes on a mode and how it would tune along the ideal feedforward. Its hops repeat along a sweep, so
+by where they are alone a boundary moving one hop spacing more or less from line to line would look the
+same: the modes either side tell them apart, and the notes say so when the boundaries move nearly that
+far from one line to the next (smaller piezo steps, to be sure). With *the ideal one the map finds,
+switched on*, its feedforward ends as that (switched on and stepped there as above), if a map found it
+well enough (to 25 %); the measured current goes back where it began.
+
+From the lab's first map of its 493 nm DL pro (−0.6 mA/V, 55 to 75 mA in 0.2 mA steps at 2 V piezo
+steps, read with the set current as above): the ideal feedforward −0.58 ± 0.01 mA/V (368 hops along 83
+boundaries), so its own was right; hops by one mode of its chip (88 GHz) or two, every 0.8 mA on
+average; on a mode it tunes −1.6 GHz/mA, and +2.2 GHz/V along the ideal feedforward; hysteresis 1.8 mA;
+the power at the wavemeter 0.52 µW per mA above a threshold of about 30 mA. Its boundaries move 1.2 mA
+from one 2 V line to the next, nearly as far as from one hop to the next: 0.5 V piezo steps next time.
 
 At the end, **or when you stop it** (the row's *Mapping* button, or *Stop map* in its window), the
 laser goes back where it began: the temperature (at the end it waits for it to settle; stopped, it sets
-it back and goes on), then the piezo and the current, then its scan if it was on. At the end it reads
-the frequency there and notes how far it is from where it began.
+it back and goes on), then the piezo, its feedforward (on again, stepped as above; stopped, the same with
+nothing read) and the current, then its scan if it was on. At the end it reads the frequency there and
+notes how far it is from where it began.
 Hysteresis may leave it on another mode, so *Recenter now* or lock it again. Closing the program puts it
 back the same way. A map whose wavemeter channel is switched off is switched on again. A map the
 wavemeter stops reading (nothing at all for three points) stops and puts everything back. So does a
@@ -1218,12 +1268,13 @@ controller that stops answering or a file that cannot be written.
 
 **Its window** (it opens when the map starts; right-click › *Laser map (going on)…* or *Last laser
 map…* opens it again) shows each way as a picture: sweeping up and sweeping down side by side, the
-swept axis across, the other up. Each point is coloured by its frequency from where the laser began
-(blue below, red above, grey at it). It is black where the laser did not lase and light grey where the
-wavemeter read nothing valid; hover over a point to see what it is. Below are the last two sweeps
-(frequency against the swept axis, mode hops as steps), the last interference pattern and the map's
-notes. When it is over, a picture of both ways is saved next to the file (`.png`). The row says how
-far it is and how long it has to go.
+swept axis across, the other up. *Show* picks what the colours show: its **frequency** from where the
+laser began (blue below, red above, grey at it), the **power at the wavemeter** (µW: dark blue the
+least, light the most) or **its photodiode**. It is black where the laser did not lase and light grey
+where nothing was read; hover over a point to see all three. Below are the last two sweeps (of the
+same, against the swept axis: mode hops as steps), the last interference pattern and the map's notes
+(the ideal feedforward each map found among them). When it is over, a picture of both ways is saved
+next to the file (`.png`). The row says how far it is and how long it has to go.
 
 ![a laser map of the simulated 854 nm DL pro, going on](docs/laser_map.png)
 
@@ -1232,9 +1283,9 @@ far it is and how long it has to go.
 
 | table      | a row is | columns |
 |------------|----------|---------|
-| `meta`     | a key, its value as JSON | `plan`, `laser` (channel, name, controller, what drives its piezo and current), `wavemeter` (model, serial), `start` (set and measured current, piezo, temperature, current-clip, feedforward, limits, scan), `recorded`, `program`, `began`, `units`, `end` (outcome, points, patterns kept, the frequency back where it began, the notes, the patterns' size) |
+| `meta`     | a key, its value as JSON | `plan`, `laser` (channel, name, controller, what drives its piezo and current), `wavemeter` (model, serial), `start` (set and measured current, piezo, temperature, current-clip, feedforward, limits, scan), `recorded`, `program`, `began`, `units`, `feedforward` (as it began, what it added at rest, from where it is reckoned, the steps of its factor and what each did, how it ended), `fits` (the ideal feedforward of each map, its hysteresis, hop spacing, tuning), `end` (outcome, points, patterns kept, the frequency back where it began, the notes, the patterns' size, the fits) |
 | `lines`    | a line | `map` (which map), `axis` (what it sweeps), `line`, `slow` (the other axis there), `temp`, `repeat` (the first line again), `t0`, `t1` |
-| `points`   | a point | `line_id`, `leg` (1 up, 2 down, 0 a descent), `k` (its step), `t` (s since the map began), `i` (mA measured), `i_set`, `v`, `temp`, `f` (THz: the median of its valid readings; empty if none), `f_lo`, `f_hi`, `n`, `bad` (invalid readings), `status`, `how` (`done`, `dark` (by its photodiode), `quiet` (the wavemeter said no light, then nothing), `invalid`, `timeout`), `wait`, `power` (µW, the wavemeter's), `exp1`, `exp2` (ms), `amin1` … `aavg2` (fringe amplitudes), `vals` (the parameters read, JSON), `event` (`hop`, `dark`, `lasing`, `invalid`, `spread`, `fade`) |
+| `points`   | a point | `line_id`, `leg` (1 up, 2 down, 0 a descent), `k` (its step), `t` (s since the map began), `i` (mA measured, as planned), `i_set`, `i_act` (mA measured, as read there), `v`, `v_act` (V, as read there), `temp`, `f` (THz: the median of its valid readings; empty if none), `f_lo`, `f_hi`, `n`, `bad` (invalid readings), `status`, `how` (`done`, `dark` (by its photodiode), `quiet` (the wavemeter said no light, then nothing), `invalid`, `timeout`), `wait`, `power` (µW, the wavemeter's), `exp1`, `exp2` (ms), `amin1` … `aavg2` (fringe amplitudes), `vals` (the parameters read, JSON), `event` (`hop`, `dark`, `lasing`, `invalid`, `spread`, `fade`) |
 | `readings` | a reading | `point_id`, `t`, `f`, `status`, `power` |
 | `patterns` | an interference pattern | `point_id`, `kind` (0 its interferometers, 1 its wide interferometer or grating, 4 and 5 its analysis x and y, if that is on), `dtype`, `n`, `codec`, `data` (lossless: differences from pixel to pixel, zlib) |
 | `events`   | something that happened | `t`, `kind`, `text` |
@@ -1250,10 +1301,13 @@ with load("map_2026-10-24_171230_ch3_854.sqlite") as m:
         xs = [p["i"] for p in points]            # mA measured (p["v"]: V)
         fs = [p["f"] for p in points]            # THz, None: dark or no valid reading
     patterns = m.patterns(points[0]["id"])       # {kind: [counts, ...]}, where kept
+    print(m.meta.get("fits") or m.fits())        # the ideal feedforward, fitted again if not kept
+    views = m.views()                            # the maps as the window has them (frequency, power, photodiode)
 ```
 
 `python -m wmlock.lasermap FILE…` says what a map holds (its plan, where it began, how many points,
-lasing, hops each way, how it ended); `--csv` writes its points as `FILE.csv` too.
+lasing, hops each way, its feedforward, the ideal one each map found, how it ended); `--csv` writes its
+points as `FILE.csv` too.
 
 **How long, how big**: a point takes the settling time, a round trip to the DLC pro and its readings.
 With 2 ms exposures that's about 70 ms with the defaults; where the laser is dim, much longer. 100 mA

@@ -3,8 +3,10 @@
 through the real client, in the same thread.
 
 Every run checks the safety rules: the measured current never above the plan's highest (or where it began), the
-set current never above current-clip, the piezo within the plan and its limits, every write a step, and nothing
-written but current, piezo, temperature and the scan's switch."""
+set current never above current-clip, the piezo within the plan and its limits, every write a step (a step of the
+feedforward's factor too, by what it really adds), the piezo never moved while the feedforward adds anything, and
+nothing written but current, piezo, temperature, the scan's switch and the feedforward: the measured current
+replayed over every write, the feedforward's included."""
 import math
 import random
 import statistics
@@ -12,8 +14,8 @@ import statistics
 import pytest
 
 from wmlock.dlcpro import DecopError, DLCPro
-from wmlock.lasermap import (STEP_I, STEP_V, Leg, MapFile, MapPlan, Mapper, MapRunner, contrast, file_name, grid,
-                             load, pack, unpack)
+from wmlock.lasermap import (STEP_I, STEP_V, Leg, MapFile, MapPlan, Mapper, MapRunner, MapView, contrast, file_name,
+                             fit_feedforward, fit_sweeps, grid, load, pack, sweep_hops, unpack)
 from wmlock.modehop import perform
 from wmlock.sim import ECDL, FakeDLCPro, SimCCD
 from wmlock.wavemeter import WLM_ERRORS, Reading
@@ -38,11 +40,11 @@ class MapBench:
     laser as it was when it began, and is handed on at its end, if its value changed (as a source does)."""
 
     def __init__(self, laser=None, current=I0, offset=V0, ff=0.0, scan=False, pd=True, temp=20.0, patterns=True,
-                 seed=0, clip=200.0, act_offset=0.0, ta=None, locked=False, noise=0.5):
+                 seed=0, clip=200.0, act_offset=0.0, ta=None, locked=False, noise=0.5, ff_on=None, ff_from=0.0):
         self.t = 0.0
         self.laser = laser if laser is not None else ECDL(F0, i_stop=100.0, i_start=103.0, seed=seed)
         cfg = {"current": current, "offset": offset, "scan": scan, "feedforward": ff, "temp": temp, "clip": clip,
-               "act_offset": act_offset, "locked": locked}
+               "act_offset": act_offset, "locked": locked, "ff_from": ff_from}
         self.dlc = FakeDLCPro("SN-M", "map bench", {1: cfg}, serve=False, clock=lambda: self.t)
         self.client = Loopback(self.dlc)
         self.ccd = SimCCD(seed=seed)
@@ -60,8 +62,12 @@ class MapBench:
             self.dlc.params["laser1:dl:pd:photodiode"] = lambda: self.laser.photodiode(self.act)
         if ta is not None:
             self.dlc.params["laser1:amp:cc:enabled"] = ta
-        for name in ("dl:cc:current-set", "scan:offset"):  # the laser follows each change as it is made
-            self.dlc.on_set["laser1:" + name] = self._settle
+        if ff_on is not None:
+            self.dlc.params["laser1:dl:cc:feedforward-enabled"] = ff_on
+        self.ff_start = (self.dlc.params["laser1:dl:cc:feedforward-enabled"],
+                         self.dlc.params["laser1:dl:cc:feedforward-factor"])
+        for name in ("dl:cc:current-set", "scan:offset", "dl:cc:feedforward-enabled", "dl:cc:feedforward-factor"):
+            self.dlc.on_set["laser1:" + name] = self._settle  # (the laser follows each change as it is made)
         self._settle(None)
 
     def _settle(self, _value):
@@ -151,25 +157,69 @@ def plan(**kw) -> MapPlan:
     return MapPlan(**d)
 
 
-def check_rules(b: MapBench, p: MapPlan, start=(I0, V0)):
-    """The safety rules over everything written."""
+def set_when(b: MapBench, name: str) -> float:
+    """The set current when `name` was first written."""
+    i_set = I0
+    for param, value in b.dlc.log:
+        if param == "laser1:" + name:
+            return i_set
+        if param == "laser1:dl:cc:current-set":
+            i_set = value
+    raise AssertionError(f"{name} never written")
+
+
+def replay(b: MapBench, start=(I0, V0)):
+    """(name, value, the measured current then) for every write, the feedforward's effect included."""
     d = b.dlc.params
     off = b.dlc.bias[1] + d["laser1:dl:cc:current-offset"]
-    ff = d["laser1:dl:cc:feedforward-factor"] if d["laser1:dl:cc:feedforward-enabled"] else 0.0
+    ref = b.dlc.ff_from[1]
+    on, factor = b.ff_start
     i_set, v = start
-    top = max(p.i_hi, start[0] + off + ff * start[1])
     for name, value in b.dlc.log:
+        if name.endswith("current-set"):
+            i_set = value
+        elif name.endswith("scan:offset"):
+            v = value
+        elif name.endswith("feedforward-enabled"):
+            on = value
+        elif name.endswith("feedforward-factor"):
+            factor = value
+        yield name, value, i_set + off + (factor * (v - ref) if on and ref is not None else 0.0)
+
+
+def check_rules(b: MapBench, p: MapPlan, start=(I0, V0)) -> float:
+    """The safety rules over everything written, the measured current replayed write by write (the feedforward's
+    switch and factor too): the highest it was."""
+    d = b.dlc.params
+    ref = b.dlc.ff_from[1]
+    on, factor = b.ff_start
+    i_set, v = start
+    act = i_set + b.dlc.bias[1] + (factor * (v - ref) if on and ref is not None else 0.0)
+    top = max(p.i_hi, act)
+    most = -math.inf
+    for (name, value), (_, _, now) in zip(b.dlc.log, replay(b, start)):
         assert name in ("laser1:dl:cc:current-set", "laser1:scan:offset", "laser1:dl:tc:temp-set",
-                        "laser1:scan:enabled"), name
+                        "laser1:scan:enabled", "laser1:dl:cc:feedforward-enabled",
+                        "laser1:dl:cc:feedforward-factor"), name
         if name.endswith("current-set"):
             assert abs(value - i_set) <= STEP_I + 1e-6
             i_set = value
-            assert value <= d["laser1:dl:cc:current-clip"] + 1e-9
+            assert 0.0 <= value <= d["laser1:dl:cc:current-clip"] + 1e-9
         elif name.endswith("scan:offset"):
             assert abs(value - v) <= STEP_V + 1e-6
+            assert not (on and factor), "the piezo moved while the feedforward adds"
             v = value
             assert min(p.v_lo, start[1]) - 1e-9 <= v <= max(p.v_hi, start[1]) + 1e-9
-        assert i_set + off + ff * v <= top + 1e-6, (name, value)
+        elif name.endswith("feedforward-enabled"):
+            assert not factor or ref is None, "switched with its factor not 0"
+            on = value
+        elif name.endswith("feedforward-factor"):
+            assert not on or abs(now - act) <= 1.0 + 1e-6, (value, now - act)  # (a step: 1 mA at most)
+            factor = value
+        assert now <= top + 1e-6, (name, value, now)
+        act = now
+        most = max(most, now)
+    return most
 
 
 # ------------------------------------------------------------------ the plan
@@ -344,20 +394,210 @@ def test_the_piezo_swept_at_each_current(tmp_path):
         assert sum(q["event"] == "hop" for q in f.points) > 4
 
 
-def test_with_the_feedforward_on_the_measured_current_is_as_mapped(tmp_path):
+def test_its_feedforward_is_off_while_it_maps_and_on_again_after(tmp_path):
+    """With its feedforward on (-0.15 mA/V, from 0 V as this fake DLC pro reckons it: -10.5 mA at 70 V), a square of
+    set current and piezo would be a slanted band of measured current: off, the map is square in the current as
+    measured. Its factor is taken to 0 in steps of 1 mA at most, the current read after each and kept no higher than
+    where it began (what the feedforward adds learned meanwhile), switched off there, and back the same way."""
     b = MapBench(ff=-0.15, patterns=False, act_offset=0.3)
-    p = plan(sweep="both", i_lo=145.0, i_hi=152.0, i_step=1.0, v_lo=60.0, v_hi=80.0, v_step=5.0, patterns="off")
+    a0 = I0 + 0.3 - 0.15 * V0
+    p = plan(sweep="both", i_lo=135.0, i_hi=152.0, i_step=1.0, v_lo=60.0, v_hi=80.0, v_step=5.0, patterns="off")
     out = MapFile(tmp_path / "m.sqlite")
     r = b.run(Mapper(p, out))
     out.close()
     assert r.state == "done", r.error
-    check_rules(b, p, start=(I0, V0))
+    assert check_rules(b, p) <= 152.0 + 1e-6
+    assert b.writes("dl:cc:feedforward-enabled") == [False, True]
+    factors = b.writes("dl:cc:feedforward-factor")
+    off_at = factors.index(0.0)
+    assert 8 <= off_at <= 14 and factors[off_at + 1] == -0.15 and factors[-1] == -0.15  # (back as it was, while off)
+    before = [now for name, _, now in replay(b) if True]
+    switched = next(k for k, (name, _, _) in enumerate(replay(b)) if name.endswith("feedforward-enabled"))
+    assert all(a0 - 1.0 - 1e-6 <= now <= a0 + 1e-6 for now in before[:switched])  # (no dip, no jump)
     with load(out.path) as f:
         assert {ln["axis"] for ln in f.lines} == {"current", "piezo"}
-        for q in f.points:  # what was set has the measured current (set + 0.3 mA + ff times the piezo) as mapped
-            assert q["i_set"] + 0.3 - 0.15 * q["v"] == pytest.approx(q["i"], abs=1e-6)
-        assert f.meta["start"]["feedforward"] == -0.15
-    assert abs(b.act - (I0 + 0.3 - 0.15 * V0)) < 1e-6 and abs(b.V - V0) < 1e-9
+        for q in f.points:  # its feedforward off: the set current and 0.3 mA, wherever the piezo
+            assert q["i_set"] + 0.3 == pytest.approx(q["i"], abs=1e-6)
+            assert q["i_act"] == pytest.approx(q["i"], abs=1e-6) and q["v_act"] == pytest.approx(q["v"], abs=1e-6)
+        assert {q["i"] for q in f.points if q["leg"] == 1 and f.lines[q["line_id"] - 1]["axis"] == "current"} >= \
+            {135.0 + k for k in range(4, 18)}  # (up to the top at every piezo voltage: a square)
+        ff = f.meta["feedforward"]
+        assert ff["was_on"] and ff["gap"] == pytest.approx(70.0, abs=1e-3)
+        assert ff["adds_at_rest"] == pytest.approx(-10.5, abs=1e-3)
+        assert ff["reckoned_from"] == pytest.approx(0.0, abs=1e-3)
+        assert ff["end"] == {"on": True, "factor": -0.15, "fitted": False} and not ff["applied"]
+        assert f.meta["start"]["feedforward"] == -0.15 and "i_act" in f.meta["units"]
+    assert b.dlc.params["laser1:dl:cc:feedforward-enabled"] is True
+    assert abs(b.act - a0) < 1e-6 and abs(b.I - I0) < 1e-9 and abs(b.V - V0) < 1e-9
+
+
+def test_a_feedforward_that_adds_nothing_at_rest_is_off_in_a_few_steps(tmp_path):
+    """As on the lab's DL pro (the piezo its scan's offset, its scan off): -0.6 mA/V that add nothing at rest. Its
+    first step of 1 mA at most finds it adds next to nothing; the rest in two: no dip either way."""
+    b = MapBench(ff=-0.6, ff_from=None, patterns=False)
+    p = plan(i_lo=140.0, i_hi=160.0, i_step=1.0, v_lo=60.0, v_hi=80.0, v_step=5.0, patterns="off")
+    r = b.run(Mapper(p, None))
+    assert r.state == "done", r.error
+    check_rules(b, p)
+    factors = b.writes("dl:cc:feedforward-factor")
+    assert len(factors[:factors.index(0.0) + 1]) <= 4 and factors[-1] == -0.6
+    m = r.mapper
+    assert abs(m.gap) < 0.1 and m.ff_state()["adds_at_rest"] == pytest.approx(0.0, abs=0.06)
+    assert min(b.writes("dl:cc:current-set")[:3]) >= I0 - 1.0 - 1e-6
+    assert abs(b.act - I0) < 1e-6 and abs(b.I - I0) < 1e-9
+
+
+def ideal(laser) -> float:
+    """The simulated laser's ideal feedforward: mA per V that keep its misalignment, and so its mode, as it is."""
+    return -(laser.kv - laser.ksv) / (laser.ki - laser.ksi)
+
+
+def test_the_ideal_feedforward_is_fitted_from_where_it_hops(tmp_path):
+    """Its mode boundaries lie along lines of constant misalignment: their slope is the ideal feedforward (-0.0457
+    mA/V for the simulated laser), found to a few percent; the hysteresis (1.2 GHz of misalignment at 1.75 GHz/mA:
+    0.69 mA), the distance between hops (6 GHz: 3.43 mA) and its tuning along the ideal feedforward (0.411 GHz/V)."""
+    b = MapBench(patterns=False)
+    p = plan(i_lo=125.0, i_hi=160.0, i_step=0.2, v_lo=50.0, v_hi=90.0, v_step=4.0, repeat=False, patterns="off")
+    out = MapFile(tmp_path / "m.sqlite")
+    r = b.run(Mapper(p, out))
+    out.close()
+    assert r.state == "done", r.error
+    m, laser = r.mapper, b.laser
+    (fit,) = m.fits
+    assert fit["ff"] == pytest.approx(ideal(laser), rel=0.08) and fit["err"] < 0.004
+    assert fit["boundaries"] >= 8 and fit["hops"] >= 60
+    assert fit["hysteresis"] == pytest.approx(2 * laser.hysteresis / (laser.ki - laser.ksi), abs=0.15)
+    assert fit["spacing"] == pytest.approx(laser.fsr / (laser.ki - laser.ksi), rel=0.1)
+    assert fit["df_di"] == pytest.approx(laser.ki, rel=0.1) and fit["df_dv"] == pytest.approx(laser.kv, rel=0.1)
+    assert fit["tuning"] == pytest.approx(laser.kv + laser.ki * ideal(laser), rel=0.1)
+    assert "the ideal feedforward -0.04" in m.result and any("the ideal feedforward" in t for _, t in m.notes)
+    with load(out.path) as f:
+        assert f.meta["fits"] == [fit]
+        (again,) = [fit_feedforward(v) for v in f.views()]  # (from its file alone, as the map had it)
+        assert again["ff"] == pytest.approx(fit["ff"], abs=1e-6) and again["hops"] == fit["hops"]
+
+
+def test_the_piezo_swept_tells_the_ideal_feedforward_too(tmp_path):
+    b = MapBench(patterns=False)
+    p = plan(sweep="piezo", i_lo=135.0, i_hi=150.0, i_step=0.5, v_lo=40.0, v_hi=100.0, v_step=1.0, repeat=False,
+             patterns="off")
+    r = b.run(Mapper(p, None))
+    assert r.state == "done", r.error
+    (fit,) = r.mapper.fits
+    assert fit["kind"] == "piezo" and fit["ff"] == pytest.approx(ideal(b.laser), rel=0.15)
+    assert fit["hysteresis"] == pytest.approx(2 * b.laser.hysteresis / (b.laser.kv - b.laser.ksv), rel=0.25)
+
+
+def test_boundaries_that_move_nearly_a_hop_from_line_to_line_are_told_apart_by_their_modes():
+    """As the lab's 493 nm DL pro: hops by one mode of its chip (-90 GHz) twice, then by two (+175 GHz), every 1.07 mA,
+    each cycle of three 7.6 GHz lower (its tuning taken off); the boundaries move -1.16 mA from one 2 V line to the
+    next, more than half the way to the next hop: by where they are alone, one boundary for another. By the modes
+    either side, the right one: -0.58 mA/V; the hysteresis (0.5 mA) and how it tunes besides."""
+    def ghz(i, v, up):
+        u = i + 0.58 * (v - 70.0) + (0.0 if up else 0.5)  # (along a boundary u stays: sweeping down, 0.5 mA lower)
+        c = math.floor(u / 1.07)
+        return [40.0, -50.0, -140.0][c % 3] - 7.6 * (c // 3) - 1.6 * (i - 65.0) + 1.1 * (v - 70.0)
+
+    currents = [55.0 + 0.2 * k for k in range(101)]
+    sweeps = {1: [], 2: []}
+    for v in [50.0 + 2 * j for j in range(21)]:
+        sweeps[1].append((v, currents, [ghz(i, v, True) for i in currents]))
+        sweeps[2].append((v, currents[::-1], [ghz(i, v, False) for i in currents[::-1]]))
+    fit = fit_sweeps(sweeps, "current")
+    assert fit["ff"] == pytest.approx(-0.58, abs=0.02) and fit["boundaries"] >= 20
+    assert fit["hysteresis"] == pytest.approx(0.5, abs=0.15)
+    assert fit["df_di"] == pytest.approx(-1.6, abs=0.05) and fit["df_dv"] == pytest.approx(1.1, abs=0.1)
+    assert fit["shift"] > 0.4 * fit["spacing"]  # (said: smaller steps of the piezo to be sure)
+
+
+def test_a_sweep_hops_only_where_it_stays_on_the_new_mode():
+    xs = [float(k) for k in range(12)]
+    gs = [0.0, -0.1, -0.2, -0.3, -6.4, -6.5, -6.6, 3.0, -6.8, -6.9, MapView.BAD, -7.0]
+    assert sweep_hops(xs, gs) == [(3.5, -1, -0.2, -6.5)]  # (the nonsense at 7 is no hop, nor the gap at 10)
+    assert sweep_hops(xs[:6], [0.0, -0.1, -0.2, -6.3, MapView.DARK, -6.5]) == []  # (two points either side, at least)
+
+
+def test_set_to_the_ideal_feedforward_at_the_end(tmp_path):
+    """ff_end 'fitted': its feedforward set to the one the map found (written while off) and switched on from where
+    that cannot take the current up; the measured current back where it began."""
+    b = MapBench(ff=-0.15, patterns=False, act_offset=0.3)
+    a0 = I0 + 0.3 - 0.15 * V0
+    p = plan(i_lo=125.0, i_hi=160.0, i_step=0.2, v_lo=50.0, v_hi=90.0, v_step=4.0, repeat=False, patterns="off",
+             ff_end="fitted")
+    out = MapFile(tmp_path / "m.sqlite")
+    r = b.run(Mapper(p, out))
+    out.close()
+    assert r.state == "done", r.error
+    check_rules(b, p)
+    factor = b.writes("dl:cc:feedforward-factor")[-1]
+    assert factor == pytest.approx(ideal(b.laser), rel=0.08) and factor == r.mapper.fitted()["ff"]
+    assert b.dlc.params["laser1:dl:cc:feedforward-factor"] == factor
+    assert b.writes("dl:cc:feedforward-enabled") == [False, True]
+    assert abs(b.act - a0) < 1e-6 and abs(b.V - V0) < 1e-9  # (measured where it began: set otherwise)
+    assert b.I == pytest.approx(I0 - 0.15 * V0 - factor * V0)
+    assert "(set)" in r.mapper.result and r.mapper.ff_applied
+    with load(out.path) as f:
+        assert f.meta["feedforward"]["end"]["fitted"] and f.meta["feedforward"]["applied"]
+
+
+def test_set_to_the_ideal_feedforward_its_own_off_from_the_start(tmp_path):
+    """Off where it began (its factor 0.2 mA/V nonetheless): its factor to 0 while off, switched on there, then
+    stepped to the ideal one (each step 1 mA at most, by what it is found to add as it goes)."""
+    b = MapBench(ff=0.2, ff_on=False, patterns=False)
+    p = plan(i_lo=125.0, i_hi=160.0, i_step=0.2, v_lo=50.0, v_hi=90.0, v_step=4.0, repeat=False, patterns="off",
+             ff_end="fitted")
+    r = b.run(Mapper(p, None))
+    assert r.state == "done", r.error
+    assert check_rules(b, p) <= 160.0 + 1e-6
+    factors = b.writes("dl:cc:feedforward-factor")
+    factor = factors[-1]
+    assert factors[0] == 0.0 and b.writes("dl:cc:feedforward-enabled") == [True]  # (switched on at a factor of 0)
+    assert factor == pytest.approx(ideal(b.laser), rel=0.08)
+    assert abs(b.act - I0) < 1e-6 and b.I == pytest.approx(I0 - factor * V0)
+
+
+def test_stopped_with_its_feedforward_off_it_is_switched_on_again(tmp_path):
+    b = MapBench(ff=-0.15, scan=True, patterns=False)
+    p = plan(patterns="off")
+    out = MapFile(tmp_path / "m.sqlite")
+    r = b.run(Mapper(p, out), cancel_at=20.0)
+    out.close()
+    assert r.state == "failed" and r.error == "stopped" and r.restored
+    check_rules(b, p)
+    assert b.writes("dl:cc:feedforward-enabled") == [False, True] and b.writes("scan:enabled") == [False, True]
+    assert b.dlc.params["laser1:dl:cc:feedforward-factor"] == -0.15
+    assert abs(b.I - I0) < 1e-9 and abs(b.V - V0) < 1e-9 and abs(b.act - (I0 - 0.15 * V0)) < 1e-6
+
+
+def test_stopped_while_its_feedforward_is_stepped_off_it_is_stepped_back(tmp_path):
+    """Stopped with its factor half way to 0: stepped back to where it was, with nothing read (each step 1 mA at most
+    by what it learned it adds), its set current back exactly."""
+    b = MapBench(ff=-0.15, patterns=False)
+    p = plan(patterns="off")
+    r = b.run(Mapper(p, None), cancel_at=1.5)
+    assert r.state == "failed" and r.error == "stopped" and r.restored
+    check_rules(b, p)
+    factors = b.writes("dl:cc:feedforward-factor")
+    assert 0.0 not in factors and factors[-1] == -0.15 and b.writes("dl:cc:feedforward-enabled") == []
+    assert len(r.mapper._steps) >= 2 and abs(b.I - I0) < 1e-9 and abs(b.V - V0) < 1e-9
+
+
+def test_its_feedforward_not_switched_on_again_is_said_and_the_current_left_low(tmp_path, monkeypatch):
+    """The DLC pro refusing to switch its feedforward on again (busy, however often asked): nothing written after,
+    the current left where switching it on could not take it up."""
+    monkeypatch.setattr("wmlock.modehop.BUSY_WAIT", 0.0)
+    b = MapBench(ff=0.15, patterns=False)  # (its feedforward adds: switching it on takes the current up 10.5 mA)
+    writes = []
+    b.dlc.busy_checks.append(lambda kind, name: kind == "set" and name.endswith("feedforward-enabled")
+                             and bool(writes.append(name) or len(writes) > 1))
+    p = plan(i_lo=140.0, i_hi=170.0, patterns="off")
+    r = b.run(Mapper(p, None), cancel_at=15.0)
+    assert r.state == "failed" and "could not switch it on again" in r.error and not r.restored
+    assert "its feedforward off" in r.error
+    check_rules(b, p)
+    assert b.dlc.params["laser1:dl:cc:feedforward-enabled"] is False
+    assert b.dlc.params["laser1:dl:cc:feedforward-factor"] == 0.15  # (its factor as it was)
+    assert I0 - 0.5 <= b.act <= I0 + 1e-6  # (where switching it on would take it no higher than where it began)
 
 
 def test_the_temperature_stepped_waits_for_it_to_settle_and_goes_back(tmp_path):
