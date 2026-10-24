@@ -1280,7 +1280,9 @@ them lases:
   heats) and hardly by the piezo. The external modes near the middle of a chip mode lase most easily, so
   the chip's modes decide which external mode lases and where it hops. Without them, one broad selection
   filter (the grating's and the gain's) does: the same rule with one resonance.
-* **A window** (the grating's feedback and the gain together) outside which it does not lase.
+* **A window** (the grating's feedback and the gain together) outside which it does not lase. The piezo may move
+  it (a grating turned as well as pushed: its feedback's band follows), and the current (the gain, as the chip
+  warms).
 * **The rule**: the external mode nearest its chip mode's best place lases, and goes on lasing until another
   is better by a hysteresis of its own. That best place lags the current's heating (the chip's temperature
   follows the current with a time constant: ahead sweeping up, behind sweeping down), and the mode lasing
@@ -1303,7 +1305,7 @@ How it is fitted, each part from what the map shows most directly:
    first line swept again at the end tells drift from the piezo, but only to whole modes: each number of
    modes of drift that could be is fitted, the best kept, and those the residuals cannot tell from it
    kept as well (and said);
-4. the rule, and the chip comb's spacing and current tuning again (from where it hops: where the
+4. the rule (with how the window moves), and the chip comb's spacing and current tuning again (from where it hops: where the
    frequencies lie on the chip's modes misleads near the window's edges, where a mode lases only on their
    inner side): every sweep simulated from its first point, scored by how many of its points the model
    puts on the mode the laser was on (differential evolution, every candidate and every sweep at once).
@@ -1311,6 +1313,9 @@ How it is fitted, each part from what the map shows most directly:
    hop counts), and is searched twice: once where the hysteresis of its own does most of the holding,
    once where the pull does (a search settles on one or the other as it goes);
 5. the power at the wavemeter: linear in the current above a threshold, and how it changes along a mode.
+
+A frequency THz away from all the others is the wavemeter misreading its interference order (both readings
+alike, so its spread does not give it away): none of the laser's modes, and left out.
 
 Fitted to a map of a laser made of a model (the simulator's `ModelLaser`), it gives back its chip's mode
 spacing to 0.1 %, its tunings to a few %, its window to a few GHz and its lag to 10 %, and puts nearly 90 %
@@ -1327,8 +1332,8 @@ of the points on the right mode.
   −1.71 GHz/mA; the piezo moves the external modes +1.37 GHz/V as the map went (27 s a volt), +0.018
   GHz/V more per volt, the grating some 40 nm nearer the chip per volt, and the chip's modes next to
   nothing (−0.12 GHz/V);
-* it lases only within −93 … +180 GHz of 607.4237 THz (272 GHz about 493.512 nm), the piezo not moving
-  that window;
+* it lases only within −89 … +181 GHz of 607.4237 THz (269 GHz about 493.510 nm), the piezo moving that window
+  only +0.25 GHz/V (its modes +1.29);
 * the combs slide past each other −2.48 GHz/mA and the alignment changes by 3.63 GHz from one chip mode
   to the next, so it hops every 1.46 mA sweeping the current, every 2.6 V sweeping the piezo; the ideal
   feedforward −0.565 mA/V (the map's boundaries say −0.58), along which it would tune +2.25 GHz/V;
@@ -1341,6 +1346,16 @@ of the points on the right mode.
   hops;
 * the model puts 77 % of the map's 4,259 points on the mode the laser was on, each sweep simulated from
   its first point; 97 % of the rest are within two points of a hop (it hops a point or two early or late).
+
+**The lab's 650 nm DL pro** (its second laser, mapped 53 to 70 mA in 0.2 mA steps over 37.6 to 97.6 V in 1 V
+steps, its feedforward off): its external cavity's modes are 3.389 GHz apart (44.2 mm), its chip's own modes
+18.37 GHz apart (n_g·L 8.16 mm: about 2.2 mm of chip at a group index of 3.7), 5.42 external modes to a chip
+mode; −1.38 and −0.249 GHz/mA, +0.40 GHz/V; it lases only within a 27 GHz window, which the piezo moves
++0.65 GHz/V, nearly with its modes: so it hops by one chip mode up and down (five or six external modes) between
+two tracks, every 1.3 mA; hysteresis 0.8 mA; it drifted +3.2 GHz per 10 minutes (this map's first line, swept
+again 15 minutes later, could tell). The model puts 85 % of its 10,513 points on the right mode (98 % of the
+rest within two points of a hop). 26 of its readings were the wavemeter misreading its order (±2.4 and ±4.9 THz),
+two of them alike both readings: left out.
 
 Two things this map could not tell. **Its drift**: its first line, swept again 19 minutes later, was where
 +1.8 GHz of drift per 10 minutes puts it, but just as much where −2.6 or +6.2 do (a whole external mode

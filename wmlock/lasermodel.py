@@ -38,7 +38,7 @@ fit(m) fits it to a map's file (lasermap.LaserMap), in steps, each from what the
    it hops tells them better than where its frequencies lie): every sweep simulated from its first point, scored
    by how many of its points the model puts on the mode the laser was on (differential evolution, all candidates
    and sweeps at once), from the rule that makes what the laser did likeliest a point at a time (_likelihood),
-   searched once where its hysteresis of its own holds a mode, once where its pull does (PULLS);
+   searched once where its hysteresis of its own holds a mode, once where its pull does (HOLDS);
 5. the power at the wavemeter: linear in the current above a threshold, and how it changes along a mode (with δ).
 
 LaserModel.facts() says it all as sentences; LaserModel.simulate() predicts the frequency along any path of current,
@@ -55,10 +55,11 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 
 C_LIGHT = 299792458.0  # m/s
-N_GROUP = 2.6          # the group index of a diode chip, roughly (GaN, GaAs: 2.5 to 3.7): for its length in mm
+GROUP_GAN, GROUP_III_V = 2.6, 3.7  # a diode chip's group index, roughly: GaN (below 560 nm), else AlGaInP, GaAs...
 UNIT_T = 600.0         # s: drift is fitted per this much time (said per 10 min)
 SINGLE = 50.0          # one selection filter: its loss as a chip resonance this many external modes apart would have
 RULE = ("lo", "hi", "h_up", "h_down", "offset", "pull", "lag")
+WINDOW = ("w_v", "w_i")
 THIN = 12000           # points enough for the combs' spacings (a larger map: thinned for those searches)
 MAX_DRIFT = 10.0       # GHz per UNIT_T: the most a comb is taken to drift (more: free-running ECDLs don't)
 BUDGET = 40            # generations of each of the rule's searches
@@ -108,7 +109,9 @@ def data_of(m, current: str = "act", spread: float = 0.3, map_n: int | None = No
     """One map's points (lasermap.LaserMap: its legs up and down; descents left out), with its first line swept
     again at the end if that was this map's: map_n (None: the last map, the one swept again). The current as
     LaserMap.sweeps has it ('act': as read at each point, else the set current and what it was besides where it
-    began). spread: GHz between a point's readings above which its frequency is no one mode's."""
+    began). spread: GHz between a point's readings above which its frequency is no one mode's. A frequency far
+    from all the others (beyond the range of the middle 98 % again, either side) is no mode's either: the
+    wavemeter misread its interference order (THz away), both readings alike."""
     start = m.meta.get("start") or {}
     off = (start.get("current_act") or 0.0) - (start.get("current_set") or 0.0)
     f_ref = next((q["f"] for q in m.points if q["f"] is not None), 0.0)
@@ -143,7 +146,11 @@ def data_of(m, current: str = "act", spread: float = 0.3, map_n: int | None = No
             rows.append((k, leg, i, v, q["t"], f, clean, q["power"] if q["power"] is not None else math.nan))
     a = np.array(rows, dtype=float) if rows else np.zeros((0, 8))
     lines = [by_id[lid] for lid, _ in sorted(order.items(), key=lambda kv: kv[1])]
-    return MapData(a[:, 0].astype(int), a[:, 1].astype(int), a[:, 2], a[:, 3], a[:, 4], a[:, 5], a[:, 6] > 0.5,
+    ok = a[:, 6] > 0.5
+    if ok.sum() > 20:  # (a wavemeter that misread its order, both readings alike: THz away; none of its modes)
+        lo, hi = np.percentile(a[ok, 5], [1, 99])
+        ok &= (a[:, 5] > lo - (hi - lo)) & (a[:, 5] < hi + (hi - lo))
+    return MapData(a[:, 0].astype(int), a[:, 1].astype(int), a[:, 2], a[:, 3], a[:, 4], a[:, 5], ok,
                    a[:, 7], lines, f_ref, first["axis"])
 
 
@@ -366,56 +373,59 @@ def _losses(modes, mid, dc, lo, hi):
         ((np.maximum(modes - hi, 0.0) + np.maximum(lo - modes, 0.0)) / 5.0) ** 2
 
 
-def _select(M, B, A, T, up, cur, ci0: float, i0: float, P, meas=None, valid=None, forced: bool = False):
-    """The rule run along sweeps, all at once, for candidates all at once. M (n, L, K): the modes' GHz along each of
-    n sweeps of L points (K modes); B (n, L): the chip comb's middle (GHz), as it moves ci0 GHz/mA with the current
-    from i0; A (n, L) mA; T (n, L) s; up (n, L): the swept axis rising there; cur (n,): the mode each sweep begins on
-    (an index into K). P (pop, 9): each candidate's rule (RULE), its chip comb's spacing and GHz/mA. Returns the
-    modes chosen (pop, n, L), or given meas (n, L, the modes measured) and valid (n, L): how many valid points each
-    candidate put on the mode measured (pop,); forced: each point from the mode measured at the one before (a point
-    at a time: one wrong hop does not take the rest of its sweep with it)."""
+def _select(pk: dict, P, cur, scored: bool = False, forced: bool = False):
+    """The rule run along sweeps, all at once, for candidates all at once. pk (LaserModel._pack): M (n, L, K), the
+    modes' GHz along each of n sweeps of L points (K modes); B (n, L), the chip comb's middle (GHz), as it moves ci0
+    GHz/mA with the current from i0; A, V (n, L): mA, V; T (n, L): s; up (n, L): the swept axis rising there; meas,
+    valid (n, L): the modes measured, the points that count. cur (n,): the mode each sweep begins on (an index into
+    K). P (pop, 11): each candidate's rule (LaserModel.rule()). Returns the modes chosen (pop, n, L), or scored: how
+    many valid points each candidate put on the mode measured (pop,); forced: each point from the mode measured at
+    the one before (a point at a time: one wrong hop does not take the rest of its sweep with it)."""
+    M, B, A, V, T, up = (pk[k] for k in ("M", "B", "A", "V", "T", "up"))
+    ci0, i0, v0 = pk["ci0"], pk["i0"], pk["v0"]
     P = np.atleast_2d(np.asarray(P, dtype=M.dtype))
-    lo, hi, h_up, h_down, offset, pull, lag, dc, ci = (P[:, k][:, None] for k in range(9))
+    lo, hi, h_up, h_down, offset, pull, lag, dc, ci, w_v, w_i = (P[:, k][:, None] for k in range(11))
     dc3 = dc[:, :, None]
     npop, (n, L, _) = len(P), M.shape
     now = np.broadcast_to(np.asarray(cur, dtype=int), (npop, n)).copy()
     warm = np.broadcast_to(A[:, 0], (npop, n)).copy()  # the current the chip is as warm as (it lags)
-    lo3, hi3 = lo[:, :, None], hi[:, :, None]
     ar = np.arange(n)[None, :]
     right = np.zeros(npop)
-    chosen = np.empty((npop, n, L), dtype=int) if meas is None else None
+    chosen = None if scored else np.empty((npop, n, L), dtype=int)
     for j in range(L):
         if j:
             fade = np.exp(-(T[:, j] - T[:, j - 1])[None, :] / np.maximum(lag, 1e-9))
             warm = A[None, :, j] + (warm - A[None, :, j]) * fade
         base = B[None, :, j] + (ci - ci0) * (A[None, :, j] - i0) + offset + ci * (warm - A[None, :, j])
-        mj = M[None, :, j, :]
+        shift = w_v * (V[None, :, j] - v0) + w_i * (A[None, :, j] - i0)  # (the window, as it moves)
         if j and forced:
-            now = np.broadcast_to(meas[None, :, j - 1], (npop, n)).copy()
+            now = np.broadcast_to(pk["meas"][None, :, j - 1], (npop, n)).copy()
         fc = M[ar, j, now]
         mid = base + pull * ((fc - base + dc / 2) % dc - dc / 2)
-        g = _losses(mj, mid[:, :, None], dc3, lo3, hi3)
+        g = _losses(M[None, :, j, :], mid[:, :, None], dc3, (lo + shift)[:, :, None], (hi + shift)[:, :, None])
         if j:  # (at its first point it is on the mode it began on)
             best = np.argmin(g, axis=2)
             h = np.where(up[None, :, j], h_up, h_down)
             g_now = np.take_along_axis(g, now[:, :, None], 2)[:, :, 0]
             g_best = np.take_along_axis(g, best[:, :, None], 2)[:, :, 0]
             now = np.where(g_now > g_best + h, best, now)
-        if meas is None:
-            chosen[:, :, j] = now
+        if scored:
+            right += ((now == pk["meas"][None, :, j]) & pk["valid"][None, :, j]).sum(axis=1)
         else:
-            right += ((now == meas[None, :, j]) & valid[None, :, j]).sum(axis=1)
-    return chosen if meas is None else right
+            chosen[:, :, j] = now
+    return right if scored else chosen
 
 
-def _likelihood(M, B, A, T, up, ci0: float, i0: float, P, meas, valid, eps: float = 0.02) -> np.ndarray:
+def _likelihood(pk: dict, P, eps: float = 0.02) -> np.ndarray:
     """The mean log likelihood of what the laser did, a point at a time from the mode measured at the one before,
-    for candidates all at once (P: pop x 10, _select's and a temperature, of a chip mode's loss): it goes on lasing,
+    for candidates all at once (P: pop x 12, _select's and a temperature, of a chip mode's loss): it goes on lasing,
     or hops to another mode as much as that one is better than the hysteresis asks (a softmax at that temperature),
     or, with eps, anything at all (what the rule cannot tell: a reading put on the wrong mode, a flicker). Smooth,
     and every hop counts: what a search needs to find where the rule is (_fit_rule)."""
+    M, B, A, V, T, up, meas, valid = (pk[k] for k in ("M", "B", "A", "V", "T", "up", "meas", "valid"))
+    ci0, i0, v0 = pk["ci0"], pk["i0"], pk["v0"]
     P = np.atleast_2d(np.asarray(P, dtype=M.dtype))
-    lo, hi, h_up, h_down, offset, pull, lag, dc, ci, temp = (P[:, k][:, None] for k in range(10))
+    lo, hi, h_up, h_down, offset, pull, lag, dc, ci, w_v, w_i, temp = (P[:, k][:, None] for k in range(12))
     npop, (n, L, K) = len(P), M.shape
     warm = np.broadcast_to(A[:, 0], (npop, n)).copy()
     ar = np.arange(n)
@@ -424,10 +434,12 @@ def _likelihood(M, B, A, T, up, ci0: float, i0: float, P, meas, valid, eps: floa
         fade = np.exp(-(T[:, j] - T[:, j - 1])[None, :] / np.maximum(lag, 1e-9))
         warm = A[None, :, j] + (warm - A[None, :, j]) * fade
         base = B[None, :, j] + (ci - ci0) * (A[None, :, j] - i0) + offset + ci * (warm - A[None, :, j])
+        shift = w_v * (V[None, :, j] - v0) + w_i * (A[None, :, j] - i0)
         was = meas[:, j - 1]
         fc = M[ar, j, was][None, :]
         mid = base + pull * ((fc - base + dc / 2) % dc - dc / 2)
-        g = _losses(M[None, :, j, :], mid[:, :, None], dc[:, :, None], lo[:, :, None], hi[:, :, None])
+        g = _losses(M[None, :, j, :], mid[:, :, None], dc[:, :, None], (lo + shift)[:, :, None],
+                    (hi + shift)[:, :, None])
         h = np.where(up[None, :, j], h_up, h_down)
         z = (g[:, ar, was][:, :, None] - g - h[:, :, None]) / temp[:, :, None]
         z[:, ar, was] = 0.0
@@ -451,13 +463,15 @@ class LaserModel:
     t0: float
     ext: Comb
     chip: Comb | None
-    lo: float = -math.inf        # GHz: the window
+    lo: float = -math.inf        # GHz: the window, at i0 and v0...
     hi: float = math.inf
     h_up: float = 0.0            # the hysteresis, sweeping up and down (of a chip resonance's loss at its most, 1)
     h_down: float = 0.0
     offset: float = 0.0          # GHz: a chip resonance's best place from its middle
     pull: float = 0.0            # the mode lasing pulls its chip resonance's best place this part of the way to it
     lag: float = 0.0             # s: the chip's temperature lags the current's heating by this
+    w_v: float = 0.0             # GHz/V: ...as the piezo moves it (the grating turned as well as moved)...
+    w_i: float = 0.0             # GHz/mA: ...and the current (the gain, with the chip's temperature)
     i_th: float | None = None    # mA: the threshold, as the power at the wavemeter says it
     slope: float | None = None   # µW/mA at the wavemeter, above it
     power_v: float | None = None  # µW/V: the power's dependence on the piezo at a given current
@@ -486,8 +500,10 @@ class LaserModel:
         return SINGLE * self.ext.spacing if self.single else self.chip.spacing
 
     def rule(self) -> np.ndarray:
-        """Its rule's parameters as _select has them: RULE's, its chip comb's spacing and GHz/mA."""
-        return np.array([getattr(self, k) for k in RULE] + [self.dc, self._ci()], dtype=float)
+        """Its rule's parameters as _select has them: RULE's, its chip comb's spacing and GHz/mA, its window's
+        motion (WINDOW)."""
+        return np.array([getattr(self, k) for k in RULE] + [self.dc, self._ci()] + [getattr(self, k) for k in WINDOW],
+                        dtype=float)
 
     def _d(self, i, v, t):
         return np.asarray(i, dtype=float) - self.i0, np.asarray(v, dtype=float) - self.v0, \
@@ -504,6 +520,11 @@ class LaserModel:
             return np.zeros_like(np.asarray(i, dtype=float))
         return self.chip.base(*self._d(i, v, t))
 
+    def window(self, i, v) -> tuple:
+        """GHz: (its window's low edge, high edge) at (i, v)."""
+        shift = self.w_v * (np.asarray(v, dtype=float) - self.v0) + self.w_i * (np.asarray(i, dtype=float) - self.i0)
+        return self.lo + shift, self.hi + shift
+
     def orders(self, margin: float = 60.0) -> np.ndarray:
         """The external orders that can lase about the map's frequencies."""
         lo = self.lo if math.isfinite(self.lo) else -600.0
@@ -512,17 +533,31 @@ class LaserModel:
         return np.arange(math.floor((lo - margin - abs(e.p0) - 400) / e.spacing),
                          math.ceil((hi + margin + abs(e.p0) + 400) / e.spacing) + 1)
 
-    def _first(self, modes, base) -> int:
-        """The mode lasing where a path begins (as if long there): the best, pulled to it."""
-        dc, P = self.dc, self.rule()
-        g = self._loss(modes, base + P[4], P)
+    def _first(self, modes, base, i, v) -> int:
+        """The mode lasing where a path begins at (i, v) (as if long there): the best, pulled to it."""
+        dc = self.dc
+        g = self._loss(modes, base + self.offset, i, v)
         k = int(np.argmin(g))
-        mid = base + P[4] + self.pull * ((modes[k] - base - P[4] + dc / 2) % dc - dc / 2)
-        return int(np.argmin(self._loss(modes, mid, P)))
+        mid = base + self.offset + self.pull * ((modes[k] - base - self.offset + dc / 2) % dc - dc / 2)
+        return int(np.argmin(self._loss(modes, mid, i, v)))
 
-    def _loss(self, modes, mid, P=None):
-        P = self.rule() if P is None else P
-        return _losses(modes, mid, self.dc, P[0], P[1])
+    def _loss(self, modes, mid, i, v):
+        lo, hi = self.window(i, v)
+        return _losses(modes, mid, self.dc, lo, hi)
+
+    def _ci(self) -> float:
+        return self.chip.p_i if self.chip is not None else 0.0
+
+    def _path(self, i, v, t, up, clock=None, dtype=float) -> dict:
+        """One path (arrays i mA, v V, t s, up: the swept axis rising) as _select's pk; clock: s at each point for
+        the chip's lag (None: t)."""
+        orders = self.orders()
+        modes = self.ext_modes(i, v, t, orders, up)
+        base = self.chip_base(i, v, t)
+        T = t if clock is None else np.asarray(clock, dtype=float)
+        arr = [np.asarray(x, dtype=dtype)[None] for x in (modes, base, i, v, T)]
+        return {"M": arr[0], "B": arr[1], "A": arr[2], "V": arr[3], "T": arr[4], "up": np.asarray(up)[None],
+                "ci0": self._ci(), "i0": self.i0, "v0": self.v0, "modes": modes, "base": base}
 
     def simulate(self, i, v, t, start: float | None = None, legs=None, clock=None) -> np.ndarray:
         """GHz: the frequency along a path (arrays i mA, v V, t s, in order), the mode lasing kept until another is
@@ -540,16 +575,12 @@ class LaserModel:
             up = np.concatenate([[True], np.diff(x) >= 0])
             if n > 1:
                 up[0] = up[1]
-        orders = self.orders()
-        modes = self.ext_modes(i, v, t, orders, up)
-        base = self.chip_base(i, v, t)
-        cur = int(np.argmin(np.abs(modes[0] - start))) if start is not None else self._first(modes[0], base[0])
-        T = t if clock is None else np.asarray(clock, dtype=float)
-        k = _select(modes[None], base[None], i[None], T[None], up[None], [cur], self._ci(), self.i0, self.rule())
+        pk = self._path(i, v, t, up, clock)
+        modes = pk["modes"]
+        cur = int(np.argmin(np.abs(modes[0] - start))) if start is not None else \
+            self._first(modes[0], pk["base"][0], i[0], v[0])
+        k = _select(pk, self.rule(), [cur])
         return modes[np.arange(n), k[0, 0]]
-
-    def _ci(self) -> float:
-        return self.chip.p_i if self.chip is not None else 0.0
 
     def step(self, i: float, v: float, t: float, state=None, clock: float | None = None) -> tuple:
         """One point of a path after another: (GHz it lases at, δ GHz from its chip resonance's best place, the state
@@ -570,17 +601,18 @@ class LaserModel:
             warm = i
         di, dv, dt = self._d(i, v, t)
         b = float(e.base(di, dv, dt, up))
-        lo = self.lo if math.isfinite(self.lo) else b - 3 * dc
-        hi = self.hi if math.isfinite(self.hi) else b + 3 * dc
+        lo, hi = self.window(i, v)
+        lo = lo if math.isfinite(lo) else b - 3 * dc
+        hi = hi if math.isfinite(hi) else b + 3 * dc
         orders = np.arange(math.floor((lo - 30 - b) / e.spacing), math.ceil((hi + 30 - b) / e.spacing) + 1)
         modes = b + orders * e.spacing
         base = float(self.chip_base(i, v, t)) + self.offset + self._ci() * (warm - i)
         if order is None or not (orders[0] <= order <= orders[-1]):
-            k = self._first(modes, base - self.offset)
+            k = self._first(modes, base - self.offset, i, v)
         else:
             k = int(order - orders[0])
             mid = base + self.pull * ((modes[k] - base + dc / 2) % dc - dc / 2)
-            g = self._loss(modes, mid)
+            g = self._loss(modes, mid, i, v)
             best = int(np.argmin(g))
             if g[k] > g[best] + (self.h_up if up else self.h_down):
                 k = best
@@ -600,37 +632,38 @@ class LaserModel:
         return sw
 
     def _pack(self, d: MapData, sw: list, dtype=float) -> dict:
-        """Those sweeps as arrays for _select, each from its first clean point, padded to the longest (dtype: of
-        the arrays; float32 for a search: twice as fast, and as good for it)."""
+        """Those sweeps as _select's pk, each from its first clean point, padded to the longest (dtype: of the
+        arrays; float32 for a search: twice as fast, and as good for it)."""
         n, L = len(sw), max(len(idx) for idx in sw)
         up_pt = d.leg == 1
         orders = self.orders()
         modes = self.ext_modes(d.i, d.v, d.t, orders, up_pt)
         f = d.f[d.ok]
         span = float(f.max() - f.min()) if len(f) else 0.0
-        reach = 0.3 * span + 60.0 if not self.single else 6 * self.ext.spacing
+        reach = 0.45 * span + 15.0 if not self.single else 6 * self.ext.spacing  # (no window reaches further)
         keep = (modes[d.ok].max(axis=0) > f.min() - reach) & (modes[d.ok].min(axis=0) < f.max() + reach)
         modes = modes[:, keep]
         base = self.chip_base(d.i, d.v, d.t)
         K = modes.shape[1]
-        M, B, A, T = (np.zeros(shape, dtype=dtype) for shape in ((n, L, K), (n, L), (n, L), (n, L)))
+        M, B, A, V, T = (np.zeros(shape, dtype=dtype) for shape in ((n, L, K), (n, L), (n, L), (n, L), (n, L)))
         meas, valid, up = np.zeros((n, L), dtype=int), np.zeros((n, L), dtype=bool), np.zeros((n, L), dtype=bool)
         for s, idx in enumerate(sw):
             k = len(idx)
             M[s, :k], M[s, k:] = modes[idx], modes[idx[-1]]
             B[s, :k], B[s, k:] = base[idx], base[idx[-1]]
             A[s, :k], A[s, k:] = d.i[idx], d.i[idx[-1]]
+            V[s, :k], V[s, k:] = d.v[idx], d.v[idx[-1]]
             T[s, :k], T[s, k:] = d.t[idx], d.t[idx[-1]] + np.arange(1, L - k + 1)
             meas[s, :k] = np.argmin(np.abs(modes[idx] - d.f[idx][:, None]), axis=1)
             valid[s, 1:k] = True
             up[s, :] = up_pt[idx[0]]
-        return {"M": M, "B": B, "A": A, "T": T, "meas": meas, "valid": valid, "up": up}
+        return {"M": M, "B": B, "A": A, "V": V, "T": T, "meas": meas, "valid": valid, "up": up,
+                "ci0": self._ci(), "i0": self.i0, "v0": self.v0}
 
     def _score(self, P, pk: dict, forced: bool = False) -> np.ndarray:
-        """The fraction right of each candidate rule (P: pop x 9, as rule()) on a packed map (forced: a point at a
+        """The fraction right of each candidate rule (P: pop x 11, as rule()) on a packed map (forced: a point at a
         time, from the mode measured at the one before)."""
-        return _select(pk["M"], pk["B"], pk["A"], pk["T"], pk["up"], pk["meas"][:, 0], self._ci(), self.i0, P,
-                       pk["meas"], pk["valid"], forced) / max(int(pk["valid"].sum()), 1)
+        return _select(pk, P, pk["meas"][:, 0], True, forced) / max(int(pk["valid"].sum()), 1)
 
     def score(self, d: MapData) -> float:
         """The fraction of the map's clean points it puts on the mode the laser was on, each sweep simulated from its
@@ -644,8 +677,7 @@ class LaserModel:
         sw = self._sweeps(d)
         for a in range(0, len(sw), CHUNK):
             pk = self._pack(d, sw[a:a + CHUNK])
-            k = _select(pk["M"], pk["B"], pk["A"], pk["T"], pk["up"], pk["meas"][:, 0], self._ci(), self.i0,
-                        self.rule())[0]
+            k = _select(pk, self.rule(), pk["meas"][:, 0])[0]
             v, meas = pk["valid"], pk["meas"]
             hop = np.zeros_like(v)
             hop[:, 1:] = (meas[:, 1:] != meas[:, :-1]) & v[:, 1:]
@@ -670,12 +702,8 @@ class LaserModel:
         x = np.concatenate([xs, xs[::-1]])
         i, v = (x, np.full(2 * n, self.v0)) if self.kind == "current" else (np.full(2 * n, self.i0), x)
         up = np.arange(2 * n) < n
-        orders = self.orders()
-        modes = self.ext_modes(i, v, self.t0, orders, up)
-        base = self.chip_base(i, v, np.full(2 * n, self.t0))
-        T = np.arange(2 * n) * (self.step_s or 0.3)
-        k = _select(modes[None], base[None], i[None], T[None], up[None], [self._first(modes[0], base[0])],
-                    self._ci(), self.i0, self.rule())[0, 0]
+        pk = self._path(i, v, np.full(2 * n, self.t0), up, np.arange(2 * n) * (self.step_s or 0.3))
+        k = _select(pk, self.rule(), [self._first(pk["modes"][0], pk["base"][0], i[0], v[0])])[0, 0]
         ku, kd = k[:n], k[n:][::-1]
         apart = float(np.mean(ku != kd))
         shifts = range(-n // 2, n // 2 + 1)
@@ -701,10 +729,13 @@ class LaserModel:
                    f"the chip's back facet to the grating (lens and chip included)")
         if not single:
             Lc = C_LIGHT / (2 * c.spacing * 1e9) * 1e3
+            nm = C_LIGHT / (self.f_ref * 1e12) * 1e9
+            n_g, what = (GROUP_GAN, "GaN") if nm < 560 else (GROUP_III_V, "AlGaInP or GaAs")
             out.append(f"its chip's own modes are {c.spacing:.3f} GHz apart (an optical length n_g·L of {Lc:.3f} mm: "
-                       f"{Lc / N_GROUP:.2f} mm of chip at a group index of {N_GROUP:g}): its front facet reflects, so "
-                       f"they decide which external mode lases and where it hops (its anti-reflection coating is "
-                       f"poor, or there is none); {c.spacing / e.spacing:.3f} external modes to a chip mode")
+                       f"{Lc / n_g:.2f} mm of chip at a group index of {n_g:g}, {what} at {nm:.0f} nm): its front "
+                       f"facet reflects, so they decide which external mode lases and where it hops (its "
+                       f"anti-reflection coating is poor, or there is none); {c.spacing / e.spacing:.3f} external "
+                       f"modes to a chip mode")
             out.append(f"so the light goes some {L - Lc:.1f} mm through air and lens from the chip's front facet to "
                        f"the grating")
         else:
@@ -725,9 +756,19 @@ class LaserModel:
             out.append(f"the piezo moves the {'filter' if single else 'chip modes'} {c.p_v:+.3f} GHz/V")
         if math.isfinite(self.lo) and math.isfinite(self.hi):
             mid = self.f_ref + (self.lo + self.hi) / 2e3
-            out.append(f"it lases only within {self.lo:+.0f} … {self.hi:+.0f} GHz of {self.f_ref:.6f} THz "
-                       f"({self.hi - self.lo:.0f} GHz about {mid:.6f} THz, {C_LIGHT / (mid * 1e12) * 1e9:.4f} nm): "
-                       f"its grating's feedback and its gain together, not moved by the piezo")
+            e = self.ext
+            moves = []
+            if abs(self.w_v) >= 0.15 * max(abs(e.p_v), 0.05):
+                moves.append(f"the piezo moves it {self.w_v:+.3f} GHz/V (the grating turned as it is pushed: its "
+                             f"external modes move {e.p_v:+.3f})")
+            else:
+                moves.append(f"the piezo hardly moves it ({self.w_v:+.3f} GHz/V)")
+            if abs(self.w_i) >= 0.15 * max(abs(self._ci()), 0.1):
+                moves.append(f"the current {self.w_i:+.3f} GHz/mA (the gain, as the chip warms)")
+            out.append(f"it lases only within {self.lo:+.0f} … {self.hi:+.0f} GHz of {self.f_ref:.6f} THz at "
+                       f"{self.v0:.1f} V and {self.i0:.1f} mA ({self.hi - self.lo:.0f} GHz about {mid:.6f} THz, "
+                       f"{C_LIGHT / (mid * 1e12) * 1e9:.4f} nm): its grating's feedback and its gain together; "
+                       + ", ".join(moves))
         ff = self.ideal_feedforward()
         if ff is not None and not single:
             step = (c.spacing - e.spacing * round(c.spacing / e.spacing))
@@ -738,7 +779,8 @@ class LaserModel:
                        f"sweeping the piezo every {abs(step / (e.p_v - c.p_v)):.2f} V")
         if ff is not None:
             along = e.p_v + e.p_i * ff
-            reach = (f" without hopping until the window's edge ({(self.hi - self.lo) / max(abs(along), 1e-9):.0f} V "
+            gain = along - (self.w_v + self.w_i * ff)  # (on the window, as that moves too)
+            reach = (f" without hopping until the window's edge ({(self.hi - self.lo) / max(abs(gain), 1e-9):.0f} V "
                      f"of piezo, at most)" if math.isfinite(self.hi - self.lo) else "")
             out.append(f"the ideal feedforward: {ff:+.3f} mA/V keeps the combs aligned; with it the laser tunes "
                        f"{along:+.3f} GHz/V{reach}")
@@ -1015,64 +1057,93 @@ def _single_filter(d: MapData, i0, v0, t0) -> Comb:
                 1.0, int(s.sum()), False, float(sol[2]))
 
 
-PULLS = ((-0.5, 0.25), (0.15, 0.85))  # the rule's searches: a mode pushed on or barely held, and one pulled hard
+HOLDS = (((-0.5, 0.25), 0.05), ((0.15, 0.85), 0.015))  # the rule's searches: (its pull, its own hysteresis at most):
+#                                                         held by a hysteresis of its own, and pulled hard instead
+
+
+def _window_guess(d: MapData, model: LaserModel) -> tuple:
+    """(its low edge and high edge at i0 and v0 (GHz), GHz/V, GHz/mA): where the window is and how it moves, guessed
+    from where the laser lased: each line's range (its 2nd to 98th percentile) against the slow axis, and within
+    lines the frequencies against the swept axis (each line's own mean taken off)."""
+    s = d.ok
+    f, fast, line = d.f[s], d.fast[s], d.line[s]
+    count = np.maximum(np.bincount(line), 1)
+    dx = fast - (np.bincount(line, fast) / count)[line]
+    w_fast = float((dx * (f - (np.bincount(line, f) / count)[line])).sum() / max(float((dx * dx).sum()), 1e-9))
+    rows = []
+    for L, ln in enumerate(d.lines):
+        sl = s & (d.line == L)
+        if not ln.get("repeat") and sl.sum() >= 10:
+            rows.append((ln["slow"], *np.percentile(d.f[sl], [2, 98])))
+    slow0 = model.v0 if d.kind == "current" else model.i0
+    if len(rows) >= 3 and np.ptp([r[0] for r in rows]) > 0:
+        r = np.array(rows)
+        A = np.column_stack([np.ones(len(r)), r[:, 0] - slow0])
+        (lo, w_lo), (hi, w_hi) = (np.linalg.lstsq(A, r[:, k], rcond=None)[0] for k in (1, 2))
+        w_slow = 0.5 * (w_lo + w_hi)
+    else:
+        (lo, hi), w_slow = np.percentile(f, [1, 99]), 0.0
+    w_v, w_i = (w_slow, w_fast) if d.kind == "current" else (w_fast, w_slow)
+    return float(lo), float(hi), float(w_v), float(w_i)
 
 
 def _fit_rule(model: LaserModel, d: MapData, budget: int, seed: int, most: int = 120, popsize: int = 15):
     """The rule (RULE: the window, the hysteresis each way, the chip resonances' best place, its pull to the mode
-    lasing, the chip's lag), and the chip comb's spacing and current tuning again (by where it hops: where the
-    frequencies lie on its resonances misleads, near the window's edges, as a mode lases only on their inner side
-    there), by differential evolution, every candidate of a generation and every sweep at once (`most` sweeps at
-    most, spread over the map), in two stages: the rule that makes what the laser did likeliest, a point at a time
-    (_likelihood: smooth, and every hop counts, so the search finds where the rule is), then from there and from a
-    plain guess (both among its first population) the rule that puts most points on the mode the laser was on, each
-    sweep simulated from its first point (what the model is for). A hysteresis of its own and a mode's pull on its
-    chip resonance both hold a mode: such a search settles on one or the other as it goes, so it is searched twice,
-    once for each (PULLS), the better kept."""
+    lasing, the chip's lag; WINDOW: how the window moves), and the chip comb's spacing and current tuning again (by
+    where it hops: where the frequencies lie on its resonances misleads, near the window's edges, as a mode lases
+    only on their inner side there), by differential evolution, every candidate of a generation and every sweep at
+    once (`most` sweeps at most, spread over the map), in two stages: the rule that makes what the laser did
+    likeliest, a point at a time (_likelihood: smooth, and every hop counts, so the search finds where the rule is),
+    then from there and from a plain guess (both among its first population) the rule that puts most points on the
+    mode the laser was on, each sweep simulated from its first point (what the model is for). A hysteresis of its
+    own and a mode's pull on its chip resonance both hold a mode: such a search settles on one or the other as it
+    goes, so it is searched twice, once for each (HOLDS), the better kept."""
     from scipy.optimize import differential_evolution
 
     pk = model._pack(d, model._sweeps(d, most), np.float32)
-    f = d.f[d.ok]
-    lo0, hi0 = float(np.percentile(f, 1)), float(np.percentile(f, 99))
+    lo0, hi0, wv0, wi0 = _window_guess(d, model)
     span = max(hi0 - lo0, model.ext.spacing)
     half = 0.5 * model.ext.spacing
     dc0, ci0 = model.dc, model._ci()
-    bounds = [(lo0 - 0.3 * span, lo0 + 0.1 * span), (hi0 - 0.1 * span, hi0 + 0.3 * span), (0.0, 0.05), (0.0, 0.05),
+    ev = abs(model.ext.p_v)
+    bounds = [(lo0 - 0.4 * span, lo0 + 0.2 * span), (hi0 - 0.2 * span, hi0 + 0.4 * span), (0.0, 0.05), (0.0, 0.05),
               (-half, half), (-0.5, 0.85), (0.0, max(2.0, 6 * (model.step_s or 0.3))),
-              (0.98 * dc0, 1.02 * dc0), (ci0 - 0.1 * abs(ci0) - 0.1, ci0 + 0.1 * abs(ci0) + 0.1)]
+              (0.98 * dc0, 1.02 * dc0), (ci0 - 0.1 * abs(ci0) - 0.1, ci0 + 0.1 * abs(ci0) + 0.1),
+              (wv0 - 0.5 * ev - 0.2, wv0 + 0.5 * ev + 0.2), (wi0 - 0.5 * abs(ci0) - 0.3, wi0 + 0.5 * abs(ci0) + 0.3)]
+    guess = [lo0 - 0.05 * span, hi0 + 0.05 * span, 0.005, 0.005, 0.0, 0.2, model.step_s or 0.3, dc0, ci0, wv0, wi0]
     if model.single:  # (one filter: no window, its width as it is)
         bounds[0], bounds[1], bounds[7] = (-1e5, -1e5 + 1), (1e5 - 1, 1e5), (dc0 * (1 - 1e-9), dc0 * (1 + 1e-9))
+        bounds[9], bounds[10] = (-1e-9, 1e-9), (-1e-9, 1e-9)
+        guess[0], guess[1], guess[9], guess[10] = bounds[0][0], bounds[1][1], 0.0, 0.0
 
     def cost(P):  # (P: parameters x candidates)
         return -model._score(np.asarray(P).T, pk)
 
-    guess = [lo0 - 0.05 * span, hi0 + 0.05 * span, 0.005, 0.005, 0.0, 0.2, model.step_s or 0.3, dc0, ci0]
-    if model.single:
-        guess[0], guess[1] = bounds[0][0], bounds[1][1]
     how = {"tol": 1e-6, "polish": False, "init": "sobol", "vectorized": True, "updating": "deferred"}
 
     def unlikely(P):
-        return -_likelihood(pk["M"], pk["B"], pk["A"], pk["T"], pk["up"], model._ci(), model.i0, np.asarray(P).T,
-                            pk["meas"], pk["valid"])
+        return -_likelihood(pk, np.asarray(P).T)
 
     soft = differential_evolution(unlikely, bounds + [(1e-4, 0.02)], maxiter=max(budget // 2, 5),
                                   popsize=max(popsize - 3, 5), seed=seed, x0=guess + [0.003], **how)
     rng = np.random.default_rng(seed)
     res = None
-    for k, pulls in enumerate(PULLS):  # (each its own population, the likeliest rule and the guess among its first)
+    for k, (pulls, most_h) in enumerate(HOLDS):  # (each its own population: the likeliest rule, the guess among it)
         part = list(bounds)
+        part[2] = part[3] = (0.0, most_h)
         part[5] = pulls
         lows, highs = np.array(part).T
         first = lows + (highs - lows) * rng.random((popsize * len(part), len(part)))
-        first[0], first[1] = np.clip(soft.x[:9], lows, highs), np.clip(guess, lows, highs)
+        first[0], first[1] = np.clip(soft.x[:11], lows, highs), np.clip(guess, lows, highs)
         r = differential_evolution(cost, part, maxiter=budget, popsize=popsize, seed=seed + k,
                                    **dict(how, init=first))
         if res is None or r.fun < res.fun:
             res = r
     for k, x in zip(RULE, res.x):
         setattr(model, k, float(x))
+    model.w_v, model.w_i = float(res.x[9]), float(res.x[10])
     if model.single:
-        model.lo, model.hi = -math.inf, math.inf
+        model.lo, model.hi, model.w_v, model.w_i = -math.inf, math.inf, 0.0, 0.0
     else:
         model.chip.spacing = float(res.x[7])
     if model.chip is not None:
