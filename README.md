@@ -401,6 +401,12 @@ Right-click a channel ▸ **Mode-hop recovery…**:
 * **Catch**: *its SHG peak within 10 % of the optimum's; 3 goes, then from the optimum's piezo
   voltage ± 30 V* (0 V: no tries elsewhere; the piezo may go that far for them, inside the lock's
   offset limits, whatever *Piezo moves at most* says).
+* **Reset**: *after a hop, first: piezo and current to nominal, up 3 mA, down 1 mA at a time to
+  + 1 mA, then a step at a time; 2 times* (with an SHG stage; 0 mA: no reset). See *The catch* below.
+* **Top of its mode**: *its SHG signal dipping: down 0.001 mA at a time, kept 0.02 mA below; looked
+  for every 0 min, locked*. The first two are for easing the current off the top of its mode after a
+  relock (0.000: not), the last for the **upkeep** (0 min, the default: never). See *Off the top of
+  its mode* and *Upkeep* below.
 * **Optimum**: the laser at its best as you set it up by hand: its current (measured), piezo
   voltage (scan offset) and SHG intra-cavity signal, locked. It is **taken when you first click
   Relock** on the laser (set it up by hand first); *Take now* here, or *right-click ▸ Take the
@@ -478,6 +484,17 @@ Not lasing, at once, without asking, even if its wavemeter channel is switched o
    asked every 0.2 mA whether it still lases;
 3. if it stopped lasing on the way somewhere it had been seen lasing, it is never let that low again
    in this recovery (half a mA above where it stopped): up once more, and down only that far.
+
+**Stopped lasing far up (or down) the piezo**, more than 5 V from where the recovery began (the
+catch's try from the optimum's piezo voltage ± 30 V, say): that far, its feedback can fade, and it
+lases again only well above its window. That is the piezo's doing, not the current's. Once it lases
+again (the current up, as in 1), the piezo goes back to where it began first, the current still up,
+then the current comes down slowly as in 2; no floor is kept from there, and the catch does not try
+from there again. On the 739 nm one (record 84, 24 October) the catch's sweep down at +30 V (125.09
+V) stopped it lasing at 58.84 mA, and it lased again only at 62.24 mA, 4 mA up. Kept half a mA above
+where it had stopped, it would have been above the top of its window (58.94 mA): the recovery failed
+(*it stops lasing below 58.84 mA, too near the top of the window*) and left it there, at 62.24 mA and
+125.09 V, its cavity lock off.
 
 Then the recovery goes on as after a hop. This happens whenever a watched laser (*Locked*,
 *Watching*) stops lasing: by its seed power it is recovered straight away; if the seed power is
@@ -608,13 +625,29 @@ mode is close by, 4 pm at 739 nm, and drops onto it):
    within 10 % of the optimum's (a lock that caught a wrong peak, or keeps losing it): its current
    is **parked at the top end of where the mode is at its best** all the same, as by hand (up 0.1
    mA at a time while the peak stays at its best, then two steps back, but never lower than it
-   was), then the piezo onto the target (step 4), and relocked. Its feedforward takes the current
+   was), then the piezo onto the target (step 5), and relocked. Its feedforward takes the current
    down as the piezo drifts up, relock after relock: left alone, the current ends up near the
    bottom of its mode, where the cavity lock will not hold and the SHG looks worse, the laser
    still on the right mode (the 739 nm one sat at 57.9 mA on 23 October, its optimum 58.24 mA, its
    mode single up to about 58.2–58.3 mA, multimode above, as the catch's sweeps showed). The note
    says so: *on the right mode: the current to the top end of where it is at its best, … → … mA*.
-2. **Catch it.** The current goes up to the top of its window, quickly, then down **0.1 mA at a
+2. **Reset**, as you would by hand, when it is not on the right mode: the piezo to the optimum's
+   voltage, then the current to **3 mA above** the optimum's, down **1 mA at a time** to 1 mA above
+   it, and on down **0.1 mA at a time** to the optimum's, a reading each (each write still 0.2 mA at
+   most). Coming from that far above, it lands on its right mode there, as a rule, even when nothing
+   within its window would bring it back: its modes can hold on far longer one way than the other
+   (hysteresis), and a dip of the current puts it on one that holds over the whole window (record 84:
+   three goes up to the top of its window, 0.7 mA up, and down found nothing). On it (its SHG peak
+   within 10 % of the optimum's): on as ever, its current to the top end of where the mode is at its
+   best (as in 1), the piezo onto the target (step 5), relocked; the summary says *back on its right
+   mode by a reset*. Not: again (**2 times**), then the goes. The current may go the 3 mA above the
+   optimum's for it (within the 5 mA a laser that stopped lasing may go; *Check setup…* says if it
+   would go further). The piezo's tuning is measured first if not known (it tells where the right
+   mode is at the optimum's piezo voltage). In the simulator, over 37 random masters whose modes hold
+   on far longer going up than going down, hopped onto the next mode by a dip of the current: all 37
+   back on their right mode with the reset (also with the feedforward on and the optimum taken 2.4 V
+   lower), 3 with the goes alone (the others had the mode they were on walked onto the target).
+3. **Catch it.** The current goes up to the top of its window, quickly, then down **0.1 mA at a
    time**, a reading each. Where the laser is on the right mode, the SHG cavity's sweep is looked
    at too: its **SHG peak**, the tallest resonance (its true height, between samples: what the
    SHG cavity locked would show), within **10 %** of the optimum's signal locked, it is caught.
@@ -622,16 +655,16 @@ mode is close by, 4 pm at 739 nm, and drops onto it):
    top end of that, a step inside. Passed the right mode, or at the window's bottom: up again
    and down once more, **3 goes** (each a third of a step from the last, so it sees other
    currents).
-3. **Not caught there?** The same from the optimum's piezo voltage **+ 30 V**, then **− 30 V**.
+4. **Not caught there?** The same from the optimum's piezo voltage **+ 30 V**, then **− 30 V**.
    The right mode is elsewhere there, by as much as the piezo tuning says (it is measured first,
    if not known). Hysteresis can keep a laser off its mode wherever the current goes at one piezo
-   voltage, and not at another.
-4. **Walk back.** The piezo onto the target in 0.5 V steps, a reading and the SHG peak after
+   voltage, and not at another. Where it stopped lasing (see *Lasing*), it is not tried again.
+5. **Walk back.** The piezo onto the target in 0.5 V steps, a reading and the SHG peak after
    each. Every 4 steps the current is **parked high again**: up 0.1 mA at a time while the peak
    stays at its best, then two steps back, at the top end of where the mode is at its best, as
    the piezo moves the mode away from it. A peak falling below 90 % of the optimum's has the
    current trimmed, up first, until it is back. A hop on the way: caught again from there.
-5. **On target**, its SHG peak within 10 % there: handed back. The SHG cavity's signal locked
+6. **On target**, its SHG peak within 10 % there: handed back. The SHG cavity's signal locked
    must come within 10 % of the optimum's too; then the error signal's DC level is nulled and
    the cavity locked.
 
@@ -642,15 +675,16 @@ the 739 nm one): one that falls short is read again before it counts, here and w
 catch compares the peak with the optimum's.
 
 If the right mode cannot be had at all (beyond the window: with modes 6 GHz apart it is 3.4 mA
-of current away), after 3 goes everywhere (18 at most in a recovery), the laser goes back where
-it began and **the mode it is on there is walked onto the target** instead, as the walk does:
+of current away), after the resets and 3 goes everywhere (18 at most in a recovery), the laser goes
+back where it began and **the mode it is on there is walked onto the target** instead, as the walk does:
 better locked on another mode than not at all. The note says so (*the right mode not caught,
 walked the mode it was on instead*), and the log why. If its SHG peak on the right mode never came
 within 10 % of the optimum's, that is said too: the optimum may have changed (a weaker TA, say):
 take it again.
 
 Until the optimum is taken, the SHG peak is compared with its usual level locked (learned while
-it runs), and the tries go from where the piezo is ± 30 V. How a sweep shows the peak against
+it runs), the tries go from where the piezo is ± 30 V, and the reset goes to where the piezo was
+when it was last on target, and to the nominal current. How a sweep shows the peak against
 the signal locked is learned at every relock (*SHG peak in a sweep … of the signal locked*, near
 1), and the sweep's peaks are compared as the signal locked would show them: a scope on another
 scale than the photodiode is found out at the first relock (if the catch could not catch it for
@@ -724,6 +758,20 @@ and it is handed back again. If that did not bring the signal up, it is handed b
 and the row says so (*SHG signal only … of usual*: a second mode whose peaks fall on the main ones
 in the sweep, or a weaker TA).
 
+**Off the top of its mode**, at every relock with an SHG stage, as you would by hand. At the top of
+its mode (parked there, or taken there by the feedforward as the piezo walks down), a second mode
+begins and the SHG signal locked **dips** below what the mode gives: a warning that a hop comes next.
+So once its SHG cavity locks, a signal more than **3 %** below usual (or usual not known yet) has the
+current eased down **0.001 mA at a time** while the signal rises. Every 5 steps the middle of the
+readings since is compared with its noise; deep in the dip, rising steeply, the steps double, up to
+0.02 mA. When three looks in a row bring no more (or after 0.5 mA), it has levelled off: it is left
+**0.02 mA below** where it was back up (the first look within its noise of where it levelled off).
+Not rising at first: it was not dipping, and the current goes back where it was. The note says *off
+the top of its mode: its SHG signal dipping (… V), … back up at … mA (from … mA), and 0.02 mA more*.
+In the simulator, relocked 0.03 to 0.12 mA over the top, it was handed back with 3 to 15 % of its
+power in a second mode without this; with it, single-mode, 0.02 to 0.11 mA below where the second
+mode begins. A laser whose signal locked is as usual is not touched.
+
 The walk does not need the current to go far from nominal, and the mode it ends on is the
 nearest one that reaches the target, not necessarily the one it was on before the hop. With
 the piezo's feedforward to the current set right, a mode stays centered as the piezo walks, and
@@ -766,6 +814,35 @@ way the map found its mode there.
    frequency must stay on one straight line and come back, and with an SHG stage the laser
    must be single-mode at both ends and in the middle. If not, or if the piezo moved a lot
    (the modes move with it), it maps again there, up to three times.
+
+### Upkeep: kept just below the top of its mode
+
+Off by default (*Top of its mode … looked for every 0 min*). Set it to every 30 min, say, and a laser
+its DLC pro locks, with an SHG stage, has the top of its mode found now and then and is kept just
+below it, as you might do by hand. That needs the laser watched and locked on target, its locks
+saying locked, its transmission up, and nothing else going on. Then:
+
+1. both locks stay on, and the current goes **up 0.005 mA at a time** (a few MHz of the master: its
+   cavity lock follows), the SHG signal locked read three times after each step (their middle);
+2. where it **dips** (1 % below where it began, or more if its signal is noisier, and still there when
+   read again), a second mode is beginning: that is the top of its mode;
+3. then the current goes down **0.001 mA at a time** while the signal rises (faster while it rises
+   steeply, 0.005 mA at most a step), as off the top of its mode after a relock (above), until it is
+   back up, at least as high as where it began (it may have begun over the top), and rises no more;
+4. from where it was back up, **0.02 mA** more (*kept … mA below*).
+
+No dip within 0.5 mA (or the window), or no coming back up on the way down: the current goes back
+where it was. A current outside its window (its nominal current changed since, say) is left alone,
+with no upkeep. If its SHG signal collapses (its SHG lock lost, a hop) or its cavity lock stops saying
+locked, the current goes back where it was, 0.005 mA a step, and the laser is watched as ever
+(relocked if it needs it). The row says *upkeep: the top of its mode at … mA, the current … → … mA
+(+…)*, as do the console and *Last recovery…*. It does not count towards *At most … recoveries an
+hour*, and it writes nothing but the current. In the simulator, over 30 lasers each from 0.4 mA below
+the top to 0.05 mA over it, it ended 0.016 to 0.058 mA below where a second mode begins (0.025 the
+median), single-mode and still locked on target.
+
+Not tried on the real laser yet: watch the first one (every 1 min for a while, say), and see where it
+puts the current against where you would.
 
 ### SHG lasers, relocked by lockpoint
 
@@ -1074,6 +1151,13 @@ Things to know:
 * **`WS7 1234 is not running (this PC has WS6 5678)`**: that wavemeter's WLM program is closed; its
   settings wait for it, never read from the other. Settings given the wrong wavemeter: *Swap settings
   with…* (see *Several wavemeters on one PC*).
+* **A recovery failed and left the current high, the piezo far up** (*it stops lasing below …, too near
+  the top of the window: left lasing at …*): from a version before this one. The catch's try at the
+  optimum's piezo voltage + 30 V stopped the laser lasing (its feedback fades that far), and the panic
+  that followed would keep it above where it stopped, beyond its window. Now a laser that stops lasing
+  more than 5 V up or down the piezo from where it began has its piezo brought back first, keeps no
+  floor from there, and is not tried there again (see *Lasing*). A failure that leaves it lasing high
+  in its own piezo voltage is the laser's (its threshold has risen): look at it.
 * **Lock runs away straight after engaging**: the gain sign is wrong for that laser; the lock reverses it
   by itself now (*gains reversed by the lock*, above). Settings are kept per wavemeter channel, so a laser
   moved onto a channel inherits that channel's gains, sign and all: an identical laser on another channel
@@ -1185,3 +1269,15 @@ that will not have its scan switched while its lock is enabled, everything goes 
 whose gains are the wrong sign is caught running away, reversed and locked (through the fake controller
 too, and its row says so); one that runs away either way (its channel linked to the wrong laser) is
 unlocked and put back; a hop or noise is not taken for it, and later on its limits unlock it as ever.
+Record 84 runs in the simulator: a master whose feedback fades 20 V up its piezo, its seed photodiode
+fooled. The try at +30 V stops it lasing, its piezo comes home, and it is relocked within its window
+(switched off, the same test fails as the laser did). A hop its window cannot undo (modes that hold on
+far longer one way than the other) is undone by the reset, also with the feedforward on and the
+optimum taken elsewhere on the piezo, and step by step it asks first; without the reset, the mode it
+is on is walked; over random such masters (a Monte Carlo), the reset brings every one back, the goes
+alone hardly any. Relocked just over the top of its mode, by the catch and by the walk, it is eased off
+it until single-mode; without that, a second mode stays; a laser whose SHG signal is as usual is not
+touched. The upkeep runs from below the top and from over it (never more than 0.005 mA a write,
+nothing else written, ending just below the top), with no dip within reach, with its SHG lock lost on
+the way (the current put back) and not locked to begin with (nothing written); and end to end, now
+and then, through the engine and the fake controller.

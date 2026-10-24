@@ -410,11 +410,15 @@ def test_a_laser_whose_scan_drives_its_current_recovers_by_its_scan_offset(quiet
         e.stop()
 
 
-def test_shg_laser_put_back_on_the_right_peak(quiet_demo, tmp_path):
+@pytest.mark.parametrize("reset", [3.0, 0.0], ids=["reset", "goes"])
+def test_shg_laser_put_back_on_the_right_peak(quiet_demo, tmp_path, reset):
+    """Its lock on the next peak: relocked, the current parked high on its mode first. Then the master hops: back on
+    its right mode by a reset (as by hand: the current 3 mA up and down to the optimum's), or without it, caught by
+    the goes up and down within its window."""
     demo, dlc = quiet_demo, quiet_demo.dlcs[2]
     shg = demo.laser(demo.SHG)
-    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, step=0.2),
-                       log_path=tmp_path / "log.jsonl")
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, step=0.2,
+                                                        reset_up=reset), log_path=tmp_path / "log.jsonl")
     try:
         e.engage(demo.SHG)  # Relock: watch it
         assert ch.state == "on" and not ch.lock.active  # watched, not locked to the wavemeter
@@ -432,16 +436,20 @@ def test_shg_laser_put_back_on_the_right_peak(quiet_demo, tmp_path):
         assert wait_for(lambda: ch.guard.armed, 5)  # watching it again
         shg.hop_mode(-1)  # the master hops: its lock relocks 6 GHz away and calls that locked
         assert wait_for(lambda: ch.state == "recovering", 5)
-        assert wait_for(lambda: ch.state == "on" and not ch.message and "caught" in ch.note, 60), ch.message
-        assert shg.lock.locked() and abs(ch.error_mhz) < 3 and shg.ecdl.m == 0  # back on its own mode, caught
+        how = "back on its right mode by a reset" if reset else "caught"
+        assert wait_for(lambda: ch.state == "on" and not ch.message and how in ch.note, 60), ch.message
+        assert shg.lock.locked() and abs(ch.error_mhz) < 3 and shg.ecdl.m == 0  # back on its own mode
         assert shg.lock.shg_state()[0] == 5 and "of the optimum's" in ch.note
         (lo, hi), off = ch.last["i_window"], ch.last["act_offset"]  # measured: 148.58 ... 151.58 mA
         assert lo == pytest.approx(148.58) and hi == pytest.approx(151.58) and ch.last["i_top"] == pytest.approx(154.58)
-        assert_gentle(currents_written(dlc, 1), lo - off - 1e-3, hi - off + 1e-3)  # set (off: as the piezo was)
-        assert ch.last["ok"] and ch.last["catch"] and ch.last["walk"] and ch.last["scan"]["x"]  # kept for a look...
+        top = 149.58 + reset if reset else hi  # (the reset: up to 3 mA above the optimum's, 149.58 mA)
+        assert_gentle(currents_written(dlc, 1), lo - off - 1e-3, top - off + 1e-3)  # set (off: as the piezo was)
+        assert max(currents_written(dlc, 1)) == pytest.approx(top - off, abs=0.01)
+        assert ch.last["ok"] and ch.last["reset" if reset else "catch"] and ch.last["scan"]["x"]  # kept for a look...
         assert ch.last["ref"][0] == pytest.approx(70.0, abs=0.5)  # (where it was on target: its right mode there)
         lines = (tmp_path / "log.jsonl").read_text().splitlines()
-        assert len(lines) == 2 and "relocked, caught the right mode at" in lines[1]  # ...and logged
+        logged = "relocked, back on its right mode by a reset" if reset else "relocked, caught the right mode at"
+        assert len(lines) == 2 and logged in lines[1]  # ...and logged
     finally:
         e.stop()
 
@@ -480,6 +488,84 @@ def test_setup_check_reads_only(quiet_demo):
         assert "watched with the DLC pro's recorder" in text
         assert [x for x in dlc.log[before:] if ":recorder:" not in x[0]] == []  # nothing written (by the check: its
         #                                                                       dropout monitor uses the recorder)
+        assert "after a hop, first a reset, as by hand" in text and "current goes down 0.001 mA at a time" in text
+        assert "upkeep:" not in text
+        from wmlock.modehop import HopParams
+
+        e.set_hop_params(demo.SHG, HopParams.from_dict({**ch.hop.to_dict(), "upkeep": 30.0}))
+        ch.setup = None
+        e.check_setup(demo.SHG)
+        assert wait_for(lambda: ch.setup is not None, 5)
+        text = "\n".join(t for _, t in ch.setup)
+        assert "upkeep: every 30 min, locked and steady (both locks left on), the current up 0.005 mA at a time" in text
+        assert "The upkeep changes nothing but the current, 0.005 mA a step" in text
+    finally:
+        e.stop()
+
+
+def test_now_and_then_the_upkeep_keeps_a_locked_shg_laser_just_below_the_top_of_its_mode(quiet_demo):
+    """HopParams.upkeep: every so many minutes a laser its DLC pro locks, with an SHG stage, watched and locked, has
+    the top of its mode found (the current up until its SHG signal locked dips, both locks left on) and is kept
+    just below it. It stays locked and watched all along, and says so on its row and in its last recovery."""
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, upkeep=0.02))
+    try:
+        las = shg.ecdl
+
+        def to_second_mode():  # mA up to where a second mode begins
+            v, i = shg._vi()
+            return (las.zone(1.0)[0] - las.misalignment(las.m, v + shg.lock.dv, i)) / (las.ki - las.ksi)
+
+        las.nudge(-(to_second_mode() - 0.25) * (las.ki - las.ksi))  # (0.25 mA below it)
+        shg.lock.frequency()
+        assert shg.lock.locked() and to_second_mode() == pytest.approx(0.25, abs=0.01)
+        before, i_set = len(dlc.log), dlc.params["laser1:dl:cc:current-set"]
+        e.engage(demo.SHG)
+        assert wait_for(lambda: ch.note.startswith("upkeep"), 40), (ch.note, ch.message)
+        assert re.match(r"upkeep: the top of its mode at 149\.8\d\d mA, the current 149\.580 → 149\.\d\d\d mA "
+                        r"\(\+0\.2\d\d\), \d+ s$", ch.note), ch.note
+        assert wait_for(lambda: ch.state == "on", 5) and not ch.message
+        assert shg.lock.locked() and shg.lock.shg_state() == (5, "locked") and 0.005 < to_second_mode() < 0.06
+        assert ch.last["why"] == "upkeep" and ch.last["ok"] and ch.last["upkeep"]["top"] > ch.last["upkeep"]["to"]
+        writes = [(n, v) for n, v in dlc.log[before:] if ":recorder:" not in n]
+        assert {n for n, _ in writes} == {"laser1:dl:cc:current-set"}  # (both locks left alone)
+        currents = [i_set] + [v for _, v in writes]
+        assert max(abs(a - b) for a, b in zip(currents, currents[1:])) <= 0.005 + 1e-9
+    finally:
+        e.stop()
+
+
+def test_an_upkeep_that_goes_wrong_puts_the_current_back_and_it_is_watched_again(quiet_demo):
+    """Its SHG signal drops out for a moment while the upkeep climbs: the current goes back where it was, a little at
+    a time, and the laser is watched again (its optimum, cleared meanwhile, is left for the next Relock click)."""
+    demo, dlc = quiet_demo, quiet_demo.dlcs[2]
+    shg = demo.laser(demo.SHG)
+    e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, upkeep=0.02))
+    try:
+        name = "laser1:nlo:pd:shg-int:photodiode"
+        real, reads = dlc.params[name], [0]
+
+        def intra():  # (gone for a few readings, in the first upkeep)
+            if ch.upkeeping:
+                reads[0] += 1
+                if 20 <= reads[0] < 26:
+                    return 0.05
+            return real()
+
+        dlc.params[name] = intra
+        e.engage(demo.SHG)
+        assert wait_for(lambda: ch.state == "on" and ch.hop.optimum, 5)  # (taken by the first Relock click)
+        ch.hop.opt_i = 0.0  # (cleared)
+        i_set = dlc.params["laser1:dl:cc:current-set"]
+        assert wait_for(lambda: ch.note.startswith("upkeep: its SHG signal fell to 0.050 V"), 40), (ch.note, ch.message)
+        assert ch.note.endswith(": the current put back"), ch.note
+        assert wait_for(lambda: ch.state == "on", 5) and not ch.message and shg.lock.locked()
+        assert ch.last["why"] == "upkeep" and not ch.last["ok"] and not ch.hop.optimum
+        written = dlc.written("laser1:dl:cc:current-set")
+        assert written and written[-1] == pytest.approx(i_set)
+        currents = [i_set] + written
+        assert max(abs(a - b) for a, b in zip(currents, currents[1:])) <= 0.005 + 1e-9
     finally:
         e.stop()
 
@@ -633,7 +719,8 @@ def test_nominal_current_is_the_measured_one(quiet_demo):
         shg.hop_mode(+1)
         assert wait_for(lambda: ch.state == "recovering", 5)
         assert wait_for(lambda: ch.state == "on" and "walked" in ch.note, 60), ch.message
-        assert_gentle(currents_written(dlc, 1), 149.0, 152.0)  # set: the measured 148.58 ... 151.58
+        top = 153.0 if ch.last.get("reset") else 152.0  # (the reset: up to 3 mA above the optimum's, 149.58 mA)
+        assert_gentle(currents_written(dlc, 1), 149.0, top)  # set: the measured 148.58 ... 151.58 (152.58)
         assert "mA measured" in ch.note and ch.last["i_window"] == [148.58, 151.58]
         assert ch.last["act_offset"] == pytest.approx(-0.42, abs=0.01)
     finally:

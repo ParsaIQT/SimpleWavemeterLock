@@ -205,6 +205,9 @@ class Channel:
         self.remote_note = ""  # what, and from where
         self.remote_t = 0.0    # monotonic...
         self.remote_wall = 0.0  # ...and time.time(): when
+        # the upkeep (HopParams.upkeep): the top of its mode found now and then, and backed off from
+        self.upkeeping = False  # the recovery in progress is that
+        self.upkeep_t = 0.0    # monotonic: when it was armed, recovered or upkept last
         # what its wavemeter lock last did by itself (it ran away: its gains reversed)
         self.lock_note = ""
         self.lock_t = 0.0      # monotonic...
@@ -716,6 +719,22 @@ class Engine:
                 why, ch.look_due = ch.look_due, ""
                 if ch.off and ch.state == "on":
                     self._look(ch, why)
+            if self._upkeep_due(ch, now):
+                ch.upkeeping = True
+                self._start_recovery(ch, "upkeep", budget=False, relock=True)
+
+    def _upkeep_due(self, ch: Channel, now: float) -> bool:
+        """A laser its DLC pro locks, with an SHG stage, watched, locked and steady (on target a while, its locks
+        saying locked, its transmission up): is its upkeep due (HopParams.upkeep minutes since it was armed,
+        recovered, or upkept)?"""
+        hop = ch.hop
+        if not (hop.enabled and hop.cavity and hop.shg and hop.upkeep > 0) or self._is_reference(ch):
+            return False
+        if ch.state != "on" or ch.runner is not None or ch.pending is not None or ch.look_why or ch.off:
+            return False
+        if not (ch.guard.armed and ch.cavity_on and says_locked(ch.cavity_txt) and says_locked(ch.shg_txt)):
+            return False
+        return now - ch.upkeep_t >= 60.0 * hop.upkeep and not self._slipping(ch)
 
     def on_readings(self, readings):
         with self.lock:
@@ -843,9 +862,9 @@ class Engine:
 
             self._controller(ch.device).submit(job, failed)
 
-    def _arm(self, ch: Channel, check: bool = True):
+    def _arm(self, ch: Channel, check: bool = True, take: bool = True):
         """A laser its DLC pro locks to a cavity: watch it, and relock it after a hop. check: if it is
-        not locked on target now, relock it now."""
+        not locked on target now, relock it now. take: Relock clicked (its optimum taken, the first time)."""
         hop = ch.hop
         if not hop.enabled:
             ch.message = "mode-hop recovery is off: right-click › Mode-hop recovery…"
@@ -864,7 +883,8 @@ class Engine:
         ch.state, ch.message = "on", ""
         ch.token += 1
         ch.guard.reset()
-        if check and not hop.optimum:  # clicked on a laser set up by hand: its optimum, the first time
+        ch.upkeep_t = time.monotonic()
+        if check and take and not hop.optimum:  # clicked on a laser set up by hand: its optimum, the first time
             self._take_optimum(ch)
         if check and ch.off:  # is it locked on target? A look, its channel switched on for it
             ch.look_next = 0.0
@@ -1738,8 +1758,8 @@ class Engine:
             m.nudge()  # (its recorder stops at once: the recovery needs the DLC pro's data acquisition)
         ch.token += 1
         ch.hop_why, ch.hop_t = why, now
-        for d in (ch.trans_hist, ch.shg_hist, ch.trans_fine, ch.shg_fine):  # (what it relocked to is learned afresh)
-            d.clear()
+        for d in (ch.trans_hist, ch.shg_hist, ch.trans_fine, ch.shg_fine) if not ch.upkeeping else ():
+            d.clear()  # (what it relocked to is learned afresh)
         ch.look_why = ch.look_due = ch.wait_fail = ""
         ch.pending, ch.wait_since = None, now
         if ch.off:  # no readings: its wavemeter channel on first
@@ -1819,7 +1839,7 @@ class Engine:
             self._recovery_failed(ch, f"{what}, {v0:.2f} V, is outside {lp.v_min:g} … {lp.v_max:g} V")
             return
         rec = Recenter(hop, i0, v0, i_lo, i_hi, v_lo, v_hi, cavity=locked, quick=quick, shg=hop.shg, act_offset=off,
-                       i_top=i_top, i_clip=clip, ref=ref)
+                       i_top=i_top, i_clip=clip, ref=ref, upkeep=ch.upkeeping)
         io = _HopIO(self, ch, controller)
         runner = Runner(rec, io, time.monotonic(), timeout=rec.timeout, finished=lambda r: self._recovery_done(ch, r))
         if runner.busy:
@@ -1829,6 +1849,13 @@ class Engine:
 
     def _recovery_failed(self, ch: Channel, why: str):
         """Before anything was touched."""
+        if ch.upkeeping:  # (an upkeep that did not begin: watched again)
+            ch.upkeeping, ch.state = False, "off"
+            ch.note, ch.note_t = f"upkeep: none, {why}", time.monotonic()
+            ch.token += 1
+            ch.pending = None
+            self._arm(ch, check=False)
+            return
         ch.state, ch.resume = "off", False
         ch.message = f"{ch.hop_why + ': ' if ch.hop_why else ''}no recovery, {why}"
         ch.token += 1
@@ -1840,6 +1867,8 @@ class Engine:
         ch.guard.reset()
         ch.state = "off"
         ch.token += 1
+        upkeep, ch.upkeeping = ch.upkeeping, False
+        ch.upkeep_t = time.monotonic()
         self._release(ch)  # its wavemeter channel, if it was switched on for the recovery
         took = f"{r.now - ch.hop_t:.0f} s"
         why = f"{ch.hop_why}: " if ch.hop_why else ""
@@ -1870,6 +1899,13 @@ class Engine:
             return
         ch.resume = False
         ch.current_set = r.i_written
+        if upkeep and r.error != "stopped":  # (an upkeep that went wrong: watched again, relocked if it must be)
+            ch.note = f"upkeep: {r.error}" + ("" if r.restored else f" (left at {rec.mA(r.i_written):.3f} mA)")
+            ch.note_t = time.monotonic()
+            log.warning("channel %d: %s", ch.n, ch.note)
+            self._keep_record(ch, r, ch.note)
+            self._arm(ch, take=False)
+            return
         if r.restored:
             where = "current and offset put back"
         else:

@@ -88,6 +88,7 @@ def volts(x: float, scale: float = 0.0) -> str:
 
 class CavitySteps:
     SHG_LOCK_S = 10.0   # s for the SHG cavity to lock
+    DIP = 0.03          # its SHG signal locked this much below usual: dipping, perhaps (the top of its mode)
     LOCK_S = 20.0       # s for the cavity lock to report locked
     PEAK_LOOKS = 4      # scans looked at, at most, to tell the right cavity peak
     SETTLE_S = 0.5      # s after starting a scan or changing a scope channel, for fresh traces
@@ -357,9 +358,11 @@ class CavitySteps:
         self.learned.update(shg_area=round(learned.area, 5), shg_side=round(learned.side, 4), shg_n=learned.n_main)
 
     def lock_shg(self):
-        """Lock the SHG cavity: its intra-cavity signal must come up, and as high as usual (as learned
-        while it ran, else where it was locked when the recovery began; the catch: within 1 - catch_min of
-        the optimum's): if not, the master is not single-mode, whatever its sweep looked like (self.doubt),
+        """Lock the SHG cavity: its intra-cavity signal must come up (and not be dipping, as at the top of its
+        mode: more than DIP below usual, ease_down eases the current off the top first), and as high as usual
+        (as learned while it ran, else where it was locked when the recovery began; the catch: within
+        1 - catch_min of the optimum's):
+        if not, the master is not single-mode, whatever its sweep looked like (self.doubt),
         unless trimming the current for that has not brought it up already (then it is handed back all the
         same, and says so). The catch learns how its sweep's peak compares with the signal locked."""
         s = self.last_sweep
@@ -389,6 +392,8 @@ class CavitySteps:
             self.note(self.relock_trouble)
             self.doubt = True
             return False
+        if not usual or top < (1 - self.DIP) * usual:  # (at the top of its mode it dips, a hop next: off the top)
+            top = yield from self.ease_down(top)
         floor = s.floor if catch and s is not None and s.seen else 0.0
         least = self.p.catch_min if catch else cavity.AREA_MIN
         share = (top - floor) / (usual - floor) if usual > floor and top else 1.0
@@ -1215,6 +1220,21 @@ def setup_report(client, laser: int, hop, lp) -> list:
             add("info", "whether the master lases is told by the SHG sweep too: flat (no resonance), it does not, "
                         "whatever its seed power says (a master that does not lase still sends its TA broadband "
                         "light); then the current jumps up until the sweep shows resonances again")
+            if hop.ease_step > 0:
+                add("info", f"at the top of its mode a second mode begins, and its SHG signal locked dips below what "
+                            f"the mode gives (a hop comes next): relocked, its signal more than "
+                            f"{100 * CavitySteps.DIP:.0f} % below usual, the current goes down {hop.ease_step:g} mA at "
+                            f"a time while the signal rises, and is left {hop.upkeep_back:g} mA below where it was "
+                            f"back up")
+            if hop.upkeep > 0:
+                up = mh.Recenter
+                add("info" if hop.cavity else "warn",
+                    f"upkeep: every {hop.upkeep:g} min, locked and steady (both locks left on), the current up "
+                    f"{up.UP_STEP:g} mA at a time until its SHG signal dips (the top of its mode; at most "
+                    f"{up.UP_MAX:g} mA up), then down {hop.ease_step or 0.001:g} mA at a time while the signal "
+                    f"rises, and kept {hop.upkeep_back:g} mA below where it was back up; anything amiss, the current "
+                    f"back where it was"
+                    + ("" if hop.cavity else ": only for a laser its DLC pro locks to a cavity, so not this one"))
 
     add("head", "Finding a mode on target")
     if hop.how() == "catch":
@@ -1230,6 +1250,17 @@ def setup_report(client, laser: int, hop, lp) -> list:
                     f"feedforward takes it down as the piezo drifts up, relock after relock), then the piezo onto the "
                     f"target, and relocked. Not to be had at all: the mode it is on walked onto the target instead "
                     f"(walk)")
+        if hop.shg and hop.reset_up > 0:
+            slow = min(max(hop.reset_slow, 0.0), hop.reset_up)
+            add("info", f"after a hop, first a reset, as by hand: the piezo to the optimum's voltage and the current "
+                        f"to the optimum's, then the current up {hop.reset_up:g} mA, down 1 mA at a time to "
+                        f"{slow:g} mA above it, and on down {hop.step:g} mA at a time to it, a reading each: coming "
+                        f"from that far above it lands on its right mode there, as a rule. On it (its SHG peak within "
+                        f"{100 * (1 - hop.catch_min):.0f} % of the optimum's), the piezo onto the target and relocked; "
+                        f"not, again ({hop.reset_tries} times in all), then the goes up and down")
+            if hop.reset_up > max(hop.jump_max, hop.i_window):
+                add("warn", f"the reset's {hop.reset_up:g} mA up goes beyond what the current may go above nominal "
+                            f"({max(hop.jump_max, hop.i_window):g} mA, the most a panic may jump to): it stops there")
         if not hop.shg:
             add("info", f"with nothing but the wavemeter (no SHG stage): caught where it is on the right mode coming "
                         f"down, it is at the mode's edge; so the current goes on down until it hops off and back up "
@@ -1268,10 +1299,14 @@ def setup_report(client, laser: int, hop, lp) -> list:
                     f"parked on the way it lases, the piezo onto the target")
 
     add("head", "What a recovery may change")
-    add("info", "the current (within its window, ≤ 0.2 mA a step; higher for a laser that stopped lasing), the scan "
-                "offset, the cavity lock and SHG lock on/off, the cavity lock's lock-without-lockpoint, the scan and "
-                "SHG scan on/off, a scope channel (given back), a FALC pro's input offset (within its limit), "
-                "find-candidates and select-lockpoint; nothing else. On failure all goes back (the current down "
-                "slowly), except that the cavity lock stays off, and a laser that stopped lasing stays where it "
-                "lases.")
+    reset = hop.how() == "catch" and hop.shg and hop.reset_up > 0
+    add("info", "the current (within its window, ≤ 0.2 mA a step; higher for a laser that stopped lasing"
+                + (f", and up to {hop.reset_up:g} mA above the optimum's for the reset" if reset else "")
+                + "), the scan offset, the cavity lock and SHG lock on/off, the cavity lock's lock-without-lockpoint, "
+                "the scan and SHG scan on/off, a scope channel (given back), a FALC pro's input offset (within its "
+                "limit), find-candidates and select-lockpoint; nothing else. On failure all goes back (the current "
+                "down slowly), except that the cavity lock stays off, and a laser that stopped lasing stays where it "
+                "lases."
+                + (f" The upkeep changes nothing but the current, {mh.Recenter.UP_STEP:g} mA a step"
+                   if hop.upkeep > 0 and hop.cavity and hop.shg else ""))
     return out

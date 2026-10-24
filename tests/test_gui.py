@@ -226,6 +226,16 @@ def test_hop_dialog_shows_the_optimum_and_takes_it(app):
     d.pc_try.setValue(20.0)
     p = d.params()
     assert p.catch_min == 0.85 and p.pc_try == 20.0 and p.opt_shg == 1.231 and p.i_nom == 150.31
+    assert (p.reset_up, p.reset_slow, p.reset_tries, p.ease_step, p.upkeep, p.upkeep_back) == (3.0, 1.0, 2, 0.001, 0.0,
+                                                                                              0.02)
+    d.reset_up.setValue(2.5)
+    d.reset_tries.setValue(3)
+    d.ease_step.setValue(0.002)
+    d.upkeep.setValue(60)
+    d.upkeep_back.setValue(0.03)
+    p = d.params()
+    assert (p.reset_up, p.reset_slow, p.reset_tries, p.ease_step, p.upkeep, p.upkeep_back) == (2.5, 1.0, 3, 0.002, 60.0,
+                                                                                              0.03)
     d._clear_optimum()
     assert d.params().opt_i == 0 and not d.params().optimum and d.params().shg_ratio == 0.98
 

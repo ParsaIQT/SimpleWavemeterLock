@@ -367,15 +367,16 @@ class ECDL:
 
     With i_stop set, it stops lasing altogether when the current drops below i_stop, and starts
     again only once the current is above i_start (above where it normally runs): setting the
-    current back is not enough. Not lasing, it gives the wavemeter nothing to read and a cavity
-    nothing to resonate with; the TA gets hardly any seed (power()), or with `ase` that fraction of
-    its lasing power as broadband light (an AR-coated chip without its feedback), which its seed
-    photodiode cannot tell from lasing.
+    current back is not enough (with dark_v, far enough up the piezo both take more current). Not
+    lasing, it gives the wavemeter nothing to read and a cavity nothing to resonate with; the TA
+    gets hardly any seed (power()), or with `ase` that fraction of its lasing power as broadband
+    light (an AR-coated chip without its feedback), which its seed photodiode cannot tell from
+    lasing.
     """
 
     def __init__(self, f0, fsr=6.0, kv=0.4, ki=-0.25, ksv=None, ksi=-2.0, kt=-4.0, kst=-1.0,
                  hysteresis=0.6, multimode=0.3, v0=70.0, i0=150.0, seed=None, mm_noise=0.03, skew=0.0,
-                 i_stop=None, i_start=None):
+                 i_stop=None, i_start=None, dark_v=None):
         self.f0, self.fsr = f0, fsr
         self.mm_noise = mm_noise  # GHz rms the wavemeter reads where it runs on two modes
         self.kv, self.ki = kv, ki
@@ -388,6 +389,8 @@ class ECDL:
         self.m = 0
         self.rng = random.Random(seed)
         self.i_stop, self.i_start = i_stop, i_start  # mA (measured): stops lasing below, starts again above
+        self.dark_v = dark_v  # (V, mA/V): beyond V of piezo its feedback fades: it needs that much more current per
+        #                       volt to lase, both thresholds (the 739 nm one, +28 V from where it ran)
         self.lasing = True
         self.slope_mw, self.i_th = 0.25, i0 - 80.0   # its power: mW per mA above threshold
         self.ase = 0.0     # not lasing, this fraction of that power still goes on (broadband)
@@ -419,10 +422,11 @@ class ECDL:
         """Settle whether it lases, and on which mode, at (v, i), with hysteresis; returns that
         mode's misalignment (GHz)."""
         start = self.i_start if self.i_start is not None else self.i_stop
+        more = self.dark_v[1] * max(v - self.dark_v[0], 0.0) if self.dark_v else 0.0
         if self.lasing:
-            if self.i_stop is not None and i < self.i_stop:
+            if self.i_stop is not None and i < self.i_stop + more:
                 self.lasing = False
-        elif start is None or i > start:
+        elif start is None or i > start + more:
             self.lasing = True  # on whichever mode is best aligned now
             self.m -= round(self.misalignment(self.m, v, i) / self.fsr)
         a = self.misalignment(self.m, v, i)

@@ -1205,6 +1205,34 @@ class HopDialog(QtWidgets.QDialog):
                                "optimum's piezo voltage + and - this\n(the piezo may go that far for it), then walks "
                                "the piezo back onto the target, the\ncurrent parked high in the mode every few steps. "
                                "0: no tries elsewhere.")
+        self.reset_up = number(p.reset_up, 0, 10, 1, 0.5)
+        self.reset_slow = number(p.reset_slow, 0, 10, 1, 0.5)
+        self.reset_tries = QtWidgets.QSpinBox()
+        self.reset_tries.setRange(1, 5)
+        self.reset_tries.setValue(p.reset_tries)
+        form.addRow("Reset", row("after a hop, first: piezo and current to nominal, up", self.reset_up,
+                                 "mA, down 1 mA at a time to +", self.reset_slow, "mA, then a step at a time;",
+                                 self.reset_tries, "times"))
+        self.reset_up.setToolTip("With an SHG stage, as by hand: the piezo to the optimum's voltage and the current to "
+                                 "the optimum's, then the current\nthis far up, down 1 mA at a time, and on down to "
+                                 "the optimum's a step at a time, a reading each: coming\nfrom that far above, it "
+                                 "lands on its right mode there, as a rule. Then on as ever: the current to the top "
+                                 "end\nof where the mode is at its best, the piezo onto the target. Only if that does "
+                                 "not bring it back,\nthe goes up and down. 0: no reset.")
+        self.ease_step = number(p.ease_step, 0, 0.1, 3, 0.001)
+        self.upkeep_back = number(p.upkeep_back, 0, 0.5, 3, 0.005)
+        self.upkeep = number(p.upkeep, 0, 1440, 0, 5)
+        form.addRow("Top of its mode", row("its SHG signal dipping: down", self.ease_step, "mA at a time, kept",
+                                           self.upkeep_back, "mA below; looked for every", self.upkeep,
+                                           "min, locked"))
+        self.ease_step.setToolTip("At the top of its mode a second mode begins, and its SHG signal (locked) dips "
+                                  "below what the mode gives:\na warning of a hop. Relocked, its SHG cavity locked "
+                                  "and its signal below usual, the current goes down\nthis much at a time while the "
+                                  "signal rises, and is left that much below where it was back up. 0: not.")
+        self.upkeep.setToolTip("Every this many minutes, while it is locked and steady (both locks left on): the "
+                               "current up in small steps\nuntil its SHG signal dips (the top of its mode), then down "
+                               "until it is back up, and kept that much below.\nAnything amiss: the current back "
+                               "where it was. 0: never.")
         self.optimum = Text("", "dim")
         self._cleared = False
         self._opt_seen = None
@@ -1396,7 +1424,10 @@ class HopDialog(QtWidgets.QDialog):
             grace=self.grace.value(), max_per_hour=self.per_hour.value(), seed=self.seed.text().strip() or "auto",
             seed_min=self.seed_min.value(), jump=self.jump.value(), jump_max=self.jump_max.value(),
             ramp=self.ramp.value(), catch_min=round(1 - self.catch_pct.value() / 100, 4),
-            catch_tries=self.catch_tries.value(), pc_try=self.pc_try.value())
+            catch_tries=self.catch_tries.value(), pc_try=self.pc_try.value(), reset_up=self.reset_up.value(),
+            reset_slow=self.reset_slow.value(), reset_tries=self.reset_tries.value(),
+            ease_step=round(self.ease_step.value(), 4), upkeep=self.upkeep.value(),
+            upkeep_back=round(self.upkeep_back.value(), 4))
         if not self.forget:
             for name in HopParams.LEARNED:
                 setattr(out, name, getattr(p, name))
