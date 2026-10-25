@@ -1304,7 +1304,8 @@ class Recenter(CavitySteps):
         sweeping to it. There, the piezo onto the target by the model's tuning (not measured), and the margins checked
         as the map method's. Not on that mode there, or not holding: the model is fitted again to all it has seen on
         the way (the margins' check too), and the plan made again, not there (MODEL_TRIES in all). The model not this
-        laser's now (it fits the map's readings badly), or no plan for it: the map's way, from this map."""
+        laser's now (it fits the map's readings badly), or no plan for it: the map's way, from this map. A model of
+        several temperatures is taken at the diode's as set (dl:tc:temp-set)."""
         try:
             from .modelhop import Planner
         except ImportError as exc:  # (numpy)
@@ -1313,7 +1314,14 @@ class Recenter(CavitySteps):
         if self.shg_ok:
             yield from self.shg_scan(True)
         ref = (self.mA(self.i_ref, self.v_ref), self.v_ref) if self.ref_given else None
-        pl = Planner(self.model, self.target, ref=ref)
+        model = self.model
+        if getattr(model, "T0", None) is not None:  # (a model of several temperatures: at the diode's now)
+            (temp,) = yield Get(("dl:tc:temp-set",))
+            if _num(temp):
+                model = model.at(float(temp))
+                self.note(f"its model at {temp:.3f} °C, the diode's temperature as set (its map's: "
+                          f"{', '.join(f'{t:g}' for t in self.model.temps or [])} °C)")
+        pl = Planner(model, self.target, ref=ref)
         self.model_tuning(pl)
         if self.quick and math.isfinite(self.e) and abs(self.e) <= self.near():
             yield from self.ask(f"The laser is {self.e:+.0f} MHz from its target: tune the piezo onto it (its model's "

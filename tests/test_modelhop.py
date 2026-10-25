@@ -204,6 +204,17 @@ def test_the_650nm_laser_hopped_comes_back_on_target_by_its_model(seed):
     assert rec.record["model"]["done"] >= 1 and rec.maps == 1
 
 
+@pytest.mark.parametrize("seed", [300, 304])
+def test_a_model_of_several_temperatures_goes_by_the_diodes_own(seed):
+    model = red(T0=19.75, temp=19.75, temps=[19.0, 19.5, 20.0, 20.5], w_T=-1.8)  # (as its temperature map had it)
+    model.chip.p_T, model.ext.p_T = -26.9, -7.35
+    true = off(model, np.random.default_rng(seed)).at(20.0)  # (its diode at 20 °C, where its controller has it)
+    r, rec, hop, e = recover(model, seed, true=true)
+    assert abs(hop) > 1.0 and r.state == "done" and abs(e) < 20.0
+    assert any(n.startswith("its model at 20.000 °C, the diode's temperature as set (its map's: 19, 19.5, 20, 20.5")
+               for n in rec.notes)
+
+
 class Thinking(Bench):
     """A bench whose io works things out on the side (as the engine's does, in a thread of its own): each answer a
     second later, readings going by meanwhile."""

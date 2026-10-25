@@ -548,12 +548,15 @@ class ModelLaser:
     hysteresis, its chip lagging the current's heat and pulled by the mode lasing), not lasing below its threshold,
     its power above (how its mode sits on its chip resonance in it); the interface of ECDL that SimLaser and a map's
     bench use (lase, freq, components, power, photodiode, T, f0, lasing). clock: s, for the model's drift (from the
-    model's t0 when made) and its chip's lag (None: no drift, the lag by the monotonic clock). Needs numpy."""
+    model's t0 when made) and its chip's lag (None: no drift, the lag by the monotonic clock). T: K its diode is from
+    t_ref °C (its controller's temperature when it was made, as a bench has it; None: the model's own, T0 or temp),
+    which a model of several temperatures goes by. Needs numpy."""
 
-    def __init__(self, model, clock=None, seed=None):
+    def __init__(self, model, clock=None, seed=None, t_ref=None):
         self.model, self.clock = model, clock
         self.f0 = model.f_ref
         self.T = 0.0
+        self.t_ref = t_ref if t_ref is not None else (model.T0 if model.T0 is not None else model.temp)
         self.lasing = True
         self.ase = 0.0
         self.rng = random.Random(seed)
@@ -566,13 +569,17 @@ class ModelLaser:
 
     def lase(self, v: float, i: float):
         """Settle which mode lases at (v, i); returns its frequency (GHz from f0), None not lasing."""
+        m = self.model
+        if m.i_th is not None and m.i_th_T is not None and m.T0 is not None and self.t_ref is not None:
+            self.i_th = m.i_th + m.i_th_T * (self.t_ref + self.T - m.T0)  # (its threshold where its diode is now)
         if i < self.i_th:
             self.lasing, self._state = False, None
             return None
         self.lasing = True
         now = self.clock() if self.clock is not None else time.monotonic()
         t = self.model.t0 + (now - self._began if self.clock is not None else 0.0)
-        self._ghz, self._delta, self._state = self.model.step(i, v, t, self._state, clock=now)
+        T = self.t_ref + self.T if self.t_ref is not None else None
+        self._ghz, self._delta, self._state = self.model.step(i, v, t, self._state, clock=now, T=T)
         return self._ghz
 
     def freq(self, v: float, i: float, extra_mhz: float = 0.0) -> float:

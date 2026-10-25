@@ -1326,8 +1326,10 @@ model of the laser is fitted to it, in a thread of its own once its file is writ
 laser is free meanwhile). It is kept in the file (`meta` `model`, and its facts, as sentences,
 `model_facts`), its facts are said in the map's notes, and **The laser…** in the map's window lists them.
 `python -m wmlock.lasermap FILE --model` fits it to any map's file and says its facts (`--save-model`
-keeps it there; `--map N` for a file with several maps; `--current set` for one made before the current
-was read at each point).
+keeps it there; `--map N` for one of a file's maps alone; `--current set` for one made before the current
+was read at each point). A file whose maps were made at several temperatures gives a model with the
+temperature in it (below). `--park NM` says where to park the laser for a wavelength (*Where to park it*,
+below).
 
 The model (`wmlock/lasermodel.py`) is a Littrow ECDL as two combs of modes and the rule that picks which of
 them lases:
@@ -1342,7 +1344,14 @@ them lases:
   filter (the grating's and the gain's) does: the same rule with one resonance.
 * **A window** (the grating's feedback and the gain together) outside which it does not lase. The piezo may move
   it (a grating turned as well as pushed: its feedback's band follows), and the current (the gain, as the chip
-  warms).
+  warms). Its edges are soft, and how soft is fitted too: beyond them a mode loses more the further out it is,
+  so a chip mode near an edge can still take over, briefly, where the one inside is between two of its
+  external modes.
+* **The diode's temperature** (as its controller sets it) moves the chip's modes (their refractive index and
+  length: some 0.04 to 0.06 nm/K for a red or near-infrared diode), the external modes (the chip's share of the
+  cavity, and the cavity's own expansion as its mount warms with the diode) and the window; the rule is the same
+  at every temperature. So a temperature moves the chip's modes past the window and the external modes: which
+  chip mode lases at a wavelength, and how far it is from the window's edges.
 * **The rule**: the external mode nearest its chip mode's best place lases, and goes on lasing until another
   is better by a hysteresis of its own. That best place lags the current's heating (the chip's temperature
   follows the current with a time constant: ahead sweeping up, behind sweeping down), and the mode lasing
@@ -1374,6 +1383,24 @@ How it is fitted, each part from what the map shows most directly:
    once where the pull does (a search settles on one or the other as it goes). The better is the model's
    rule; the other is kept as well, and said if it does nearly as well (its recoveries plan for both);
 5. the power at the wavemeter: linear in the current above a threshold, and how it changes along a mode.
+
+**At several temperatures** (a map at each: the map dialog's temperature range), each temperature's combs are
+fitted alone (steps 1 to 3), and the temperature's coefficients come from where they are at each. Each comb's
+offset is known only to whole modes, so every coefficient that puts its temperatures on one line, a whole mode
+more or less per step, fits them equally well: with steps of 0.5 K, the 650 nm laser's chip modes (18.36 GHz
+apart) could move −26.9 GHz/K, or 36.7 more or less, and its external modes (3.39 GHz) −7.3 GHz/K, or 6.8 more
+or less. Of these, the chip's is the one a diode's chip has (nearest 0.05 nm/K), then the external modes' the one
+that goes with it (the chip's share of the cavity, de/dc of the chip's, and no more than the rest of the cavity
+expanding as an aluminium mount at the diode's temperature would, nor shrinking as it warms). The others are kept
+and said: at the temperatures mapped they are the same model, between them they are not, and its facts say which
+steps would tell (0.25 K for that laser). Then the combs are fitted again over every temperature at once with
+those coefficients (the external modes' drift as a line swept again told it, not fitted again: mapped one after
+another, over the temperatures a drift and the temperature's doing are one; the chip's modes not drifting), the
+window's from where it lased at each, the rule over every temperature's sweeps at once, and the chip's coefficient
+corrected from where it hops at each temperature (where its frequencies bunch on the chip's modes is biased near
+the window's edges, differently at each). A laser made of a model and mapped at three temperatures comes back with
+its chip's coefficient to 0.5 %, its external modes', its window's and its threshold's to a few %. A model of several temperatures is taken at the diode's temperature as set wherever it is used
+(`LaserModel.at(T)`): by a recovery (`dl:tc:temp-set`), by the simulator's laser made of it.
 
 A frequency THz away from all the others is the wavemeter misreading its interference order (both readings
 alike, so its spread does not give it away): none of the laser's modes, and left out. Far away means beyond four
@@ -1433,14 +1460,27 @@ again 15 minutes later, could tell). The model puts 85 % of its 10,513 points on
 rest within two points of a hop). 26 of its readings were the wavemeter misreading its order (±2.4 and ±4.9 THz),
 two of them alike both readings: left out.
 
-Its **temperature map** (19.0 to 20.5 °C in 0.5 °C steps, 53 to 70 mA, 27.6 to 107.6 V): at each temperature
-the model is the same laser, its external modes 3.387 ± 0.001 GHz apart, its chip's 18.29 to 18.45 GHz, its window
-27 GHz wide, the ideal feedforward −0.42 mA/V, 85 % of the points on the right mode. What the temperature moves is
-where its chip's modes line up with a given wavelength: 649.869 nm, for one, is on a mode only in a band of current
-some 1.5 mA wide that moves +8 mA per °C (about 64 mA at 19.0 °C, 54 and 68 mA at 19.5, 58 at 20.0, 62 at 20.5,
-a chip mode, 13.4 mA, apart), and in it every 7 V of piezo (each external mode). Of these, at 19.5 °C, 88.3 V set
-and 67.5 mA it lases on one mode from 66.6 to 69.0 mA sweeping up or down, its frequency all but still in the
-current, about 1.4 mW reaching the wavemeter.
+Its **temperature map** (19.0 to 20.5 °C in 0.5 °C steps, 53 to 70 mA, 27.6 to 107.6 V), one model with the
+temperature in it: its chip's modes move −26.8 GHz/K (0.038 nm/K), its external modes −7.35 GHz/K (−4.96 of it
+the chip's share of the cavity, −2.39 the rest: its mount warming with the diode), its window −1.8 GHz/K; so its
+chip's modes slide past its external modes a chip mode every 0.94 K, and its current warms the chip 0.051 K/mA.
+It puts 85 to 87 % of the points on the right mode at each temperature (four models, one a temperature, did 85 %).
+Its window is a flat top 16 GHz wide with soft edges (a mode 31 GHz beyond one loses as much again as one halfway
+between chip modes): at 19.0, 20.0 and 20.5 °C the map shows the laser, at a hop, going for a few tenths of a mA to
+the neighbouring chip mode's mode (four to seven external modes away) before the next of its own, which a model
+with hard edges could not do (83 %). Its steps of 0.5 K are fitted as well by the chip's modes moving −63.6 or
++9.9 GHz/K and the external modes −14.1 or −0.5 GHz/K: the ones above are what a red diode's chip and an ECDL's
+cavity do, and between the temperatures mapped the model is only as good as that choice (steps of 0.25 K would
+tell).
+
+**Where to park it at 649.869 nm** (`--park 649.869`): its widest modes are all about 19.5 °C. At 19.45 °C, the
+piezo at 81.77 V set and 55.09 mA (as measured) its mode is the same sweeping up or down from 53.88 to 56.28 mA;
+at 19.50 °C (a temperature mapped: whichever of those coefficients is the laser's), 88.47 V set and 67.73 mA, from
+66.58 to 68.73 mA, and parked there it holds from 66.13 to 69.18 mA. That one the map shows too: at 19.5 °C, 88.6 V
+set, its mode is the same up and down from 66.6 to 69.0 mA at its pace, its widest at any temperature (±0.6 to
+0.8 mA at the others; the model, swept as the map was, puts the widest at the same piezo voltages and currents,
+±0.8 to 1.0 mA wide: it sees most of why 19.5 °C is better, not all of it). There a lock on the piezo takes up
+−10.5/+12.2 GHz of drift of the cavity before it hops with the feedforward off, ±2.3 GHz at the −0.30 mA/V it had.
 
 Two things this map could not tell. **Its drift**: its first line, swept again 19 minutes later, was where
 +1.8 GHz of drift per 10 minutes puts it, but just as much where −2.6 or +6.2 do (a whole external mode
@@ -1457,6 +1497,37 @@ speed, the pull's does not. Either way, coming down onto a mode from above (as t
 puts it reproducibly on the same one: up and down, it is on different modes nearly everywhere.
 
 Its recoveries go by it: see *Recovery by the laser's model* under *Mode-hop recovery*.
+
+### Where to park it
+
+`python -m wmlock.lasermap FILE --park NM` says where to put the laser to lase at NM nm on the mode that holds
+most widely there, by its model (the one kept in the file, if it can be the laser's, else fitted; with a map at
+several temperatures, the temperature as well: `--temp LO HI` to look elsewhere than the temperatures mapped).
+Power is not counted. `wmlock/parking.py` does it:
+
+* at temperatures 0.05 K apart across the map's (then five times finer about the best), piezo voltages 0.5 V apart
+  and currents 0.05 mA apart across what it covered, the model **at rest** (its chip as warm as its current, its
+  external modes between where sweeping up and down put them) is swept along the current up, and back down, at
+  every piezo voltage, by its rule and by the rule held the other way (its map tells them apart only so far);
+* where a mode is on target, the same both ways and by both rules, is a spot. Its **core**: the currents about it
+  where the laser is on that mode sweeping up and sweeping down alike, so that from either side it comes to that
+  mode, whatever it was on before. **Held**: parked on it, how far the current can move each way before it hops
+  (its hysteresis with it). The spots are ranked by their core's narrower side: a wide mode, and the spot in its
+  middle. The sweeps begin 3 mA beyond the currents searched, so that at their edges they have come from somewhere.
+  A laser whose modes sweeping up and down are seldom the same (the 493 nm one: on different modes over nearly all
+  of its range) has few such spots; after them come those on target one way only (come to sweeping the current up,
+  or down: said so), ranked by how far parked there they hold, at least;
+* for the best few: the piezo voltages it holds over, the current kept; how much **drift of its cavity a lock can
+  take up** before it hops, the frequency held by the piezo and the current moved with it as a feedforward has it
+  (none, the controller's, the ideal); and, with a model of several temperatures, the best spot near it (4 V,
+  3 mA) were the temperature's coefficients the others its map allows (`--robust`, `robust=True`, ranks every
+  spot by the worst of those: what the map can vouch for whichever they are). For each, the current to set with
+  the controller's feedforward off, and on.
+
+The feedforward that keeps the combs aligned while the frequency is tuned (the ideal) is the worst for a laser
+held at one frequency: its cavity drifting, the lock moves the piezo back, and the feedforward moves the current
+with it, which moves the chip's modes off the mode lasing. With none, the chip's modes stay where they are (the
+piezo hardly moves them) and the lock takes up as much drift as the window allows.
 
 **The simulator's lasers** can be made of a model: `sim.ModelLaser(model, clock)` lases as the model says
 (`LaserModel.step`, a point after another, its chip lagging and pulled as fitted), with the model's
@@ -1618,6 +1689,7 @@ wmlock/relock.py     taking over and handing back a DLC pro's cavity and SHG loc
 wmlock/dropouts.py   lock dropouts: the DLC pro's recorder (or polling) read, dropouts found
 wmlock/lasermap.py   laser maps: the plan, the sweeps both ways, the file (SQLite), reading it back; python -m wmlock.lasermap
 wmlock/lasermodel.py the laser's model from its map: two combs and a rule, fitted (numpy, scipy), its facts
+wmlock/parking.py    where to park a laser for a wavelength by its model, on the mode that holds most widely
 wmlock/modelhop.py   recovery by the laser's model: anchored, fitted to what it does, a plan onto a mode on target (numpy)
 wmlock/cavity.py     reading SHG sweeps, cavity scans and error signals, pure maths
 wmlock/engine.py     threads and state: source → lock → per-controller workers
@@ -1710,10 +1782,15 @@ written. End to end through the engine, its window and the fake controllers, and
 wlmData and server.py (details, patterns exported and no longer). The laser's model is fitted to a map of a
 laser made of a model (a chip with modes of its own: its spacings, tunings, window and pull come back) and
 to one of the simulator's ECDL (one selection filter: its mode spacing, tunings and ideal feedforward come
-back); its facts, a drift the map cannot tell, its file, the command line and the engine's fit after a
-map are tested too (numpy and scipy: without them those tests are skipped). Recovery by the laser's model:
+back); mapped at three temperatures, its chip's and external modes' temperature coefficients and its
+threshold's come back, and its model at another temperature is where its terms put it (the others its steps
+allow agreeing at the temperatures mapped, half a chip mode apart between them); where its model parks it for a
+wavelength, the laser comes to the same mode on target from below and from above; its facts, a drift the map
+cannot tell, its file, the command line (`--park` too) and the engine's fit after a map are tested too (numpy
+and scipy: without them those tests are skipped). Recovery by the laser's model:
 its planner anchored, fitted to what the laser did (how far its chip's modes and its cavity moved), planning
 onto a mode on target that holds, and elsewhere where one did not; the lab's two lasers, as their maps' models
 have them but a little off, hopped and brought back on target by it; its sums done on the side while readings
-go by, a stop meanwhile putting everything back; a model that does not describe the laser not gone by; the
-method chosen; a channel keeping its laser's model, and the dialog showing it.
+go by, a stop meanwhile putting everything back; a model that does not describe the laser not gone by; a model
+of several temperatures taken at the diode's as set; the method chosen; a channel keeping its laser's model, and
+the dialog showing it.

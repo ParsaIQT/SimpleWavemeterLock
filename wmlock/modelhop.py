@@ -103,7 +103,8 @@ class Planner:
             m.chip.p_t = 0.0
         rules = [m.rule()]
         if model.alt is not None:
-            rules.append(np.array([model.alt[k] for k in RULE + ("dc", "ci") + WINDOW], dtype=float))
+            alt = {"soft": model.soft, **model.alt}  # (kept before its window's edges were soft: as its own)
+            rules.append(np.array([alt[k] for k in RULE + ("dc", "ci") + WINDOW], dtype=float))
         for P in rules:  # (their windows' frequencies too)
             if math.isfinite(P[0]) and math.isfinite(P[1]):
                 P[0] += shift
@@ -181,7 +182,7 @@ class Planner:
             if math.isfinite(P[0]) and math.isfinite(P[1]):
                 shift = P[9] * (float(self._dv(v)) - m.v0) + P[10] * (i - m.i0)
                 lo, hi = P[0] + shift, P[1] + shift
-                edge = min(WINDOW_IN, 0.1 * (hi - lo))
+                edge = min(WINDOW_IN, 0.1 * _width(P)) - _beyond(P)
                 slid = max(ghz - (hi - edge), 0.0) + min(ghz - (lo + edge), 0.0)
                 P[0] += slid
                 P[1] += slid
@@ -213,7 +214,7 @@ class Planner:
             d = PHI_MIN * self.rules[r][7]
             out += [(r, self.phi, self.slide), (r, self.phi + d, self.slide), (r, self.phi - d, self.slide)]
             if self._bounded():
-                w = min(WINDOW_SLIP, 0.1 * (self.rules[r][1] - self.rules[r][0]))
+                w = min(WINDOW_SLIP, 0.1 * _width(self.rules[r]))
                 out += [(r, self.phi, self.slide + w), (r, self.phi, self.slide - w)]
         if self.which:
             out.sort(key=lambda x: x[0] != self.which)  # (the model's own first)
@@ -312,7 +313,7 @@ class Planner:
             d = max(spread, PHI_MIN * dc)
             members = [(r, phi, slide), (r, phi + d, slide), (r, phi - d, slide)]
             if self._bounded():
-                w = min(WINDOW_SLIP, 0.1 * (self.rules[r][1] - self.rules[r][0]))
+                w = min(WINDOW_SLIP, 0.1 * _width(self.rules[r]))
                 for side, sign in ((ok[slides[ok] <= slide - w], -1.0), (ok[slides[ok] >= slide + w][::-1], 1.0)):
                     if len(side):  # (as far as the readings allow, and between; its chip's modes as they say there)
                         pick = np.unique(np.round(np.linspace(0, len(side) - 1, min(SPREAD, len(side)))).astype(int))
@@ -339,7 +340,8 @@ class Planner:
 
     def _slides(self, segs, r: int = 0) -> np.ndarray:
         """GHz: where its window may be by rule r, from where the model has it: each reading inside it (2 GHz out at
-        most), and no further than a stable diode's window drifts (WINDOW_DRIFT of its width) from where the model
+        most, and as far into soft edges as a mode lases: _beyond), and no further than a stable diode's window drifts
+        (WINDOW_DRIFT of its width) from where the model
         has it, or from as near as the readings allow; a chip mode's eighth apart (SLIDES at most), and where the
         model has it if that is one."""
         m, P = self.m, self.rules[r]
@@ -349,11 +351,12 @@ class Planner:
         i = np.array([s.i for ss in segs for s in ss])
         v = np.array([s.v for ss in segs for s in ss])
         shift = P[9] * (self._dv(v) - m.v0) + P[10] * (i - m.i0)
-        a = float(np.max(f - (P[1] + shift))) - 2.0  # (the least that has every reading below its top)
-        b = float(np.min(f - (P[0] + shift))) + 2.0  # (the most that has every reading above its bottom)
+        out_by = 2.0 + _beyond(P)
+        a = float(np.max(f - (P[1] + shift))) - out_by  # (the least that has every reading below its top)
+        b = float(np.min(f - (P[0] + shift))) + out_by  # (the most that has every reading above its bottom)
         if a > b:
             return np.array([0.5 * (a + b)])
-        d = WINDOW_DRIFT * (P[1] - P[0])
+        d = WINDOW_DRIFT * _width(P)
         a, b = (max(a, -d), min(b, d)) if a <= 0.0 <= b else (max(a, b - d), b) if b < 0.0 else (a, min(b, a + d))
         out = np.linspace(a, b, min(SLIDES, max(1, math.ceil((b - a) / (P[7] / 8)))) + 1)
         if a <= 0.0 <= b:
@@ -482,6 +485,17 @@ class Planner:
         return out
 
 
+def _beyond(P) -> float:
+    """GHz beyond its window's edges a mode may lase by rule P, its edges softer than the old hard ones (5 GHz): where
+    it loses a sixth of what one halfway between chip modes does more (_losses)."""
+    return 0.4 * max(float(P[11]) - 5.0, 0.0)
+
+
+def _width(P) -> float:
+    """GHz: rule P's window as wide as hard edges would make it (its soft edges counted as far as _beyond)."""
+    return float(P[1] - P[0]) + 2 * _beyond(P)
+
+
 def _apply(m: LaserModel, P):
     """The model's rule made P (as _select has it)."""
     m.lo, m.hi, m.h_up, m.h_down, m.offset, m.pull, m.lag = (float(x) for x in P[:7])
@@ -489,18 +503,18 @@ def _apply(m: LaserModel, P):
         m.chip.spacing = float(P[7])
     if m.chip is not None:
         m.chip.p_i = float(P[8])
-    m.w_v, m.w_i = float(P[9]), float(P[10])
+    m.w_v, m.w_i, m.soft = float(P[9]), float(P[10]), float(P[11])
 
 
 def _first_of(modes, base: float, P, di: float, dv: float, ci0: float) -> int:
     """The mode lasing where a path begins (as if long there) by rule P (as _select has it; its chip comb's middle
     there base, as ci0 GHz/mA has it; di, dv from the model's i0, v0): the best, pulled to it (LaserModel._first)."""
-    lo, hi, _, _, offset, pull, _, dc, ci, w_v, w_i = (float(x) for x in P)
+    lo, hi, _, _, offset, pull, _, dc, ci, w_v, w_i, soft = (float(x) for x in P)
     shift = w_v * dv + w_i * di
     mid = base + (ci - ci0) * di + offset
-    k = int(np.argmin(_losses(modes, mid, dc, lo + shift, hi + shift)))
+    k = int(np.argmin(_losses(modes, mid, dc, lo + shift, hi + shift, soft)))
     mid += pull * ((modes[k] - mid + dc / 2) % dc - dc / 2)
-    return int(np.argmin(_losses(modes, mid, dc, lo + shift, hi + shift)))
+    return int(np.argmin(_losses(modes, mid, dc, lo + shift, hi + shift, soft)))
 
 
 def _grid(a: float, b: float, step: float) -> np.ndarray:

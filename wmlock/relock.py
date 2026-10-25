@@ -1297,8 +1297,11 @@ def setup_report(client, laser: int, hop, lp, model=None) -> list:
             add("warn", f"walking {hop.reach:g} GHz takes {hop.reach * 1e3 / abs(hop.kv):.1f} V of piezo, more than "
                         f"the ±{hop.v_window:g} V a recovery may move it")
     elif how == "model":
+        temps = (model.get("model") or {}).get("temps") if (model.get("model") or {}).get("T0") is not None else None
         add("info", f"by its model, from its last map ({model.get('from', '?')}, {model.get('t', '?')}: "
-                    f"{model.get('right', 0):.0%} of that map's points on the right mode): a map here first and the "
+                    f"{model.get('right', 0):.0%} of that map's points on the right mode"
+                    + (f"; made at {min(temps):g} … {max(temps):g} °C, the model is taken at the diode's temperature "
+                       f"as set" if temps else "") + "): a map here first and the "
                     f"model fitted to it (how far its modes have moved), then the way onto a mode on target that holds "
                     f"best, its own or another at another piezo voltage, and which way the current comes to it; the "
                     f"margins checked as the map's; up to {mh.Recenter.MODEL_TRIES} plans, the model fitted again to "

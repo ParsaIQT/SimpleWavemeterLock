@@ -1,6 +1,7 @@
 """The laser's model (lasermodel.py) fitted to maps of simulated lasers: one made of a model (sim.ModelLaser, a chip
-with modes of its own: what it was made of comes back) and the simulator's ECDL (one selection filter); its facts,
-its file, the command line, the engine's fit after a map."""
+with modes of its own: what it was made of comes back, at one temperature and mapped at three) and the simulator's ECDL
+(one selection filter); its facts, its file, the command line, the engine's fit after a map; where it parks the laser
+(parking.py)."""
 import threading
 import types
 
@@ -12,6 +13,7 @@ pytest.importorskip("scipy")
 from test_lasermap import MapBench, plan  # noqa: E402
 
 from wmlock import lasermodel as lm  # noqa: E402
+from wmlock import parking  # noqa: E402
 from wmlock.engine import Channel, Engine  # noqa: E402
 from wmlock.lasermap import MapFile, Mapper, load, main  # noqa: E402
 from wmlock.sim import ECDL, ModelLaser  # noqa: E402
@@ -28,6 +30,14 @@ def lab_like(**kw) -> lm.LaserModel:
         i_th=28.0, slope=0.5, power_dp=-0.35)
     for k, v in kw.items():
         setattr(model, k, v)
+    return model
+
+
+def warm_lab(**kw) -> lm.LaserModel:
+    """lab_like, and its temperature: from 20 °C, its chip's modes -40 GHz/K (0.049 nm/K), its external modes -6 GHz/K
+    (its chip's share of the cavity, -3.8, and its mount's), its window -2 GHz/K; its threshold +0.5 mA/K."""
+    model = lab_like(T0=20.0, temp=20.0, w_T=-2.0, i_th_T=0.5, **kw)
+    model.chip.p_T, model.ext.p_T = -40.0, -6.0
     return model
 
 
@@ -50,6 +60,16 @@ def lab_map(tmp_path_factory):
                   current=65.0, offset=69.0)
     with load(path) as m:
         return path, lm.fit(m, budget=40)
+
+
+@pytest.fixture(scope="module")
+def warm_map(tmp_path_factory):
+    path = mapped(tmp_path_factory.mktemp("warm"), lambda clock: ModelLaser(warm_lab(), clock=clock, t_ref=20.0),
+                  plan(i_lo=55.0, i_hi=75.0, i_step=0.25, v_lo=49.0, v_hi=89.0, v_step=2.0, patterns="off",
+                       t_lo=19.5, t_hi=20.5, t_step=0.5, t_hold=3.0),
+                  current=65.0, offset=69.0, temp=20.0)
+    with load(path) as m:
+        return path, lm.fit(m, budget=20)
 
 
 def test_a_laser_made_of_a_model_comes_back_from_its_map(lab_map):
@@ -239,3 +259,87 @@ def test_the_engine_fits_it_once_the_map_is_written(tmp_path, lab_map, monkeypat
     Engine._model_of(eng, ch, m2, bad, done)
     assert m2.model is None and m2.model_note.startswith("no model of the laser: ")
     assert m2.notes == [(None, m2.model_note)]
+
+
+def test_mapped_at_three_temperatures_its_temperature_comes_back(warm_map):
+    _, got = warm_map
+    assert got.T0 == 20.0 and got.temps == [19.5, 20.0, 20.5]
+    assert got.ext.spacing == pytest.approx(8.26, rel=2e-3) and got.chip.spacing == pytest.approx(87.35, rel=5e-3)
+    assert got.chip.p_T == pytest.approx(-40.0, abs=3.0)  # (its steps tell it: another, ±175 GHz/K, no chip's)
+    assert got.ext.p_T == pytest.approx(-6.0, abs=0.6)  # (and of the external ones, ±16.5, only this its cavity's)
+    assert got.aliases["chip"] == [] and all(abs(c + 6.0) > 15 for c in got.aliases["ext"])
+    assert got.w_T == pytest.approx(-2.0, abs=6.0)  # (where it lased at each: its window 270 GHz wide, roughly)
+    assert got.i_th_T == pytest.approx(0.5, abs=0.3)
+    assert got.right > 0.8 and [T for T, _ in got.by_temp] == [19.5, 20.0, 20.5]
+    assert min(r for _, r in got.by_temp) > 0.75
+    assert got.plausible
+    text = "\n".join(got.facts())
+    assert "the diode's temperature (mapped at 19.5, 20, 20.5 °C; the model's terms from 20 °C) moves its chip" in text
+    assert "of the points at each temperature, it puts on the mode the laser was on " in text
+    assert got.ext.drift_known and "a drift of its cavity meanwhile" not in text  # (its first line swept again told)
+
+
+def test_the_model_at_another_temperature_is_where_its_terms_put_it():
+    m = warm_lab()
+    hot = m.at(21.0)
+    i, v = 66.0, 70.0
+    assert float(hot.chip_base(i, v, 0.0)) == pytest.approx(float(m.chip_base(i, v, 0.0, T=21.0)))
+    assert hot.ext_modes(i, v, 0.0, [0, 1]) == pytest.approx(m.ext_modes(i, v, 0.0, [0, 1], T=21.0))
+    assert float(hot.window(i, v)[0]) == pytest.approx(float(m.window(i, v, T=21.0)[0])) == m.lo - 2.0 + \
+        m.w_v * (v - m.v0) + m.w_i * (i - m.i0)
+    path = [60.0 + 0.25 * k for k in range(60)]
+    s1 = s2 = None
+    for x in path:  # (a step at a time, at 21 °C: the same either way)
+        f1, _, s1 = m.step(x, v, 0.0, s1, T=21.0)
+        f2, _, s2 = hot.step(x, v, 0.0, s2)
+        assert f1 == pytest.approx(f2, abs=1e-9)
+    assert m.simulate(path, [v] * 60, [0.0] * 60, T=21.0) == pytest.approx(hot.simulate(path, [v] * 60, [0.0] * 60))
+    m.temps = [19.5, 20.0, 20.5]
+    other = m.with_temps(-40.0 + 87.35 / 0.5, -6.0 - 8.26 / 0.5)  # (a whole mode more per step, each)
+    for T in m.temps:  # (where its map was made, the same, whole modes more or less)
+        for a, b, spacing in ((m.chip_base(i, v, 0.0, T), other.chip_base(i, v, 0.0, T), 87.35),
+                              (m.ext_modes(i, v, 0.0, [0], None, T)[0], other.ext_modes(i, v, 0.0, [0], None, T)[0],
+                               8.26)):
+            k = (float(b) - float(a)) / spacing
+            assert k == pytest.approx(round(k), abs=1e-6)
+    assert float(other.chip_base(i, v, 0.0, 19.75)) - float(m.chip_base(i, v, 0.0, 19.75)) == \
+        pytest.approx(87.35 / 2, abs=1e-6)  # (between them, half a chip mode apart)
+
+
+def test_parked_by_its_model_the_laser_comes_to_its_mode_from_either_side(warm_map):
+    _, got = warm_map
+    want = warm_lab()
+    target = want.f_ref + 0.030  # THz: 30 GHz above where its model is from
+    spots = parking.park(got, target, t_step=0.1, v_step=1.0, i_step=0.1, top=3, feedforward=-0.3)
+    sp = spots[0]  # (this laser's modes sweeping up and down are seldom the same: its spots one way too)
+    assert len(spots) == 3 and all((a.way != "either", -a.score) <= (b.way != "either", -b.score)
+                                   for a, b in zip(spots, spots[1:]))
+    assert 19.5 <= sp.T <= 20.5 and sp.score > 0.3 and min(sp.held) >= sp.score
+    assert sorted(sp.lock) == pytest.approx(sorted([0.0, -0.3, got.ideal_feedforward()])) and sp.piezo is not None
+    assert sp.worst_of and all(w[0] == got.chip.p_T for w in sp.worst_of)  # (no other chip's: only external ones)
+    true = want.at(sp.T)
+    sides = {"either": (-3.0, 3.0), "up": (-3.0,), "down": (3.0,)}[sp.way]
+    ends = []
+    for side in sides:  # (from below, from above: as its way has it)
+        path = np.linspace(sp.i + side, sp.i, 31)
+        f = true.simulate(path, np.full(31, sp.v), np.full(31, true.t0), clock=np.arange(31) * 1e3)
+        ends.append(f[-1])
+    assert max(ends) - min(ends) < 1e-6  # (the same mode, whichever way it may come)
+    assert ends[0] == pytest.approx((target - true.f_ref) * 1e3, abs=1.0)  # (on target, as nearly as it was fitted)
+    text = parking.say_spot(sp)
+    assert text.startswith(f"{sp.T:.2f} °C, piezo ")
+    assert ("the same sweeping up and down from " in text) == (sp.way == "either")
+    assert "a lock on the piezo takes up a drift of its cavity of " in text and "with no feedforward" in text
+
+
+def test_the_command_line_says_where_to_park_it(tmp_path, capsys, warm_map):
+    path, got = warm_map
+    copy = tmp_path / "copy.sqlite"
+    copy.write_bytes(path.read_bytes())
+    lm.save(copy, got)  # (its model kept: gone by, not fitted again)
+    nm = 299792.458 / (got.f_ref + 0.030)
+    assert main([str(copy), "--park", f"{nm:.6f}", "--temp", "20", "20"]) == 0  # (at 20 °C alone: quick)
+    out = capsys.readouterr().out
+    assert f"where to park it at {nm:.6f} nm" in out and "the widest mode first, power not counted" in out
+    assert out.count("20.00 °C, piezo ") >= 2 and not any(ln.startswith("  model: ") for ln in out.splitlines())
+    assert "     set: the current " in out and "its feedforward off" in out

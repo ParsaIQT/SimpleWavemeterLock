@@ -2169,6 +2169,36 @@ def export_csv(m: LaserMap, path) -> int:
     return len(m.points)
 
 
+def park_text(m: LaserMap, nm: float, model=None, temps=None, current: str = "act", robust: bool = False) -> str:
+    """Where to park a map's laser to lase at nm nm (parking.py), in words: by its model (given, else kept in its file
+    if it can be its laser's, else fitted); robust: ranked by the worst with the temperature's other coefficients."""
+    from . import lasermodel, parking
+    from .wavemeter import C_NM_THZ
+
+    if model is None:
+        model = lasermodel.stored(m)
+        if model is None or not model.plausible:
+            model = lasermodel.fit(m, current, log=lambda text: print(f"  model: {text}", flush=True))
+    start, fed = m.meta.get("start") or {}, m.meta.get("feedforward") or {}
+    ff = start.get("feedforward") if start.get("feedforward_enabled") else None
+    thz = C_NM_THZ / nm
+    spots = parking.park(model, thz, temps=tuple(temps) if temps else None, feedforward=ff, robust=robust)
+    say_nm = f"{nm:.6f}".rstrip("0").rstrip(".")
+    out = [f"  where to park it at {say_nm} nm ({thz:.6f} THz), by its model: the widest mode first" +
+           (" whichever of the temperature's coefficients its map allows" if robust else "") + ", power not counted"]
+    if not spots:
+        out.append("   none: no mode on target holds there, as its model has it")
+    off = fed.get("off_offset") if fed.get("off_offset") is not None else start.get("act_offset", 0.0)
+    for sp in spots:
+        out.append(f"   - {parking.say_spot(sp)}")
+        text = f"     set: the current {sp.i - off:.2f} mA, its feedforward off"
+        if ff and fed.get("reckoned_from") is not None:
+            text += (f" ({sp.i - off - ff * (sp.v_set - fed['reckoned_from']):.2f} mA with it on, {ff:+.3f} mA/V "
+                     f"reckoned from {fed['reckoned_from']:.1f} V)")
+        out.append(text + "; the piezo (scan offset) as above, the temperature as above and settled")
+    return "\n".join(out)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m wmlock.lasermap", description="What a laser map's file holds.")
     ap.add_argument("files", nargs="+", metavar="FILE")
@@ -2181,6 +2211,14 @@ def main(argv=None) -> int:
     ap.add_argument("--current", choices=("act", "set", "plan"), default="act",
                     help="with --model: the current as read at each point (act), else set (set: files from before "
                          "it was read), or as planned")
+    ap.add_argument("--park", type=float, metavar="NM",
+                    help="where to park it to lase at NM nm, on the mode that holds most widely there, by its model "
+                         "(kept in the file, else fitted; a map at several temperatures: the temperature too)")
+    ap.add_argument("--temp", type=float, nargs=2, metavar=("LO", "HI"),
+                    help="with --park: the temperatures to look over, °C (else those it was mapped at)")
+    ap.add_argument("--robust", action="store_true",
+                    help="with --park: ranked by the worst of each spot and the spots near it were the temperature's "
+                         "coefficients the others its map allows as well")
     args = ap.parse_args(argv)
     for name in args.files:
         with load(name) as m:
@@ -2188,6 +2226,7 @@ def main(argv=None) -> int:
             if args.csv:
                 out = Path(name).with_suffix(".csv")
                 print(f"  {export_csv(m, out):,} points written to {out}")
+            model = None
             if args.model:
                 from . import lasermodel
 
@@ -2196,6 +2235,8 @@ def main(argv=None) -> int:
                 print("  the laser, as its model has it:")
                 for fact in model.facts():
                     print(f"   - {fact}")
+            if args.park is not None:
+                print(park_text(m, args.park, model, args.temp, args.current, args.robust))
         if args.model and args.save_model:
             lasermodel.save(name, model)
             print(f"  kept in {name}")
