@@ -45,8 +45,8 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
   ground you give them, both ways, its feedforward off (a square in the current as measured), with
   everything the wavemeter says at every point (its frequency, power, exposure, and its interference
   patterns: the spectrum, where a second mode shows) and what the DLC pro measures, kept in a file to look
-  at the laser afterwards and to model it; the ideal feedforward fitted from where it hops, and set if you
-  like (see *Laser maps*).
+  at the laser afterwards and to model it (the model's physics: [docs/laser_model.md](docs/laser_model.md));
+  the ideal feedforward fitted from where it hops, and set if you like (see *Laser maps*).
 * Fast by construction: the wavemeter is read in its own thread, all network I/O
   happens in one worker thread per controller (writes are coalesced, Nagle off),
   and the GUI only repaints numbers that changed. Nothing ever blocks the window.
@@ -60,6 +60,7 @@ pip install PySide6 ifaddr numpy scipy
 ```
 
 numpy and scipy are for the laser's model, fitted to its maps (*Laser maps*): the rest runs without them.
+`pip install numba` as well, and the model is fitted ten times as fast.
 
 For lasers on an analog output board (*Lasers on an analog output*), also `pip install mcculw`, with
 MCC's InstaCal installed (Windows).
@@ -1322,15 +1323,19 @@ from one 2 V line to the next, nearly as far as from one hop to the next: 0.5 V 
 
 ### The laser's model
 
+*How it works, with figures: the physics, the fit and how well it does, and what it is used for:
+[docs/laser_model.md](docs/laser_model.md) (and [as a PDF](docs/laser_model.pdf)).*
+
 At the end of a map (one with 200 points or more that lased, unless unticked in the dialog), a physical
-model of the laser is fitted to it, in a thread of its own once its file is written (about ten seconds for a map of 4,000 points; the
-laser is free meanwhile). The rule's searches, most of the time it takes, work their candidates out on all of the
-PC's cores but one at once (every one, from the command line). **`pip install numba`** for its inner loops
-compiled (`wmlock/compiled.py`): they look only at the modes that could be chosen (a mode is a hop only if its
-loss is below the one lasing less the hysteresis; most points have none), the same modes chosen as without it,
-and the whole about ten times as fast. The first fit compiles them (some seconds), then they are kept. Without
-numba (or with `WMLOCK_NO_NUMBA` set), numpy, as before. It is kept in the file (`meta` `model`, and its facts, as sentences,
-`model_facts`), its facts are said in the map's notes, and **The laser…** in the map's window lists them.
+model of the laser is fitted to it, in a thread of its own once its file is written (about ten seconds for a
+map of 4,000 points; the laser is free meanwhile). The rule's searches, most of the time it takes, work their
+candidates out on all of the PC's cores but one at once (every one, from the command line).
+**`pip install numba`** for its inner loops compiled (`wmlock/compiled.py`): they look only at the modes that
+could be chosen (a mode is a hop only if its loss is below the one lasing less the hysteresis; most points have
+none), the same modes chosen as without it, and the whole about ten times as fast. The first fit compiles them
+(some seconds), then they are kept. Without numba (or with `WMLOCK_NO_NUMBA` set), numpy, as before. It is kept
+in the file (`meta` `model`, and its facts, as sentences, `model_facts`), its facts are said in the map's
+notes, and **The laser…** in the map's window lists them.
 `python -m wmlock.lasermap FILE --model` fits it to any map's file and says its facts (`--save-model`
 keeps it there; `--map N` for one of a file's maps alone; `--current set` for one made before the current
 was read at each point). A file whose maps were made at several temperatures gives a model with the
