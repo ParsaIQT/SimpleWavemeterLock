@@ -114,6 +114,38 @@ def event_pos(ev) -> QtCore.QPoint:
     return ev.position().toPoint() if hasattr(ev, "position") else ev.pos()
 
 
+def scrolling(body: QtWidgets.QWidget) -> QtWidgets.QScrollArea:
+    """body in a scroll area of its own, borderless: for a dialog that may not all fit on the screen (its buttons
+    below it, not in it, stay in view)."""
+    area = QtWidgets.QScrollArea()
+    area.setWidgetResizable(True)
+    area.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+    area.setWidget(body)
+    return area
+
+
+def fit_screen(window: QtWidgets.QWidget, width: int, height: int):
+    """Resize a window to width x height, or as much of that as the screen it opens on has room for (its title bar
+    and the taskbar left)."""
+    parent = window.parentWidget()
+    screen = parent.window().screen() if parent is not None and hasattr(parent, "screen") else None
+    free = (screen or QtGui.QGuiApplication.primaryScreen()).availableGeometry()
+    window.resize(max(min(width, free.width() - 40), 200), max(min(height, free.height() - 80), 200))
+
+
+def long_items(combo: QtWidgets.QComboBox, chars: int = 50):
+    """A combo box of long items no wider than `chars` characters (the one chosen cut short there), each item whole
+    in its tooltip and in the list it opens (as wide as the longest, if the screen is)."""
+    combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    combo.setMinimumContentsLength(chars)
+    fm = combo.fontMetrics()
+    for k in range(combo.count()):
+        combo.setItemData(k, combo.itemText(k), Qt.ItemDataRole.ToolTipRole)
+    longest = max((fm.horizontalAdvance(combo.itemText(k)) for k in range(combo.count())), default=0)
+    screen = QtGui.QGuiApplication.primaryScreen().availableGeometry()
+    combo.view().setMinimumWidth(min(longest + 40, int(0.9 * screen.width())))
+
+
 class Text(QtWidgets.QLabel):
     """QLabel that only touches Qt when its text or colour really changes."""
 
@@ -1166,7 +1198,11 @@ class HopDialog(QtWidgets.QDialog):
         self.setWindowTitle(f"Mode-hop recovery · channel {ch.n}")
         self.ch = ch
         p = self._p = ch.hop
-        form = QtWidgets.QFormLayout(self)
+        outer = QtWidgets.QVBoxLayout(self)
+        body = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(body)
+        area = scrolling(body)  # (it may not all fit on the screen: OK and Cancel, below it, do)
+        outer.addWidget(area, 1)
 
         def row(*widgets):
             box = QtWidgets.QHBoxLayout()
@@ -1228,6 +1264,7 @@ class HopDialog(QtWidgets.QDialog):
         self.method = QtWidgets.QComboBox()
         self.method.addItems([label for _, label in self.METHOD])
         self.method.setCurrentIndex(next((k for k, (key, _) in enumerate(self.METHOD) if key == p.method), 0))
+        long_items(self.method)
         form.addRow("Method", self.method)
         md = getattr(ch, "model_dict", None)
         has = md is not None and md.get("laser") == [ch.device, ch.laser]
@@ -1378,9 +1415,12 @@ class HopDialog(QtWidgets.QDialog):
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
-        form.addRow(bb)
+        outer.addWidget(bb)
         self.who.currentIndexChanged.connect(self._who)
         self._who()
+        want, m = body.sizeHint(), outer.contentsMargins()
+        fit_screen(self, want.width() + m.left() + m.right() + area.verticalScrollBar().sizeHint().width(),
+                   want.height() + m.top() + m.bottom() + outer.spacing() + bb.sizeHint().height())
 
     @staticmethod
     def _learned(p: HopParams) -> str:
@@ -1587,7 +1627,7 @@ class RecoveryDialog(QtWidgets.QDialog):
     def __init__(self, parent, rec: dict):
         super().__init__(parent)
         self.setWindowTitle(f"Last recovery · channel {rec.get('channel', '?')}")
-        self.resize(760, 560)
+        fit_screen(self, 760, 560)
         v = QtWidgets.QVBoxLayout(self)
         head = Text(f"{rec.get('time', '')}   {rec.get('outcome', '')}   ({rec.get('took_s', 0):.0f} s)",
                     "ok" if rec.get("ok") else "err")
@@ -1951,15 +1991,11 @@ class MapDialog(QtWidgets.QDialog):
         self.setWindowTitle(f"Laser map · channel {n}" + (f" ({ch.name})" if ch.name else ""))
         p = ch.map_plan or MapPlan()
         self._filled = ch.map_plan is not None
-        self.resize(780, 720)
+        fit_screen(self, 780, 720)
         outer = QtWidgets.QVBoxLayout(self)
         inner = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(inner)
-        area = QtWidgets.QScrollArea()  # (it may not all fit on the screen)
-        area.setWidgetResizable(True)
-        area.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        area.setWidget(inner)
-        outer.addWidget(area, 1)
+        outer.addWidget(scrolling(inner), 1)  # (it may not all fit on the screen)
 
         def row(*widgets):
             box = QtWidgets.QHBoxLayout()
@@ -2227,7 +2263,7 @@ class MapWindow(QtWidgets.QWidget):
         super().__init__(win, Qt.WindowType.Window)
         self.win, self.engine, self.n = win, engine, n
         self.setWindowTitle(f"Laser map · channel {n}")
-        self.resize(980, 760)
+        fit_screen(self, 980, 760)
         v = QtWidgets.QVBoxLayout(self)
         top = QtWidgets.QHBoxLayout()
         self.which = QtWidgets.QComboBox()
@@ -2433,7 +2469,7 @@ class ModelDialog(QtWidgets.QDialog):
     def __init__(self, parent, model, path=None):
         super().__init__(parent)
         self.setWindowTitle("The laser, as its model has it" + (f" · {Path(path).name}" if path else ""))
-        self.resize(760, 620)
+        fit_screen(self, 760, 620)
         v = QtWidgets.QVBoxLayout(self)
         browser = QtWidgets.QTextBrowser()
         items = "".join(f"<li style='margin-bottom:6px'>{html.escape(fact)}</li>" for fact in model.facts())
@@ -2454,7 +2490,7 @@ class SetupDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.engine, self.n = engine, n
         self.setWindowTitle(f"Check setup · channel {n}")
-        self.resize(720, 560)
+        fit_screen(self, 720, 560)
         v = QtWidgets.QVBoxLayout(self)
         self.view = QtWidgets.QTextBrowser()
         v.addWidget(self.view, 1)

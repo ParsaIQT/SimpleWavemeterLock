@@ -205,6 +205,29 @@ def test_hop_dialog_round_trip(app):
                           confirm=True, falc_max=0.02, peak_tol=40.0, lock_min=0.3)  # measured values forgotten
 
 
+def test_hop_dialog_fits_the_screen_with_ok_and_cancel_in_view(app):
+    from wmlock.engine import Channel
+    from wmlock.qt import Qt, QtGui
+
+    ch = Channel(5, {"link": {"device": "192.168.1.30", "laser": 1}, "hop": {"enabled": True, "method": "catch"}})
+    d = gui.HopDialog(None, ch)
+    free = QtGui.QGuiApplication.primaryScreen().availableGeometry()  # (offscreen: 800 x 800, too small for it all)
+    area = d.findChild(QtWidgets.QScrollArea)
+    bb = d.findChild(QtWidgets.QDialogButtonBox)
+    assert area.widget().sizeHint().height() > free.height()  # (its settings do not all fit: they scroll...)
+    assert d.width() <= free.width() and d.height() <= free.height() and d.minimumSizeHint().height() < 300
+    assert bb.parent() is d and not area.isAncestorOf(bb)  # (...and OK and Cancel, below them, never scroll away)
+    d.show()
+    app.processEvents()
+    assert bb.geometry().bottom() <= d.height() and bb.isVisible()
+    longest = max(d.method.fontMetrics().horizontalAdvance(label) for _, label in gui.HopDialog.METHOD)
+    assert d.method.sizeHint().width() < 0.5 * longest  # (once as wide as its longest item: the dialog 1732 px wide)
+    whole = gui.HopDialog.METHOD[1][1]
+    assert d.method.currentText() == whole and d.method.itemData(1, Qt.ItemDataRole.ToolTipRole) == whole
+    assert d.method.view().minimumWidth() > d.method.sizeHint().width()  # (its list as wide as its items)
+    d.close()
+
+
 def test_hop_dialog_offers_the_lasers_model(app):
     from wmlock.engine import Channel
     from wmlock.lasermodel import Comb, LaserModel
