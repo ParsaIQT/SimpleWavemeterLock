@@ -1323,8 +1323,9 @@ from one 2 V line to the next, nearly as far as from one hop to the next: 0.5 V 
 ### The laser's model
 
 At the end of a map (one with 200 points or more that lased, unless unticked in the dialog), a physical
-model of the laser is fitted to it, in a thread of its own once its file is written (two minutes or so for a map of 4,000 points; the
-laser is free meanwhile). It is kept in the file (`meta` `model`, and its facts, as sentences,
+model of the laser is fitted to it, in a thread of its own once its file is written (half a minute or so for a map of 4,000 points; the
+laser is free meanwhile). The rule's searches, most of the time it takes, work their candidates out on all of the
+PC's cores but one at once. It is kept in the file (`meta` `model`, and its facts, as sentences,
 `model_facts`), its facts are said in the map's notes, and **The laser…** in the map's window lists them.
 `python -m wmlock.lasermap FILE --model` fits it to any map's file and says its facts (`--save-model`
 keeps it there; `--map N` for one of a file's maps alone; `--current set` for one made before the current
@@ -1531,8 +1532,10 @@ map_2026-10-25_005024_ch6.sqlite: DLpro (S/N 28698), channel 6, 192.168.1.102 la
 (a laser of large hysteresis gets the way to come to it instead, as *sweep it DOWN to … mA from … mA or above*),
 then the others in a table; `--verbose` says the map, its model's facts and every spot in full besides. The model
 is the one kept in the file, unless there is none, it cannot be the laser's, an older version kept it, or it is of
-one temperature where the map has several: then it is fitted (some minutes; `--save-model` keeps it, and the next
-time is quick). `--temp LO HI` looks elsewhere than the temperatures mapped. `wmlock/parking.py` does it:
+one temperature where the map has several: then it is fitted (2½ minutes for the 650 nm map's four temperatures,
+55,000 points, on a 4-core PC; a line under it says how far it has got as it goes; `--save-model` keeps it as soon
+as it is fitted, and the next time is quick). `--temp LO HI` looks elsewhere than the temperatures mapped.
+`wmlock/parking.py` does it:
 
 * at temperatures 0.05 K apart across the map's (then five times finer about the best), piezo voltages 0.5 V apart
   and currents 0.05 mA apart across what it covered, the model **at rest** (its chip as warm as its current, its

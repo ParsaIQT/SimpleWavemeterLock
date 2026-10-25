@@ -301,13 +301,15 @@ def park(model: LaserModel, target_thz: float, temps: tuple | None = None, curre
         return found
 
     spots = []
-    for T in Ts:
+    for k, T in enumerate(Ts):
+        say(f"where it parks: {k + 1} of {len(Ts)} temperatures" if T is not None else "where it parks")
         spots += scan(T, pz)
     say(f"{len(spots):,} spots on target over {len(Ts)} temperatures, {len(pz)} piezo voltages, {len(cur)} currents"
         + (f", each with the temperature's {len(others)} other coefficients" if robust and others else ""))
     if refine and spots:
         best = _distinct(spots, max(3, top // 2), robust)
-        for sp in best:
+        for k, sp in enumerate(best):
+            say(f"where it parks: about the best, {k + 1} of {len(best)}, finer")
             fine_T = [None] if sp.T is None else \
                 [T for T in _grid(sp.T - t_step, sp.T + t_step, t_step / 5) if Ts[0] - 1e-9 <= T <= Ts[-1] + 1e-9]
             fine_V = _grid(max(sp.v - 2 * v_step, v_range[0]), min(sp.v + 2 * v_step, v_range[1]), v_step / 5)
@@ -318,13 +320,15 @@ def park(model: LaserModel, target_thz: float, temps: tuple | None = None, curre
     ffs = [0.0] + [f for f in (feedforward, ff_ideal) if f is not None and abs(f) > 1e-9]
     period = _hop_period(model)
     best = _distinct(spots, 3 * top, robust)
-    for sp in best:  # (its margins parked there, exactly: ranked again by them, those that hold nothing left out)
+    for k, sp in enumerate(best):  # (its margins parked there, exactly: ranked again by them, those that hold
+        say(f"how far each holds: {k + 1} of {len(best)}")  # nothing left out)
         _margins(model.at(sp.T), P, sp, target, ffs, v_range, i_range)
         if sp.way != "either":
             sp.start = max(sp.entry - 2 * period, i_range[0]) if sp.way == "up" else \
                 min(sp.entry + 2 * period, i_range[1])
     out = _distinct([sp for sp in best if sp.score >= MIN_HOLD], top, robust)
-    for sp in out:
+    for k, sp in enumerate(out):
+        say(f"the temperature's other coefficients: {k + 1} of {len(out)}")
         if aliases and not sp.worst_of:
             near_v = _grid(max(sp.v - NEAR_V, v_range[0]), min(sp.v + NEAR_V, v_range[1]), v_step / 2)
             for ((c_T, e_T), alt), Q in zip(others, alt_rules):

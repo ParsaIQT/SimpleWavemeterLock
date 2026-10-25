@@ -135,6 +135,71 @@ def test_misread_frequencies_by_the_dozen_do_not_mislead_it(tmp_path, lab_map):
     assert again.plausible and again.hops_on > 0.9 and again.right > again.null + 0.2
 
 
+def test_a_modes_loss_needs_no_folding_onto_one_chip_resonance():
+    rng = np.random.default_rng(2)
+    modes, mid, dc = rng.uniform(-400.0, 400.0, 2000), rng.uniform(-60.0, 60.0, 2000), 87.35
+    folded = np.sin(np.pi * ((modes - mid + dc / 2) % dc - dc / 2) / dc) ** 2  # (as it was: δ within ±dc/2)
+    assert np.allclose(lm._losses(modes, mid, dc, -1e9, 1e9), folded, rtol=0.0, atol=1e-9)
+
+
+def test_its_searches_share_their_candidates_out_and_say_how_far_they_have_got(lab_map, monkeypatch):
+    """The rule's searches work their candidates out on several threads at once, the same to the last bit as on one
+    (only the candidates are shared out); and say how far they have got, a generation at a time."""
+    path, got = lab_map
+    with load(path) as m:
+        d = lm.data_of(m)
+    pk = got._pack(d, got._sweeps(d, 40), np.float32)
+    P = got.rule()[None, :] * (1 + 0.02 * np.random.default_rng(1).standard_normal((48, 12)))
+    monkeypatch.setattr(lm, "THREADS", 1)
+    alone = got._score(P, pk)
+    monkeypatch.setattr(lm, "THREADS", 4)
+    assert np.array_equal(got._score(P, pk), alone) and len(set(alone)) > 1
+    Q = np.concatenate([P, np.full((48, 1), 0.003)], axis=1)  # (and the likelihood, at its temperature)
+    assert np.array_equal(lm._shared(lambda R: lm._likelihood(pk, R), Q), lm._likelihood(pk, Q))
+    ticks = []
+    with load(path) as m:
+        lm.fit(m, budget=2, tick=ticks.append)
+    assert ticks[0] == "the rule: search 1 of 3, beginning" and "the rule: search 1 of 3, generation 1 of 5" in ticks
+    assert any(t.startswith("the rule: search 3 of 3, generation ") for t in ticks)
+    assert ticks[-1] == "how well it does, over the whole map"
+
+
+def test_a_long_job_says_how_far_it_has_got_on_one_line():
+    import io
+
+    from wmlock.lasermap import Ticker
+
+    class Console(io.StringIO):
+        def isatty(self):
+            return True
+
+    out = Console()
+    t = Ticker(out)
+    t("the rule: search 1 of 3, generation 1 of 20")
+    t("the rule: search 1 of 3, generation 2 of 20")
+    t.say("  model: right mode at 86% of the points")
+    t("where it parks: 1 of 31 temperatures")
+    t.clear()
+    raw = out.getvalue()
+    assert "\r  … the rule: search 1 of 3, generation 2 of 20 (0:00)" in raw
+    screen = []  # (what the console shows at the end: each line as its carriage returns leave it)
+    for line in raw.split("\n"):
+        shown = ""
+        for part in line.split("\r"):
+            shown = part + shown[len(part):]
+        screen.append(shown.rstrip())
+    assert [ln for ln in screen if ln] == ["  model: right mode at 86% of the points"]
+    piped = io.StringIO()  # (to a file or a pipe: a line now and then, none in its first 30 s)
+    t = Ticker(piped)
+    t("where it parks: 1 of 31 temperatures")
+    assert piped.getvalue() == ""
+    t.began -= 31.0
+    t.last -= 31.0
+    t("where it parks: 9 of 31 temperatures")
+    t("where it parks: 10 of 31 temperatures")
+    assert piped.getvalue() == "  … where it parks: 9 of 31 temperatures (0:31)\n"
+
+
 def test_the_hops_tell_its_comb_from_a_coarser_one(lab_map):
     path, got = lab_map
     with load(path) as m:
@@ -361,7 +426,7 @@ def test_parking_by_a_model_of_one_temperature_kept_by_an_older_version_fits_it_
     assert main([str(copy), "--park", f"{nm:.6f}", "--temp", "20", "20", "--save-model"]) == 0
     out = capsys.readouterr().out
     assert "  fitting its model of all 3 temperatures (the one kept in the file is an older version's)" in out
-    assert "fitted now (" in out and f"kept in {copy}" in out and "  PARK IT for " in out
+    assert "fitted now (" in out and ", kept in the file: " in out and "  PARK IT for " in out
     with load(copy) as m:
         again = lm.stored(m)
     assert again.version == lm.MODEL_VERSION and again.T0 == 20.0

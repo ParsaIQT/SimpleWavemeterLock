@@ -68,7 +68,10 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
@@ -82,6 +85,8 @@ WINDOW = ("w_v", "w_i", "soft")
 THIN = 12000           # points enough for the combs' spacings (a larger map: thinned for those searches)
 MAX_DRIFT = 10.0       # GHz per UNIT_T: the most a comb is taken to drift (more: free-running ECDLs don't)
 BUDGET = 40            # generations of each of the rule's searches
+THREADS = max(1, (os.cpu_count() or 2) - 1)  # threads a search's candidates are shared among (numpy lets go of the
+#                                              GIL as it works: so many cores at once, one left for the rest)
 CHUNK = 100            # sweeps scored at once (memory: sweeps x points x modes)
 LENGTHS = ((5.0, 500.0), (0.5, 30.0))  # mm: the optical lengths an ECDL's external cavity and its chip (n_g L) have
 HOPS_ON = 0.7          # of its map's hops, at least this share whole numbers of its external modes (else: not its comb)
@@ -469,11 +474,29 @@ def fit_comb(d: MapData, spacing: float, rate: float, i0: float, v0: float, t0: 
 
 
 # ----------------------------------------------------------------- the rule
+_POOL, _POOL_LOCK = None, threading.Lock()
+
+
+def _shared(fn, P) -> np.ndarray:
+    """fn(Q) for parts Q of P (candidates, a row each), on THREADS threads at once, joined: as fn(P), sooner. Only the
+    candidates are shared out, each worked out as alone: the same results, to the last bit."""
+    global _POOL
+    P = np.atleast_2d(P)
+    k = min(THREADS, len(P) // 8)
+    if k < 2 or threading.current_thread().name.startswith("laser model"):  # (none of its own threads waits on it)
+        return fn(P)
+    with _POOL_LOCK:
+        if _POOL is None:
+            _POOL = ThreadPoolExecutor(THREADS, thread_name_prefix="laser model")
+    return np.concatenate(list(_POOL.map(fn, np.array_split(P, k))))
+
+
 def _losses(modes, mid, dc, lo, hi, soft=5.0):
     """Each mode's loss: sin²(π δ / dc), δ its distance from its chip resonance's best place (mid, the others dc
-    apart), and more outside the window (lo .. hi): (d / soft)², d GHz beyond its edge (its feedback and gain falling
-    off: a mode soft GHz out loses as much more as one halfway between chip modes does)."""
-    return np.sin(np.pi * ((modes - mid + dc / 2) % dc - dc / 2) / dc) ** 2 + \
+    apart: sin² repeats every dc, so δ is not folded into one, which took most of a search's time), and more outside
+    the window (lo .. hi): (d / soft)², d GHz beyond its edge (its feedback and gain falling off: a mode soft GHz out
+    loses as much more as one halfway between chip modes does)."""
+    return np.sin(np.pi * (modes - mid) / dc) ** 2 + \
         ((np.maximum(modes - hi, 0.0) + np.maximum(lo - modes, 0.0)) / soft) ** 2
 
 
@@ -890,7 +913,7 @@ class LaserModel:
     def _score(self, P, pk: dict, forced: bool = False) -> np.ndarray:
         """The fraction right of each candidate rule (P: pop x 12, as rule()) on a packed map (forced: a point at a
         time, from the mode measured at the one before)."""
-        return _select(pk, P, pk["meas"][:, 0], True, forced) / max(int(pk["valid"].sum()), 1)
+        return _shared(lambda Q: _select(pk, Q, pk["meas"][:, 0], True, forced), P) / max(int(pk["valid"].sum()), 1)
 
     def score(self, d: MapData) -> float:
         """The fraction of the map's clean points it puts on the mode the laser was on, each sweep simulated from its
@@ -1303,12 +1326,13 @@ def fit_power_dp(d: MapData, model: LaserModel, jump: float = 1.5) -> float | No
 
 
 def fit(m, current: str = "act", map_n: int | None = None, budget: int | None = None, seed: int = 0,
-        log=None) -> LaserModel:
+        log=None, tick=None) -> LaserModel:
     """The model of a map's laser (lasermap.LaserMap; map_n: which of its maps, None the last, or all of them if they
     were made at several temperatures: fit_temps), as the module's docstring says. budget: generations of the rule's
-    search (None: BUDGET; fewer: faster, coarser). log(text): progress."""
+    search (None: BUDGET; fewer: faster, coarser). log(text): progress; tick(text): how far it has got, as it goes
+    (each generation of the rule's searches: the longest part)."""
     if map_n is None and len({t for t in map_temps(m).values() if t is not None}) > 1:
-        return fit_temps(m, current, budget, seed, log)
+        return fit_temps(m, current, budget, seed, log, tick)
     say = log or (lambda text: None)
     d = data_of(m, current, map_n=map_n)
     if d.ok.sum() < 50:
@@ -1321,7 +1345,7 @@ def fit(m, current: str = "act", map_n: int | None = None, budget: int | None = 
     model = LaserModel(d.f_ref, i0, v0, t0, ext, chip, kind=d.kind)
     temps = d.temps()
     model.temp = temps[0] if len(temps) == 1 else (m.meta.get("start") or {}).get("temp_set")
-    _finish(model, m, d, rough, BUDGET if budget is None else budget, seed)
+    _finish(model, m, d, rough, BUDGET if budget is None else budget, seed, tick=tick)
     say(f"right mode at {model.right:.0%} of the points")
     return model
 
@@ -1357,10 +1381,13 @@ def _combs(d: MapData, i0: float, v0: float, t0: float, say) -> tuple:
     return rate, rough, ext, chip
 
 
-def _finish(model: LaserModel, m, d: MapData, rough: float, budget: int, seed: int, window=None, most: int = 120):
+def _finish(model: LaserModel, m, d: MapData, rough: float, budget: int, seed: int, window=None, most: int = 120,
+            tick=None):
     """The rest of a model whose combs are fitted (fit, fit_temps): what its map says besides, its rule (window: the
     window's guess, as _window_guess has it; None: that; at several temperatures, its chip's modes' temperature
-    coefficient again from where it hops at each: _chip_temp), how well it does, its power, its hysteresis."""
+    coefficient again from where it hops at each: _chip_temp), how well it does, its power, its hysteresis.
+    tick(text): how far it has got."""
+    tick = tick or (lambda text: None)
     model.pace, model.step_s, model.step_x, model.again_s = pace_of(d)
     model.i_span = [float(np.min(d.i[d.ok])), float(np.max(d.i[d.ok]))]
     model.v_span = [float(np.min(d.v[d.ok])), float(np.max(d.v[d.ok]))]
@@ -1376,9 +1403,11 @@ def _finish(model: LaserModel, m, d: MapData, rough: float, budget: int, seed: i
                            f"tunes them could be another, a whole mode per line more or less ({ext.spacing / step:.2f} "
                            f"GHz/{unit} apart): map with smaller steps of it to be sure" if step else
                            "its lines are far apart for this: map with smaller steps to be sure")
-    _fit_rule(model, d, budget, seed, most, window=window)
+    _fit_rule(model, d, budget, seed, most, window=window, tick=tick)
     if model.T0 is not None and len(d.temps()) > 1:
+        tick("its chip's modes at each temperature, from where it hops")
         _chip_temp(model, d)
+    tick("how well it does, over the whole map")
     model.right, model.near, model.null = model.accuracy(d)
     model.hops_on = hops_on(d, ext.spacing, min(1.0, 0.4 * rough), 0.25 * min(ext.spacing, rough))
     if model.alt is not None:
@@ -1390,7 +1419,7 @@ def _finish(model: LaserModel, m, d: MapData, rough: float, budget: int, seed: i
     model.hysteresis, model.apart = model.hysteresis_of(float(np.percentile(fast, 2)), float(np.percentile(fast, 98)))
 
 
-def fit_temps(m, current: str = "act", budget: int | None = None, seed: int = 0, log=None) -> LaserModel:
+def fit_temps(m, current: str = "act", budget: int | None = None, seed: int = 0, log=None, tick=None) -> LaserModel:
     """The model of a laser mapped at several temperatures (a map at each, as lasermap.MapPlan's t_step makes them),
     as the module's docstring says: each temperature's combs fitted alone, the temperature's coefficients from where
     they are at each (_chip_coef, _ext_coef), the combs fitted again over all of them at once (_joint_comb); the
@@ -1458,7 +1487,7 @@ def fit_temps(m, current: str = "act", budget: int | None = None, seed: int = 0,
     keep = np.isin(d.maps(), list(exts))
     d = d.only(keep)
     _finish(model, m, d, min(roughs[n] for n in exts), BUDGET if budget is None else budget, seed, window,
-            max(120, 40 * len(Tn)))
+            max(120, 40 * len(Tn)), tick)
     model.by_temp = [[T, float(model.score(d.only(d.T == T)))] for T in model.temps]
     say(f"right mode at {model.right:.0%} of the points (" +
         ", ".join(f"{r:.0%} at {T:g} °C" for T, r in model.by_temp) + ")")
@@ -1666,7 +1695,7 @@ def _window_guess(d: MapData, model: LaserModel) -> tuple:
 
 
 def _fit_rule(model: LaserModel, d: MapData, budget: int, seed: int, most: int = 120, popsize: int = 15,
-              window=None):
+              window=None, tick=None):
     """The rule (RULE: the window, the hysteresis each way, the chip resonances' best place, its pull to the mode
     lasing, the chip's lag; WINDOW: how the window moves, how soft its edges), and the chip comb's spacing and current
     tuning again (by
@@ -1679,8 +1708,21 @@ def _fit_rule(model: LaserModel, d: MapData, budget: int, seed: int, most: int =
     own and a mode's pull on its chip resonance both hold a mode: such a search settles on one or the other as it
     goes, so it is searched twice, once for each (HOLDS), the better kept. window: the window's guess (as
     _window_guess has it; None: that). The edges' softness is searched as its logarithm (hard and soft alike tried:
-    most maps cannot tell much of it)."""
+    most maps cannot tell much of it). tick(text): how far it has got, a generation at a time. Its candidates are
+    worked out on THREADS threads at once (_shared)."""
     from scipy.optimize import differential_evolution
+
+    tick = tick or (lambda text: None)
+    searches = 1 + len(HOLDS)
+
+    def going(k, n):  # (search k's progress, a generation at a time)
+        done = [0]
+        tick(f"the rule: search {k} of {searches}, beginning")
+
+        def callback(x, convergence=None):
+            done[0] += 1
+            tick(f"the rule: search {k} of {searches}, generation {done[0]} of {n}")
+        return callback
 
     pk = model._pack(d, model._sweeps(d, most), np.float32)
     lo0, hi0, wv0, wi0 = _window_guess(d, model) if window is None else window
@@ -1711,10 +1753,11 @@ def _fit_rule(model: LaserModel, d: MapData, budget: int, seed: int, most: int =
     how = {"tol": 1e-6, "polish": False, "init": "sobol", "vectorized": True, "updating": "deferred"}
 
     def unlikely(P):
-        return -_likelihood(pk, rules(P))
+        return -_shared(lambda Q: _likelihood(pk, Q), rules(P))
 
     likely = differential_evolution(unlikely, bounds + [(1e-4, 0.02)], maxiter=max(budget // 2, 5),
-                                    popsize=max(popsize - 3, 5), seed=seed, x0=guess + [0.003], **how)
+                                    popsize=max(popsize - 3, 5), seed=seed, x0=guess + [0.003],
+                                    callback=going(1, max(budget // 2, 5)), **how)
     rng = np.random.default_rng(seed)
     found = []
     for k, (pulls, most_h) in enumerate(HOLDS):  # (each its own population: the likeliest rule, the guess among it)
@@ -1725,7 +1768,7 @@ def _fit_rule(model: LaserModel, d: MapData, budget: int, seed: int, most: int =
         first = lows + (highs - lows) * rng.random((popsize * len(part), len(part)))
         first[0], first[1] = np.clip(likely.x[:12], lows, highs), np.clip(guess, lows, highs)
         found.append(differential_evolution(cost, part, maxiter=budget, popsize=popsize, seed=seed + k,
-                                            **dict(how, init=first)))
+                                            callback=going(k + 2, budget), **dict(how, init=first)))
     res, *others = sorted(found, key=lambda r: r.fun)
     model.alt = None
     if others:  # (the other way of holding a mode: kept as well)

@@ -69,6 +69,7 @@ import json
 import logging
 import math
 import queue
+import shutil
 import sqlite3
 import statistics
 import sys
@@ -138,6 +139,61 @@ def fmt_time(s: float) -> str:
     if s < 3600:
         return f"{s // 60} min {s % 60:02d} s" if s < 600 else f"{s // 60} min"
     return f"{s // 3600} h {s % 3600 // 60:02d} min"
+
+
+class Ticker:
+    """How far a long job has got, with how long it has taken, on one line written over as it goes (on a console; to
+    a file or a pipe, a line every 30 s, from 30 s on); say(text) writes a line to keep, above it."""
+
+    def __init__(self, out=None):
+        self.out = out or sys.stdout
+        self.tty = bool(getattr(self.out, "isatty", lambda: False)())
+        self.began = self.last = time.monotonic()
+        self.shown = 0
+
+    def __call__(self, text: str):
+        now = time.monotonic()
+        took = int(now - self.began)
+        line = f"  … {text} ({took // 60}:{took % 60:02d})"
+        if self.tty:
+            line = line[:max(shutil.get_terminal_size((100, 24)).columns - 1, 20)]
+            self.out.write("\r" + line + " " * max(self.shown - len(line), 0))
+            self.shown = len(line)
+            self.out.flush()
+        elif now - self.last >= 30.0:
+            self.out.write(line + "\n")
+            self.out.flush()
+            self.last = now
+
+    def say(self, text: str):
+        self.clear()
+        self.out.write(text + "\n")
+        self.out.flush()
+
+    def clear(self):
+        if self.shown:
+            self.out.write("\r" + " " * self.shown + "\r")
+            self.out.flush()
+            self.shown = 0
+
+
+def quick_edit_off():
+    """On a Windows console, its QuickEdit off until this program ends: with it on, a click in the window holds the
+    program's output, and so the program, until a key is pressed (it looks as though it hangs, doing nothing)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import atexit
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        handle, mode = k32.GetStdHandle(-10), ctypes.c_uint32()  # (the console's input)
+        if not k32.GetConsoleMode(handle, ctypes.byref(mode)) or not mode.value & 0x0040:  # (ENABLE_QUICK_EDIT_MODE)
+            return
+        k32.SetConsoleMode(handle, (mode.value & ~0x0040) | 0x0080)  # (ENABLE_EXTENDED_FLAGS, for it to hold)
+        atexit.register(k32.SetConsoleMode, handle, mode.value)
+    except Exception:  # (no console, or no such call: as it is)
+        pass
 
 
 def fmt_bytes(n: float) -> str:
@@ -2180,10 +2236,11 @@ def brief(m: LaserMap) -> str:
             (f"; mapped at {', '.join(f'{t:g}' for t in temps)} °C" if temps else ""))
 
 
-def park_model(m: LaserMap, current: str = "act", verbose: bool = False) -> tuple:
+def park_model(m: LaserMap, current: str = "act", verbose: bool = False, keep: bool = False) -> tuple:
     """(the model to park its laser by, how it came, whether it was fitted now): the one kept in its file, unless
     there is none, it cannot be its laser's, it is an older version's, or it is of one temperature where the file has
-    several: then fitted (saying so, and its steps if verbose)."""
+    several: then fitted (saying so, how far it has got as it goes, and its steps if verbose), and kept in the file
+    at once if keep (were the parking stopped, the next time is quick)."""
     from . import lasermodel
 
     kept = lasermodel.stored(m)
@@ -2195,12 +2252,19 @@ def park_model(m: LaserMap, current: str = "act", verbose: bool = False) -> tupl
     if why is None:
         return kept, f"its model, kept in the file: {kept.right:.0%} of its map's points on the right mode", False
     what = f"of all {len(temps)} temperatures" if len(temps) > 1 else "of its map"
-    print(f"  fitting its model {what} ({why}): some minutes …", flush=True)
-    began = time.monotonic()
-    model = lasermodel.fit(m, current, log=(lambda text: print(f"  model: {text}", flush=True)) if verbose else None)
+    print(f"  fitting its model {what} ({why}): some minutes, how far it has got below …", flush=True)
+    began, ticker = time.monotonic(), Ticker()
+    try:
+        model = lasermodel.fit(m, current, log=(lambda text: ticker.say(f"  model: {text}")) if verbose else ticker,
+                               tick=ticker)
+    finally:
+        ticker.clear()
     took = fmt_time(time.monotonic() - began)
-    return model, (f"its model {what}, fitted now ({took}): {model.right:.0%} of its map's points on the right mode; "
-                   f"--save-model keeps it in the file"), True
+    if keep:
+        lasermodel.save(m.path, model)
+    return model, (f"its model {what}, fitted now ({took})" + (", kept in the file" if keep else "") +
+                   f": {model.right:.0%} of its map's points on the right mode" +
+                   ("" if keep else "; --save-model keeps it in the file")), True
 
 
 def park_text(m: LaserMap, nm: float, model, note: str = "", temps=None, robust: bool = False,
@@ -2214,7 +2278,12 @@ def park_text(m: LaserMap, nm: float, model, note: str = "", temps=None, robust:
     start, fed = m.meta.get("start") or {}, m.meta.get("feedforward") or {}
     ff = start.get("feedforward") if start.get("feedforward_enabled") else None
     thz = C_NM_THZ / nm
-    spots = parking.park(model, thz, temps=tuple(temps) if temps else None, feedforward=ff, robust=robust)
+    ticker = Ticker()
+    try:
+        spots = parking.park(model, thz, temps=tuple(temps) if temps else None, feedforward=ff, robust=robust,
+                             log=ticker)
+    finally:
+        ticker.clear()
     off = fed.get("off_offset") if fed.get("off_offset") is not None else start.get("act_offset", 0.0)
     reck = fed.get("reckoned_from")
     say_nm = f"{nm:.6f}".rstrip("0").rstrip(".")
@@ -2300,8 +2369,10 @@ def main(argv=None) -> int:
     ap.add_argument("--verbose", action="store_true",
                     help="with --park: the map, its model's facts and every spot in full besides")
     args = ap.parse_args(argv)
+    if args.model or args.park is not None:  # (minutes: a click in its window must not hold it)
+        quick_edit_off()
+
     for name in args.files:
-        fitted = None
         with load(name) as m:
             print(describe(m) if args.park is None or args.verbose else brief(m))
             if args.csv:
@@ -2311,25 +2382,26 @@ def main(argv=None) -> int:
             if args.model:
                 from . import lasermodel
 
-                model = fitted = lasermodel.fit(m, args.current, args.map - 1 if args.map > 0 else None,
-                                                log=lambda text: print(f"  model: {text}", flush=True))
+                ticker = Ticker()
+                try:
+                    model = lasermodel.fit(m, args.current, args.map - 1 if args.map > 0 else None,
+                                           log=lambda text: ticker.say(f"  model: {text}"), tick=ticker)
+                finally:
+                    ticker.clear()
                 print("  the laser, as its model has it:")
                 for fact in model.facts():
                     print(f"   - {fact}")
+                if args.save_model:
+                    lasermodel.save(name, model)
+                    print(f"  kept in {name}")
             if args.park is not None:
                 note = "its model, fitted now"
                 if model is None:
-                    model, note, new = park_model(m, args.current, args.verbose)
-                    fitted = model if new else None
+                    model, note, new = park_model(m, args.current, args.verbose, keep=args.save_model)
                     if args.verbose and new:  # (the one kept, the map's description said)
                         print("  the laser, as its model fitted now has it:")
                         print("\n".join(f"   - {fact}" for fact in model.facts()))
                 print(park_text(m, args.park, model, note, args.temp, args.robust, args.verbose))
-        if fitted is not None and args.save_model:
-            from . import lasermodel
-
-            lasermodel.save(name, fitted)
-            print(f"  kept in {name}")
     return 0
 
 
