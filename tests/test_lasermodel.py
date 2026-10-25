@@ -83,6 +83,7 @@ def test_a_laser_made_of_a_model_comes_back_from_its_map(lab_map):
     assert got.ext.p_v + got.ext.p_t * pace == pytest.approx(want.ext.p_v + 2 * want.ext.p_vv * (got.v0 - want.v0),
                                                              rel=0.05)
     assert abs(got.chip.p_v) < 0.15 * got.ext.p_v
+    assert not got.chip.drift_known and got.chip.p_t == 0.0  # (its first line swept again: its chip's modes no drift)
     assert got.ideal_feedforward() == pytest.approx(want.ideal_feedforward(), rel=0.1)
     shift = (want.f_ref - got.f_ref) * 1e3  # (its frequencies are from the map's first reading)
     assert got.lo == pytest.approx(want.lo + shift, abs=15.0) and got.hi == pytest.approx(want.hi + shift, abs=15.0)
@@ -314,7 +315,7 @@ def test_parked_by_its_model_the_laser_comes_to_its_mode_from_either_side(warm_m
     sp = spots[0]  # (this laser's modes sweeping up and down are seldom the same: its spots one way too)
     assert len(spots) == 3 and all((a.way != "either", -a.score) <= (b.way != "either", -b.score)
                                    for a, b in zip(spots, spots[1:]))
-    assert 19.5 <= sp.T <= 20.5 and sp.score > 0.3 and min(sp.held) >= sp.score
+    assert 19.5 <= sp.T <= 20.5 and sp.score > 0.3 and (sp.way == "either" or sp.start is not None)
     assert sorted(sp.lock) == pytest.approx(sorted([0.0, -0.3, got.ideal_feedforward()])) and sp.piezo is not None
     assert sp.worst_of and all(w[0] == got.chip.p_T for w in sp.worst_of)  # (no other chip's: only external ones)
     true = want.at(sp.T)
@@ -340,6 +341,27 @@ def test_the_command_line_says_where_to_park_it(tmp_path, capsys, warm_map):
     nm = 299792.458 / (got.f_ref + 0.030)
     assert main([str(copy), "--park", f"{nm:.6f}", "--temp", "20", "20"]) == 0  # (at 20 °C alone: quick)
     out = capsys.readouterr().out
-    assert f"where to park it at {nm:.6f} nm" in out and "the widest mode first, power not counted" in out
-    assert out.count("20.00 °C, piezo ") >= 2 and not any(ln.startswith("  model: ") for ln in out.splitlines())
-    assert "     set: the current " in out and "its feedforward off" in out
+    assert out.startswith("copy.sqlite: ") and "mapped at 19.5, 20, 20.5 °C" in out
+    assert "  its model, kept in the file: " in out and "fitting its model" not in out
+    assert f"  PARK IT for {nm:.6f} nm" in out and "    1. temperature  20.00 °C, settled\n" in out
+    assert "    2. piezo        " in out and "    3. current      " in out and "    4. lock         on the piezo" in out
+    assert "  other spots, in order:" in out and "external cavity's modes are" not in out  # (its facts: --verbose)
+    assert max(len(ln) for ln in out.splitlines()) <= 120
+
+
+def test_parking_by_a_model_of_one_temperature_kept_by_an_older_version_fits_it_again(tmp_path, capsys, warm_map,
+                                                                                      monkeypatch):
+    monkeypatch.setattr(lm, "BUDGET", 4)  # (quick, coarse: what it says, not how well)
+    path, got = warm_map
+    copy = tmp_path / "copy.sqlite"
+    copy.write_bytes(path.read_bytes())
+    old = lm.LaserModel.from_dict({k: v for k, v in got.to_dict().items() if k not in ("T0", "version")})
+    lm.save(copy, old)  # (as a version before kept it: of one temperature, its make 1)
+    nm = 299792.458 / (got.f_ref + 0.030)
+    assert main([str(copy), "--park", f"{nm:.6f}", "--temp", "20", "20", "--save-model"]) == 0
+    out = capsys.readouterr().out
+    assert "  fitting its model of all 3 temperatures (the one kept in the file is an older version's)" in out
+    assert "fitted now (" in out and f"kept in {copy}" in out and "  PARK IT for " in out
+    with load(copy) as m:
+        again = lm.stored(m)
+    assert again.version == lm.MODEL_VERSION and again.T0 == 20.0

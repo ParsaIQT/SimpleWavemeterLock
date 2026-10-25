@@ -88,6 +88,7 @@ HOPS_ON = 0.7          # of its map's hops, at least this share whole numbers of
 CHIP_T = (-7.5e-5, -1.3e-4, -3e-5)  # per K, of its frequency: how a diode chip's modes move with its temperature (the
 #                                     likeliest, and the most and least any has: 0.05, 0.085 and 0.02 nm/K at 650 nm)
 MOUNT_T = 23e-6        # per K: an aluminium mount's expansion (an ECDL's cavity no more than this, at the diode's)
+MODEL_VERSION = 2      # a model's make: 2, its temperature, its window's edges soft, its chip's modes not drifting
 
 
 # --------------------------------------------------------------------- data
@@ -405,7 +406,7 @@ def _lsq(d: MapData, s, m_num, extra: list, leg) -> tuple:
 
 
 def fit_comb(d: MapData, spacing: float, rate: float, i0: float, v0: float, t0: float, mask=None,
-             legs: bool = True) -> Comb:
+             legs: bool = True, drift: bool = True) -> Comb:
     """One comb fitted to the map: each line's offset (where its frequencies bunch, `rate` GHz per unit of the swept
     axis taken off), unwrapped from line to line; each point's mode number from that; then frequency = mode number
     * spacing + quadratic in current and piezo, linear in time, offset by the way it was swept, by least squares
@@ -414,7 +415,9 @@ def fit_comb(d: MapData, spacing: float, rate: float, i0: float, v0: float, t0: 
     fitted (as many as a drift of MAX_DRIFT could be), the one fitting best kept, those as good as it within what
     the residuals can tell (they go together along a mode) kept as others. No line swept again: no drift term.
     legs: an offset by the way it was swept (not for the chip comb: sweeping up and down at a current the laser is
-    mostly on different chip modes, which that would take for a change of their spacing)."""
+    mostly on different chip modes, which that would take for a change of their spacing). drift: whether it drifts at
+    all (not the chip comb: its temperature is held, and where frequencies bunch on it, the line swept again later
+    on other modes of it, would make a drift of that, and the piezo's tuning its opposite)."""
     s = d.ok if mask is None else (d.ok & mask)
     di, dv, dt = d.i - i0, d.v - v0, (d.t - t0) / UNIT_T
     leg = np.where(d.leg == 2, 0.5, -0.5) if legs else np.zeros(len(d.f))
@@ -438,18 +441,18 @@ def fit_comb(d: MapData, spacing: float, rate: float, i0: float, v0: float, t0: 
     main = ~repeat & ~np.isnan(phase)
     jump = float(np.max(np.abs(np.diff(unwrapped[main]))) / spacing) if main.sum() > 1 else 0.0
     again = np.flatnonzero(repeat & ~np.isnan(phase))
-    drift_known = bool(len(again)) and main.sum() >= 3
     guess = {}
-    if drift_known:  # (where the main lines put a line swept again at its piezo voltage, had nothing drifted)
-        a = np.polyfit(slow[main], unwrapped[main], 2)
+    if len(again) and main.sum() >= 3:  # (where the main lines put a line swept again at its piezo voltage, had
+        a = np.polyfit(slow[main], unwrapped[main], 2)  # nothing drifted)
         guess = {L: phase[L] + spacing * round((np.polyval(a, slow[L]) - phase[L]) / spacing) for L in again}
+    drift_known = bool(guess) and drift
     extra = [di, di * di, dv, dv * dv] + ([dt] if drift_known else [])
     tried = []
     span = max((float(np.max(d.t[s & (d.line == L)])) for L in again), default=0.0) - float(np.min(d.t[s]))
     most = int(MAX_DRIFT * span / UNIT_T / spacing) if drift_known else 0
     for k in range(-most, most + 1):
         u = unwrapped.copy()
-        for L in again:
+        for L in guess:
             u[L] = guess[L] + k * spacing
         tried.append(_comb_lsq(d, s, x, u, spacing, extra, leg))
     best = min(tried, key=lambda r: r[1])
@@ -611,6 +614,7 @@ class LaserModel:
     #                              whole modes more or less per step), and the steps that would tell ('step', K)
     i_th_T: float | None = None  # mA/K: its threshold, as the temperature moves it
     by_temp: list | None = None  # [[°C, the fraction of the points there it puts on the right mode]], each mapped
+    version: int = MODEL_VERSION  # its make (this version's; 1: kept by a version before it said)
 
     # ----------------------------------------------------------- the rule
     @property
@@ -1213,7 +1217,7 @@ class LaserModel:
 
     @classmethod
     def from_dict(cls, d: dict) -> LaserModel:
-        d = dict(d)
+        d = {"version": 1, **d}  # (kept by a version before it said its make: 1)
         d["ext"] = Comb(**d["ext"])
         d["chip"] = Comb(**d["chip"]) if d.get("chip") else None
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
@@ -1235,6 +1239,16 @@ def stored(m) -> LaserModel | None:
     """The model kept in a map's file (lasermap.LaserMap), None if none."""
     d = m.meta.get("model")
     return LaserModel.from_dict(d) if isinstance(d, dict) else None
+
+
+def outdated(m, model: LaserModel) -> str | None:
+    """Why a model kept in a map's file (m) is to be fitted to it again though it can be its laser's: an older
+    version fitted it (MODEL_VERSION), or it is of one temperature where the file has several; None if neither."""
+    if model.version < MODEL_VERSION:
+        return "an older version's"
+    if model.T0 is None and len({t for t in map_temps(m).values() if t is not None}) > 1:
+        return "of one temperature"
+    return None
 
 
 # ---------------------------------------------------------------------- fit
@@ -1326,7 +1340,7 @@ def _combs(d: MapData, i0: float, v0: float, t0: float, say) -> tuple:
     if quantum is not None and quantum > 4 * rough:
         chip_rate = _chip_rate(few, quantum)
         dc, _ = comb_spacing(few, chip_rate, 0.97 * quantum, 1.03 * quantum)
-        chip = fit_comb(d, dc, chip_rate, i0, v0, t0, legs=False)
+        chip = fit_comb(d, dc, chip_rate, i0, v0, t0, legs=False, drift=False)
         say(f"chip comb: {chip.spacing:.3f} GHz, {chip.p_i:+.3f} GHz/mA")
         de, _ = comb_spacing(few, rate, 2.0, min(chip.spacing / 4.5, 40.0))
         small = min(1.0, 0.4 * rough)

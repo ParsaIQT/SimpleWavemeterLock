@@ -2139,7 +2139,7 @@ def describe(m: LaserMap) -> str:
     end = meta.get("end", {})
     if end:
         out.append(f"  ended: {end.get('outcome', '?')}")
-    facts, doubted = meta.get("model_facts"), False
+    facts, doubted, old = meta.get("model_facts"), False, False
     if meta.get("model"):  # (said again by this version: what it doubts of a model an older one kept)
         try:
             from . import lasermodel
@@ -2147,12 +2147,14 @@ def describe(m: LaserMap) -> str:
             model = lasermodel.stored(m)
             if model is not None:
                 facts, doubted = model.facts(), not model.plausible
+                old = model.version < lasermodel.MODEL_VERSION
         except (ImportError, TypeError, ValueError, KeyError):
             pass
     if facts:
-        out.append("  the laser, as its model has it (kept in the file):")
+        out.append("  the laser, as its model has it (kept in the file" + (", by an older version" if old else "") +
+                   "):")
         out += [f"   - {fact}" for fact in facts]
-        if doubted:
+        if doubted or old:
             out.append("  (fit it again: --model --save-model)")
     return "\n".join(out)
 
@@ -2169,33 +2171,108 @@ def export_csv(m: LaserMap, path) -> int:
     return len(m.points)
 
 
-def park_text(m: LaserMap, nm: float, model=None, temps=None, current: str = "act", robust: bool = False) -> str:
-    """Where to park a map's laser to lase at nm nm (parking.py), in words: by its model (given, else kept in its file
-    if it can be its laser's, else fitted); robust: ranked by the worst with the temperature's other coefficients."""
-    from . import lasermodel, parking
+def brief(m: LaserMap) -> str:
+    """A map's file in a line: its name, its laser, the temperatures it was made at."""
+    laser = m.meta.get("laser", {})
+    temps = sorted({ln["temp"] for ln in m.lines if ln.get("temp") is not None})
+    return (f"{m.path.name}: {laser.get('product-name') or 'a laser'}, channel {laser.get('channel', '?')}, "
+            f"{laser.get('device', '?')} laser{laser.get('laser', '?')}" +
+            (f"; mapped at {', '.join(f'{t:g}' for t in temps)} °C" if temps else ""))
+
+
+def park_model(m: LaserMap, current: str = "act", verbose: bool = False) -> tuple:
+    """(the model to park its laser by, how it came, whether it was fitted now): the one kept in its file, unless
+    there is none, it cannot be its laser's, it is an older version's, or it is of one temperature where the file has
+    several: then fitted (saying so, and its steps if verbose)."""
+    from . import lasermodel
+
+    kept = lasermodel.stored(m)
+    temps = {t for t in lasermodel.map_temps(m).values() if t is not None}
+    old = lasermodel.outdated(m, kept) if kept is not None and kept.plausible else None
+    why = ("none is kept in the file" if kept is None else
+           "the one kept in the file cannot be its laser's" if not kept.plausible else
+           f"the one kept in the file is {old}" if old else None)
+    if why is None:
+        return kept, f"its model, kept in the file: {kept.right:.0%} of its map's points on the right mode", False
+    what = f"of all {len(temps)} temperatures" if len(temps) > 1 else "of its map"
+    print(f"  fitting its model {what} ({why}): some minutes …", flush=True)
+    began = time.monotonic()
+    model = lasermodel.fit(m, current, log=(lambda text: print(f"  model: {text}", flush=True)) if verbose else None)
+    took = fmt_time(time.monotonic() - began)
+    return model, (f"its model {what}, fitted now ({took}): {model.right:.0%} of its map's points on the right mode; "
+                   f"--save-model keeps it in the file"), True
+
+
+def park_text(m: LaserMap, nm: float, model, note: str = "", temps=None, robust: bool = False,
+              verbose: bool = False) -> str:
+    """Where to park a map's laser to lase at nm nm (parking.py), by its model, in words: the best spot as the steps
+    to take (the temperature, the piezo, the current and which way to come to it, the lock), the others in a table;
+    verbose: every spot in full besides. robust: ranked by the worst with the temperature's other coefficients."""
+    from . import parking
     from .wavemeter import C_NM_THZ
 
-    if model is None:
-        model = lasermodel.stored(m)
-        if model is None or not model.plausible:
-            model = lasermodel.fit(m, current, log=lambda text: print(f"  model: {text}", flush=True))
     start, fed = m.meta.get("start") or {}, m.meta.get("feedforward") or {}
     ff = start.get("feedforward") if start.get("feedforward_enabled") else None
     thz = C_NM_THZ / nm
     spots = parking.park(model, thz, temps=tuple(temps) if temps else None, feedforward=ff, robust=robust)
-    say_nm = f"{nm:.6f}".rstrip("0").rstrip(".")
-    out = [f"  where to park it at {say_nm} nm ({thz:.6f} THz), by its model: the widest mode first" +
-           (" whichever of the temperature's coefficients its map allows" if robust else "") + ", power not counted"]
-    if not spots:
-        out.append("   none: no mode on target holds there, as its model has it")
     off = fed.get("off_offset") if fed.get("off_offset") is not None else start.get("act_offset", 0.0)
-    for sp in spots:
-        out.append(f"   - {parking.say_spot(sp)}")
-        text = f"     set: the current {sp.i - off:.2f} mA, its feedforward off"
-        if ff and fed.get("reckoned_from") is not None:
-            text += (f" ({sp.i - off - ff * (sp.v_set - fed['reckoned_from']):.2f} mA with it on, {ff:+.3f} mA/V "
-                     f"reckoned from {fed['reckoned_from']:.1f} V)")
-        out.append(text + "; the piezo (scan offset) as above, the temperature as above and settled")
+    reck = fed.get("reckoned_from")
+    say_nm = f"{nm:.6f}".rstrip("0").rstrip(".")
+    out = [f"  {note}"] if note else []
+    if not spots:
+        return "\n".join(out + [f"  no mode on target at {say_nm} nm holds anywhere it was mapped, by its model"])
+
+    def temp(sp):
+        T = sp.T if sp.T is not None else model.temp
+        return f"{T:.2f} °C" if T is not None else "as mapped"
+
+    def set_i(sp, on=False):  # (mA to set: the feedforward off, or on, adding its factor times the piezo's move)
+        return sp.i - off - (ff * (sp.v_set - reck) if on else 0.0)
+
+    sp = spots[0]
+    lo, hi = sp.lock.get(0.0, (0.0, 0.0))
+    out += ["", f"  PARK IT for {say_nm} nm ({thz:.6f} THz), the widest mode there by its model" +
+            (" (whichever of the temperature's coefficients its map allows)" if robust else "") + ":",
+            f"    1. temperature  {temp(sp)}, settled",
+            f"    2. piezo        {sp.v_set:.2f} V (scan offset)"]
+    if sp.way == "either":
+        out.append(f"    3. current      {set_i(sp):.2f} mA, from either side: its mode is the same coming up or down "
+                   f"from {sp.i - sp.core[0]:.2f} to {sp.i + sp.core[1]:.2f} mA")
+    else:
+        word = "UP" if sp.way == "up" else "DOWN"
+        out.append(f"    3. current      sweep it {word} to {set_i(sp):.2f} mA from {sp.start - off:.1f} mA or "
+                   f"{'below' if sp.way == 'up' else 'above'}: coming {'down' if sp.way == 'up' else 'up'}, it is on "
+                   f"another mode there")
+    out.append("                    (as set with the feedforward off" +
+               (f"; with it on at {ff:+.3f} mA/V, set {set_i(sp, True):.2f} mA)" if ff and reck is not None else ")"))
+    out.append(f"    4. lock         on the piezo, the feedforward off: it takes up {lo:+.1f}/{hi:+.1f} GHz of its "
+               f"cavity's drift before it hops")
+    if ff and ff in sp.lock:
+        out.append(f"                    (with the feedforward on, {sp.lock[ff][0]:+.1f}/{sp.lock[ff][1]:+.1f} GHz)")
+    out.append(f"    There it holds -{sp.held[0]:.2f}/+{sp.held[1]:.2f} mA of current, -{sp.piezo[0]:.1f}/"
+               f"+{sp.piezo[1]:.1f} V of piezo, before it hops.")
+    out.append("    Off target? Its cavity has drifted since the map: move the piezo onto it, then come to the current "
+               "again (3).")
+    if sp.way != "either" and sp.back < parking.MIN_HOLD:
+        out.append(f"    Keep its current from going back {'down' if sp.way == 'up' else 'up'}: it would hop at once "
+                   f"(so the lock on the piezo alone, the feedforward off).")
+    if sp.worst_of:
+        w = min(sp.worst_of, key=lambda x: x[2])
+        out.append(f"    Were its temperature's coefficients others its map allows as well, a spot near it would hold "
+                   f"±{w[2]:.2f} mA at worst" + ("" if w[2] > 0.3 else ": map in finer temperature steps to be sure"))
+    if len(spots) > 1:
+        out += ["", "  other spots, in order:",
+                "    temperature  piezo     current set  come to it          holds (mA)     lock, feedforward off"]
+        for q in spots[1:]:
+            way = "either way" if q.way == "either" else \
+                f"{q.way}, from {'≤' if q.way == 'up' else '≥'} {q.start - off:.1f}"
+            ql = q.lock.get(0.0, (0.0, 0.0))
+            out.append(f"    {temp(q):11s}  {q.v_set:6.2f} V  {set_i(q):6.2f} mA    {way:18s}  "
+                       f"-{q.held[0]:.2f}/+{q.held[1]:.2f}    {ql[0]:+.1f}/{ql[1]:+.1f} GHz")
+    if verbose:
+        out += ["", "  in full:"] + [f"   - {parking.say_spot(q)}" for q in spots]
+    else:
+        out += ["", "  (--verbose: the map, its model's facts and every spot in full)"]
     return "\n".join(out)
 
 
@@ -2205,7 +2282,8 @@ def main(argv=None) -> int:
     ap.add_argument("--csv", action="store_true", help="write each one's points as FILE.csv")
     ap.add_argument("--model", action="store_true",
                     help="fit the laser's model to it (lasermodel.py; needs numpy and scipy) and say its facts")
-    ap.add_argument("--save-model", action="store_true", help="with --model: keep the model in the file")
+    ap.add_argument("--save-model", action="store_true",
+                    help="with --model, or --park fitting one: keep the model in the file (the next --park is quick)")
     ap.add_argument("--map", type=int, default=0, metavar="N",
                     help="with --model: which of its maps (1, 2...; 0: the last)")
     ap.add_argument("--current", choices=("act", "set", "plan"), default="act",
@@ -2219,10 +2297,13 @@ def main(argv=None) -> int:
     ap.add_argument("--robust", action="store_true",
                     help="with --park: ranked by the worst of each spot and the spots near it were the temperature's "
                          "coefficients the others its map allows as well")
+    ap.add_argument("--verbose", action="store_true",
+                    help="with --park: the map, its model's facts and every spot in full besides")
     args = ap.parse_args(argv)
     for name in args.files:
+        fitted = None
         with load(name) as m:
-            print(describe(m))
+            print(describe(m) if args.park is None or args.verbose else brief(m))
             if args.csv:
                 out = Path(name).with_suffix(".csv")
                 print(f"  {export_csv(m, out):,} points written to {out}")
@@ -2230,15 +2311,24 @@ def main(argv=None) -> int:
             if args.model:
                 from . import lasermodel
 
-                model = lasermodel.fit(m, args.current, args.map - 1 if args.map > 0 else None,
-                                       log=lambda text: print(f"  model: {text}", flush=True))
+                model = fitted = lasermodel.fit(m, args.current, args.map - 1 if args.map > 0 else None,
+                                                log=lambda text: print(f"  model: {text}", flush=True))
                 print("  the laser, as its model has it:")
                 for fact in model.facts():
                     print(f"   - {fact}")
             if args.park is not None:
-                print(park_text(m, args.park, model, args.temp, args.current, args.robust))
-        if args.model and args.save_model:
-            lasermodel.save(name, model)
+                note = "its model, fitted now"
+                if model is None:
+                    model, note, new = park_model(m, args.current, args.verbose)
+                    fitted = model if new else None
+                    if args.verbose and new:  # (the one kept, the map's description said)
+                        print("  the laser, as its model fitted now has it:")
+                        print("\n".join(f"   - {fact}" for fact in model.facts()))
+                print(park_text(m, args.park, model, note, args.temp, args.robust, args.verbose))
+        if fitted is not None and args.save_model:
+            from . import lasermodel
+
+            lasermodel.save(name, fitted)
             print(f"  kept in {name}")
     return 0
 

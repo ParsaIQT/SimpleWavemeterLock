@@ -14,7 +14,7 @@ way (its map tells them apart only so far). Where a mode is on target, the same 
 The spots are ranked by the narrower side of their core (a wide mode, and the spot in its middle), then refined
 about the best (the temperature, the piezo, five times finer). A laser whose modes sweeping up and down are seldom
 the same (a large hysteresis) has few such spots: after them come those on target one way only (come to sweeping
-the current up, or down), ranked by how far parked there it holds, at least, either way. For the best few besides:
+the current up, or down), ranked by how far parked there the current can go on that way. For the best few besides:
 the piezo voltages it holds over, the current kept; the drift of its cavity a lock can take up (the frequency held
 by the piezo, the current moved with it as a feedforward has it: none, the controller's, the ideal) before it hops;
 and with a model of several temperatures, the best spot near it with the temperature's other coefficients (whole
@@ -34,6 +34,8 @@ from .lasermodel import LaserModel, _select
 
 REST = 1e6        # s between the points of a path at rest (the chip as warm as its current at each)
 REACH_V = 12.0    # V: how far the piezo is moved each way for its margins
+REACH_I = 4.0     # mA: how far the current is moved each way for its margins
+MIN_HOLD = 0.1    # mA: a spot whose mode, parked on, holds less than this either way is none
 REACH_DRIFT = 15.0  # GHz: how far a cavity's drift is followed by the lock, each way
 NEAR_V, NEAR_I = 4.0, 3.0  # V, mA: a spot this near, with the temperature's other coefficients, is near enough
 BEYOND = 3.0      # mA: the sweeps begin this far beyond the currents searched (what they come from there, as it would)
@@ -45,13 +47,13 @@ class Spot:
     measured) and how widely its mode holds there: order (its external mode, the model's numbering); way: 'either'
     (the same mode sweeping up and down, by both rules), or 'up' or 'down' (on it only come to that way: its core
     nothing); core (mA below and above the spot: the same mode sweeping up and down, by both rules); held (mA down
-    and up, parked on it: by both rules; one way, the other side at least as far as where it came on); window (GHz
+    and up, parked on it, by both rules: how far the current can go each way before it hops); window (GHz
     the target is above its window's low edge, below its high one); edges: which of those margins reached the end of
     what was searched (core low, core high, held down, held up: at least that); piezo (V
     down and up it holds over, the current kept); lock ({feedforward mA/V: (GHz of drift down, up)} a lock holding
     the frequency by the piezo takes up before it hops); worst (mA: with each of the temperature's other
     coefficients, the best spot near it (NEAR_V, NEAR_I): its core's narrower side, the worst of them; None: not
-    asked, or one temperature); score (mA: its core's narrower side; one way, its held's)."""
+    asked, or one temperature); score (mA: its core's narrower side; one way, its held on that way)."""
     T: float | None
     v: float
     v_set: float
@@ -67,10 +69,18 @@ class Spot:
     worst_of: list = field(default_factory=list)  # [(chip GHz/K, external GHz/K, the best spot near: its score mA, V,
     #                                                mA)]
     way: str = "either"
+    entry: float | None = None   # mA: one way, where its mode came on, as the current came that way...
+    start: float | None = None   # ...and where to begin the current from, to come to it so (two hops' worth before)
 
     @property
     def score(self) -> float:
-        return min(self.core) if self.way == "either" else min(self.held)
+        """mA: its core's narrower side; one way, how far parked it holds the current going on that way."""
+        return min(self.core) if self.way == "either" else self.held[1 if self.way == "up" else 0]
+
+    @property
+    def back(self) -> float:
+        """mA: one way, how far parked it holds the current going back (its hysteresis then the other way's)."""
+        return min(self.held) if self.way == "either" else self.held[0 if self.way == "up" else 1]
 
 
 def _grid(lo: float, hi: float, step: float) -> np.ndarray:
@@ -173,7 +183,8 @@ def _spots(m: LaserModel, P: np.ndarray, T, cur: np.ndarray, pz: np.ndarray, tar
             w_lo, w_hi = (float(w) for w in m.window(i, pz[s]))
             out.append(Spot(T, float(pz[s]), float(pz[s]) - m.v_set_to_act, i, int(orders[s, one[s, j]]), (0.0, 0.0),
                             (i - float(cur[a]), float(cur[b]) - i), (target - w_lo, w_hi - target),
-                            (False, False, a == 0, b == L - 1), way=way))
+                            (False, False, a == 0, b == L - 1), way=way,
+                            entry=float(cur[a]) if way == "up" else float(cur[b])))
     return out
 
 
@@ -192,17 +203,18 @@ def _distinct(spots: list, most: int, robust: bool = False, dT: float = 0.15, dV
 
 
 def _holds(m: LaserModel, P: np.ndarray, ii: np.ndarray, vv: np.ndarray, shift: np.ndarray, start: np.ndarray,
-           up: bool) -> np.ndarray:
+           up) -> np.ndarray:
     """Along paths at rest (rows: ii mA, vv V, shift GHz added to its external modes), each from its first point on
-    the mode at start GHz there: how many steps each holds on it, by every rule (P), its hysteresis as `up` has it:
-    rules x paths."""
+    the mode at start GHz there: how many steps each holds on it, by every rule (P), its hysteresis as `up` has it
+    (each path's, or all of them alike): rules x paths."""
     n, L = ii.shape
     e = m.ext.base(ii - m.i0, vv - m.v0, 0.0) + shift
     half = _span(m, P)
     k0 = np.round((start - e[:, 0]) / m.ext.spacing).astype(int)
     orders = k0[:, None] + np.arange(-half, half + 1)[None, :]
     pk = {"M": e[:, :, None] + orders[:, None, :] * m.ext.spacing, "B": m.chip_base(ii, vv, m.t0), "A": ii, "V": vv,
-          "T": np.broadcast_to(np.arange(L, dtype=float)[None, :] * REST, (n, L)), "up": np.full((n, L), up),
+          "T": np.broadcast_to(np.arange(L, dtype=float)[None, :] * REST, (n, L)),
+          "up": np.broadcast_to(np.asarray(up, dtype=bool).reshape(-1, 1), (n, L)),
           "ci0": m._ci(), "i0": m.i0, "v0": m.v0}
     k = _select(pk, P, np.full(n, half))
     moved = k != half
@@ -210,13 +222,19 @@ def _holds(m: LaserModel, P: np.ndarray, ii: np.ndarray, vv: np.ndarray, shift: 
 
 
 def _margins(m: LaserModel, P: np.ndarray, sp: Spot, target: float, ffs: list, v_range: tuple, i_range: tuple,
-             dv: float = 0.05):
-    """sp's piezo margins, the current kept, and how much drift a lock takes up (sp.piezo, sp.lock), by the model
-    there (m)."""
+             dv: float = 0.05, di: float = 0.02):
+    """sp's margins at rest, parked on its mode, by the model there (m): the current either way, the piezo kept,
+    its hysteresis as the current goes (sp.held: one way, exactly, where the sweeps had only its least); the piezo
+    either way, the current kept (sp.piezo); the drift of its cavity a lock takes up before it hops, by each
+    feedforward (sp.lock). The current kept, its hysteresis is the way it came to it (one way), or the lesser of both
+    (either way)."""
+    cs = np.arange(int(REACH_I / di) + 1) * di
     steps = np.arange(int(REACH_V / dv) + 1) * dv
-    rows = []  # (I, V, shift) paths: the piezo either way; then the lock either way, each feedforward
+    rows = [(sp.i - cs, np.full(len(cs), sp.v), np.zeros(len(cs)), False),  # (I, V, shift, the current rising)
+            (sp.i + cs, np.full(len(cs), sp.v), np.zeros(len(cs)), True)]
+    came = None if sp.way == "either" else sp.way == "up"  # (the current kept: the way it came to it holds on)
     for sign in (-1, 1):
-        rows.append((np.full(len(steps), sp.i), sp.v + sign * steps, np.zeros(len(steps))))
+        rows.append((np.full(len(steps), sp.i), sp.v + sign * steps, np.zeros(len(steps)), came))
     e0 = float(m.ext.base(sp.i - m.i0, sp.v - m.v0, 0.0))
     for ff in ffs:
         tune = m.ext.p_v + m.ext.p_i * ff  # (GHz/V the external modes move along it, about)
@@ -226,21 +244,24 @@ def _margins(m: LaserModel, P: np.ndarray, sp: Spot, target: float, ffs: list, v
             v = sp.v + sign * dvs
             i = sp.i + ff * sign * dvs
             shift = -(m.ext.base(i - m.i0, v - m.v0, 0.0) - e0)  # (its external modes held: the lock's doing)
-            rows.append((i, v, shift))
+            rows.append((i, v, shift, came if ff == 0 else bool(ff * sign > 0)))
     L = max(len(r[0]) for r in rows)
-    pad = [np.concatenate([r, np.full(L - len(r), r[-1])]) for row in rows for r in row]
-    ii, vv, S = (np.array(pad[k::3]) for k in range(3))
-    held = np.minimum(_holds(m, P, ii, vv, S, np.full(len(rows), target), True),
-                      _holds(m, P, ii, vv, S, np.full(len(rows), target), False)).min(axis=0)
+    ii, vv, S = (np.array([np.concatenate([r[c], np.full(L - len(r[c]), r[c][-1])]) for r in rows]) for c in range(3))
+    ups = [r[3] for r in rows]
+    held = np.minimum(_holds(m, P, ii, vv, S, np.full(len(rows), target), [u is not False for u in ups]),
+                      _holds(m, P, ii, vv, S, np.full(len(rows), target), [u is True for u in ups])).min(axis=0)
     inside = (vv >= v_range[0] - 1e-9) & (vv <= v_range[1] + 1e-9) & (ii >= i_range[0] - 1e-9) & \
         (ii <= i_range[1] + 1e-9)
     stop = np.argmin(np.concatenate([inside, np.zeros((len(rows), 1), dtype=bool)], axis=1), axis=1)
     last = np.minimum(held, stop) - 1  # (the last step on it, within what was searched)
     k = np.maximum(last, 0)
-    sp.piezo = tuple(float(abs(vv[r, k[r]] - sp.v)) for r in (0, 1))
+    edge = stop <= held  # (what was searched ended before it hopped: at least that)
+    sp.held = (float(sp.i - ii[0, k[0]]), float(ii[1, k[1]] - sp.i))
+    sp.edges = (sp.edges[0], sp.edges[1], bool(edge[0]), bool(edge[1]))
+    sp.piezo = tuple(float(abs(vv[r, k[r]] - sp.v)) for r in (2, 3))
     sp.lock = {}
     for f, ff in enumerate(ffs):
-        a, b = 2 + 2 * f, 3 + 2 * f
+        a, b = 4 + 2 * f, 5 + 2 * f
         drift = [float(S[r, k[r]]) for r in (a, b)]  # (GHz its cavity drifted, taken up)
         sp.lock[ff] = (min(drift), max(drift))
 
@@ -293,16 +314,32 @@ def park(model: LaserModel, target_thz: float, temps: tuple | None = None, curre
             for T in fine_T:
                 spots += scan(T, fine_V)
         say(f"refined about the best {len(best)}: {len(spots):,} spots")
-    out = _distinct(spots, top, robust)
     ff_ideal = model.ideal_feedforward()
     ffs = [0.0] + [f for f in (feedforward, ff_ideal) if f is not None and abs(f) > 1e-9]
-    for sp in out:
+    period = _hop_period(model)
+    best = _distinct(spots, 3 * top, robust)
+    for sp in best:  # (its margins parked there, exactly: ranked again by them, those that hold nothing left out)
         _margins(model.at(sp.T), P, sp, target, ffs, v_range, i_range)
+        if sp.way != "either":
+            sp.start = max(sp.entry - 2 * period, i_range[0]) if sp.way == "up" else \
+                min(sp.entry + 2 * period, i_range[1])
+    out = _distinct([sp for sp in best if sp.score >= MIN_HOLD], top, robust)
+    for sp in out:
         if aliases and not sp.worst_of:
             near_v = _grid(max(sp.v - NEAR_V, v_range[0]), min(sp.v + NEAR_V, v_range[1]), v_step / 2)
             for ((c_T, e_T), alt), Q in zip(others, alt_rules):
                 _worst([sp], c_T, e_T, _spots(alt.at(sp.T), Q, sp.T, cur, near_v, target, i_range))
     return out
+
+
+def _hop_period(m: LaserModel) -> float:
+    """mA: how often it hops sweeping the current (from one chip mode to the next: the vernier), 1.5 if not
+    known."""
+    e, c = m.ext, m.chip
+    if c is None or m.single or abs(c.p_i - e.p_i) < 1e-6:
+        return 1.5
+    step = abs(c.spacing - e.spacing * round(c.spacing / e.spacing)) or e.spacing
+    return float(min(max(step / abs(c.p_i - e.p_i), 0.2), 5.0))
 
 
 def _worst(spots: list, c_T: float, e_T: float, alts: list):
@@ -349,7 +386,7 @@ def say_spot(sp: Spot) -> str:
     else:
         text = (f"{where}: its mode (order {sp.order:+d}) only come to sweeping the current {sp.way} (from "
                 f"{'below' if sp.way == 'up' else 'above'}: the other way it is on another); parked on it, it holds "
-                f"from {sp.i - sp.held[0]:.2f} to {sp.i + sp.held[1]:.2f} mA at least "
+                f"from {sp.i - sp.held[0]:.2f} to {sp.i + sp.held[1]:.2f} mA "
                 f"(-{least(sp.held[0], sp.edges[2])}/+{least(sp.held[1], sp.edges[3])})")
     if sp.piezo is not None:
         text += f"; the current kept, the piezo -{sp.piezo[0]:.1f}/+{sp.piezo[1]:.1f} V"

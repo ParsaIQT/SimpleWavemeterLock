@@ -832,9 +832,10 @@ A laser mapped with its model fitted at the end (*Laser maps*, *The laser's mode
 with its channel: the map's notes say *its recoveries go by it from now on* if the model puts at least
 60 % of the map's points on the right mode and the channel is still linked to the laser mapped
 (*Mode-hop recovery…* shows which map it came from, and when). A newer map replaces it. A map made before
-(or on another PC) gives it too: right-click › **Its laser's model from a map…** takes the model kept in the
-file, or fits one to it in the background (a few minutes; the row's tooltip says how it went), if the map is of
-the laser the channel is linked to. Its recoveries then go by it (method *auto* without an SHG stage, or
+(or on another PC) gives it too, if the map is of the laser the channel is linked to: right-click › **Its laser's
+model from a map…** takes the model kept in the file, or fits one to it in the background (a few minutes; the
+row's tooltip says how it went) if none is kept, an older version kept it, or it is of one temperature where the
+map has several. Its recoveries then go by it (method *auto* without an SHG stage, or
 *model*), and it is that laser's own: where its chip's modes are, how its window moves, its hysteresis, its
 chip lagging the current.
 
@@ -1373,7 +1374,11 @@ How it is fitted, each part from what the map shows most directly:
    in the current and the piezo, linear in time, the external one offset by the way it was swept. The
    first line swept again at the end tells drift from the piezo, but only to whole modes: each number of
    modes of drift that could be is fitted, the best kept, and those the residuals cannot tell from it
-   kept as well (and said);
+   kept as well (and said). The chip's modes are given no drift: their temperature is held, and where the
+   frequencies bunch on them, the line swept again lasing on others of them, would make one of that, and the
+   piezo's tuning of them its opposite (a version before this one had the 493 nm laser's chip modes drifting
+   −5.4 GHz per 10 minutes and moving +0.98 GHz/V with the piezo, so an ideal feedforward of +0.02 mA/V where its
+   map's boundaries say −0.60);
 4. the rule (with how the window moves), and the chip comb's spacing and current tuning again (from where it hops: where the
    frequencies lie on the chip's modes misleads near the window's edges, where a mode lases only on their
    inner side): every sweep simulated from its first point, scored by how many of its points the model
@@ -1501,9 +1506,33 @@ Its recoveries go by it: see *Recovery by the laser's model* under *Mode-hop rec
 ### Where to park it
 
 `python -m wmlock.lasermap FILE --park NM` says where to put the laser to lase at NM nm on the mode that holds
-most widely there, by its model (the one kept in the file, if it can be the laser's, else fitted; with a map at
-several temperatures, the temperature as well: `--temp LO HI` to look elsewhere than the temperatures mapped).
-Power is not counted. `wmlock/parking.py` does it:
+most widely there, by its model; power is not counted. It says it as the steps to take, first:
+
+```
+map_2026-10-25_005024_ch6.sqlite: DLpro (S/N 28698), channel 6, 192.168.1.102 laser2; mapped at 19, 19.5, 20, 20.5 °C
+  its model, kept in the file: 86% of its map's points on the right mode
+
+  PARK IT for 649.869 nm (461.312138 THz), the widest mode there by its model:
+    1. temperature  19.45 °C, settled
+    2. piezo        81.77 V (scan offset)
+    3. current      55.08 mA, from either side: its mode is the same coming up or down from 53.88 to 56.28 mA
+                    (as set with the feedforward off; with it on at -0.300 mA/V, set 59.35 mA)
+    4. lock         on the piezo, the feedforward off: it takes up -11.9/+12.0 GHz of its cavity's drift before it hops
+                    (with the feedforward on, -2.4/+2.6 GHz)
+    There it holds -1.56/+1.68 mA of current, -2.8/+3.3 V of piezo, before it hops.
+    Off target? Its cavity has drifted since the map: move the piezo onto it, then come to the current again (3).
+    Were its temperature's coefficients others its map allows as well, a spot near it would hold ±0.95 mA at worst
+
+  other spots, in order:
+    temperature  piezo     current set  come to it          holds (mA)     lock, feedforward off
+    19.01 °C      86.27 V   63.84 mA    either way          -1.54/+1.60    -11.7/+12.2 GHz
+```
+
+(a laser of large hysteresis gets the way to come to it instead, as *sweep it DOWN to … mA from … mA or above*),
+then the others in a table; `--verbose` says the map, its model's facts and every spot in full besides. The model
+is the one kept in the file, unless there is none, it cannot be the laser's, an older version kept it, or it is of
+one temperature where the map has several: then it is fitted (some minutes; `--save-model` keeps it, and the next
+time is quick). `--temp LO HI` looks elsewhere than the temperatures mapped. `wmlock/parking.py` does it:
 
 * at temperatures 0.05 K apart across the map's (then five times finer about the best), piezo voltages 0.5 V apart
   and currents 0.05 mA apart across what it covered, the model **at rest** (its chip as warm as its current, its
@@ -1516,13 +1545,15 @@ Power is not counted. `wmlock/parking.py` does it:
   middle. The sweeps begin 3 mA beyond the currents searched, so that at their edges they have come from somewhere.
   A laser whose modes sweeping up and down are seldom the same (the 493 nm one: on different modes over nearly all
   of its range) has few such spots; after them come those on target one way only (come to sweeping the current up,
-  or down: said so), ranked by how far parked there they hold, at least;
+  or down: said so), ranked by how far, parked there, the current can go on that way before it hops. The current
+  kept, its hysteresis stays the way it came (the lock on the piezo, the feedforward off, keeps it so); come back the
+  other way, it may hop at once, and it says so;
 * for the best few: the piezo voltages it holds over, the current kept; how much **drift of its cavity a lock can
   take up** before it hops, the frequency held by the piezo and the current moved with it as a feedforward has it
-  (none, the controller's, the ideal); and, with a model of several temperatures, the best spot near it (4 V,
-  3 mA) were the temperature's coefficients the others its map allows (`--robust`, `robust=True`, ranks every
-  spot by the worst of those: what the map can vouch for whichever they are). For each, the current to set with
-  the controller's feedforward off, and on.
+  (none, the controller's, the ideal); how far the current can go either way (exactly, from where it is parked);
+  and, with a model of several temperatures, the best spot near it (4 V, 3 mA) were the temperature's coefficients
+  the others its map allows (`--robust`, `robust=True`, ranks every spot by the worst of those: what the map can
+  vouch for whichever they are). For each, the current to set with the controller's feedforward off, and on.
 
 The feedforward that keeps the combs aligned while the frequency is tuned (the ideal) is the worst for a laser
 held at one frequency: its cavity drifting, the lock moves the piezo back, and the feedforward moves the current

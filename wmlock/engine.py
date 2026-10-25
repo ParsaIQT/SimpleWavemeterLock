@@ -1891,6 +1891,7 @@ class Engine:
 
             with load(path) as f:
                 laser, model = f.meta.get("laser") or {}, lasermodel.stored(f)
+                old = lasermodel.outdated(f, model) if model is not None and model.plausible else None
         except ImportError as exc:
             return f"its laser's model needs numpy and scipy ({exc})"
         except Exception as exc:  # (not a map, say)
@@ -1900,9 +1901,10 @@ class Engine:
             if [laser.get("device"), laser.get("laser")] != [ch.device, ch.laser]:
                 return (f"{path.name} is a map of laser {laser.get('laser')} of {laser.get('device') or '?'}, not of "
                         f"the laser channel {n} is linked to: its model not taken")
-        if model is not None and model.plausible:
+        if model is not None and model.plausible and old is None:
             return self._take_model(ch, model, path.name)
-        why = (f"the model it keeps is not this laser's ({'; '.join(model.doubts())}): a model is being fitted to it "
+        why = (f"the model it keeps is {old}: a model is being fitted to it again" if old else
+               f"the model it keeps is not this laser's ({'; '.join(model.doubts())}): a model is being fitted to it "
                f"again" if model is not None else "it keeps no model of the laser: one is being fitted to it")
 
         def fit():

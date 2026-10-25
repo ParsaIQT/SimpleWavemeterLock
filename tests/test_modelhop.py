@@ -365,3 +365,10 @@ def test_a_channel_takes_its_lasers_model_from_a_map_made_before(tmp_path):
     while ch.model_note.startswith("being fitted") and time.monotonic() < end:
         time.sleep(0.05)
     assert ch.model_note.startswith("none from bare.sqlite: ") and ch.laser_model() == model
+    said = Engine.model_from_file(eng, 3, a_map("old.sqlite", "192.168.1.30", blue(right=0.9, version=1)))
+    assert said.startswith("old.sqlite: the model it keeps is an older version's: a model is being fitted to it "
+                           "again, in the background")  # (its laser's, as far as it can tell, but not by this version)
+    end = time.monotonic() + 10.0
+    while ch.model_note.startswith("being fitted") and time.monotonic() < end:
+        time.sleep(0.05)
+    assert ch.model_note.startswith("none from old.sqlite: ") and ch.laser_model() == model
