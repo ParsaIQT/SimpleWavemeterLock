@@ -1814,7 +1814,6 @@ class Engine:
     def _map_over(self, ch: Channel, m: Mapper | None, text: str, r: MapRunner | None = None):
         """The map over (r: its runner, None if it never began): the channel is as before, the file closed."""
         ok = r is not None and r.state == "done"
-        ch.state = "off"
         ch.token += 1
         self._release(ch)
         if getattr(self.source, "details", False):
@@ -1836,6 +1835,7 @@ class Engine:
                 threading.Thread(target=self._model_of, args=(ch, m, out.path, closing), daemon=True,
                                  name="laser model").start()
         ch.map_note, ch.message = text, "" if ok else text
+        ch.state = "off"  # (last: off, its note is there to read)
         (log.info if ok else log.warning)("channel %d: %s", ch.n, text)
 
     MODEL_GOOD = 0.6  # a laser's model putting fewer of its map's points on the right mode is not gone by
@@ -1863,8 +1863,11 @@ class Engine:
             m.notes.extend((None, "  " + fact) for fact in model.facts())
             m.model, m.model_note = model, f"its model: right mode at {model.right:.0%} of the points"
             laser = m.info.get("laser") or {}
+            doubts = model.doubts()
             with self.lock:
-                if model.right < self.MODEL_GOOD:
+                if doubts:
+                    m.notes.append((None, "its recoveries do not go by it: " + "; ".join(doubts)))
+                elif model.right < self.MODEL_GOOD:
                     m.notes.append((None, f"its recoveries do not go by it ({model.right:.0%}: too little)"))
                 elif [laser.get("device"), laser.get("laser")] == [ch.device, ch.laser]:
                     ch.adopt_model(model, path.name)
@@ -1897,8 +1900,10 @@ class Engine:
             if [laser.get("device"), laser.get("laser")] != [ch.device, ch.laser]:
                 return (f"{path.name} is a map of laser {laser.get('laser')} of {laser.get('device') or '?'}, not of "
                         f"the laser channel {n} is linked to: its model not taken")
-        if model is not None:
+        if model is not None and model.plausible:
             return self._take_model(ch, model, path.name)
+        why = (f"the model it keeps is not this laser's ({'; '.join(model.doubts())}): a model is being fitted to it "
+               f"again" if model is not None else "it keeps no model of the laser: one is being fitted to it")
 
         def fit():
             try:
@@ -1916,13 +1921,16 @@ class Engine:
         with self.lock:
             ch.model_note = f"being fitted to {path.name}…"
         threading.Thread(target=fit, daemon=True, name="laser model").start()
-        return (f"{path.name} keeps no model of the laser: it is being fitted to it, in the background (a few "
-                f"minutes); Mode-hop recovery… shows it once it is taken, and the row's tooltip says how it went")
+        return (f"{path.name}: {why}, in the background (a few minutes); Mode-hop recovery… shows it once it is taken, "
+                f"and the row's tooltip says how it went")
 
     def _take_model(self, ch: Channel, model, source: str) -> str:
         """Its laser's model from now on, if it describes the laser well enough (MODEL_GOOD): what was done."""
+        doubts = model.doubts()
         with self.lock:
-            if model.right < self.MODEL_GOOD:
+            if doubts:
+                ch.model_note = f"the one from {source} is not this laser's: " + "; ".join(doubts)
+            elif model.right < self.MODEL_GOOD:
                 ch.model_note = (f"the one from {source} puts only {model.right:.0%} of that map's points on the right "
                                  f"mode: not gone by")
             else:

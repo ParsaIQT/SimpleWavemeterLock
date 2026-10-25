@@ -66,6 +66,8 @@ THIN = 12000           # points enough for the combs' spacings (a larger map: th
 MAX_DRIFT = 10.0       # GHz per UNIT_T: the most a comb is taken to drift (more: free-running ECDLs don't)
 BUDGET = 40            # generations of each of the rule's searches
 CHUNK = 100            # sweeps scored at once (memory: sweeps x points x modes)
+LENGTHS = ((5.0, 500.0), (0.5, 30.0))  # mm: the optical lengths an ECDL's external cavity and its chip (n_g L) have
+HOPS_ON = 0.7          # of its map's hops, at least this share whole numbers of its external modes (else: not its comb)
 
 
 # --------------------------------------------------------------------- data
@@ -109,14 +111,17 @@ class MapData:
 
 def data_of(m, current: str = "act", spread: float = 0.3, map_n: int | None = None) -> MapData:
     """One map's points (lasermap.LaserMap: its legs up and down; descents left out), with its first line swept
-    again at the end if that was this map's: map_n (None: the last map, the one swept again). The current as
+    again at the end if that was this map's: map_n (None: the last map, the one swept again); their frequencies
+    from the middle (median) of the file's, whichever map (f_ref). The current as
     LaserMap.sweeps has it ('act': as read at each point, else the set current and what it was besides where it
     began). spread: GHz between a point's readings above which its frequency is no one mode's. A frequency far
-    from all the others (beyond the range of the middle 98 % again, either side) is no mode's either: the
-    wavemeter misread its interference order (THz away), both readings alike."""
+    from all the others (beyond four times the range of the middle half, either side of it) is no mode's either:
+    the wavemeter misread its interference order (THz away), both readings alike; as many as a quarter of them
+    could not widen that range."""
     start = m.meta.get("start") or {}
     off = (start.get("current_act") or 0.0) - (start.get("current_set") or 0.0)
-    f_ref = next((q["f"] for q in m.points if q["f"] is not None), 0.0)
+    fs = [q["f"] for q in m.points if q["f"] is not None]
+    f_ref = round(float(np.median(fs)), 6) if fs else 0.0  # (THz: the map's middle frequency, whatever its misreads)
     mains = [ln for ln in m.lines if not ln.get("repeat")]
     if not mains:
         raise ValueError("no lines in the map")
@@ -150,8 +155,9 @@ def data_of(m, current: str = "act", spread: float = 0.3, map_n: int | None = No
     lines = [by_id[lid] for lid, _ in sorted(order.items(), key=lambda kv: kv[1])]
     ok = a[:, 6] > 0.5
     if ok.sum() > 20:  # (a wavemeter that misread its order, both readings alike: THz away; none of its modes)
-        lo, hi = np.percentile(a[ok, 5], [1, 99])
-        ok &= (a[:, 5] > lo - (hi - lo)) & (a[:, 5] < hi + (hi - lo))
+        q1, q3 = np.percentile(a[ok, 5], [25, 75])
+        w = max(q3 - q1, 1.0)
+        ok &= (a[:, 5] > q1 - 4 * w) & (a[:, 5] < q3 + 4 * w)
     return MapData(a[:, 0].astype(int), a[:, 1].astype(int), a[:, 2], a[:, 3], a[:, 4], a[:, 5], ok,
                    a[:, 7], lines, f_ref, first["axis"])
 
@@ -241,10 +247,33 @@ def hop_quantum(d: MapData, small: float) -> float | None:
     if len(sizes) < 10:
         return None
     sizes = np.array(sizes)
+    f = d.f[d.ok]
+    sizes = sizes[sizes <= np.ptp(np.percentile(f, [1, 99]))]  # (no hop is larger than where it lases)
+    if len(sizes) < 10:
+        return None
     grid = np.linspace(2.5 * small, min(sizes.max(), 500.0), 4000)
     score = np.cos(2 * np.pi * sizes[None, :] / grid[:, None]).mean(axis=1)
     k = _largest_peak(score)
     return float(grid[k]) if score[k] > 0.5 else None
+
+
+def hops_on(d: MapData, spacing: float, small: float = 1.0, tol: float | None = None) -> float | None:
+    """The share of the map's hops (consecutive clean points of a sweep more than `small` GHz apart, a mode's own
+    tuning taken off) whose sizes are within tol GHz (a quarter of the spacing) of a whole number of spacings, not
+    none: near 1 for the comb its modes are; small for one too coarse (its hops within its modes, which do not
+    jump; with tol a quarter of the finer spacing, few of the rest near its multiples). None: no hops."""
+    rate = onmode_rate(d)
+    sizes = []
+    for idx in d.sweeps():
+        f, x, ok = d.f[idx], d.fast[idx], d.ok[idx]
+        step = np.diff(f) - rate * np.diff(x)
+        good = ok[:-1] & ok[1:] & (np.abs(step) > small)
+        sizes.append(step[good])
+    sizes = np.concatenate(sizes) if sizes else np.zeros(0)
+    if len(sizes) < 10:
+        return None
+    k = np.round(sizes / spacing)
+    return float(np.mean((k != 0) & (np.abs(sizes - k * spacing) < (0.25 * spacing if tol is None else tol))))
 
 
 @dataclass
@@ -480,6 +509,9 @@ class LaserModel:
     power_dp: float | None = None  # µW per GHz a mode sits above its chip resonance's best place (δ)
     right: float = 0.0           # the fraction of the map's points the model puts on the right mode...
     near: float = 0.0            # ...and of those it misses, within two points of a hop the laser made
+    null: float | None = None    # the fraction a model that never hops would put on the right mode (each sweep on its
+    #                              first point's mode)
+    hops_on: float | None = None  # the share of the map's hops that are whole numbers of its external modes
     points: int = 0
     kind: str = "current"
     pace: float | None = None
@@ -512,6 +544,35 @@ class LaserModel:
         motion (WINDOW)."""
         return np.array([getattr(self, k) for k in RULE] + [self.dc, self._ci()] + [getattr(self, k) for k in WINDOW],
                         dtype=float)
+
+    def doubts(self) -> list:
+        """Why it cannot be the laser's model, if it cannot (its map misled its fit: misread frequencies, too few
+        hops): sentences; none, it can."""
+        out = []
+        L = C_LIGHT / (2 * self.ext.spacing * 1e9) * 1e3
+        if not LENGTHS[0][0] <= L <= LENGTHS[0][1]:
+            out.append(f"its external modes {self.ext.spacing:.4f} GHz apart would make its cavity {L:.2f} mm long "
+                       f"(optically): no ECDL's is ({LENGTHS[0][0]:g} to {LENGTHS[0][1]:g} mm)")
+        if not self.single:
+            Lc = C_LIGHT / (2 * self.chip.spacing * 1e9) * 1e3
+            if not LENGTHS[1][0] <= Lc <= LENGTHS[1][1]:
+                out.append(f"its chip's modes {self.chip.spacing:.3f} GHz apart would make its chip {Lc:.3f} mm long "
+                           f"(optically, n_g L): no laser diode's is ({LENGTHS[1][0]:g} to {LENGTHS[1][1]:g} mm)")
+            elif Lc >= L:
+                out.append(f"its chip's modes ({self.chip.spacing:.3f} GHz apart) would make its chip longer than its "
+                           f"whole cavity ({Lc:.2f} against {L:.2f} mm)")
+        if self.hops_on is not None and self.hops_on < HOPS_ON:
+            out.append(f"only {self.hops_on:.0%} of its map's hops are whole numbers of its external modes "
+                       f"({self.ext.spacing:.4f} GHz): they are not its modes")
+        if self.null is not None and self.right < self.null + 0.05:
+            out.append(f"it puts no more of the map's points on the right mode ({self.right:.0%}) than one that never "
+                       f"hops would ({self.null:.0%})")
+        return out
+
+    @property
+    def plausible(self) -> bool:
+        """It can be the laser's model (doubts())."""
+        return not self.doubts()
 
     def with_rule(self, rule: dict) -> LaserModel:
         """A copy of it with another rule (as alt has it: rule()'s terms by name)."""
@@ -701,8 +762,9 @@ class LaserModel:
 
     def accuracy(self, d: MapData) -> tuple:
         """(the fraction of the map's clean points it puts on the mode the laser was on, the fraction of those it
-        misses within two points of a hop the laser made: where the model hops a point or two early or late)."""
-        right = total = near = 0
+        misses within two points of a hop the laser made: where the model hops a point or two early or late, the
+        fraction a model that never hops would put on it: each sweep on the mode of its first point)."""
+        right = total = near = null = 0
         sw = self._sweeps(d)
         for a in range(0, len(sw), CHUNK):
             pk = self._pack(d, sw[a:a + CHUNK])
@@ -718,7 +780,8 @@ class LaserModel:
             right += int(((k == meas) & v).sum())
             total += int(v.sum())
             near += int((miss & close).sum())
-        return right / max(total, 1), near / max(total - right, 1)
+            null += int(((meas == meas[:, :1]) & v).sum())
+        return right / max(total, 1), near / max(total - right, 1), null / max(total, 1)
 
     def hysteresis_of(self, lo: float, hi: float) -> tuple:
         """(mA (or V): how far its modes sweeping down are from where they were sweeping up, the part of the range
@@ -801,11 +864,15 @@ class LaserModel:
         ff = self.ideal_feedforward()
         if ff is not None and not single:
             step = (c.spacing - e.spacing * round(c.spacing / e.spacing))
-            rel = c.p_i - e.p_i
+            rel, rel_v = c.p_i - e.p_i, e.p_v - c.p_v
+
+            def every(x, unit):
+                return f"every {abs(step / x):.2f} {unit} or so" if abs(x) > 1e-6 else "never"
+
             out.append(f"it hops where an external mode near another chip mode lines up better: the combs slide past "
                        f"each other {rel:+.3f} GHz/mA, and from one chip mode to the next the alignment changes by "
-                       f"{abs(step):.2f} GHz, so sweeping the current it hops every {abs(step / rel):.2f} mA or so, "
-                       f"sweeping the piezo every {abs(step / (e.p_v - c.p_v)):.2f} V")
+                       f"{abs(step):.2f} GHz, so sweeping the current it hops {every(rel, 'mA')}, sweeping the piezo "
+                       f"{every(rel_v, 'V')}")
         if ff is not None:
             along = e.p_v + e.p_i * ff
             gain = along - (self.w_v + self.w_i * ff)  # (on the window, as that moves too)
@@ -816,9 +883,16 @@ class LaserModel:
         out += self._hysteresis_facts(single)
         out += self._power_facts(single)
         out += self._drift_facts(nu, L)
+        null = f"; one that never hops would put {self.null:.0%} there" if self.null is not None else ""
+        hops = (f"; {self.hops_on:.0%} of the map's hops are whole numbers of its external modes"
+                if self.hops_on is not None else "")
         out.append(f"the model puts {self.right:.0%} of the map's {self.points:,} points on the mode the laser was on "
-                   f"(each sweep simulated from its first point); {self.near:.0%} of the rest are within two points of "
-                   f"a hop: there it hops a point or two early or late")
+                   f"(each sweep simulated from its first point){null}; {self.near:.0%} of the rest are within two "
+                   f"points of a hop: there it hops a point or two early or late{hops}")
+        doubts = self.doubts()
+        if doubts:  # (first: what the rest is worth)
+            out.insert(0, "NOT THIS LASER'S MODEL: its map misled its fit (misread frequencies, too few hops?), so "
+                          "nothing goes by it: " + "; ".join(doubts))
         return out + list(self.notes)
 
     def _piezo_facts(self, nu: float, L: float) -> list:
@@ -1038,7 +1112,12 @@ def fit(m, current: str = "act", map_n: int | None = None, budget: int | None = 
         dc, _ = comb_spacing(few, chip_rate, 0.97 * quantum, 1.03 * quantum)
         chip = fit_comb(d, dc, chip_rate, i0, v0, t0, legs=False)
         say(f"chip comb: {chip.spacing:.3f} GHz, {chip.p_i:+.3f} GHz/mA")
-        de, _ = comb_spacing(few, rate, 2.0, chip.spacing / 4.5)
+        de, _ = comb_spacing(few, rate, 2.0, min(chip.spacing / 4.5, 40.0))
+        small = min(1.0, 0.4 * rough)
+        on, on_rough = hops_on(d, de, small, 0.25 * min(de, rough)), hops_on(d, rough, small)
+        if on is not None and on_rough is not None and on_rough > on + 0.1:  # (its hops say which is its comb)
+            say(f"external comb: {de:.4f} GHz has {on:.0%} of the hops on it, {rough:.4f} GHz {on_rough:.0%}: that")
+            de = rough
     else:
         de = rough
     ext = fit_comb(d, de, rate, i0, v0, t0)
@@ -1064,7 +1143,8 @@ def fit(m, current: str = "act", map_n: int | None = None, budget: int | None = 
                            f"GHz/{unit} apart): map with smaller steps of it to be sure" if step else
                            "its lines are far apart for this: map with smaller steps to be sure")
     _fit_rule(model, d, budget, seed)
-    model.right, model.near = model.accuracy(d)
+    model.right, model.near, model.null = model.accuracy(d)
+    model.hops_on = hops_on(d, ext.spacing, min(1.0, 0.4 * rough), 0.25 * min(ext.spacing, rough))
     if model.alt is not None:
         model.alt["right"] = float(model.with_rule(model.alt).accuracy(d)[0])
     model.points = int(d.ok.sum())

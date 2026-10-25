@@ -2139,10 +2139,21 @@ def describe(m: LaserMap) -> str:
     end = meta.get("end", {})
     if end:
         out.append(f"  ended: {end.get('outcome', '?')}")
-    facts = meta.get("model_facts")
+    facts, doubted = meta.get("model_facts"), False
+    if meta.get("model"):  # (said again by this version: what it doubts of a model an older one kept)
+        try:
+            from . import lasermodel
+
+            model = lasermodel.stored(m)
+            if model is not None:
+                facts, doubted = model.facts(), not model.plausible
+        except (ImportError, TypeError, ValueError, KeyError):
+            pass
     if facts:
         out.append("  the laser, as its model has it (kept in the file):")
         out += [f"   - {fact}" for fact in facts]
+        if doubted:
+            out.append("  (fit it again: --model --save-model)")
     return "\n".join(out)
 
 

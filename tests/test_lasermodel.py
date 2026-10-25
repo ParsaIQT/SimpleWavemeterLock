@@ -6,7 +6,7 @@ import types
 
 import pytest
 
-pytest.importorskip("numpy")
+np = pytest.importorskip("numpy")
 pytest.importorskip("scipy")
 
 from test_lasermap import MapBench, plan  # noqa: E402
@@ -91,6 +91,50 @@ def test_its_facts_say_the_laser_in_numbers(lab_map):
     near = got.alt["right"] >= got.right - 0.05  # (the map tells the two apart only so far, or it does)
     assert (f"another rule does {'nearly as well' if near else 'less well'}: its pull " in text
             and ("so its recovery plans for both" in text) == near)
+
+
+def test_misread_frequencies_by_the_dozen_do_not_mislead_it(tmp_path, lab_map):
+    import sqlite3
+
+    path, got = lab_map
+    copy = tmp_path / "misread.sqlite"
+    copy.write_bytes(path.read_bytes())
+    db = sqlite3.connect(str(copy))  # (one point in 20 read 4.9 THz off, one in 33 -2.45 THz: its order misread)
+    db.execute("UPDATE points SET f = f + 4.9 WHERE f IS NOT NULL AND id % 20 = 0")
+    db.execute("UPDATE points SET f = f - 2.45 WHERE f IS NOT NULL AND id % 33 = 1")
+    db.commit()
+    db.close()
+    with load(copy) as m:  # (its very first reading among them: the frequencies' reference is not)
+        d = lm.data_of(m)
+        assert d.f_ref == pytest.approx(got.f_ref, abs=0.01)  # (THz: the middle of its frequencies, not 2.45 THz off)
+        assert not d.ok[np.abs(d.f) > 1000].any() and d.ok.sum() > 0.85 * len(d.f)  # (left out, the rest kept)
+        again = lm.fit(m, budget=2)
+    assert again.ext.spacing == pytest.approx(got.ext.spacing, rel=2e-3)
+    assert again.chip.spacing == pytest.approx(got.chip.spacing, rel=5e-3)
+    assert again.plausible and again.hops_on > 0.9 and again.right > again.null + 0.2
+
+
+def test_the_hops_tell_its_comb_from_a_coarser_one(lab_map):
+    path, got = lab_map
+    with load(path) as m:
+        d = lm.data_of(m)
+    assert lm.hops_on(d, got.ext.spacing) > 0.9  # (its hops are whole numbers of its external modes...)
+    coarse = 4 * got.ext.spacing  # (...not of a comb as coarse, its single hops within its modes, few others near)
+    assert lm.hops_on(d, coarse, tol=0.25 * got.ext.spacing) < 0.3
+
+
+def test_a_model_no_laser_could_be_is_said_so_and_not_gone_by():
+    bad = lab_like(ext=lm.Comb(108.07, p_i=-0.375, p_v=0.685), chip=lm.Comb(493.97, p_i=-0.377, p_v=0.685),
+                   right=0.9999, null=0.999, hops_on=0.02)  # (the 650 nm laser, as misreads once had its model)
+    doubts = bad.doubts()
+    assert not bad.plausible and len(doubts) == 4
+    assert "would make its cavity 1.39 mm long (optically): no ECDL's is" in doubts[0]
+    assert "would make its chip 0.303 mm long (optically, n_g L): no laser diode's is" in doubts[1]
+    assert doubts[2].startswith("only 2% of its map's hops are whole numbers of its external modes")
+    assert doubts[3].startswith("it puts no more of the map's points on the right mode (100%) than one that never")
+    assert bad.facts()[0].startswith("NOT THIS LASER'S MODEL: its map misled its fit")
+    good = lab_like(right=0.8, null=0.3, hops_on=0.97)
+    assert good.plausible and not good.facts()[0].startswith("NOT")
 
 
 def test_a_drift_the_map_cannot_tell_is_said_so():

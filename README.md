@@ -1376,7 +1376,22 @@ How it is fitted, each part from what the map shows most directly:
 5. the power at the wavemeter: linear in the current above a threshold, and how it changes along a mode.
 
 A frequency THz away from all the others is the wavemeter misreading its interference order (both readings
-alike, so its spread does not give it away): none of the laser's modes, and left out.
+alike, so its spread does not give it away): none of the laser's modes, and left out. Far away means beyond four
+times the middle half's range, either side of it, which a quarter of the readings misread could not widen; and
+the frequencies are reckoned from the middle (median) of the file's, not its first reading (itself misread, it would
+put the whole model THz off). A version before this one went by the middle 98 % instead and, on the 650 nm
+laser's temperature map, took one reading misread by 4.8 THz for a hop: its "external modes" came out 108 GHz
+apart and its "chip's" 494 GHz (1.4 mm and 0.3 mm), every point on the "right mode".
+
+**What it doubts.** Whatever the map, a model is checked against what no ECDL can be, and against the map itself:
+its external cavity's optical length between 5 mm and 0.5 m, its chip's (n_g·L) between 0.5 and 30 mm and shorter
+than the cavity; at least 70 % of the map's hops whole numbers of its external modes (a comb too coarse has the
+hops within its modes, which do not jump; the external comb's spacing is chosen by this too, between the two
+searches that give one); and more of the points on the right mode than a model that never hops would put there.
+One that fails any is said so first among its facts (*NOT THIS LASER'S MODEL*, and why), and nothing goes by it:
+a channel does not take it for its recoveries, and *Its laser's model from a map…* fits a map's file again rather
+than take such a model kept in it. `python -m wmlock.lasermap FILE` says a kept model's facts as this version
+sees them, doubts and all (`--model --save-model` fits it again).
 
 Fitted to a map of a laser made of a model (the simulator's `ModelLaser`), it gives back its chip's mode
 spacing to 0.1 %, its tunings to a few %, its window to a few GHz and its lag to 10 %, and puts nearly 90 %
@@ -1417,6 +1432,15 @@ two tracks, every 1.3 mA; hysteresis 0.8 mA; it drifted +3.2 GHz per 10 minutes 
 again 15 minutes later, could tell). The model puts 85 % of its 10,513 points on the right mode (98 % of the
 rest within two points of a hop). 26 of its readings were the wavemeter misreading its order (±2.4 and ±4.9 THz),
 two of them alike both readings: left out.
+
+Its **temperature map** (19.0 to 20.5 °C in 0.5 °C steps, 53 to 70 mA, 27.6 to 107.6 V): at each temperature
+the model is the same laser, its external modes 3.387 ± 0.001 GHz apart, its chip's 18.29 to 18.45 GHz, its window
+27 GHz wide, the ideal feedforward −0.42 mA/V, 85 % of the points on the right mode. What the temperature moves is
+where its chip's modes line up with a given wavelength: 649.869 nm, for one, is on a mode only in a band of current
+some 1.5 mA wide that moves +8 mA per °C (about 64 mA at 19.0 °C, 54 and 68 mA at 19.5, 58 at 20.0, 62 at 20.5,
+a chip mode, 13.4 mA, apart), and in it every 7 V of piezo (each external mode). Of these, at 19.5 °C, 88.3 V set
+and 67.5 mA it lases on one mode from 66.6 to 69.0 mA sweeping up or down, its frequency all but still in the
+current, about 1.4 mW reaching the wavemeter.
 
 Two things this map could not tell. **Its drift**: its first line, swept again 19 minutes later, was where
 +1.8 GHz of drift per 10 minutes puts it, but just as much where −2.6 or +6.2 do (a whole external mode

@@ -339,8 +339,17 @@ def test_a_channel_takes_its_lasers_model_from_a_map_made_before(tmp_path):
     junk = tmp_path / "junk.sqlite"
     junk.write_bytes(b"not a map")
     assert Engine.model_from_file(eng, 3, junk).startswith("cannot read junk.sqlite: ")
+    misled = blue(ext=lm.Comb(108.07, p_i=-0.375, p_v=0.685))  # (as misread frequencies once had a laser's model)
+    said = Engine.model_from_file(eng, 3, a_map("misled.sqlite", "192.168.1.30", misled))
+    assert said.startswith("misled.sqlite: the model it keeps is not this laser's (its external modes 108.0700 GHz "
+                           "apart would make its cavity 1.39 mm long")
+    assert "a model is being fitted to it again, in the background" in said
+    end = time.monotonic() + 10.0
+    while ch.model_note.startswith("being fitted") and time.monotonic() < end:
+        time.sleep(0.05)
+    assert ch.laser_model() == model  # (not taken: fitted again, to no points)
     said = Engine.model_from_file(eng, 3, a_map("bare.sqlite", "192.168.1.30"))  # (no model kept: fitted, empty)
-    assert said.startswith("bare.sqlite keeps no model of the laser: it is being fitted to it, in the background")
+    assert said.startswith("bare.sqlite: it keeps no model of the laser: one is being fitted to it, in the background")
     end = time.monotonic() + 10.0
     while ch.model_note.startswith("being fitted") and time.monotonic() < end:
         time.sleep(0.05)
