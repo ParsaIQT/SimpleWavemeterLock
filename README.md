@@ -1323,9 +1323,13 @@ from one 2 V line to the next, nearly as far as from one hop to the next: 0.5 V 
 ### The laser's model
 
 At the end of a map (one with 200 points or more that lased, unless unticked in the dialog), a physical
-model of the laser is fitted to it, in a thread of its own once its file is written (half a minute or so for a map of 4,000 points; the
+model of the laser is fitted to it, in a thread of its own once its file is written (about ten seconds for a map of 4,000 points; the
 laser is free meanwhile). The rule's searches, most of the time it takes, work their candidates out on all of the
-PC's cores but one at once. It is kept in the file (`meta` `model`, and its facts, as sentences,
+PC's cores but one at once (every one, from the command line). **`pip install numba`** for its inner loops
+compiled (`wmlock/compiled.py`): they look only at the modes that could be chosen (a mode is a hop only if its
+loss is below the one lasing less the hysteresis; most points have none), the same modes chosen as without it,
+and the whole about ten times as fast. The first fit compiles them (some seconds), then they are kept. Without
+numba (or with `WMLOCK_NO_NUMBA` set), numpy, as before. It is kept in the file (`meta` `model`, and its facts, as sentences,
 `model_facts`), its facts are said in the map's notes, and **The laser…** in the map's window lists them.
 `python -m wmlock.lasermap FILE --model` fits it to any map's file and says its facts (`--save-model`
 keeps it there; `--map N` for one of a file's maps alone; `--current set` for one made before the current
@@ -1479,14 +1483,14 @@ with hard edges could not do (83 %). Its steps of 0.5 K are fitted as well by th
 cavity do, and between the temperatures mapped the model is only as good as that choice (steps of 0.25 K would
 tell).
 
-**Where to park it at 649.869 nm** (`--park 649.869`): its widest modes are all about 19.5 °C. At 19.45 °C, the
-piezo at 81.77 V set and 55.09 mA (as measured) its mode is the same sweeping up or down from 53.88 to 56.28 mA;
-at 19.50 °C (a temperature mapped: whichever of those coefficients is the laser's), 88.47 V set and 67.73 mA, from
-66.58 to 68.73 mA, and parked there it holds from 66.13 to 69.18 mA. That one the map shows too: at 19.5 °C, 88.6 V
-set, its mode is the same up and down from 66.6 to 69.0 mA at its pace, its widest at any temperature (±0.6 to
-0.8 mA at the others; the model, swept as the map was, puts the widest at the same piezo voltages and currents,
-±0.8 to 1.0 mA wide: it sees most of why 19.5 °C is better, not all of it). There a lock on the piezo takes up
-−10.5/+12.2 GHz of drift of the cavity before it hops with the feedforward off, ±2.3 GHz at the −0.30 mA/V it had.
+**Where to park it at 649.869 nm** (`--park 649.869`): its widest modes are all about 19.5 °C. At 19.47 °C, the
+piezo at 81.87 V set and 54.71 mA (as measured) its mode is the same sweeping up or down from 53.53 to 55.88 mA,
+and parked there it holds from 53.23 to 56.39 mA. The map shows its widest mode about 19.5 °C too: at 19.5 °C,
+88.6 V set, its mode is the same up and down from 66.6 to 69.0 mA at its pace, its widest at any temperature (±0.6
+to 0.8 mA at the others; the model, swept as the map was, puts the widest at the same piezo voltages and currents,
+±0.8 to 1.0 mA wide: it sees most of why 19.5 °C is better, not all of it). At the first, a lock on the piezo takes
+up −12.7/+12.5 GHz of drift of the cavity before it hops with the feedforward off, −2.3/+2.5 GHz at the −0.30 mA/V
+it had.
 
 Two things this map could not tell. **Its drift**: its first line, swept again 19 minutes later, was where
 +1.8 GHz of drift per 10 minutes puts it, but just as much where −2.6 or +6.2 do (a whole external mode
@@ -1514,27 +1518,28 @@ map_2026-10-25_005024_ch6.sqlite: DLpro (S/N 28698), channel 6, 192.168.1.102 la
   its model, kept in the file: 86% of its map's points on the right mode
 
   PARK IT for 649.869 nm (461.312138 THz), the widest mode there by its model:
-    1. temperature  19.45 °C, settled
-    2. piezo        81.77 V (scan offset)
-    3. current      55.08 mA, from either side: its mode is the same coming up or down from 53.88 to 56.28 mA
-                    (as set with the feedforward off; with it on at -0.300 mA/V, set 59.35 mA)
-    4. lock         on the piezo, the feedforward off: it takes up -11.9/+12.0 GHz of its cavity's drift before it hops
-                    (with the feedforward on, -2.4/+2.6 GHz)
-    There it holds -1.56/+1.68 mA of current, -2.8/+3.3 V of piezo, before it hops.
+    1. temperature  19.47 °C, settled
+    2. piezo        81.87 V (scan offset)
+    3. current      54.70 mA, from either side: its mode is the same coming up or down from 53.53 to 55.88 mA
+                    (as set with the feedforward off; with it on at -0.300 mA/V, set 59.01 mA)
+    4. lock         on the piezo, the feedforward off: it takes up -12.7/+12.5 GHz of its cavity's drift before it hops
+                    (with the feedforward on, -2.3/+2.5 GHz)
+    There it holds -1.48/+1.68 mA of current, -2.5/+3.3 V of piezo, before it hops.
     Off target? Its cavity has drifted since the map: move the piezo onto it, then come to the current again (3).
-    Were its temperature's coefficients others its map allows as well, a spot near it would hold ±0.95 mA at worst
+    Were its temperature's coefficients others its map allows as well, a spot near it would hold ±0.94 mA at worst
 
   other spots, in order:
     temperature  piezo     current set  come to it          holds (mA)     lock, feedforward off
-    19.01 °C      86.27 V   63.84 mA    either way          -1.54/+1.60    -11.7/+12.2 GHz
+    19.01 °C      86.27 V   63.84 mA    either way          -1.48/+1.58    -11.7/+12.5 GHz
 ```
 
 (a laser of large hysteresis gets the way to come to it instead, as *sweep it DOWN to … mA from … mA or above*),
 then the others in a table; `--verbose` says the map, its model's facts and every spot in full besides. The model
 is the one kept in the file, unless there is none, it cannot be the laser's, an older version kept it, or it is of
-one temperature where the map has several: then it is fitted (2½ minutes for the 650 nm map's four temperatures,
-55,000 points, on a 4-core PC; a line under it says how far it has got as it goes; `--save-model` keeps it as soon
-as it is fitted, and the next time is quick). `--temp LO HI` looks elsewhere than the temperatures mapped.
+one temperature where the map has several: then it is fitted (15 s for the 650 nm map's four temperatures,
+55,000 points, on a 4-core PC with numba, 2½ minutes without; a line under it says how far it has got as it goes;
+`--save-model` keeps it as soon as it is fitted, and the next time is quick). `--temp LO HI` looks elsewhere than
+the temperatures mapped.
 `wmlock/parking.py` does it:
 
 * at temperatures 0.05 K apart across the map's (then five times finer about the best), piezo voltages 0.5 V apart

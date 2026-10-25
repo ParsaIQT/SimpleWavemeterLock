@@ -164,6 +164,35 @@ def test_its_searches_share_their_candidates_out_and_say_how_far_they_have_got(l
     assert ticks[-1] == "how well it does, over the whole map"
 
 
+@pytest.mark.skipif(not lm.compiled.AVAILABLE, reason="numba is not installed")
+def test_its_compiled_loops_choose_as_its_numpy_ones_do(lab_map, monkeypatch):
+    """compiled.select and .likelihood (numba) against lasermodel's numpy code: rules about its own, their windows'
+    edges hard to very soft, the modes chosen the same, point by point; the likelihoods the same but for what the
+    compiled leaves out (terms under e^-20) and its sine (to 7e-10)."""
+    path, got = lab_map
+    with load(path) as m:
+        d = lm.data_of(m)
+    pk = got._pack(d, got._sweeps(d, 40))
+    rng = np.random.default_rng(3)
+    P = got.rule()[None, :] * (1 + 0.03 * rng.standard_normal((24, 12)))
+    P[:, 2:4] = np.abs(P[:, 2:4]) + rng.uniform(0.0, 0.03, (24, 2))  # (its hysteresis: none to large)
+    P[:, 11] = np.exp(rng.uniform(np.log(0.5), np.log(300.0), 24))  # (its window's edges: hard to very soft)
+    Q = np.concatenate([P, rng.uniform(1e-4, 0.02, (24, 1))], axis=1)
+    first = pk["meas"][:, 0]
+
+    def each():
+        return (lm._select(pk, P, first), lm._select(pk, P, first, True), lm._select(pk, P, first, True, True),
+                lm._likelihood(pk, Q))
+
+    compiled = each()
+    pk.pop("_compiled")
+    monkeypatch.setattr(lm.compiled, "AVAILABLE", False)
+    plain = each()
+    assert np.array_equal(compiled[0], plain[0]) and compiled[0].shape == (24, *pk["meas"].shape)
+    assert np.array_equal(compiled[1], plain[1]) and np.array_equal(compiled[2], plain[2])
+    assert np.allclose(compiled[3], plain[3], rtol=1e-7, atol=0.0)
+
+
 def test_a_long_job_says_how_far_it_has_got_on_one_line():
     import io
 

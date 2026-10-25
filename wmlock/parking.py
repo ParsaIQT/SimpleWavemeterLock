@@ -123,7 +123,7 @@ def _sweeps(m: LaserModel, P: np.ndarray, cur: np.ndarray, pz: np.ndarray, targe
         pk = {"M": np.ascontiguousarray(M[:, sl]), "B": np.ascontiguousarray(B[:, sl]),
               "A": np.ascontiguousarray(ii[:, sl]), "V": vv, "T": rest, "up": np.full((n, L), rising),
               "ci0": m._ci(), "i0": m.i0, "v0": m.v0}
-        first = [m._first(pk["M"][s, 0], pk["B"][s, 0], pk["A"][s, 0], pz[s]) for s in range(n)]
+        first = m._firsts(pk["M"][:, 0], pk["B"][:, 0], pk["A"][:, 0], pz)
         k = _select(pk, P, first)
         out.append(k if rising else k[:, :, ::-1])
     return out[0], out[1], M, orders

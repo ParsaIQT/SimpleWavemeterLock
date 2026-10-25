@@ -68,6 +68,7 @@ import csv
 import json
 import logging
 import math
+import os
 import queue
 import shutil
 import sqlite3
@@ -2333,7 +2334,9 @@ def park_model(m: LaserMap, current: str = "act", verbose: bool = False, keep: b
     if why is None:
         return kept, f"its model, kept in the file: {kept.right:.0%} of its map's points on the right mode", False
     what = f"of all {len(temps)} temperatures" if len(temps) > 1 else "of its map"
-    print(f"  fitting its model {what} ({why}): some minutes, how far it has got below …", flush=True)
+    print(f"  fitting its model {what} ({why})" + ("" if lasermodel.compiled.AVAILABLE else
+                                                   " (pip install numba: ten times as fast)") +
+          ": how far it has got below …", flush=True)
     began, ticker = time.monotonic(), Ticker()
     try:
         model = lasermodel.fit(m, current, log=(lambda text: ticker.say(f"  model: {text}")) if verbose else ticker,
@@ -2455,6 +2458,9 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.model or args.park is not None:  # (minutes: a click in its window must not hold it)
         quick_edit_off()
+        from . import lasermodel
+
+        lasermodel.THREADS = max(1, os.cpu_count() or 1)  # (every core: nothing else of this program runs meanwhile)
 
     failed = False
     for name in args.files:

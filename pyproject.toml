@@ -13,6 +13,7 @@ dependencies = ["PySide6>=6.4", "ifaddr>=0.2", "numpy", "scipy>=1.9"]
 [project.optional-dependencies]
 server = ["fastapi", "uvicorn"]
 dac = ["mcculw"]  # lasers on a Measurement Computing analog output board (Windows, with InstaCal)
+fast = ["numba"]  # the laser's model fitted, and parked by, ten times as fast (wmlock/compiled.py)
 test = ["pytest", "fastapi", "httpx"]
 
 [project.gui-scripts]

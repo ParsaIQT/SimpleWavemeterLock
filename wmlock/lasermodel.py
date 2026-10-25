@@ -76,6 +76,8 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
+from . import compiled
+
 C_LIGHT = 299792458.0  # m/s
 GROUP_GAN, GROUP_III_V = 2.6, 3.7  # a diode chip's group index, roughly: GaN (below 560 nm), else AlGaInP, GaAs...
 UNIT_T = 600.0         # s: drift is fitted per this much time (said per 10 min)
@@ -262,12 +264,38 @@ def onmode_rate(d: MapData, jump: float = 1.5) -> float:
 def _bunching(x: np.ndarray, groups: np.ndarray, spacings: np.ndarray) -> np.ndarray:
     """For each spacing: how much x bunches at whole multiples of it, group by group (each its own offset): the
     groups' |mean of exp(2πi x / spacing)|, weighted by their sizes."""
-    out = np.zeros(len(spacings))
-    total = len(x)
-    for g in np.unique(groups):
-        s = groups == g
-        z = np.exp(2j * np.pi * x[s][None, :] / spacings[:, None]).sum(axis=1)
-        out += np.abs(z)
+    order, starts = _grouped(groups)
+    return _bunched(x[order][None, :], starts, 1.0 / np.asarray(spacings, dtype=float)[:, None], len(x))
+
+
+def _grouped(groups: np.ndarray) -> tuple:
+    """(the order that puts points group by group, where each group begins in that order)."""
+    order = np.argsort(groups, kind="stable")
+    g = groups[order]
+    return order, np.flatnonzero(np.concatenate([[True], g[1:] != g[:-1]])) if len(g) else np.zeros(0, dtype=int)
+
+
+def _bunched(X: np.ndarray, starts: np.ndarray, per, total: int, most: int = 4_000_000) -> np.ndarray:
+    """For each row of X (points in the order _grouped puts them; or one row for all) and of per (1 / a spacing, a
+    row each, or one for all): the groups' |sum of exp(2πi x per)| summed, over total. Worked out in cycles less the
+    nearest whole one (float32 is then as good as float64, and its sin and cos several times as fast), the groups'
+    sums at once (reduceat), in parts of `most` at most."""
+    per = np.asarray(per, dtype=float).reshape(-1, 1)
+    rows = max(X.shape[0], per.shape[0])
+    if X.shape[1] == 0:
+        return np.zeros(rows)
+    out = np.empty(rows)
+    step = max(1, min(most // X.shape[1], -(-rows // max(THREADS, 1))))
+
+    def part(a):
+        u = (X if X.shape[0] == 1 else X[a:a + step]) * (per if per.shape[0] == 1 else per[a:a + step])
+        f = (u - np.rint(u)).astype(np.float32) * np.float32(2 * np.pi)
+        c = np.add.reduceat(np.cos(f), starts, axis=1, dtype=np.float64)
+        s = np.add.reduceat(np.sin(f), starts, axis=1, dtype=np.float64)
+        out[a:a + len(c)] = np.hypot(c, s).sum(axis=1)
+
+    pool = _pool() if rows > step else None  # (the rows on several threads at once: numpy lets go of the GIL)
+    list(map(part, range(0, rows, step))) if pool is None else list(pool.map(part, range(0, rows, step)))
     return out / max(total, 1)
 
 
@@ -291,7 +319,8 @@ def comb_spacing(d: MapData, rate: float, lo: float, hi: float, quad: float = 0.
     x0 = d.fast[s] - np.median(d.fast[s])
     x = d.f[s] - rate * x0 - quad * x0 ** 2
     g = d.line[s]
-    grid = np.exp(np.linspace(math.log(lo), math.log(hi), int(4000 * math.log(hi / lo)) + 1))
+    grid = np.exp(np.linspace(math.log(lo), math.log(hi), int(1000 * math.log(hi / lo)) + 1))  # (a peak is s / x
+    #                             wide in its logarithm, x GHz the spread of a line's frequencies: 20 to 30 steps)
     b = _bunching(x, g, grid)
     k = _largest_peak(b)
     fine = np.linspace(grid[max(k - 2, 0)], grid[min(k + 2, len(grid) - 1)], 201)
@@ -319,7 +348,8 @@ def hop_quantum(d: MapData, small: float) -> float | None:
     if len(sizes) < 10:
         return None
     grid = np.linspace(2.5 * small, min(sizes.max(), 500.0), 4000)
-    score = np.cos(2 * np.pi * sizes[None, :] / grid[:, None]).mean(axis=1)
+    u = sizes[None, :] / grid[:, None]  # (in cycles, less the nearest whole one: float32's cos as good, and faster)
+    score = np.cos((u - np.rint(u)).astype(np.float32) * np.float32(2 * np.pi)).mean(axis=1, dtype=np.float64)
     k = _largest_peak(score)
     return float(grid[k]) if score[k] > 0.5 else None
 
@@ -477,18 +507,27 @@ def fit_comb(d: MapData, spacing: float, rate: float, i0: float, v0: float, t0: 
 _POOL, _POOL_LOCK = None, threading.Lock()
 
 
-def _shared(fn, P) -> np.ndarray:
-    """fn(Q) for parts Q of P (candidates, a row each), on THREADS threads at once, joined: as fn(P), sooner. Only the
-    candidates are shared out, each worked out as alone: the same results, to the last bit."""
+def _pool():
+    """The threads its work is shared out among (THREADS of them, made once), or None if it is to be done here: on
+    one thread only, or on one of its own (none of them waits on the others)."""
     global _POOL
-    P = np.atleast_2d(P)
-    k = min(THREADS, len(P) // 8)
-    if k < 2 or threading.current_thread().name.startswith("laser model"):  # (none of its own threads waits on it)
-        return fn(P)
+    if THREADS < 2 or threading.current_thread().name.startswith("laser model"):
+        return None
     with _POOL_LOCK:
         if _POOL is None:
             _POOL = ThreadPoolExecutor(THREADS, thread_name_prefix="laser model")
-    return np.concatenate(list(_POOL.map(fn, np.array_split(P, k))))
+    return _POOL
+
+
+def _shared(fn, P) -> np.ndarray:
+    """fn(Q) for parts Q of P (candidates, a row each), on THREADS threads at once, joined: as fn(P), sooner. Only the
+    candidates are shared out, each worked out as alone: the same results, to the last bit."""
+    P = np.atleast_2d(P)
+    k = min(4 * THREADS, len(P) // 4)  # (more parts than threads: one that takes longer holds none of them up)
+    pool = _pool() if k > 1 else None
+    if pool is None:
+        return fn(P)
+    return np.concatenate(list(pool.map(fn, np.array_split(P, k))))
 
 
 def _losses(modes, mid, dc, lo, hi, soft=5.0):
@@ -500,6 +539,30 @@ def _losses(modes, mid, dc, lo, hi, soft=5.0):
         ((np.maximum(modes - hi, 0.0) + np.maximum(lo - modes, 0.0)) / soft) ** 2
 
 
+def _compiled_args(pk: dict) -> tuple:
+    """pk's arrays as compiled.select and .likelihood take them: each as contiguous as numba wants, one float type
+    for all (pk's M's), what is not there zeros (made once, kept in pk)."""
+    keys = ("M", "B", "A", "V", "T", "up", "WT", "meas", "valid")
+    sources = tuple(pk.get(k) for k in keys)
+    kept = pk.get("_compiled")
+    got = kept[1] if kept is not None and all(a is b for a, b in zip(kept[0], sources)) else None
+    if got is None:  # (made again if any of its arrays was replaced since)
+        M = np.ascontiguousarray(pk["M"])
+        if M.dtype not in (np.float32, np.float64):
+            M = M.astype(float)
+        n, L = M.shape[:2]
+
+        def each(key, dtype=M.dtype):
+            x = pk.get(key)
+            return np.zeros((n, L), dtype=dtype) if x is None else \
+                np.ascontiguousarray(np.broadcast_to(np.asarray(x, dtype=dtype), (n, L)))
+
+        got = (M, each("B"), each("A"), each("V"), each("T"), each("up", np.bool_), each("WT"), each("meas", np.int64),
+               each("valid", np.bool_), float(pk["ci0"]), float(pk["i0"]), float(pk["v0"]))
+        pk["_compiled"] = (sources, got)
+    return got
+
+
 def _select(pk: dict, P, cur, scored: bool = False, forced: bool = False):
     """The rule run along sweeps, all at once, for candidates all at once. pk (LaserModel._pack): M (n, L, K), the
     modes' GHz along each of n sweeps of L points (K modes); B (n, L), the chip comb's middle (GHz), as it moves ci0
@@ -508,7 +571,25 @@ def _select(pk: dict, P, cur, scored: bool = False, forced: bool = False):
     window (LaserModel.w_T). cur (n,): the mode each sweep begins on (an index into K). P (pop, 12): each candidate's
     rule (LaserModel.rule()). Returns the modes chosen (pop, n, L), or scored: how many valid points each candidate
     put on the mode measured (pop,); forced: each point from the mode measured at the one before (a point at a time:
-    one wrong hop does not take the rest of its sweep with it)."""
+    one wrong hop does not take the rest of its sweep with it). Compiled (compiled.select) if numba is installed."""
+    if compiled.AVAILABLE:
+        args = _compiled_args(pk)
+        P = np.ascontiguousarray(np.atleast_2d(np.asarray(P, dtype=float)))
+        n = args[0].shape[0]
+        cur = np.ascontiguousarray(np.broadcast_to(np.asarray(cur, dtype=np.int64), (len(P), n)))
+        k = min(4 * THREADS, n // 8) if len(P) <= 4 else 1  # (a few rules along many paths: the paths shared out)
+        pool = _pool() if k > 1 else None
+        if pool is None:
+            right, chosen = compiled.select(*args, P, cur, scored, forced)
+            return right if scored else chosen
+
+        def part(ix):
+            sl = slice(int(ix[0]), int(ix[-1]) + 1)
+            return compiled.select(*(a[sl] if isinstance(a, np.ndarray) else a for a in args), P,
+                                   np.ascontiguousarray(cur[:, sl]), scored, forced)
+
+        got = list(pool.map(part, np.array_split(np.arange(n), k)))
+        return np.sum([g[0] for g in got], axis=0) if scored else np.concatenate([g[1] for g in got], axis=1)
     M, B, A, V, T, up = (pk[k] for k in ("M", "B", "A", "V", "T", "up"))
     ci0, i0, v0, WT = pk["ci0"], pk["i0"], pk["v0"], pk.get("WT")
     P = np.atleast_2d(np.asarray(P, dtype=M.dtype))
@@ -551,7 +632,11 @@ def _likelihood(pk: dict, P, eps: float = 0.02) -> np.ndarray:
     for candidates all at once (P: pop x 13, _select's and a temperature, of a chip mode's loss): it goes on lasing,
     or hops to another mode as much as that one is better than the hysteresis asks (a softmax at that temperature),
     or, with eps, anything at all (what the rule cannot tell: a reading put on the wrong mode, a flicker). Smooth,
-    and every hop counts: what a search needs to find where the rule is (_fit_rule)."""
+    and every hop counts: what a search needs to find where the rule is (_fit_rule). Compiled (compiled.likelihood)
+    if numba is installed."""
+    if compiled.AVAILABLE:
+        return compiled.likelihood(*_compiled_args(pk), np.ascontiguousarray(np.atleast_2d(np.asarray(P, dtype=float))),
+                                   float(eps))
     M, B, A, V, T, up, meas, valid = (pk[k] for k in ("M", "B", "A", "V", "T", "up", "meas", "valid"))
     ci0, i0, v0, WT = pk["ci0"], pk["i0"], pk["v0"], pk.get("WT")
     P = np.atleast_2d(np.asarray(P, dtype=M.dtype))
@@ -775,6 +860,16 @@ class LaserModel:
         mid = base + self.offset + self.pull * ((modes[k] - base - self.offset + dc / 2) % dc - dc / 2)
         return int(np.argmin(self._loss(modes, mid, i, v, T)))
 
+    def _firsts(self, modes, base, i, v) -> np.ndarray:
+        """_first for many paths at once (modes: paths x orders; base, i, v: each path's), at T0."""
+        dc = self.dc
+        lo, hi = (np.asarray(x, dtype=float).reshape(-1, 1) for x in self.window(i, v))
+        mid = (np.asarray(base, dtype=float) + self.offset).reshape(-1, 1)
+        k = np.argmin(_losses(modes, mid, dc, lo, hi, self.soft), axis=1)
+        near = np.take_along_axis(modes, k[:, None], 1)
+        mid = mid + self.pull * ((near - mid + dc / 2) % dc - dc / 2)
+        return np.argmin(_losses(modes, mid, dc, lo, hi, self.soft), axis=1)
+
     def _loss(self, modes, mid, i, v, T=None):
         lo, hi = self.window(i, v, T)
         return _losses(modes, mid, self.dc, lo, hi, self.soft)
@@ -884,27 +979,29 @@ class LaserModel:
         n, L = len(sw), max(len(idx) for idx in sw)
         up_pt = d.leg == 1
         orders = self.orders()
-        modes = self.ext_modes(d.i, d.v, d.t, orders, up_pt, d.T)
-        f = d.f[d.ok]
+        e = self.ext.base(*self._d(d.i, d.v, d.t), up_pt, self._dT(d.T))  # (order 0's mode at each point: the rest
+        f = d.f[d.ok]  # whole spacings from it; only those of the sweeps' points worked out)
         span = float(f.max() - f.min()) if len(f) else 0.0
         reach = 0.45 * span + 15.0 if not self.single else 6 * self.ext.spacing  # (no window reaches further)
-        keep = (modes[d.ok].max(axis=0) > f.min() - reach) & (modes[d.ok].min(axis=0) < f.max() + reach)
-        modes = modes[:, keep]
+        step = orders * self.ext.spacing
+        keep = (float(np.max(e[d.ok])) + step > f.min() - reach) & (float(np.min(e[d.ok])) + step < f.max() + reach)
+        step = step[keep]
         base = self.chip_base(d.i, d.v, d.t, d.T)
         wt = np.broadcast_to(self.w_T * self._dT(d.T), base.shape)
-        K = modes.shape[1]
+        K = len(step)
         M, B, A, V, T, W = (np.zeros(shape, dtype=dtype) for shape in ((n, L, K), (n, L), (n, L), (n, L), (n, L),
                                                                         (n, L)))
         meas, valid, up = np.zeros((n, L), dtype=int), np.zeros((n, L), dtype=bool), np.zeros((n, L), dtype=bool)
         for s, idx in enumerate(sw):
             k = len(idx)
-            M[s, :k], M[s, k:] = modes[idx], modes[idx[-1]]
+            modes = e[idx][:, None] + step
+            M[s, :k], M[s, k:] = modes, modes[-1]
             B[s, :k], B[s, k:] = base[idx], base[idx[-1]]
             A[s, :k], A[s, k:] = d.i[idx], d.i[idx[-1]]
             V[s, :k], V[s, k:] = d.v[idx], d.v[idx[-1]]
             T[s, :k], T[s, k:] = d.t[idx], d.t[idx[-1]] + np.arange(1, L - k + 1)
             W[s, :k], W[s, k:] = wt[idx], wt[idx[-1]]
-            meas[s, :k] = np.argmin(np.abs(modes[idx] - d.f[idx][:, None]), axis=1)
+            meas[s, :k] = np.argmin(np.abs(modes - d.f[idx][:, None]), axis=1)
             valid[s, 1:k] = True
             up[s, :] = up_pt[idx[0]]
         return {"M": M, "B": B, "A": A, "V": V, "T": T, "WT": W, "meas": meas, "valid": valid, "up": up,
@@ -1641,12 +1738,11 @@ def _chip_rate(d: MapData, quantum: float) -> float:
     rates = np.linspace(-15.0, 15.0, 601)
     s = d.ok
     x0 = d.fast[s] - np.median(d.fast[s])
-    best, at = -1.0, 0.0
-    for r in rates:
-        b = _bunching(d.f[s] - r * x0, d.line[s], np.array([quantum]))[0]
-        if b > best:
-            best, at = b, r
-    return float(at)
+    order, starts = _grouped(d.line[s])
+    f, x0 = d.f[s][order], x0[order]
+    b = np.concatenate([_bunched(f[None, :] - rates[a:a + 64, None] * x0[None, :], starts, 1.0 / quantum, len(f))
+                        for a in range(0, len(rates), 64)])
+    return float(rates[int(np.argmax(b))])
 
 
 def _single_filter(d: MapData, i0, v0, t0, T0: float | None = None) -> Comb:
@@ -1724,7 +1820,10 @@ def _fit_rule(model: LaserModel, d: MapData, budget: int, seed: int, most: int =
             tick(f"the rule: search {k} of {searches}, generation {done[0]} of {n}")
         return callback
 
-    pk = model._pack(d, model._sweeps(d, most), np.float32)
+    sw = model._sweeps(d, most)
+    pk = model._pack(d, sw, np.float32)
+    pk_likely = model._pack(d, sw[::2], np.float32) if len(sw) >= 80 else pk  # (the first, coarse search: on every
+    #                                                                           other sweep, twice as fast)
     lo0, hi0, wv0, wi0 = _window_guess(d, model) if window is None else window
     span = max(hi0 - lo0, model.ext.spacing)
     half = 0.5 * model.ext.spacing
@@ -1753,7 +1852,7 @@ def _fit_rule(model: LaserModel, d: MapData, budget: int, seed: int, most: int =
     how = {"tol": 1e-6, "polish": False, "init": "sobol", "vectorized": True, "updating": "deferred"}
 
     def unlikely(P):
-        return -_shared(lambda Q: _likelihood(pk, Q), rules(P))
+        return -_shared(lambda Q: _likelihood(pk_likely, Q), rules(P))
 
     likely = differential_evolution(unlikely, bounds + [(1e-4, 0.02)], maxiter=max(budget // 2, 5),
                                     popsize=max(popsize - 3, 5), seed=seed, x0=guess + [0.003],
