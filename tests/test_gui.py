@@ -569,7 +569,10 @@ def test_another_pcs_wavemeter_is_framed_under_its_name_and_adjusted_from_here(a
         assert panel.header.title.text() == "Lab B" and panel.framed and win.local.framed
         colors = gui.panel_colors(["Lab A", "Lab B"])
         assert panel.header.title._color == colors["Lab B"] != colors["Lab A"] == win.local.header.title._color
-        assert win.local.header.title.text() == "Lab A" and win.local.header.detail.text() == "this PC"
+        here = "this PC   " + socket.gethostname() + "".join(f"  {', '.join(gui.lan_addresses())}"
+                                                            for _ in [1] if gui.lan_addresses())
+        assert win.local.header.title.text() == "Lab A" and win.local.header.detail.text() == here  # (its name and
+        #                                                           addresses on the LAN, as another PC's shows its own)
         assert win.windowTitle() == "Wavemeter Lock · Lab A" and win.st_net.text().startswith("⇄ 1 other PC")
         assert panel.header.status.text().endswith("readings/s")
         row = panel.rows[1]
@@ -779,7 +782,8 @@ def test_a_pc_with_two_wavemeters_frames_each_and_swaps_their_settings(app, monk
                                  and a.rows[1].wl.text().startswith("396.959"))[1], 3)
         spin(app, 0.6)
         assert win.st_wlm.text().startswith("● 2 wavemeters   10 ch")
-        assert a.header.detail.text() == "this PC" and a.header.status.text().endswith("readings/s")
+        assert a.header.detail.text().startswith(f"this PC   {socket.gethostname()}")
+        assert a.header.status.text().endswith("readings/s")
         QtTest = importlib.import_module(qt.BINDING + ".QtTest")
         QtTest.QTest.mouseClick(b.header, QtCore.Qt.MouseButton.LeftButton)  # fold it away
         assert b.folded and not b.rows[1].isVisible() and "simulated WS6 5678" in win.gui["folded"]

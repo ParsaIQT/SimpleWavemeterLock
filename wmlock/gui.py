@@ -13,6 +13,7 @@ import functools
 import html
 import math
 import signal
+import socket
 import sys
 import time
 import types
@@ -20,6 +21,7 @@ import zlib
 from pathlib import Path
 
 from . import dac, view
+from .dlcpro import lan_addresses
 from .engine import DAC_LOCK, Engine
 from .lasermap import (CLIP, FF, FF_ON, FOLDER, LOCK_ON, PC_MAX, PC_MIN, PD_NAMES, PD_UNITS, STEP_I, STEP_V, TA_ON,
                        TEMP_MAX, TEMP_MIN, TEMP_SET, MapPlan, fmt_bytes)
@@ -955,12 +957,15 @@ class Panel(QtWidgets.QFrame):
                 row.refresh(now)
 
     def paint_header(self, several: bool):
-        """Its name, 'this PC', and how its wavemeter is read (with others of this PC's about)."""
+        """Its name, 'this PC' (its name on the LAN, its addresses: as another PC's shows its own), and how its
+        wavemeter is read (with others of this PC's about)."""
         e, share = self.engine, self.meter.share
         h = self.header
         h.arrow.paint("▸" if self.folded else "▾", "dim")
         self.set_label(self.label)
-        where = "this PC" + ("" if share is None or share.control else "   the others may only watch")
+        ips = ", ".join(lan_addresses())
+        where = (f"this PC   {share.host if share is not None else socket.gethostname()}" + (f"  {ips}" if ips else "")
+                 + ("" if share is None or share.control else "   the others may only watch"))
         h.detail.paint(f"{where}   {self.summary()}" if self.folded else where, "dim")
         if not several:
             h.status.paint("", "dim")

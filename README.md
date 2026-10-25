@@ -380,14 +380,20 @@ from sipyco.pc_rpc import Client
 
 wm = Client("lab-pc-1", 3280)
 try:
+    wm.set_setpoint(398.91121, "Anansi")        # the laser named Anansi (its row's name): to exactly that
+    wm.set_setpoint("Anansi", 398.91121)        # (the same, the name first)
     wm.set_setpoint(398.91121)                  # the laser near 398.91121 nm: to exactly that
-    wm.wait("398.91XXX", mhz=1.0, timeout=10)   # until it is locked within 1 MHz of it
+    wm.wait("Anansi", mhz=1.0, timeout=10)      # until it is locked within 1 MHz of it
     ok, why = wm.is_ok("399", "369", "935")     # before an oven run: (True, '') or (False, why)
     obs = wm.observe("Mulungu")                 # its lock watched from now...
     drops = wm.end_observe(obs)                 # ...until now: numpy array [[unix time, s], ...]
 finally:
     wm.close_rpc()
 ```
+
+Which PC to call: any running the program; its frame says its name on the LAN and its address next
+to *this PC* (with other PCs about), as the other PCs' frames say theirs, and so does the tooltip of
+*ARTIQ :3280* in the status bar.
 
 [examples/sipyco_client.py](examples/sipyco_client.py) has these as functions to copy: reading, a
 setpoint set and waited for, a scan, an oven run checked before and all through, a watchdog thread
@@ -413,11 +419,13 @@ From an ARTIQ experiment, the same through its `device_db`: `device_db["wavemete
 | `get_setpoint(laser)`, `get_deviation(laser)`, `is_locked(laser)` | its setpoint (nm, None: none); its reading less its setpoint (MHz); locked? |
 | `status(laser)`, `lasers()` | all about one laser, or every laser shown: name, wavemeter, PC, channel, setpoint, reading, deviation, its state, the line under its digits |
 
-* **Which laser.** By its name, as its row has it (`"399"`, any case; part of a name only one has:
-  `"cool"`), by its wavelength (a number: the laser whose setpoint, or reading, is nearest, within 30
-  GHz; digits as text: the one whose setpoint begins with them, `"398.91"` or `"398.91XXX"`), or by
-  wavemeter channel (`"#5"`, `"lab-pc-2#5"`, `"WS7 1234#5"`). Two that fit are refused, naming both:
-  say which by name or channel.
+* **Which laser.** By its name tag, as its row has it (`"Anansi"`, `"399"`; any case; part of a
+  name only one has: `"Anan"`), by its wavelength (a number: the laser whose setpoint, or reading,
+  is nearest, within 30 GHz; digits as text: the one whose setpoint begins with them, `"398.91"` or
+  `"398.91XXX"`), or by wavemeter channel (`"#5"`, `"lab-pc-2#5"`, `"WS7 1234#5"`). Two that fit are
+  refused, naming both: say which by name or channel. The laser may come first or second:
+  `set_setpoint("Anansi", 398.91121)` and `set_setpoint(398.91121, "Anansi")` are the same (likewise
+  `set_frequency`, `shift_setpoint`). Name a laser: right-click its row › *Rename…*.
 * **Exactly.** A setpoint is taken as given (`398.91121` is 398.91121 nm, not rounded). One more
   than 30 GHz from where it was is refused (a typo? 389 for 398) unless `force=True`. Each call
   returns once it is done: another PC's laser too, by that PC, its row here showing it.

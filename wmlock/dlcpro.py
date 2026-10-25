@@ -419,6 +419,50 @@ def broadcast_addresses() -> list:
     return list(dict.fromkeys(out))
 
 
+_lan = (-1e9, [])  # (monotonic, addresses): lan_addresses() as last looked up
+
+
+def lan_addresses(max_age: float = 60.0) -> list:
+    """This PC's IPv4 addresses on its networks (not loopback, nor link-local), as looked up at most max_age s ago:
+    first the one its route out of this PC goes from (what the others reach it by, as a rule), then its adapters'
+    (ifaddr); without either, what its name resolves to."""
+    global _lan
+    t, found = _lan
+    if time.monotonic() - t < max_age:
+        return list(found)
+    out = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))  # (TEST-NET-1: nothing is sent, the route out says which address)
+            out.append(s.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        import ifaddr  # optional
+
+        for adapter in ifaddr.get_adapters():
+            for ip in adapter.ips:
+                if isinstance(ip.ip, str):  # (IPv6 entries are tuples)
+                    out.append(ip.ip)
+    except Exception:
+        pass
+    if not out:
+        try:
+            out = socket.gethostbyname_ex(socket.gethostname())[2]
+        except OSError:
+            pass
+    ok = []
+    for a in dict.fromkeys(out):
+        try:
+            ip = ipaddress.IPv4Address(a)
+        except ValueError:
+            continue
+        if not (ip.is_loopback or ip.is_link_local or ip.is_unspecified):
+            ok.append(a)
+    _lan = (time.monotonic(), ok)
+    return list(ok)
+
+
 def _is_ip(text: str) -> bool:
     try:
         ipaddress.ip_address(text)

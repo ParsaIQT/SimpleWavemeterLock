@@ -309,7 +309,8 @@ def test_its_settings_who_may_call_and_a_port_taken():
     s.settings["artiq"] = True
     s.start()
     try:
-        assert s.summary() == f"ARTIQ :{port}" and "127.0.0.1, TCP port" in s.detail()
+        assert s.summary() == f"ARTIQ :{port}" and f"{socket.gethostname()} (this PC alone), TCP port {port}" in \
+            s.detail()
         other = rpc.Server(Target(), {"artiq_port": port, "lan": False})
         other.start()
         assert other.error.startswith(f"TCP port {port} cannot be had") and not other.listening
@@ -435,6 +436,32 @@ def test_a_setpoint_set_exactly_here_and_on_the_other_pc(lab):
         c.call("set_setpoint", "abc", "423")
     with pytest.raises(TypeError, match="not a number"):
         c.call("set_setpoint", [1], "423")
+
+
+def test_a_laser_set_by_its_name_tag_either_way_round(lab):
+    a, b, c = lab
+    a.engine.rename(1, "Anansi")
+    b.engine.rename(3, "Mulungu")
+    b.engine.rename(2, "Anansi 866")  # (only part of it: the one named so exactly is the one meant)
+    assert wait_for(lambda: a.peer("Lab B").views[3].get("name") == "Mulungu", 3)
+    assert c.call("set_setpoint", 396.95913, "Anansi")["wavemeter"] == "Lab A"
+    assert a.engine.channels[1].setpoint_nm == 396.95913
+    assert c.call("set_setpoint", "Anansi", 396.95914)["was_nm"] == 396.95913  # (the name first: the same)
+    assert c.call("set_setpoint", "anansi", 396.95915)["setpoint_nm"] == 396.95915  # (any case)
+    assert a.engine.channels[1].setpoint_nm == 396.95915 and b.engine.channels[2].setpoint_nm is None
+    r = c.call("set_setpoint", "Mulungu", 854.44396)  # another PC's, by its name tag: done there
+    assert r["wavemeter"] == "Lab B" and r["laser"] == "Mulungu" and b.engine.channels[3].setpoint_nm == 854.44396
+    assert c.call("get_setpoint", "Mulungu") == 854.44396 and c.call("status", "mulungu")["channel"] == 3
+    c.call("shift_setpoint", "Mulungu", 5.0)  # (the name first, here too)
+    assert b.engine.channels[3].setpoint_nm == pytest.approx(C_NM_THZ / (C_NM_THZ / 854.44396 + 5e-6), abs=1e-12)
+    c.call("set_frequency", "Anansi", C_NM_THZ / 396.95912)
+    assert a.engine.channels[1].setpoint_nm == pytest.approx(396.95912, abs=1e-12)
+    assert c.call("set_setpoint", "Anansi 8", 866.45206)["channel"] == 2  # (part of a name only one has: that one)
+    assert b.engine.channels[2].setpoint_nm == 866.45206
+    with pytest.raises(LookupError, match="2 lasers 'nansi'"):
+        c.call("set_setpoint", "nansi", 396.95912)  # (part of two names: say which)
+    with pytest.raises(LookupError, match="no laser 'Kweku'"):
+        c.call("set_setpoint", "Kweku", 396.95912)
 
 
 def test_lock_wait_okay_and_unlock_here_and_there(lab):

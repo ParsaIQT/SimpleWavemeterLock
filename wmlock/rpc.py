@@ -48,6 +48,7 @@ from collections import OrderedDict
 from fractions import Fraction
 
 from . import view
+from .dlcpro import lan_addresses
 from .wavemeter import C_NM_THZ
 
 log = logging.getLogger(__name__)
@@ -293,7 +294,8 @@ class Server:
         self._stop = threading.Event()
         self._sock = s
         with self.lock:
-            self.listening = f"{host or 'every network'}, TCP port {self.port}"
+            here = ", ".join(lan_addresses()) if not host else "this PC alone"
+            self.listening = f"{socket.gethostname()}" + (f" ({here})" if here else "") + f", TCP port {self.port}"
         self._thread = threading.Thread(target=self._accept, args=(s, self._stop), daemon=True, name="artiq")
         self._thread.start()
 
@@ -464,6 +466,14 @@ def _real(x, what: str) -> float:
     if not math.isfinite(v):
         raise ValueError(f"{what}: not a number: {x!r}")
     return v
+
+
+def _laser_first(value, laser) -> tuple:
+    """(value, laser) as meant, whichever order they came in: the laser first, set_setpoint('Anansi', 398.91121), is
+    taken as set_setpoint(398.91121, 'Anansi') (a name is text, a value a number)."""
+    if isinstance(value, str) and isinstance(laser, numbers.Real) and not isinstance(laser, bool):
+        return laser, value
+    return value, laser
 
 
 def _wavelength(x) -> float:
@@ -667,15 +677,18 @@ class Api:
 
     # ---------------------------------------------------------------- adjusting
     def set_setpoint(self, nm, laser=None, force=False) -> dict:
-        """Its setpoint to exactly nm (vacuum). laser: which (None: the one whose setpoint is nearest nm, within 30
-        GHz). A setpoint moved more than 30 GHz is refused unless force. Returns the laser and its setpoint before
+        """Its setpoint to exactly nm (vacuum). laser: which, by its name ('Anansi'), wavelength or channel (None: the
+        one whose setpoint is nearest nm, within 30 GHz); named first, set_setpoint('Anansi', 398.91121), does the same.
+        A setpoint moved more than 30 GHz is refused unless force. Returns the laser and its setpoint before
         (was_nm)."""
+        nm, laser = _laser_first(nm, laser)
         nm = _wavelength(nm)
         target = self._find(nm if laser is None else laser, time.monotonic())
         return self._setpoint(target, nm, force)
 
     def set_frequency(self, thz, laser=None, force=False) -> dict:
         """Its setpoint to thz (THz), as set_setpoint."""
+        thz, laser = _laser_first(thz, laser)
         thz = _real(thz, "frequency (THz)")
         if thz <= 0:
             raise ValueError(f"{thz} THz is not a frequency")
@@ -683,6 +696,7 @@ class Api:
 
     def shift_setpoint(self, mhz, laser, force=False) -> dict:
         """Its setpoint moved by mhz (MHz, in frequency: + is bluer), as set_setpoint."""
+        mhz, laser = _laser_first(mhz, laser)
         mhz = _real(mhz, "mhz")
         target = self._find(laser, time.monotonic())
         sp = target.v.get("sp")

@@ -9,8 +9,10 @@ raises, saying why: LookupError (no such laser, or two that fit), ValueError, Ru
 PermissionError (that PC lets no other PC adjust its lasers), TimeoutError; ConnectionRefusedError if nothing answers
 on that PC and port.
 
-Lasers are named as their rows are ('399'), or by wavelength ('398.91XXX': the one whose setpoint begins so; a
-number: the one nearest it), or by wavemeter channel ('lab-pc-2#5'). Wavelengths are in vacuum, nm.
+Lasers are named by their name tags, as their rows have them ('Anansi', '399': right-click › Rename… names one), or
+by wavelength ('398.91XXX': the one whose setpoint begins so; a number: the one nearest it), or by wavemeter channel
+('lab-pc-2#5'). Wavelengths are in vacuum, nm. Which PC to call: any running the program (its frame shows its name
+and address next to 'this PC').
 
     python sipyco_client.py lab-pc-1             every laser, and whether it is locked
     python sipyco_client.py lab-pc-1 399 935     ...and whether those are okay
@@ -58,8 +60,9 @@ def read(laser="399", host=HOST, port=PORT):
 
 # ------------------------------------------------------------------------------------------- setting
 def go_to(nm, laser=None, host=HOST, port=PORT):
-    """Its setpoint to exactly nm, then until it is locked there (within 1 MHz). laser None: the one nearest nm (within
-    30 GHz). A setpoint moved more than 30 GHz is refused (a typo?) unless force=True."""
+    """Its setpoint to exactly nm, then until it is locked there (within 1 MHz): go_to(398.91121, "Anansi"). laser None:
+    the one nearest nm (within 30 GHz). A setpoint moved more than 30 GHz is refused (a typo?) unless force=True.
+    (wm.set_setpoint("Anansi", 398.91121), the name first, does the same.)"""
     with wavemeter(host, port) as wm:
         done = wm.set_setpoint(nm, laser)  # {laser, wavemeter, channel, setpoint_nm, was_nm}
         which = f"{done['wavemeter']}#{done['channel']}"  # (that laser and no other, from now on)
