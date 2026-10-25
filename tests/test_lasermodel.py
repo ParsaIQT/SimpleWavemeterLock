@@ -2,6 +2,7 @@
 with modes of its own: what it was made of comes back) and the simulator's ECDL (one selection filter); its facts,
 its file, the command line, the engine's fit after a map."""
 import threading
+import types
 
 import pytest
 
@@ -11,7 +12,7 @@ pytest.importorskip("scipy")
 from test_lasermap import MapBench, plan  # noqa: E402
 
 from wmlock import lasermodel as lm  # noqa: E402
-from wmlock.engine import Engine  # noqa: E402
+from wmlock.engine import Channel, Engine  # noqa: E402
 from wmlock.lasermap import MapFile, Mapper, load, main  # noqa: E402
 from wmlock.sim import ECDL, ModelLaser  # noqa: E402
 
@@ -86,6 +87,10 @@ def test_its_facts_say_the_laser_in_numbers(lab_map):
     assert "on a mode its power changes -0.3" in text
     assert "the opposite of what the map shows" in text  # (less light, more heat: that would push a mode on)
     assert "the model puts " in text
+    assert got.alt is not None and got.alt["right"] > 0.5 and set(got.alt) >= set(lm.RULE + lm.WINDOW) | {"dc", "ci"}
+    near = got.alt["right"] >= got.right - 0.05  # (the map tells the two apart only so far, or it does)
+    assert (f"another rule does {'nearly as well' if near else 'less well'}: its pull " in text
+            and ("so its recovery plans for both" in text) == near)
 
 
 def test_a_drift_the_map_cannot_tell_is_said_so():
@@ -163,17 +168,30 @@ def test_the_engine_fits_it_once_the_map_is_written(tmp_path, lab_map, monkeypat
     path, _ = lab_map
     copy = tmp_path / "copy.sqlite"
     copy.write_bytes(path.read_bytes())
-    m = Mapper(plan())
+    ch = Channel(2, {"link": {"device": "192.168.1.30", "laser": 1}})
+    eng = types.SimpleNamespace(lock=threading.Lock(), dirty=False, MODEL_GOOD=0.0)
+    m = Mapper(plan(), info={"laser": {"device": "192.168.1.30", "laser": 1}})
     done = threading.Thread(target=lambda: None)
     done.start()
-    Engine._model_of(None, m, copy, done)
+    Engine._model_of(eng, ch, m, copy, done)
     assert m.model is not None and m.model_note.startswith("its model: right mode at ")
-    assert m.notes[0] == (None, "the laser, as its model has it:") and len(m.notes) == 1 + len(m.model.facts())
+    assert m.notes[0] == (None, "the laser, as its model has it:") and len(m.notes) == 2 + len(m.model.facts())
+    assert m.notes[-1][1].startswith("its recoveries go by it from now on")
+    assert ch.laser_model() == m.model and ch.model_dict["from"] == "copy.sqlite" and eng.dirty  # (kept with it)
     with load(copy) as f:
         assert lm.stored(f) == m.model
+    other = Channel(3, {"link": {"device": "192.168.1.31", "laser": 1}})  # (linked to another laser by now)
+    m3 = Mapper(plan(), info={"laser": {"device": "192.168.1.30", "laser": 1}})
+    Engine._model_of(eng, other, m3, copy, done)
+    assert m3.model is not None and other.laser_model() is None
+    poor = types.SimpleNamespace(lock=threading.Lock(), dirty=False, MODEL_GOOD=1.01)
+    ch4 = Channel(4, {"link": {"device": "192.168.1.30", "laser": 1}})
+    m4 = Mapper(plan(), info={"laser": {"device": "192.168.1.30", "laser": 1}})
+    Engine._model_of(poor, ch4, m4, copy, done)
+    assert ch4.laser_model() is None and "its recoveries do not go by it" in m4.notes[-1][1]
     bad = tmp_path / "bad.sqlite"
     MapFile(bad).close()  # (an empty map)
     m2 = Mapper(plan())
-    Engine._model_of(None, m2, bad, done)
+    Engine._model_of(eng, ch, m2, bad, done)
     assert m2.model is None and m2.model_note.startswith("no model of the laser: ")
     assert m2.notes == [(None, m2.model_note)]

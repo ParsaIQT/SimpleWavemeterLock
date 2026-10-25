@@ -38,7 +38,8 @@ fit(m) fits it to a map's file (lasermap.LaserMap), in steps, each from what the
    it hops tells them better than where its frequencies lie): every sweep simulated from its first point, scored
    by how many of its points the model puts on the mode the laser was on (differential evolution, all candidates
    and sweeps at once), from the rule that makes what the laser did likeliest a point at a time (_likelihood),
-   searched once where its hysteresis of its own holds a mode, once where its pull does (HOLDS);
+   searched once where its hysteresis of its own holds a mode, once where its pull does (HOLDS): the better kept,
+   the other as well (alt: the map tells them apart only so far, and the recovery plans for both);
 5. the power at the wavemeter: linear in the current above a threshold, and how it changes along a mode (with δ).
 
 LaserModel.facts() says it all as sentences; LaserModel.simulate() predicts the frequency along any path of current,
@@ -47,6 +48,7 @@ Needs numpy and scipy.
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import sqlite3
@@ -487,6 +489,12 @@ class LaserModel:
     hysteresis: float | None = None
     apart: float | None = None
     notes: list = field(default_factory=list)
+    i_span: list | None = None   # mA, V: the currents and piezo voltages its map covered (as the model has them)...
+    v_span: list | None = None
+    v_set_to_act: float = 0.0    # V: ...the piezo as measured less as set (the model's is the measured one)
+    temp: float | None = None    # °C: the diode's temperature, as set, when it was mapped
+    alt: dict | None = None      # the rule held the other way (_fit_rule's other search): rule()'s terms by name (RULE,
+    #                              WINDOW, dc, ci), and the fraction of the map's points it puts on the right mode
 
     # ----------------------------------------------------------- the rule
     @property
@@ -504,6 +512,18 @@ class LaserModel:
         motion (WINDOW)."""
         return np.array([getattr(self, k) for k in RULE] + [self.dc, self._ci()] + [getattr(self, k) for k in WINDOW],
                         dtype=float)
+
+    def with_rule(self, rule: dict) -> LaserModel:
+        """A copy of it with another rule (as alt has it: rule()'s terms by name)."""
+        m = copy.deepcopy(self)
+        for k in RULE + WINDOW:
+            setattr(m, k, float(rule[k]))
+        if not m.single:
+            m.chip.spacing = float(rule["dc"])
+        if m.chip is not None:
+            m.chip.p_i = float(rule["ci"])
+        m.alt = None
+        return m
 
     def _d(self, i, v, t):
         return np.asarray(i, dtype=float) - self.i0, np.asarray(v, dtype=float) - self.v0, \
@@ -600,7 +620,7 @@ class LaserModel:
         elif self.lag <= 0:
             warm = i
         di, dv, dt = self._d(i, v, t)
-        b = float(e.base(di, dv, dt, up))
+        b = float(e.base(di, dv, dt)) + self.leg_now(i, warm, up)
         lo, hi = self.window(i, v)
         lo = lo if math.isfinite(lo) else b - 3 * dc
         hi = hi if math.isfinite(hi) else b + 3 * dc
@@ -619,6 +639,15 @@ class LaserModel:
         mid = base + self.pull * ((modes[k] - base + dc / 2) % dc - dc / 2)
         delta = float((modes[k] - mid + dc / 2) % dc - dc / 2)
         return float(modes[k]), delta, (int(orders[k]), warm, now_t, x, up)
+
+    def leg_now(self, i: float, warm: float, up: bool) -> float:
+        """GHz its external modes are off where they would be at rest, the current sweeping (p_leg: down less up, at
+        the map's pace): as warm as `warm` mA (its chip lagging), they are that much behind; with no lag known, as
+        swept up or down."""
+        rate = self.step_x / self.step_s if self.step_x and self.step_s else 0.0
+        if self.lag > 0 and rate > 0:
+            return -0.5 * self.ext.p_leg * (i - warm) / (rate * self.lag)
+        return self.ext.p_leg * (0.5 - float(up))
 
     def _sweeps(self, d: MapData, most: int | None = None) -> list:
         """The map's sweeps (indices of their clean points) that have two at least (`most`: at most that many,
@@ -840,6 +869,16 @@ class LaserModel:
                        f"{self.h_up:.4f} and {self.h_down:.4f} of {'the filter' if single else 'a chip mode'}'s loss "
                        f"at its most)")
         out.append("in the model: " + "; ".join(how))
+        a = self.alt
+        if a is not None and a.get("right") is not None:
+            window = (f", its window moving {a['w_v']:+.3f} GHz/V and {a['w_i']:+.3f} GHz/mA"
+                      if math.isfinite(a["lo"]) and math.isfinite(a["hi"]) else "")
+            near = a["right"] >= self.right - 0.05
+            out.append(f"another rule does {'nearly as well' if near else 'less well'}: its pull {a['pull']:+.0%}, its "
+                       f"hysteresis of its own {a['h_up']:.4f} and {a['h_down']:.4f}, its chip lagging {a['lag']:.2f} "
+                       f"s{window}; it puts {a['right']:.0%} of the points on the right mode (this one "
+                       f"{self.right:.0%})" + (": the map tells the two apart only so far, so its recovery plans for "
+                                               "both" if near else ""))
         return out
 
     def past(self) -> tuple | None:
@@ -1010,6 +1049,10 @@ def fit(m, current: str = "act", map_n: int | None = None, budget: int | None = 
         chip = _single_filter(d, i0, v0, t0)
     model = LaserModel(d.f_ref, i0, v0, t0, ext, chip, kind=d.kind)
     model.pace, model.step_s, model.step_x, model.again_s = pace_of(d)
+    model.i_span = [float(np.min(d.i[d.ok])), float(np.max(d.i[d.ok]))]
+    model.v_span = [float(np.min(d.v[d.ok])), float(np.max(d.v[d.ok]))]
+    model.v_set_to_act = _v_set_to_act(m)
+    model.temp = (m.meta.get("start") or {}).get("temp_set")
     if ext.jump > 0.42:
         slow = [ln["slow"] for ln in d.lines if not ln.get("repeat")]
         step = float(np.median(np.abs(np.diff(slow)))) if len(slow) > 1 else 0.0
@@ -1022,6 +1065,8 @@ def fit(m, current: str = "act", map_n: int | None = None, budget: int | None = 
                            "its lines are far apart for this: map with smaller steps to be sure")
     _fit_rule(model, d, budget, seed)
     model.right, model.near = model.accuracy(d)
+    if model.alt is not None:
+        model.alt["right"] = float(model.with_rule(model.alt).accuracy(d)[0])
     model.points = int(d.ok.sum())
     model.i_th, model.slope, model.power_v = fit_power(d)
     model.power_dp = fit_power_dp(d, model)
@@ -1029,6 +1074,12 @@ def fit(m, current: str = "act", map_n: int | None = None, budget: int | None = 
     model.hysteresis, model.apart = model.hysteresis_of(float(np.percentile(fast, 2)), float(np.percentile(fast, 98)))
     say(f"right mode at {model.right:.0%} of the points")
     return model
+
+
+def _v_set_to_act(m) -> float:
+    """V: the piezo voltage as measured less as set, over a map's points (0 where it was not measured)."""
+    diff = [q["v_act"] - q["v"] for q in m.points if q.get("v_act") is not None and q.get("v") is not None]
+    return float(np.median(diff)) if diff else 0.0
 
 
 def _chip_rate(d: MapData, quantum: float) -> float:
@@ -1127,7 +1178,7 @@ def _fit_rule(model: LaserModel, d: MapData, budget: int, seed: int, most: int =
     soft = differential_evolution(unlikely, bounds + [(1e-4, 0.02)], maxiter=max(budget // 2, 5),
                                   popsize=max(popsize - 3, 5), seed=seed, x0=guess + [0.003], **how)
     rng = np.random.default_rng(seed)
-    res = None
+    found = []
     for k, (pulls, most_h) in enumerate(HOLDS):  # (each its own population: the likeliest rule, the guess among it)
         part = list(bounds)
         part[2] = part[3] = (0.0, most_h)
@@ -1135,10 +1186,15 @@ def _fit_rule(model: LaserModel, d: MapData, budget: int, seed: int, most: int =
         lows, highs = np.array(part).T
         first = lows + (highs - lows) * rng.random((popsize * len(part), len(part)))
         first[0], first[1] = np.clip(soft.x[:11], lows, highs), np.clip(guess, lows, highs)
-        r = differential_evolution(cost, part, maxiter=budget, popsize=popsize, seed=seed + k,
-                                   **dict(how, init=first))
-        if res is None or r.fun < res.fun:
-            res = r
+        found.append(differential_evolution(cost, part, maxiter=budget, popsize=popsize, seed=seed + k,
+                                            **dict(how, init=first)))
+    res, *others = sorted(found, key=lambda r: r.fun)
+    model.alt = None
+    if others:  # (the other way of holding a mode: kept as well)
+        x = [float(v) for v in others[0].x]
+        model.alt = dict(zip(RULE + ("dc", "ci") + WINDOW, x))
+        if model.single:
+            model.alt.update(lo=-math.inf, hi=math.inf, dc=model.dc, w_v=0.0, w_i=0.0)
     for k, x in zip(RULE, res.x):
         setattr(model, k, float(x))
     model.w_v, model.w_i = float(res.x[9]), float(res.x[10])

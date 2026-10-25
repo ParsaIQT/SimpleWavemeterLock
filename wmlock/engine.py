@@ -230,6 +230,11 @@ class Channel:
         self.map_pending = None  # a map about to begin (its Mapper), its laser's settings being read
         self.map_info = None   # what a map would use of its laser, as last read for the dialog (map_look)
         self.gaps = deque(maxlen=30)  # s between its readings, of late (how fast the wavemeter reads it)
+        # its laser's model (lasermodel.py), fitted to its last map: what recoveries go by (HopParams.method 'model')
+        m = cfg.get("model")
+        self.model_dict = m if isinstance(m, dict) and isinstance(m.get("model"), dict) else None  # {model, from,
+        self._model = None     # (the LaserModel, made of model_dict once asked for)          laser, t, right}
+        self.model_note = ""   # how taking its laser's model from a map's file went, or is going
 
     @property
     def param(self) -> str:
@@ -260,7 +265,32 @@ class Channel:
             d["hop"] = self.hop.to_dict()
         if self.map_plan is not None:
             d["map"] = self.map_plan.to_dict()
+        if self.model_dict is not None:
+            d["model"] = self.model_dict
         return d
+
+    def laser_model(self):
+        """Its laser's model (lasermodel.LaserModel), if it has one, fitted to a map of the laser it is linked to now
+        (None: none; or numpy, scipy missing)."""
+        d = self.model_dict
+        if d is None or d.get("laser") != [self.device, self.laser]:
+            return None
+        if self._model is None:
+            try:
+                from .lasermodel import LaserModel
+
+                self._model = LaserModel.from_dict(d["model"])
+            except (ImportError, TypeError, ValueError, KeyError) as exc:
+                log.warning("channel %d: its laser's model cannot be used: %s", self.n, exc)
+                self.model_dict = None
+                return None
+        return self._model
+
+    def adopt_model(self, model, source: str):
+        """Its laser's model from now on (lasermodel.LaserModel fitted to a map of its laser now: source, that map)."""
+        self.model_dict = {"model": model.to_dict(), "from": source, "laser": [self.device, self.laser],
+                           "t": time.strftime("%Y-%m-%d %H:%M"), "right": round(model.right, 3)}
+        self._model = model
 
     @property
     def dac(self) -> bool:
@@ -426,6 +456,24 @@ class _HopIO:
         if op[0] == "get":
             wire = ("get", tuple(self.names.get(name, name) for name in op[1]))
         self.ctrl.submit(lambda client: ok(perform(client, laser, wire)), err)
+
+    def think(self, fn, done, failed):
+        """Work fn out in a thread of its own, the engine's lock not held (seconds of numpy: the laser's model);
+        the answer under it."""
+        e = self.engine
+
+        def run():
+            try:
+                result = fn()
+            except Exception as exc:  # (a bug: the recovery stops, and puts things back)
+                log.exception("channel %d: recovery", self.ch.n)
+                with e.lock:
+                    failed(exc)
+                return
+            with e.lock:
+                done(result)
+
+        threading.Thread(target=run, daemon=True, name=f"recovery {self.ch.n}: thinking").start()
 
 
 class Engine:
@@ -1785,14 +1833,18 @@ class Engine:
             text += f"; saved to {out.path}"
             if m.plan.model and m.lasing >= MODEL_MIN:
                 m.model_note = "fitting the laser's model…"
-                threading.Thread(target=self._model_of, args=(m, out.path, closing), daemon=True,
+                threading.Thread(target=self._model_of, args=(ch, m, out.path, closing), daemon=True,
                                  name="laser model").start()
         ch.map_note, ch.message = text, "" if ok else text
         (log.info if ok else log.warning)("channel %d: %s", ch.n, text)
 
-    def _model_of(self, m: Mapper, path: Path, closing: threading.Thread):
+    MODEL_GOOD = 0.6  # a laser's model putting fewer of its map's points on the right mode is not gone by
+
+    def _model_of(self, ch: Channel, m: Mapper, path: Path, closing: threading.Thread):
         """The laser's model from its map's file, once that is written (lasermodel.py): kept in the file, its facts
-        in the map's notes (Mapper.model; model_note: how it went)."""
+        in the map's notes (Mapper.model; model_note: how it went), and with the channel (Channel.adopt_model) for
+        its recoveries to go by, if it describes the laser well enough (MODEL_GOOD), and it is still linked to the
+        laser mapped."""
         closing.join()
         try:
             from . import lasermodel
@@ -1810,10 +1862,75 @@ class Engine:
             m.notes.append((None, "the laser, as its model has it:"))
             m.notes.extend((None, "  " + fact) for fact in model.facts())
             m.model, m.model_note = model, f"its model: right mode at {model.right:.0%} of the points"
+            laser = m.info.get("laser") or {}
+            with self.lock:
+                if model.right < self.MODEL_GOOD:
+                    m.notes.append((None, f"its recoveries do not go by it ({model.right:.0%}: too little)"))
+                elif [laser.get("device"), laser.get("laser")] == [ch.device, ch.laser]:
+                    ch.adopt_model(model, path.name)
+                    self.dirty = True
+                    m.notes.append((None, "its recoveries go by it from now on (Mode-hop recovery's method: auto "
+                                          "or model)"))
             log.info("map %s: %s", path, m.model_note)
             return
         m.notes.append((None, m.model_note))
         log.warning("map %s: %s", path, m.model_note)
+
+    def model_from_file(self, n: int, path) -> str:
+        """Its laser's model from a map's file (lasermap.py): the one kept in it, or fitted to it now, in a thread of
+        its own (minutes; Channel.model_note says how it goes). Its recoveries go by it from then on, if the map is of
+        the laser the channel is linked to (its controller and laser, as the map has them) and the model describes it
+        well enough (MODEL_GOOD). Returns what it did, or is doing."""
+        path = Path(path)
+        try:
+            from . import lasermodel
+            from .lasermap import load
+
+            with load(path) as f:
+                laser, model = f.meta.get("laser") or {}, lasermodel.stored(f)
+        except ImportError as exc:
+            return f"its laser's model needs numpy and scipy ({exc})"
+        except Exception as exc:  # (not a map, say)
+            return f"cannot read {path.name}: {exc or type(exc).__name__}"
+        with self.lock:
+            ch = self.channels[n]
+            if [laser.get("device"), laser.get("laser")] != [ch.device, ch.laser]:
+                return (f"{path.name} is a map of laser {laser.get('laser')} of {laser.get('device') or '?'}, not of "
+                        f"the laser channel {n} is linked to: its model not taken")
+        if model is not None:
+            return self._take_model(ch, model, path.name)
+
+        def fit():
+            try:
+                with load(path) as f:
+                    got = lasermodel.fit(f)
+                lasermodel.save(path, got)
+                note = self._take_model(ch, got, path.name)
+            except Exception as exc:  # (whatever the map: never in the way)
+                log.exception("laser model of %s", path)
+                note = f"none from {path.name}: {exc or type(exc).__name__}"
+                with self.lock:
+                    ch.model_note = note
+            log.info("channel %d: its laser's model: %s", ch.n, note)
+
+        with self.lock:
+            ch.model_note = f"being fitted to {path.name}…"
+        threading.Thread(target=fit, daemon=True, name="laser model").start()
+        return (f"{path.name} keeps no model of the laser: it is being fitted to it, in the background (a few "
+                f"minutes); Mode-hop recovery… shows it once it is taken, and the row's tooltip says how it went")
+
+    def _take_model(self, ch: Channel, model, source: str) -> str:
+        """Its laser's model from now on, if it describes the laser well enough (MODEL_GOOD): what was done."""
+        with self.lock:
+            if model.right < self.MODEL_GOOD:
+                ch.model_note = (f"the one from {source} puts only {model.right:.0%} of that map's points on the right "
+                                 f"mode: not gone by")
+            else:
+                ch.adopt_model(model, source)
+                self.dirty = True
+                ch.model_note = (f"from {source}, {model.right:.0%} of that map's points on the right mode: its "
+                                 f"recoveries go by it from now on (Mode-hop recovery's method: auto or model)")
+            return ch.model_note
 
     # ------------------------------------------------------- mode-hop recovery
     def set_hop_params(self, n: int, params: HopParams):
@@ -2052,8 +2169,9 @@ class Engine:
             what = "the offset" if ch.piezo == ACTUATOR else f"its piezo voltage ({ch.piezo})"
             self._recovery_failed(ch, f"{what}, {v0:.2f} V, is outside {lp.v_min:g} … {lp.v_max:g} V")
             return
+        model = ch.laser_model() if hop.method in ("auto", "model") and not ch.upkeeping else None
         rec = Recenter(hop, i0, v0, i_lo, i_hi, v_lo, v_hi, cavity=locked, quick=quick, shg=hop.shg, act_offset=off,
-                       i_top=i_top, i_clip=clip, ref=ref, upkeep=ch.upkeeping)
+                       i_top=i_top, i_clip=clip, ref=ref, upkeep=ch.upkeeping, model=model, target=ch.f_set)
         io = _HopIO(self, ch, controller)
         runner = Runner(rec, io, time.monotonic(), timeout=rec.timeout, finished=lambda r: self._recovery_done(ch, r))
         if runner.busy:
@@ -2184,13 +2302,14 @@ class Engine:
             ch.setup = None
             key, laser, hop, lp, ff, on_dac = ch.device, ch.laser, ch.hop, ch.lock.p, ch.ff_ao, ch.dac
             wlm = self._channel_report(ch)
+            model = ch.model_dict if ch.laser_model() is not None else None
 
             def job(client):
                 if on_dac:  # (an analog output: the board, what its outputs were set to)
                     report = client.report(laser, ff) + [("info", f"lock: {lp.v_min:g} … {lp.v_max:g} V, at most "
                                                                   f"±{lp.excursion:g} V from where it locked")]
                 else:
-                    report = setup_report(client, laser, hop, lp) + wlm
+                    report = setup_report(client, laser, hop, lp, model) + wlm
                 with self.lock:
                     if ch.device == key:
                         ch.setup = report

@@ -892,10 +892,11 @@ class CavitySteps:
 
 
 # ------------------------------------------------------------ setup check
-def setup_report(client, laser: int, hop, lp) -> list:
+def setup_report(client, laser: int, hop, lp, model=None) -> list:
     """Everything a recovery would use on this laser, read (only reads) from its controller, and
     what looks wrong: [(level, text)], level 'head', 'ok', 'info', 'warn' or 'error'.
-    client: a DLCPro; hop: HopParams; lp: the wavemeter lock's LockParams."""
+    client: a DLCPro; hop: HopParams; lp: the wavemeter lock's LockParams; model: its laser's model as its
+    channel keeps it (Channel.model_dict), if it has one."""
     out = []
 
     def add(level, text):
@@ -1237,7 +1238,8 @@ def setup_report(client, laser: int, hop, lp) -> list:
                     + ("" if hop.cavity else ": only for a laser its DLC pro locks to a cavity, so not this one"))
 
     add("head", "Finding a mode on target")
-    if hop.how() == "catch":
+    how = hop.how(model=model is not None)
+    if how == "catch":
         add("info", f"catch, as by hand: back onto the right mode (the one it was on target on before it hopped) by "
                     f"the current: up to the top of its window, then down {hop.step:g} mA at a time until the laser is "
                     f"on it and its SHG peak (the tallest resonance in the SHG sweep, between samples) is within "
@@ -1286,7 +1288,7 @@ def setup_report(client, laser: int, hop, lp) -> list:
                 f"from where the piezo is ± {hop.pc_try:g} V")
         if hop.shg_ratio:
             add("info", f"its SHG sweep shows the peak at {hop.shg_ratio:.2f} of the signal locked (learned)")
-    elif hop.how() == "walk":
+    elif how == "walk":
         add("info", f"walk: single mode first by the SHG sweep, trimming the current; within {hop.reach:g} GHz (else "
                     f"first hop to a nearer mode with the current), the piezo onto the target in {hop.walk_step:g} V "
                     f"steps, the mode looked at after each and the current trimmed when it gets worse. A laser that "
@@ -1294,9 +1296,18 @@ def setup_report(client, laser: int, hop, lp) -> list:
         if hop.kv and hop.reach * 1e3 > abs(hop.kv) * hop.v_window:
             add("warn", f"walking {hop.reach:g} GHz takes {hop.reach * 1e3 / abs(hop.kv):.1f} V of piezo, more than "
                         f"the ±{hop.v_window:g} V a recovery may move it")
+    elif how == "model":
+        add("info", f"by its model, from its last map ({model.get('from', '?')}, {model.get('t', '?')}: "
+                    f"{model.get('right', 0):.0%} of that map's points on the right mode): a map here first and the "
+                    f"model fitted to it (how far its modes have moved), then the way onto a mode on target that holds "
+                    f"best, its own or another at another piezo voltage, and which way the current comes to it; the "
+                    f"margins checked as the map's; up to {mh.Recenter.MODEL_TRIES} plans, the model fitted again to "
+                    f"all it read after each, then the map")
     else:
         add("info", f"map: the current swept over its window both ways in {hop.step:g} mA steps, the best mode "
                     f"parked on the way it lases, the piezo onto the target")
+        if hop.method == "model":
+            add("warn", "its laser has no model to go by yet (map it, its model fitted at the end): the map instead")
 
     add("head", "What a recovery may change")
     reset = hop.how() == "catch" and hop.shg and hop.reset_up > 0

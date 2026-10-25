@@ -496,6 +496,7 @@ class ChannelRow(Row):
             m.addAction("Laser map…", self.map_dialog).setEnabled(bool(ch.device) and ch.state == "off")
             if ch.map_last is not None:
                 m.addAction("Last laser map…", lambda: self.win.map_window(self.engine, self.n))
+        m.addAction("Its laser's model from a map…", self.model_dialog).setEnabled(bool(ch.device) and not ch.dac)
         if ch.hop.enabled and ch.hop.shg:
             m.addAction("Take the optimum now (as set by hand)", lambda: self.engine.take_optimum(self.n)).setEnabled(
                 bool(ch.device) and ch.state != "recovering")
@@ -551,6 +552,15 @@ class ChannelRow(Row):
         d = MapDialog(self, self.engine, self.n)
         if d.exec():
             self.win.map_window(self.engine, self.n)
+
+    def model_dialog(self):
+        """Its laser's model from a map's file (made before, or elsewhere): its recoveries go by it."""
+        from .lasermap import FOLDER
+
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "A map of its laser", str(FOLDER),
+                                                        "Laser maps (*.sqlite);;All files (*)")
+        if path:
+            QtWidgets.QMessageBox.information(self, "Its laser's model", self.engine.model_from_file(self.n, path))
 
     def last_dialog(self):
         last = self.engine.channels[self.n].last
@@ -1139,13 +1149,16 @@ class HopDialog(QtWidgets.QDialog):
     RELOCK = (("auto", "as its DLC pro is set: by lockpoint, unless it locks without one"),
               ("lockpoint", "pick the right peak and select it as the lockpoint, as by hand"),
               ("plain", "re-enable the lock and let it find its resonance"))
-    METHOD = (("auto", "catch with an SHG stage, else map"),
+    METHOD = (("auto", "its model, if it has one and no SHG stage; else catch with an SHG stage, else map"),
               ("catch", "catch: back onto its own mode by the current (up, then down until it is on it: its SHG peak "
                         "back; already on it, its current to the top end of where the mode is at its best; with the "
                         "wavemeter alone, parked in the middle of where its mode holds), then the piezo onto the "
                         "target"),
               ("walk", "walk: single mode first, then the piezo slowly onto the target, as by hand"),
-              ("map", "map: sweep the current over the window, up and down, and pick the best mode"))
+              ("map", "map: sweep the current over the window, up and down, and pick the best mode"),
+              ("model", "model: its laser's model, fitted to its last map, says where a mode is on target and holds "
+                        "best (its own, or another at another piezo voltage) and which way to come to it; a map here "
+                        "first, to see how far its modes moved"))
 
     def __init__(self, parent, ch, take=None):
         """take: take the optimum now (Engine.take_optimum for this channel), if it can be."""
@@ -1216,6 +1229,13 @@ class HopDialog(QtWidgets.QDialog):
         self.method.addItems([label for _, label in self.METHOD])
         self.method.setCurrentIndex(next((k for k, (key, _) in enumerate(self.METHOD) if key == p.method), 0))
         form.addRow("Method", self.method)
+        md = getattr(ch, "model_dict", None)
+        has = md is not None and md.get("laser") == [ch.device, ch.laser]
+        self.model_info = Text(f"its laser's model: from {md.get('from', '?')} ({md.get('t', '?')}), "
+                               f"{md.get('right', 0):.0%} of that map's points on the right mode" if has else
+                               "its laser's model: none yet (map it: Laser map…, its model fitted at the end)", "dim")
+        self.model_info.setWordWrap(True)
+        form.addRow("", self.model_info)
         self.catch_pct = number(round(100 * (1 - p.catch_min)), 1, 60, 0, 1)
         self.catch_tries = QtWidgets.QSpinBox()
         self.catch_tries.setRange(1, 10)

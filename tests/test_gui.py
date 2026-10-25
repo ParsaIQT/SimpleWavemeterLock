@@ -205,6 +205,25 @@ def test_hop_dialog_round_trip(app):
                           confirm=True, falc_max=0.02, peak_tol=40.0, lock_min=0.3)  # measured values forgotten
 
 
+def test_hop_dialog_offers_the_lasers_model(app):
+    from wmlock.engine import Channel
+    from wmlock.lasermodel import Comb, LaserModel
+
+    ch = Channel(5, {"link": {"device": "192.168.1.30", "laser": 1}, "hop": {"enabled": True, "method": "model"}})
+    d = gui.HopDialog(None, ch)
+    assert d.method.currentText().startswith("model: its laser's model, fitted to its last map")
+    assert d.model_info.text().startswith("its laser's model: none yet (map it")
+    assert d.params().method == "model"
+    model = LaserModel(f_ref=607.42, i0=64.0, v0=67.0, t0=0.0, ext=Comb(8.26), chip=Comb(87.4), right=0.77)
+    ch.adopt_model(model, "map 3.sqlite")
+    ch.model_dict["t"] = "2026-10-25 10:00"
+    d = gui.HopDialog(None, ch)
+    assert d.model_info.text() == ("its laser's model: from map 3.sqlite (2026-10-25 10:00), 77% of that map's points "
+                                   "on the right mode")
+    d.method.setCurrentIndex(0)
+    assert d.params().method == "auto" and d.method.currentText().startswith("its model, if it has one and no SHG")
+
+
 def test_hop_dialog_shows_the_optimum_and_takes_it(app):
     from wmlock.engine import Channel
 
@@ -834,8 +853,9 @@ def test_a_laser_map_from_its_dialog_to_its_window_and_picture(app, demo, tmp_pa
         assert shown and "its external cavity's modes are 6.0000 GHz apart" in \
             shown[0].findChild(QtWidgets.QTextBrowser).toPlainText()
         shown[0].close()
-        acts = {a.text() for a in _menu_actions(row)}
+        acts = {a.text(): a for a in _menu_actions(row)}
         assert "Last laser map…" in acts and "Laser map…" in acts
+        assert acts["Its laser's model from a map…"].isEnabled()
     finally:
         for w in list(getattr(win, "map_windows", {}).values()):
             w.close()

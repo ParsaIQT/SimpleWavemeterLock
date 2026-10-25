@@ -403,9 +403,12 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   the wavemeter to go by, until it is on it, and then parked in the middle of where the mode holds:
   see *The catch with the wavemeter alone*), then the piezo onto the target. **Walk**: single mode first, then the piezo slowly onto the target on whatever mode that
   is, keeping an eye on the mode in the SHG cavity and trimming the current when it gets worse
-  (the catch falls back on it when the right mode cannot be had). **Map** (the default without
-  an SHG stage): sweep the current over its window, up and down, and pick the mode that holds
-  best. The walk keeps the current near nominal; the catch and the map need the window.
+  (the catch falls back on it when the right mode cannot be had). **Map**: sweep the current over
+  its window, up and down, and pick the mode that holds best. **Model** (the default without an SHG
+  stage once the laser has a model, from its last map): its own model says where a mode is on
+  target and holds, and which way to come to it (see *Recovery by the laser's model* below); without
+  one, the map. The walk keeps the current near nominal; the catch, the map and the model need the
+  window.
 * **Catch**: *its SHG peak within 10 % of the optimum's; 3 goes, then from the optimum's piezo
   voltage ± 30 V* (0 V: no tries elsewhere; the piezo may go that far for them, inside the lock's
   offset limits, whatever *Piezo moves at most* says).
@@ -822,6 +825,63 @@ way the map found its mode there.
    frequency must stay on one straight line and come back, and with an SHG stage the laser
    must be single-mode at both ends and in the middle. If not, or if the piezo moved a lot
    (the modes move with it), it maps again there, up to three times.
+
+### Recovery by the laser's model
+
+A laser mapped with its model fitted at the end (*Laser maps*, *The laser's model*) keeps that model
+with its channel: the map's notes say *its recoveries go by it from now on* if the model puts at least
+60 % of the map's points on the right mode and the channel is still linked to the laser mapped
+(*Mode-hop recovery…* shows which map it came from, and when). A newer map replaces it. A map made before
+(or on another PC) gives it too: right-click › **Its laser's model from a map…** takes the model kept in the
+file, or fits one to it in the background (a few minutes; the row's tooltip says how it went), if the map is of
+the laser the channel is linked to. Its recoveries then go by it (method *auto* without an SHG stage, or
+*model*), and it is that laser's own: where its chip's modes are, how its window moves, its hysteresis, its
+chip lagging the current.
+
+1. **Anchored.** Where the laser was last on target (in the last 15 minutes) its right mode was on
+   target: that places the model's external modes as they are now (they drift), and the target inside
+   where it lases.
+2. **A map here**, as the map method's: the current over its window, up and down, at the piezo voltage
+   it is at. The model is fitted to it: its external modes where the readings have them, then how far its
+   chip's modes have moved since its map (their temperature, their age) and where it lases (its window),
+   each sweep simulated from its first reading, the modes it lases on those it was read on. Every
+   other answer that fits as well is kept too, and so is the model's other rule (the one held the other
+   way, which its map could tell apart only so far) if it fits nearly as well: the model's *members*.
+   A model that fits worse than one that never hops, or whose modes are not where the readings are, is
+   not this laser's as it is now (realigned, or its temperature changed a lot): the map's way, from
+   this map.
+3. **A plan.** For piezo voltages across the piezo's range (as far as its map went, and 5 V more), the
+   current that puts a mode on target there: the one it was on, or one a few modes away at another
+   piezo voltage (the target, either way); each come to sweeping up from the window's bottom or down
+   from its top, by way of the other end first, as the recovery does. Each is simulated by every
+   member, then on past it and back in 0.02 mA steps: the plan is the one the most members bring onto
+   its mode with the margins asked for (*Keep a hop at least …*), then by their margins, then little
+   piezo and the current near nominal. The note says which mode, where, which way, and the margins.
+4. **There.** The piezo to the plan's voltage, the current round by the far end of the window and
+   swept to the operating point, a reading a step (each one against what the model expected). On its
+   mode: the piezo onto the target with the model's own tuning (nothing to measure), then the margins
+   checked as the map method's. Not on it, or not holding: everything it read on the way, the margins'
+   check too, goes into the model, fitted again, and the next plan avoids where that one did not hold;
+   six plans at most, then the map's way.
+
+If no mode can be put on target within the window, it says why as the model sees it: where it lases,
+from the target, and how that moves with the piezo and the current. The model's sums (a second or two each,
+for a fit or a plan) are done on the side: the other channels' locks go on meanwhile. It needs numpy.
+
+Against the lab's two lasers as their maps' models have them (`sim.ModelLaser`), each made a little
+unlike its model (its rule's terms off as another fit of its map would have them: the hysteresis by
+±40 %, the pull by ±0.05, the lag by ±30 %, the window's edges by 3 % of its width, how the window moves
+by ±15 %), its chip's modes anywhere and its cavity drifted, then a hop (its chip's modes moving, its
+cavity, its window by up to a tenth of its width, or its temperature, all of these), 48 hops of each laser
+for each of two such truths (made from its model, and from the map's other fit):
+
+| laser | by its model | by the map |
+|-------|--------------|------------|
+| 493 nm (its window 270 GHz wide, its chip modes 87 GHz apart) | 94 of 96 on target, 63 on its first plan; 118 readings on average | 36 of 96; 200 readings |
+| 650 nm (a window only 27 GHz wide, its chip modes 18 GHz apart) | 95 of 96, 92 on its first plan; 96 readings | 87 of 96; 99 readings |
+
+Of the three it did not recover, two it would have had on a seventh and a ninth plan, and one not with any
+margin: the target was where that laser lased only at the very bottom of its current window.
 
 ### Upkeep: kept just below the top of its mode
 
@@ -1311,7 +1371,8 @@ How it is fitted, each part from what the map shows most directly:
    puts on the mode the laser was on (differential evolution, every candidate and every sweep at once).
    It starts from the rule that makes what the laser did likeliest, a point at a time (smooth, and every
    hop counts), and is searched twice: once where the hysteresis of its own does most of the holding,
-   once where the pull does (a search settles on one or the other as it goes);
+   once where the pull does (a search settles on one or the other as it goes). The better is the model's
+   rule; the other is kept as well, and said if it does nearly as well (its recoveries plan for both);
 5. the power at the wavemeter: linear in the current above a threshold, and how it changes along a mode.
 
 A frequency THz away from all the others is the wavemeter misreading its interference order (both readings
@@ -1370,6 +1431,8 @@ index. What heat does show is the lag: sweeping 0.79 mA/s, the chip is as warm a
 current. A map swept at a quarter of the speed would tell the lag from the rest: its part shrinks with the
 speed, the pull's does not. Either way, coming down onto a mode from above (as the recovery does) is what
 puts it reproducibly on the same one: up and down, it is on different modes nearly everywhere.
+
+Its recoveries go by it: see *Recovery by the laser's model* under *Mode-hop recovery*.
 
 **The simulator's lasers** can be made of a model: `sim.ModelLaser(model, clock)` lases as the model says
 (`LaserModel.step`, a point after another, its chip lagging and pulled as fitted), with the model's
@@ -1531,6 +1594,7 @@ wmlock/relock.py     taking over and handing back a DLC pro's cavity and SHG loc
 wmlock/dropouts.py   lock dropouts: the DLC pro's recorder (or polling) read, dropouts found
 wmlock/lasermap.py   laser maps: the plan, the sweeps both ways, the file (SQLite), reading it back; python -m wmlock.lasermap
 wmlock/lasermodel.py the laser's model from its map: two combs and a rule, fitted (numpy, scipy), its facts
+wmlock/modelhop.py   recovery by the laser's model: anchored, fitted to what it does, a plan onto a mode on target (numpy)
 wmlock/cavity.py     reading SHG sweeps, cavity scans and error signals, pure maths
 wmlock/engine.py     threads and state: source → lock → per-controller workers
 wmlock/meters.py     this PC's wavemeters, an engine each: found, settings kept, swapped, hidden
@@ -1623,4 +1687,9 @@ wlmData and server.py (details, patterns exported and no longer). The laser's mo
 laser made of a model (a chip with modes of its own: its spacings, tunings, window and pull come back) and
 to one of the simulator's ECDL (one selection filter: its mode spacing, tunings and ideal feedforward come
 back); its facts, a drift the map cannot tell, its file, the command line and the engine's fit after a
-map are tested too (numpy and scipy: without them those tests are skipped).
+map are tested too (numpy and scipy: without them those tests are skipped). Recovery by the laser's model:
+its planner anchored, fitted to what the laser did (how far its chip's modes and its cavity moved), planning
+onto a mode on target that holds, and elsewhere where one did not; the lab's two lasers, as their maps' models
+have them but a little off, hopped and brought back on target by it; its sums done on the side while readings
+go by, a stop meanwhile putting everything back; a model that does not describe the laser not gone by; the
+method chosen; a channel keeping its laser's model, and the dialog showing it.

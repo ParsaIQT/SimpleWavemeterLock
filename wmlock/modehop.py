@@ -167,7 +167,9 @@ class HopParams:
     shg: bool = False         # it has an SHG stage: check the mode in its cavity, relock it
     method: str = "auto"      # how it finds a mode on target: catch (back onto the right mode by the current, then
     #                           the piezo onto the target), walk (a single-mode mode, then the piezo onto the target),
-    #                           map (sweep the current), auto (catch with an SHG stage, else map)
+    #                           map (sweep the current), model (the laser's own model, from its map: where its right
+    #                           mode is on target and holds, and the way to it), auto (the model if it has one and no
+    #                           SHG stage, else catch with an SHG stage, else map)
     relock: str = "auto"      # the DLC pro's lock: auto | lockpoint (pick the peak) | plain (re-enable)
     falc: bool = True         # null the error signal's DC with the FALC pro's input offset first
     falc_max: float = 0.05    # V: the most the input offset may move from where it was
@@ -261,11 +263,14 @@ class HopParams:
         wavemeter is never that far off)."""
         return self.peak_tol if self.cavity else self.tolerance
 
-    def how(self, shg: bool | None = None) -> str:
-        """The method it uses: 'catch', 'walk' or 'map'."""
+    def how(self, shg: bool | None = None, model: bool = False) -> str:
+        """The method it uses: 'catch', 'walk', 'map' or 'model' (model: it has one; else 'model' is 'map')."""
+        if self.method == "model":
+            return "model" if model else "map"
         if self.method in ("catch", "walk", "map"):
             return self.method
-        return "catch" if (self.shg if shg is None else shg) else "map"
+        shg = self.shg if shg is None else shg
+        return "catch" if shg else "model" if model else "map"
 
     @property
     def optimum(self) -> bool:
@@ -338,6 +343,13 @@ class Wait:
 class Confirm:
     """Step by step: wait until the user says go on (sent on only with HopParams.confirm)."""
     text: str
+
+
+@dataclass
+class Think:
+    """Work something out: fn(), its result sent back. It may take seconds (the laser's model fitted, a plan made):
+    done off the thread that drives the procedure, if its io can (io.think), so that the rest goes on meanwhile."""
+    fn: object
 
 
 # what a recovery may write besides current and offset, and how
@@ -443,6 +455,7 @@ class Point:
     up: bool   # the current was rising
     bad: bool = False    # the SHG sweep there showed a second mode
     rough: bool = False  # the reading is off its mode's line by far more than the noise
+    t: float = math.nan  # s: when it was read
 
 
 def _merge(ranges, gap):
@@ -697,7 +710,7 @@ class Recenter(CavitySteps):
     def __init__(self, p: HopParams, current: float, offset: float, i_lo: float, i_hi: float,
                  v_lo: float, v_hi: float, kv: float = 0.0, cavity: bool = False, quick: bool = True,
                  shg: bool | None = None, act_offset: float = 0.0, i_top: float | None = None,
-                 i_clip: float = math.inf, ref=None, upkeep: bool = False):
+                 i_clip: float = math.inf, ref=None, upkeep: bool = False, model=None, target: float = math.nan):
         """Currents are set currents (what is written); act_offset is the measured current minus
         the set current (with the piezo at `offset`), for showing them as measured, and for the
         nominal current, which is.
@@ -712,7 +725,8 @@ class Recenter(CavitySteps):
         (window()). i_clip: the controller's own limit on the set current.
         ref: (piezo voltage, set current) where the laser was on target, on the right mode, before it hopped
         (the catch: by default where it is now). upkeep: not a recovery: locked, the top of its mode found and backed
-        off from (upkeep), the locks left as they are."""
+        off from (upkeep), the locks left as they are. model: the laser's own (lasermodel.LaserModel, from its map:
+        the method 'model'), target: THz (what the readings are from)."""
         self.p = p
         self.quick = quick
         self.I0, self.V0 = current, offset  # where the laser was when this began (where it lases, after a panic)
@@ -749,7 +763,9 @@ class Recenter(CavitySteps):
         self.notes = []
         self.learned = {}                   # HopParams fields to keep, beyond kv and spacing
         self.record = {"notes": [], "maps": [], "sweeps": []}
-        self.method = p.how(shg)
+        self.model, self.target = model, target
+        self.method = p.how(shg, model is not None and math.isfinite(target))
+        self.mapped = None                  # (V, [Point]) of the last map
         # whether it lases
         self.seed_name = ""                 # the parameter that shows the seed power ('': not watched)
         self.seed = math.nan                # mW, as last read
@@ -770,6 +786,7 @@ class Recenter(CavitySteps):
         self._slopes = deque(maxlen=9)
         # the catch
         self.v_ref, self.i_ref = ref if ref is not None else (offset, current)  # the right mode on target there
+        self.ref_given = ref is not None
         self.v_opt = p.opt_v if p.optimum else self.v_ref  # the optimum's piezo voltage
         self.ratio = p.shg_ratio or 1.0     # its SHG peak scanned over its intra-cavity signal locked
         self.caught = None                  # (V, mA measured) where the right mode was caught, if it was
@@ -1140,7 +1157,8 @@ class Recenter(CavitySteps):
         while True:
             try:
                 yield from self.come_inside()
-                yield from {"walk": self.walk, "catch": self.catch_mode}.get(self.method, self.find)()
+                yield from {"walk": self.walk, "catch": self.catch_mode, "model": self.by_model}.get(self.method,
+                                                                                                  self.find)()
                 if not self.cavity and not self.shg:
                     return (yield from self.finish())
                 if (yield from self.hand_back()):
@@ -1227,18 +1245,19 @@ class Recenter(CavitySteps):
             self.learned["seed_ok"] = round(float(seed[0]), 3)
         return self.result()
 
-    def find(self):
-        """Put the laser on target, on a mode with margins: the quick way if it is near, else map."""
+    def find(self, mapped=None):
+        """Put the laser on target, on a mode with margins: the quick way if it is near, else map (mapped: the bands
+        of a map just made here: those first)."""
         if self.shg_ok:
             yield from self.shg_scan(True)  # its sweep shows how single-mode the laser is, all along
-        if self.quick and math.isfinite(self.e) and abs(self.e) <= self.near():
+        if mapped is None and self.quick and math.isfinite(self.e) and abs(self.e) <= self.near():
             yield from self.ask(f"The laser is {self.e:+.0f} MHz from its target: tune the piezo onto it")
             if ((yield from self.tune()) == "ok" and (yield from self.check(self.p.margin))
                     and (yield from self.mode_ok())):
                 return
         lo, hi = self.mA(self.i_lo), self.mA(self.i_hi)
-        for _ in range(self.MAX_MAPS):
-            bands = yield from self.map()
+        for k in range(self.MAX_MAPS):
+            bands = list(mapped) if k == 0 and mapped is not None else (yield from self.map())
             if not bands:
                 yield from self.go_home()
                 raise Failed(f"no mode within {lo:.2f} … {hi:.2f} mA, sweeping up or down, "
@@ -1266,6 +1285,149 @@ class Recenter(CavitySteps):
                 break                     # too close to a hop: map again, here
         yield from self.go_home()
         raise Failed(f"no mode that holds reaches the target within {lo:.2f} … {hi:.2f} mA" + self.nearest())
+
+    # ------------------------------------------------------------ by its model
+    MODEL_TRIES = 6      # plans tried, each after the model is fitted again to all it has seen (one that did not
+    #                      hold is not made again)
+    MODEL_AGREE = 0.6    # the model fitted to a map here putting fewer of its readings on their modes, and not
+    MODEL_BETTER = 0.1   # this many more than a model that never hops, or fewer than MODEL_COMB of them on its
+    MODEL_COMB = 0.7     # external comb: not this laser's now (it was realigned, its temperature changed a lot)
+    MODEL_V = 5.0        # V beyond the piezo voltages its map covered that the model is trusted
+
+    def by_model(self):
+        """Method 'model': the laser's own model (lasermodel.LaserModel, fitted to its map) puts it on a mode on target
+        (modelhop.Planner). Anchored where it was on target before it hopped (its right mode is on target there, and
+        inside where it lases), and fitted to a map of the modes here (its external modes, its chip's modes and where
+        it lases have moved since its own map; how far, this map's readings tell), it says where across the piezo's
+        range a mode is on target and holds best (the one it was on, or another at another piezo voltage), and which
+        way the current must come to it there (hysteresis): to the far end of the window by way of the other, then
+        sweeping to it. There, the piezo onto the target by the model's tuning (not measured), and the margins checked
+        as the map method's. Not on that mode there, or not holding: the model is fitted again to all it has seen on
+        the way (the margins' check too), and the plan made again, not there (MODEL_TRIES in all). The model not this
+        laser's now (it fits the map's readings badly), or no plan for it: the map's way, from this map."""
+        try:
+            from .modelhop import Planner
+        except ImportError as exc:  # (numpy)
+            self.note(f"its model needs numpy ({exc}): the map's way instead")
+            return (yield from self.find())
+        if self.shg_ok:
+            yield from self.shg_scan(True)
+        ref = (self.mA(self.i_ref, self.v_ref), self.v_ref) if self.ref_given else None
+        pl = Planner(self.model, self.target, ref=ref)
+        self.model_tuning(pl)
+        if self.quick and math.isfinite(self.e) and abs(self.e) <= self.near():
+            yield from self.ask(f"The laser is {self.e:+.0f} MHz from its target: tune the piezo onto it (its model's "
+                                f"tuning, {self.kv:+.0f} MHz/V)")
+            if ((yield from self.tune()) == "ok" and (yield from self.check(self.p.margin))
+                    and (yield from self.mode_ok())):
+                return
+        bands = yield from self.map()
+        v, points = self.mapped
+        for leg in (1, 2):
+            seg = pl.segment()
+            for pt in points:
+                if pt.leg == leg and not (pt.bad or pt.rough):
+                    pl.observe(seg, pt.t, self.mA(pt.i, v), v, pt.up, pt.e / 1e3)
+        agree = yield Think(pl.fit)
+        rec = {"phi": round(pl.phi, 3), "slide": round(pl.slide, 2), "drift": round(pl.drift, 3),
+               "agree": None if agree is None else round(agree, 3), "right": pl.right, "plans": []}
+        self.record["model"] = rec
+        if (agree is None or pl.on_comb < self.MODEL_COMB
+                or (agree < self.MODEL_AGREE and agree < pl.null + self.MODEL_BETTER)):
+            self.note("its model fits this map's readings badly" +
+                      (f" ({pl.on_comb:.0%} of them on its external modes, {agree:.0%} on the modes it says, where "
+                       f"one that never hops would have {pl.null:.0%})" if agree is not None else "") +
+                      ": not this laser's as it is now (realigned, its temperature changed a lot?); the map's way")
+            return (yield from self.find(bands))
+        self.note(f"its model, fitted to this map: {agree:.0%} of its readings on the modes it says, its chip's modes "
+                  f"{pl.phi:+.2f} GHz from where its own map had them"
+                  + (f", where it lases {pl.slide:+.1f} GHz" if abs(pl.slide) >= 0.05 else "")
+                  + (f", its external modes {pl.drift:+.2f} GHz from where they were on target" if ref is not None
+                     and abs(pl.drift) >= 0.05 else ""))
+        lo_m, hi_m = self.mA(self.i_lo), self.mA(self.i_hi)
+        v_lo, v_hi = self.v_lo, self.v_hi
+        if self.model.v_span:  # (as far as its map went, and a little)
+            a, b = (x - self.model.v_set_to_act for x in self.model.v_span)
+            v_lo, v_hi = max(v_lo, a - self.MODEL_V), min(v_hi, b + self.MODEL_V)
+        ts = [pt.t for pt in points if math.isfinite(pt.t)]
+        step_s = _median([b - a for a, b in zip(ts, ts[1:]) if b > a]) if len(ts) > 2 else 0.2
+        avoid = []
+        for k in range(self.MODEL_TRIES):
+            args = (lo_m, hi_m, v_lo, v_hi, self.p.step, self.mA(self.nominal), self.V, step_s or 0.2, self.p.margin)
+            plan = (yield Think(lambda args=args, avoid=list(avoid): pl.plan(*args, avoid=avoid))) if v_lo <= v_hi \
+                else None
+            if plan is None:
+                self.note("its model: no way onto a mode on target within the window"
+                          + (" but those that did not hold" if avoid else self.model_why(pl)))
+                break
+            i_set = plan.i - self.act_offset - self.ff * (plan.v - self.V0)
+            which = ("a mode" if pl.right is None else "its right mode" if plan.order == pl.right else
+                     f"the external mode {plan.order - pl.right:+d} from its right one")
+            rec["plans"].append([round(plan.v, 3), round(plan.i, 3), plan.way, round(plan.ahead, 3),
+                                 round(plan.behind, 3), round(plan.share, 2), plan.order - (pl.right or 0)])
+            yield from self.ask(f"Its model: the piezo to {plan.v:.2f} V, then the current sweeping {plan.way} to "
+                                f"{plan.i:.2f} mA: {which} on target there, {plan.ahead:.2f} mA from a hop on the way "
+                                f"it comes, {plan.behind:.2f} mA back"
+                                + (f" (so in {plan.share:.0%} of the ways the readings allow it to be now)"
+                                   if plan.share < 1 else ""))
+            self.stage = f"by its model: {plan.v:.2f} V, sweeping {plan.way} to {plan.i:.2f} mA"
+            if abs(self.V - plan.v) > 1e-6:
+                yield from self.move(offset=plan.v, read=False)
+            yield from self.come_to(plan.up)
+            seg = pl.segment()
+            start, misses = (self.i_lo if plan.up else self.i_hi), 0
+            want = {round(i, 6): g for i, g in plan.path}
+            for i in _steps(start, i_set, self.p.step):
+                e = yield from self.move(current=i)
+                pl.observe(seg, self.t, self.mA(i), self.V, plan.up, e / 1e3)
+                g = want.get(round(self.mA(i), 6))
+                misses += g is not None and math.isfinite(e) and abs(e / 1e3 - g) > 0.35 * pl.m.ext.spacing
+            e = yield from self.steady()
+            if math.isfinite(e) and abs(e) < 0.3 * pl.m.ext.spacing * 1e3:
+                self.model_tuning(pl)
+                self.note(f"its model: on {which} at {self.mA(self.I):.2f} mA, {self.V:.2f} V, come to sweeping "
+                          f"{plan.way}: {e:+.0f} MHz from the target" + (f" ({misses} readings on the way not as it "
+                                                                          f"said)" if misses else ""))
+                loop = abs(self.model.ext.p_leg) * 1e3
+                if (yield from self.tune()) == "ok":
+                    seg = pl.segment()
+                    pl.observe(seg, self.t, self.mA(self.I), self.V, plan.up, self.e / 1e3)
+
+                    def seen(i, x, up, seg=seg):
+                        pl.observe(seg, self.t, self.mA(i), self.V, up, x / 1e3)
+
+                    if ((yield from self.check(max(self.MIN_MARGIN, min(self.p.margin, 0.8 * plan.margin)), loop,
+                                               seen))
+                            and (yield from self.mode_ok())):
+                        rec["done"] = k + 1
+                        return
+                self.note("its model: it does not hold there")
+            else:
+                self.note(f"its model: at {self.mA(self.I):.2f} mA it is {e:+.0f} MHz from the target, not on {which}")
+            avoid.append((plan.v, plan.i, plan.up))
+            agree = yield Think(pl.fit)
+            rec["refits"] = rec.get("refits", []) + [[round(pl.phi, 3), round(pl.slide, 2),
+                                                      None if agree is None else round(agree, 3)]]
+        self.note("its model did not bring it onto a mode on target: the map's way")
+        return (yield from self.find())
+
+    def model_why(self, pl) -> str:
+        """Why its model has no way onto the target, if it is where it lases (its window, as the model has it now)."""
+        lo, hi = (float(x) for x in pl._window(self.mA(self.I), self.V))
+        if not (math.isfinite(lo) and math.isfinite(hi)) or lo + 2.0 < 0.0 < hi - 2.0:
+            return " (none it can come to on target holds there)"
+        return (f" (where it lases is {lo:+.0f} … {hi:+.0f} GHz from the target here: the target at its edge or "
+                f"beyond, it moves {pl.m.w_v:+.2f} GHz/V with the piezo, {pl.m.w_i:+.2f} GHz/mA with the current, and "
+                f"with the diode's temperature)")
+
+    def model_tuning(self, pl):
+        """The model's tuning where the laser is (no measuring): the piezo's, the current's on a mode, the modes'
+        spacing."""
+        i, v = self.mA(self.I), self.V
+        self.kv, self.kv_known, self.kv_measured = pl.kv(i, v), True, True
+        self.slope = pl.slope(i, v)
+        self.spacing = pl.m.ext.spacing * 1e3
+        self.threshold = max(HOP_MIN, 0.4 * self.spacing)
 
     def go_home(self):
         """Before giving up: back to the current it began at, the way that gives the mode it was on
@@ -1303,7 +1465,7 @@ class Recenter(CavitySteps):
         points, sweeps, traces = [], [], []
 
         def at(i, e, leg, up):
-            points.append(Point(i, e, leg, up))
+            points.append(Point(i, e, leg, up, t=self.t))
             s = (yield from self.shg_sweep()) if self.shg_ok else None
             sweeps.append(s)
             traces.append(cavity.decimate(self._last_trace, 300) if s is not None else None)
@@ -1311,7 +1473,7 @@ class Recenter(CavitySteps):
         yield from at(lo, (yield from self.read()), 1, True)
         for leg, (a, b, up) in enumerate(((lo, hi, True), (hi, lo, False)), start=1):
             if leg == 2:  # the top reading starts the sweep down as well: the same laser, the same place
-                points.append(Point(hi, points[-1].e, 2, False))
+                points.append(Point(hi, points[-1].e, 2, False, t=points[-1].t))
                 sweeps.append(sweeps[-1])
                 traces.append(traces[-1])
             for i in _steps(a, b, step):
@@ -1331,6 +1493,7 @@ class Recenter(CavitySteps):
             for (ok, text), pt, _, y in examples:
                 self.record["sweeps"].append({"why": f"map {self.maps}", "i": round(self.mA(pt.i), 3), "ok": ok,
                                               "text": text, "y": y})
+        self.mapped = (v, points)
         res = analyse(points, step)
         modes, self.threshold, self.slope = res.modes, res.threshold, res.slope
         self.modes = modes
@@ -1526,17 +1689,23 @@ class Recenter(CavitySteps):
                 self.kv = self._kv_try = kv  # use it, but believe it once a second step agrees
         return "ok" if abs(self.e) <= self.tol() else "slow"
 
-    def check(self, m: float):
+    def check(self, m: float, loop: float = 0.0, seen=None):
         """Step the current by +-m around here: True if the frequency stays on one straight line
         and comes back (no hop within m), and with an SHG stage, single mode at both ends.
-        Finishes back on target."""
+        Finishes back on target. loop: MHz the mode is known to be off its line one way or the other as the
+        current comes (its model's: the chip lagging the current), not a hop. seen(set mA, MHz, up): each
+        reading, as it is made."""
         self.stage = "checking the margins"
         ic, ec = self.I, self.e
         lo, hi = max(ic - m, self.i_lo), min(ic + m, self.i_hi)
         xs, es, modes = [0.0], [ec], []
+        last = ic
         for i in (0.5 * (ic + hi), hi, ic, 0.5 * (ic + lo), lo, ic):
             es.append((yield from self.move(current=i)))
             xs.append(i - ic)
+            if seen is not None:
+                seen(i, es[-1], i > last)
+            last = i
             if self.shg_ok and i in (hi, lo) and i != ic:
                 s = yield from self.shg_sweep()
                 ok, text = self.judge(s) if s is not None else (None, "")
@@ -1551,7 +1720,7 @@ class Recenter(CavitySteps):
         sxx = sum((x - mx) ** 2 for x in xs)
         b = sum((x - mx) * (y - me) for x, y in zip(xs, es)) / sxx if sxx > 0 else 0.0
         worst = max(abs(y - me - b * (x - mx)) for x, y in zip(xs, es))
-        if worst > max(25.0, 6.0 * self.noise, 0.15 * abs(b) * m):
+        if worst > max(25.0, 6.0 * self.noise, 0.15 * abs(b) * m, 1.5 * loop):
             self.note(f"hop within {m:.2f} mA of {self.mA(ic):.2f} mA (off the line by {worst:.0f} MHz)")
             return False
         if modes:
@@ -3082,8 +3251,33 @@ class Runner:
                 return
             self.prompt = req.text
             self._waiting, self._since = "confirm", self.now
+        elif isinstance(req, Think):
+            think = getattr(self.io, "think", None)
+            if think is None:  # (here and now)
+                try:
+                    result = req.fn()
+                except Exception as exc:  # a bug: stop, and put things back
+                    log.exception("recovery")
+                    self._fail(f"internal error: {exc}")
+                    return
+                self._send(result)
+                return
+            self._token += 1
+            tok = self._token
+            self._waiting, self._since = "think", self.now
+            think(req.fn, lambda result: self._thought(tok, result), lambda exc: self._thought(tok, None, exc))
         else:
             self._fail(f"internal error: unknown request {req!r}")
+
+    def _thought(self, tok: int, result, exc: Exception | None = None):
+        """What a Think worked out, or how it failed (a bug: stop, and put things back)."""
+        if tok != self._token or self.state != "running" or self._waiting != "think":
+            return  # (stopped meanwhile)
+        self._waiting = None
+        if exc is not None:
+            self._fail(f"internal error: {exc}")
+        else:
+            self._send(result)
 
     def _ramp(self, target: float, pace: float = 0.0):
         """Current from where the last operation leaves it to target, STEP_MAX a write; with pace, a

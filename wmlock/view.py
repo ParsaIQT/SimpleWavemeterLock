@@ -257,10 +257,12 @@ def notes(e, n: int) -> str:
     if ch.hop.enabled:
         hop = ch.hop
         text += (f"\nmode-hop recovery on: {hop.i_nom - hop.i_below:.2f} … {hop.i_nom + hop.i_window:.2f} mA "
-                 f"(measured), by {hop.how()}"
+                 f"(measured), by {hop.how(model=ch.laser_model() is not None)}"
                  + (", takes over the DLC pro's cavity lock" if hop.cavity else "")
                  + (", checks the mode in the SHG cavity" if hop.shg else "")
                  + (", step by step" if hop.confirm else ""))
+    if getattr(ch, "model_note", ""):
+        text += f"\nits laser's model: {ch.model_note}"
     if ch.off:
         text += "\nits wavemeter channel is switched off ('Use' unticked in the WLM software)"
     if ch.note:
