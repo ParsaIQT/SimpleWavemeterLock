@@ -41,9 +41,10 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
 * **The WLM software restarted when it gets stuck** (on by default): an exception of its own and its
   readings freeze, or it closes by itself: closed (killed if it hangs), started again, measuring
   again, by itself (see *When the WLM software gets stuck*).
-* **ARTIQ** (on by default): every copy of the program answers ARTIQ's calls (sipyco) for every laser on
-  every PC: setpoints (to the digit), Lock, readings, *are these lasers okay?*, and their lock dropouts
-  over a stretch of time. No server of its own, nothing to install on the ARTIQ side (see *ARTIQ*).
+* **Calls from other programs** (sipyco's, as ARTIQ makes them; on by default): every copy of the
+  program answers them for every laser on every PC, from any Python program (`sipyco.pc_rpc.Client`)
+  or ARTIQ experiment: setpoints (to the digit), Lock, readings, *are these lasers okay?*, and their
+  lock dropouts over a stretch of time. No server of its own (see *ARTIQ*).
 * **Several wavemeters on one PC**: one copy of the program reads them all, each framed under its
   own name with its own channels, lasers and settings, told apart by their serial numbers (see
   *Several wavemeters on one PC*).
@@ -368,28 +369,37 @@ each in a frame of its own too, and adjust each.
 
 ## ARTIQ
 
-Every copy of the program answers ARTIQ's calls, for every laser it shows: its own PC's, and the
-other PCs' (*Several PCs*), whose own PC does what is asked, as if clicked there. There is no
-server of its own: put any one of the PCs in ARTIQ's `device_db.py`, best one that is always on:
+Every copy of the program answers calls from other programs, for every laser it shows: its own
+PC's, and the other PCs' (*Several PCs*), whose own PC does what is asked, as if clicked there. The
+calls are sipyco's, as ARTIQ makes them: call any PC running the program (best one that is always
+on) from any Python program, on any PC, with sipyco's client. It comes with ARTIQ; elsewhere
+`pip install git+https://github.com/m-labs/sipyco` (it is not on PyPI). There is no server of its own.
 
 ```python
-device_db["wavemeter"] = {"type": "controller", "host": "lab-pc-1", "port": 3280}
+from sipyco.pc_rpc import Client
+
+wm = Client("lab-pc-1", 3280)
+try:
+    wm.set_setpoint(398.91121)                  # the laser near 398.91121 nm: to exactly that
+    wm.wait("398.91XXX", mhz=1.0, timeout=10)   # until it is locked within 1 MHz of it
+    ok, why = wm.is_ok("399", "369", "935")     # before an oven run: (True, '') or (False, why)
+    obs = wm.observe("Mulungu")                 # its lock watched from now...
+    drops = wm.end_observe(obs)                 # ...until now: numpy array [[unix time, s], ...]
+finally:
+    wm.close_rpc()
 ```
 
-and call it from an experiment's host code (not a kernel):
+[examples/sipyco_client.py](examples/sipyco_client.py) has these as functions to copy: reading, a
+setpoint set and waited for, a scan, an oven run checked before and all through, a watchdog thread
+on a connection of its own, a measurement whose points taken while a laser was not locked are
+marked bad, what each refusal looks like, and the same from asyncio (`AsyncioClient`). A Client is
+one connection, for one thread at a time: another thread opens its own. With a timeout
+(`Client(host, port, timeout=60)`), make it longer than any `wait()` you call.
 
-```python
-self.setattr_device("wavemeter")
-self.wavemeter.set_setpoint(398.91121)                # the laser near 398.91121 nm: to exactly that
-self.wavemeter.wait("398.91XXX", mhz=1.0, timeout=10) # until it is locked within 1 MHz of it
-ok, why = self.wavemeter.is_ok("399", "369", "935")   # before an oven run: (True, '') or (False, why)
-obs = self.wavemeter.observe("Mulungu")               # its lock watched from now...
-drops = self.wavemeter.end_observe(obs)               # ...until now: numpy array [[unix time, s], ...]
-```
-
-[examples/artiq_wavemeter.py](examples/artiq_wavemeter.py) has three experiments to copy: an oven run
-cancelled (or stopped) when a laser is not fine, a scan whose points taken while a laser was not
-locked are marked bad, and a setpoint scan.
+From an ARTIQ experiment, the same through its `device_db`: `device_db["wavemeter"] = {"type":
+"controller", "host": "lab-pc-1", "port": 3280}`, then `self.setattr_device("wavemeter")` and
+`self.wavemeter.is_ok(...)` in its host code (not a kernel);
+[examples/artiq_wavemeter.py](examples/artiq_wavemeter.py) has three such experiments.
 
 | call | what it does |
 |---|---|
@@ -1842,11 +1852,12 @@ wmlock/engine.py     threads and state: source → lock → per-controller worke
 wmlock/meters.py     this PC's wavemeters, an engine each: found, settings kept, swapped, hidden
 wmlock/view.py       what a row shows (Qt-free): painted here, and sent to the other PCs
 wmlock/share.py      the other PCs: found, their rows shown, adjustments asked and done (UDP)
-wmlock/rpc.py        ARTIQ's calls (sipyco's pc_rpc, both encodings), for every laser on every PC
+wmlock/rpc.py        calls from other programs (sipyco's pc_rpc, both encodings), for every laser on every PC
 wmlock/observe.py    a laser's lock observed for ARTIQ: its dropouts and unlocks, as [unix time, s]
 wmlock/gui.py        Qt window
 wmlock/sim.py        simulated wavemeter, mode-hopping lasers (and TAs), fake DLC pros (demo and tests)
 server/server.py     optional HTTP server for the wavemeter PC
+examples/sipyco_client.py    calling it from any Python program (sipyco's Client): setpoints, okay?, dropouts...
 examples/artiq_wavemeter.py  ARTIQ experiments that call it: an oven run, a scan marked by dropouts, a setpoint scan
 ```
 
@@ -1886,8 +1897,8 @@ wavemeter framed under its name, adjusted from it, folded away. ARTIQ's calls ar
 sipyco's client as its source has it (the handshake, both encodings, its errors, numpy arrays; a
 call in pyon v1 never evaluated), against two copies of the program: setpoints set exactly here and
 on the other PC, lasers chosen by name, wavelength and channel (and two that fit refused), locks
-waited for, *okay?*, dropouts and unlocks observed here and there; with sipyco installed, its own
-client too. The WLM software stuck or gone is restarted against a stand-in for wlmData: asked to
+waited for, *okay?*, dropouts and unlocks observed here and there, each function of
+examples/sipyco_client.py doing what it says; with sipyco installed, its own client too. The WLM software stuck or gone is restarted against a stand-in for wlmData: asked to
 close, killed when it hangs, started again and measuring; never with no frequency shown, when
 someone stopped it, or when told not to; no more often than allowed, and given up. Lasers on an
 analog output are

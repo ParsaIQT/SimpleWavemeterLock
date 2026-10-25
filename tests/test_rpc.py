@@ -1,13 +1,18 @@
 """ARTIQ's calls (rpc.py): sipyco's pc_rpc as its client speaks it (written here from sipyco's source: pc_rpc.py,
 pyon_v1.py, pyon.py; both encodings), and the calls themselves, on two instances (share.py) talking over the loopback
 interface, the client calling one of them."""
+import asyncio
 import base64
+import importlib.util
 import json
 import math
 import socket
+import sys
 import time
+import types
 from collections import OrderedDict
 from fractions import Fraction
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -155,6 +160,13 @@ class SipycoClient:
     def close(self):
         self.f.close()  # (else the socket stays open while its reader does)
         self.sock.close()
+
+    close_rpc = close
+
+    def __getattr__(self, name):  # (as sipyco's client has its methods: wm.lasers() for call("lasers"))
+        if name.startswith("_") or name not in self.__dict__.get("methods", ()):
+            raise AttributeError(name)
+        return lambda *args, **kwargs: self.call(name, *args, **kwargs)
 
 
 def free_tcp_port() -> int:
@@ -535,3 +547,89 @@ def test_lock_dropouts_are_observed_too(quiet_demo):  # noqa: F811
         assert api.is_ok("#7") == (True, "")
     finally:
         e.stop()
+
+
+# ---------------------------------------------------------------- examples/sipyco_client.py, as it says
+def examples(monkeypatch):
+    """examples/sipyco_client.py, with sipyco.pc_rpc this test's (sipyco's protocol, as its source has it)."""
+    pc_rpc = types.ModuleType("sipyco.pc_rpc")
+    pc_rpc.Client = lambda host, port, target_name=None, timeout=None: SipycoClient(port)
+
+    class Async:
+        async def connect_rpc(self, host, port, target_name):
+            self.c = SipycoClient(port)
+
+        def __getattr__(self, name):
+            async def call(*args, **kwargs):
+                return self.__dict__["c"].call(name, *args, **kwargs)
+
+            return call
+
+        async def close_rpc(self):
+            self.c.close()
+
+    pc_rpc.AsyncioClient, pc_rpc.AutoTarget = Async, object()
+    pkg = types.ModuleType("sipyco")
+    pkg.pc_rpc = pc_rpc
+    monkeypatch.setitem(sys.modules, "sipyco", pkg)
+    monkeypatch.setitem(sys.modules, "sipyco.pc_rpc", pc_rpc)
+    spec = importlib.util.spec_from_file_location(
+        "sipyco_client_example", Path(__file__).resolve().parents[1] / "examples" / "sipyco_client.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_sipyco_examples_do_what_they_say(lab, monkeypatch, capsys):
+    a, b, c = lab
+    ex = examples(monkeypatch)
+    where = dict(host="127.0.0.1", port=c.sock.getpeername()[1])
+    ex.take_point = lambda i: time.sleep(0.02)
+    for pc in (a, b):
+        pc.engine.link(1, pc.demo.dlcs[0].key, 1)
+        pc.engine.set_setpoint(1, 396.95912)
+        pc.engine.engage(1)
+    assert wait_for(lambda: a.engine.channels[1].state == b.engine.channels[1].state == "on", 10)
+    ex.show_lasers(**where)
+    out = capsys.readouterr().out
+    assert "Lab A#1   397          396.959" in out and "set 396.959120" in out and "locked" in out
+    assert "Lab B#2   866" in out and "no setpoint" in out
+    ex.read("Lab A#1", **where)
+    assert capsys.readouterr().out.startswith("Lab A#1: 396.95")
+    ex.go_to(396.95913, "Lab B#1", **where)
+    assert b.engine.channels[1].setpoint_nm == 396.95913
+    assert "397: 396.95912 -> 396.95913 nm, locked" in capsys.readouterr().out
+    ex.scan("Lab A#1", 396.95910, 396.95914, 3, **where)
+    assert a.engine.channels[1].setpoint_nm == 396.95912  # (put back...
+    assert not c.call("is_ok", "Lab A#1")[0]  # ...38 MHz from where the scan left it: not okay until it is there)
+    c.call("wait", "Lab A#1", 1.0, 10.0)
+    assert ex.oven_run(["Lab A#1", "Lab B#1"], seconds=1.2, **where) is True
+    assert ex.oven_run(["Lab A#1", "Lab A#2"], seconds=1.0, **where) is False
+    assert "oven run cancelled: ‘866’: not locked" in capsys.readouterr().out
+    dog = ex.Watchdog(["Lab A#1", "Lab B#1"], every=0.1, **where)
+    dog.start()
+    time.sleep(0.4)
+    assert not dog.bad.is_set()
+    b.engine.disengage(1)
+    assert dog.bad.wait(3) and dog.why == "‘397’: not locked"
+    dog.stop()
+    b.engine.engage(1)
+    assert wait_for(lambda: b.engine.channels[1].state == "on", 5)
+
+    def point(i):  # (the laser unlocked for points 5 to 9)
+        if i == 5:
+            b.engine.disengage(1)
+        elif i == 10:
+            b.engine.engage(1)
+            assert wait_for(lambda: b.engine.channels[1].state == "on", 5)
+        time.sleep(0.05)
+
+    ex.take_point = point
+    drops, bad = ex.measure_with_dropouts("Lab B#1", points=15, **where)
+    assert drops.shape == (1, 2) and bad[0] in (4, 5) and bad[-1] in (10, 11) and len(bad) >= 5
+    assert "points marked bad" in capsys.readouterr().out
+    ex.careful("Lab A#1", **where)
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].startswith("no laser 'nope'") and "GHz from ‘397’'s setpoint" in out[1]
+    asyncio.run(ex.in_asyncio(**where))
+    assert capsys.readouterr().out.startswith("False ")  # (no laser '399' there: not okay, and why)
