@@ -8,12 +8,11 @@ version = "0.1.0"
 description = "Minimal, fast wavemeter lock for TOPTICA DLC pro lasers"
 readme = "README.md"
 requires-python = ">=3.8"
-dependencies = ["PySide6>=6.4", "ifaddr>=0.2", "numpy", "scipy>=1.9"]
+dependencies = ["PySide6>=6.4", "ifaddr>=0.2", "numpy", "scipy>=1.9", "numba"]
 
 [project.optional-dependencies]
 server = ["fastapi", "uvicorn"]
 dac = ["mcculw"]  # lasers on a Measurement Computing analog output board (Windows, with InstaCal)
-fast = ["numba"]  # the laser's model fitted, and parked by, ten times as fast (wmlock/compiled.py)
 test = ["pytest", "fastapi", "httpx"]
 
 [project.gui-scripts]

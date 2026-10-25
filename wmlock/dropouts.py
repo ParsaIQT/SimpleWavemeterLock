@@ -84,6 +84,10 @@ class Detector:
         """The data stops here for a while (or is not to be looked at): a run going on ends here."""
         return self._close(dt)
 
+    def going(self):
+        """The first sample of the run going on (a dropout, perhaps, still to end), None if none."""
+        return self._run[0] if self._run is not None else None
+
     def _close(self, dt: float) -> list:
         r, self._run, self._high = self._run, None, 0
         if r is None:
@@ -129,6 +133,8 @@ class Monitor(threading.Thread):
         self.resolution = 0.0   # s between samples
         self.covered = 0.0      # s of samples looked at while the lock should hold
         self.held = 0.0         # s the lock should have held
+        self.seen = 0.0         # time.time(): its dropouts until then are reported (or were not to be looked for)...
+        self.open_since = None  # ...but one that began then (time.time()) and goes on (None: none goes on)
         self.saved = {}         # the recorder's settings as found (put back at the end)
         self._mono = time.monotonic()
         self._summary_at = self._mono + self.SUMMARY_S
@@ -157,6 +163,7 @@ class Monitor(threading.Thread):
             self._tick()
             if self.status()[0]:
                 return True
+            self.seen, self.open_since = time.time(), None  # (nothing to look for meanwhile)
             if not stopped:
                 stopped = True
                 try:
@@ -313,6 +320,7 @@ class Monitor(threading.Thread):
                 break
             if not self.status()[0]:  # (a recovery begins, say: its data acquisition is wanted)
                 c.set(p("enabled"), False)
+                self.seen, self.open_since = time.time(), None
                 return None
             count = min(self._count(), size)
             now = time.monotonic()  # (the samples it had then)
@@ -347,6 +355,8 @@ class Monitor(threading.Thread):
                         for i0, span, low in detector.feed(read, dt, values, limit):
                             self.report(Dropout(t_wall + i0 * dt, span * dt, low, limit, "recorder", dt))
                     read += len(values)
+                    run = detector.going()
+                    self.seen, self.open_since = t_wall + read * dt, t_wall + run * dt if run is not None else None
             # the next look: READ_S on, or as it should be full, whichever comes first
             end = t0 + size * (self.resolution or self.dt)
             wait = max(min(self.READ_S, end + 0.02 - time.monotonic()), 0.2)
@@ -448,6 +458,7 @@ class Monitor(threading.Thread):
                 detector.gap(period)
                 self._tick()
                 last = None
+                self.seen, self.open_since = time.time(), None
                 self._sleep(0.5)
                 continue
             t, mono = time.time(), time.monotonic()
@@ -468,6 +479,8 @@ class Monitor(threading.Thread):
                 for first, span, low in detector.feed(i, dt, [v], limit):
                     began = next((tt for k, tt in times if k == first), t)
                     self.report(Dropout(began, span * dt, low, limit, "polling", dt))
+            run = detector.going()
+            self.seen, self.open_since = t, next((tt for k, tt in times if k == run), t) if run is not None else None
             wait = period - (time.monotonic() - mono)
             if wait > 0:
                 self._stop_ev.wait(wait)

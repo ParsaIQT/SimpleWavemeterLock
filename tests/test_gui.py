@@ -113,6 +113,37 @@ def test_window_shows_channels_and_links_from_menu(app, demo):
         spin(app, 0.1)
 
 
+def test_a_stuck_wlm_restarted_is_said_and_can_be_left_alone(app):
+    from wmlock.sim import Demo, SimWavemeter
+
+    demo = Demo(discovery_port=0, wavemeter=SimWavemeter(noise=0.05), exposure=0.01)
+    e = Engine({"wlm_restart": False}, demo.make_source, discovery_targets=["127.0.0.1"])
+    assert e.source.restart is False  # (as its settings say)
+    win = gui.MainWindow(e, lambda: None)
+    e.start()
+    win.show()
+    try:
+        assert wait_for(lambda: (app.processEvents(), 1 in win.rows)[1], 3)
+        win.show_menu(win.rect().center())
+        tick = next(a for a in win._menu.actions() if a.text() == "Restart the WLM software if it gets stuck")
+        assert tick.isCheckable() and not tick.isChecked()
+        tick.trigger()  # (on)
+        win._menu.close()
+        assert e.source.restart and e.config["wlm_restart"] is True and e.to_config()["wlm_restart"] is True
+        e.source.STALL_S, e.source.RESTART_S = 0.5, 0.3
+        win.show_menu(win.rect().center())
+        sim = next(a.menu() for a in win._menu.actions() if a.text() == "Simulate a fault")
+        next(a for a in sim.actions() if a.text().startswith("WLM software stuck")).trigger()
+        win._menu.close()
+        assert wait_for(lambda: (app.processEvents(), bool(e.source.restarted))[1], 5)
+        spin(app, 0.6)  # (the status bar, twice a second)
+        assert "   ⟲ WLM " in win.st_wlm.text() and win.st_wlm.toolTip().startswith("the WLM software restarted")
+    finally:
+        win.close()
+        spin(app, 0.1)
+        demo.close()
+
+
 def test_reference_row(app):
     from wmlock.sim import Demo, SimWavemeter
 
@@ -601,6 +632,26 @@ def test_network_dialog_round_trip(app):
     assert d.values()["label"] == "" and d.label.placeholderText() == socket.gethostname()  # (its default name)
     d.peers.setText("a; b ,c")
     assert d.values()["peers"] == ["a", "b", "c"]
+
+
+def test_network_dialog_says_and_sets_how_artiq_calls(app):
+    from wmlock.rpc import Api, Server
+    from wmlock.share import Share
+
+    e = Engine({}, lambda sink: None)
+    settings = {"label": "Lab 2", "artiq_from": ["artiq-master"]}
+    share = Share(e, settings)
+    api = Server(Api(lambda: []), settings)
+    d = gui.ShareDialog(None, share, api=api)
+    v = d.values()
+    assert v["artiq"] is True and v["artiq_port"] == 3280 and v["artiq_from"] == ["artiq-master"]
+    assert "ARTIQ's calls: answered on nothing yet" in d.found.text()  # (not started)
+    d.artiq.setChecked(False)
+    d.artiq_port.setValue(4000)
+    d.artiq_from.setText("10.0.0.5; artiq-master")
+    assert {k: d.values()[k] for k in ("artiq", "artiq_port", "artiq_from")} == {
+        "artiq": False, "artiq_port": 4000, "artiq_from": ["10.0.0.5", "artiq-master"]}
+    assert not hasattr(gui.ShareDialog(None, share), "artiq")  # (no server: no such settings)
 
 
 def test_a_pc_without_a_wavemeter_shows_the_others(app):

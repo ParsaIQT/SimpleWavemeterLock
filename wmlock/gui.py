@@ -2591,11 +2591,12 @@ class ReferenceDialog(QtWidgets.QDialog):
 
 
 class ShareDialog(QtWidgets.QDialog):
-    """Network: this PC's wavemeter shared with the other PCs on the LAN, theirs shown here (share.py)."""
+    """Network: this PC's wavemeter shared with the other PCs on the LAN, theirs shown here (share.py); ARTIQ's calls
+    answered (rpc.py)."""
 
-    def __init__(self, parent, share, title: str = "Network"):
+    def __init__(self, parent, share, title: str = "Network", api=None):
         super().__init__(parent)
-        self.share = share
+        self.share, self.api = share, api
         self.setWindowTitle(title)
         s = share.settings
         form = QtWidgets.QFormLayout(self)
@@ -2630,6 +2631,18 @@ class ShareDialog(QtWidgets.QDialog):
         self.port.setRange(1024, 65535)
         self.port.setValue(share.port)
         form.addRow("Port", row(self.port, "UDP, the same on every PC"))
+        if api is not None:
+            self.artiq = QtWidgets.QCheckBox("Answer ARTIQ's calls (sipyco) for every laser shown here: setpoints, "
+                                             "Lock, Unlock, readings, okay?, dropouts")
+            self.artiq.setChecked(api.on)
+            form.addRow(self.artiq)
+            self.artiq_port = QtWidgets.QSpinBox()
+            self.artiq_port.setRange(1024, 65535)
+            self.artiq_port.setValue(api.port)
+            form.addRow("ARTIQ port", row(self.artiq_port, "TCP: the device_db's port (its host: this PC)"))
+            self.artiq_from = QtWidgets.QLineEdit(", ".join(s.get("artiq_from") or []))
+            self.artiq_from.setPlaceholderText("any PC")
+            form.addRow("ARTIQ from", row(self.artiq_from, "only these PCs may call (names or addresses)"))
         self.found = Text("", "dim")
         self.found.setWordWrap(True)
         self.found.setMinimumWidth(520)
@@ -2655,13 +2668,20 @@ class ShareDialog(QtWidgets.QDialog):
         if share.port_note:
             lines.append(share.port_note)
         lines.append(f"traffic: {share.rate_out / 1e3:.1f} kB/s out, {share.rate_in / 1e3:.1f} kB/s in")
+        if self.api is not None:
+            lines.append(self.api.detail())
         self.found.paint("\n".join(lines), "dim")
 
     def values(self) -> dict:
-        return {"on": self.on.isChecked(), "label": self.label.text().strip(), "control": self.control.isChecked(),
-                "group": self.group.text().strip(), "key": self.key.text(),
-                "peers": [a.strip() for a in self.peers.text().replace(";", ",").split(",") if a.strip()],
-                "port": self.port.value()}
+        out = {"on": self.on.isChecked(), "label": self.label.text().strip(), "control": self.control.isChecked(),
+               "group": self.group.text().strip(), "key": self.key.text(),
+               "peers": [a.strip() for a in self.peers.text().replace(";", ",").split(",") if a.strip()],
+               "port": self.port.value()}
+        if self.api is not None:
+            out.update({"artiq": self.artiq.isChecked(), "artiq_port": self.artiq_port.value(),
+                        "artiq_from": [a.strip() for a in self.artiq_from.text().replace(";", ",").split(",")
+                                       if a.strip()]})
+        return out
 
 
 class Scroll(QtWidgets.QScrollArea):
@@ -2695,12 +2715,12 @@ class Scroll(QtWidgets.QScrollArea):
 
 
 class MainWindow(QtWidgets.QWidget):
-    def __init__(self, engine: Engine, save, share=None, meters=None):
+    def __init__(self, engine: Engine, save, share=None, meters=None, api=None):
         """share: a share.Share, to show the other PCs' wavemeters too (None: this PC's alone); meters: this PC's
         wavemeters (meters.Meters, the first of them engine's and share's), each framed under its name (None:
-        engine's alone)."""
+        engine's alone); api: what answers ARTIQ's calls (rpc.Server), None: nothing."""
         super().__init__()
-        self.engine, self.save, self.share, self.meters = engine, save, share, meters
+        self.engine, self.save, self.share, self.meters, self.api = engine, save, share, meters, api
         self.gui = engine.config.setdefault("gui", {})
         self.digits = int(self.gui.get("digits", 9))
         self.setWindowTitle("Wavemeter Lock")
@@ -2731,11 +2751,13 @@ class MainWindow(QtWidgets.QWidget):
         self.st_wlm = Text("", "dim")
         self.st_ref = Text("", "dim")
         self.st_net = Text("", "dim")
+        self.st_api = Text("", "dim")
         self.st_lan = Text("", "dim")
         status.addWidget(self.st_wlm)
         status.addWidget(self.st_ref)
         status.addStretch(1)
         status.addWidget(self.st_net)
+        status.addWidget(self.st_api)
         status.addWidget(self.st_lan)
         v.addLayout(status)
 
@@ -2836,19 +2858,27 @@ class MainWindow(QtWidgets.QWidget):
             worst = next((c for c in ("err", "warn") if c in colors), colors[0])
             self.st_ref.paint("    ".join(texts), worst)
         e = self.engine
+        restarted = [(panel, panel.engine.source) for panel in self.locals
+                     if getattr(panel.engine.source, "restarted", "")
+                     and time.time() - panel.engine.source.restarted_t < 3600.0]
+        note = ""  # (the WLM software stuck or gone, restarted: said for an hour)
+        if restarted:
+            note = "   ⟲ WLM " + time.strftime("%H:%M", time.localtime(max(src.restarted_t for _, src in restarted)))
+        self.st_wlm.setToolTip("\n".join((f"{panel.label}: " if self.several else "") + src.restarted
+                                         for panel, src in restarted))
         if self.several:
             ok = sum(1 for panel in self.locals if panel.engine.source_ok)
             rows = sum(len(panel.row_list) for panel in self.locals)
             rate = sum(panel.engine.rate for panel in self.locals)
-            self.st_wlm.paint(f"● {len(self.locals)} wavemeters   {rows} ch   {rate:.0f} readings/s",
+            self.st_wlm.paint(f"● {len(self.locals)} wavemeters   {rows} ch   {rate:.0f} readings/s{note}",
                               "dim" if ok == len(self.locals) else "err")
         elif getattr(e.source, "viewer", False):
             self.st_wlm.paint("no wavemeter on this PC", "dim")
         elif e.source_ok:
             label = getattr(e.source, "name", "") or getattr(e.source, "label", "")
-            self.st_wlm.paint(f"● {label}   {len(self.row_list)} ch   {e.rate:.0f} readings/s", "dim")
+            self.st_wlm.paint(f"● {label}   {len(self.row_list)} ch   {e.rate:.0f} readings/s{note}", "dim")
         else:
-            self.st_wlm.paint(f"● {e.source_msg}", "err")
+            self.st_wlm.paint(f"● {e.source_msg}{note}", "err")
         for panel in self.locals:
             if panel.framed:
                 panel.paint_header(self.several)
@@ -2859,6 +2889,9 @@ class MainWindow(QtWidgets.QWidget):
             self.st_lan.paint(f"{n} controller{'s' if n != 1 else ''} on LAN", "dim")
         if self.share is not None:
             self._slow_share(now)
+        if self.api is not None:
+            self.st_api.paint(self.api.summary(), "err" if self.api.error else "dim")
+            self.st_api.setToolTip(self.api.detail() + "\n(right-click › Network…)")
         for row in self.all_rows():
             row.update_tooltip()
         dirty = any(panel.engine.dirty for panel in self.locals) or (self.meters is not None and self.meters.dirty)
@@ -3043,12 +3076,16 @@ class MainWindow(QtWidgets.QWidget):
         share = share or self.share
         if share is None:
             return
-        d = ShareDialog(self, share, f"Network · {share.label}" if self.several else "Network")
+        d = ShareDialog(self, share, f"Network · {share.label}" if self.several else "Network", self.api)
         if d.exec():
+            artiq = [share.settings.get(k) for k in ("artiq", "artiq_port", "artiq_from", "lan")]
             share.settings.update(d.values())
             for panel in self.locals:  # (the network's settings are all of theirs)
                 if panel.meter.share is not None:
                     panel.meter.share.configure()
+            if self.api is not None and artiq != [share.settings.get(k) for k in ("artiq", "artiq_port", "artiq_from",
+                                                                                  "lan")]:
+                self.api.start()  # (anew, as they say now)
             self.engine.dirty = True
 
     def _save(self):
@@ -3081,6 +3118,14 @@ class MainWindow(QtWidgets.QWidget):
             sub = m.addMenu("Show wavemeter")
             for serial, name in self.meters.hidden():
                 sub.addAction(name, functools.partial(self.show_meter, serial))
+        restartable = [panel.engine for panel in self.locals if getattr(panel.engine.source, "restartable", False)]
+        if restartable:
+            a = m.addAction("Restart the WLM software if it gets stuck")
+            a.setCheckable(True)
+            a.setChecked(all(e.source.restart for e in restartable))
+            a.setToolTip("No new reading for 30 s while it shows one, or closed by itself: closed (killed if it hangs) "
+                         "and started again, at most every 10 minutes")
+            a.toggled.connect(lambda on: [e.set_wlm_restart(on) for e in restartable])
         a = m.addAction("Always on top")
         a.setCheckable(True)
         a.setChecked(bool(self.gui.get("on_top")))
@@ -3103,6 +3148,8 @@ class MainWindow(QtWidgets.QWidget):
                 sim.addSeparator()
                 if self.several:
                     sim.addAction(panel.label).setEnabled(False)
+                sim.addAction("WLM software stuck (an exception of its own): its readings frozen",
+                              panel.engine.source.stall)
                 self._sim_laser_actions(sim, panel.engine)
         self._menu = m
         m.popup(self.mapToGlobal(pos))
@@ -3220,6 +3267,8 @@ class MainWindow(QtWidgets.QWidget):
     def closeEvent(self, ev):
         self.timer.stop()
         self._save()
+        if self.api is not None:  # (first: no calls from ARTIQ while it closes)
+            self.api.stop()
         if self.meters is not None:
             self.meters.stop()
         else:
@@ -3242,13 +3291,13 @@ def refuse(title: str, text: str) -> int:
     return 1
 
 
-def run(engine: Engine, save, share=None, meters=None) -> int:
+def run(engine: Engine, save, share=None, meters=None, api=None) -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
     app.setApplicationName("Wavemeter Lock")
     app.setStyle("Fusion")
     app.setPalette(dark_palette())
     app.setStyleSheet(QSS)
-    win = MainWindow(engine, save, share, meters)
+    win = MainWindow(engine, save, share, meters, api)
     for sig in (signal.SIGINT, signal.SIGTERM):  # Ctrl+C / kill: close cleanly, settings saved
         signal.signal(sig, lambda *_: win.close())
     if meters is not None:
@@ -3257,6 +3306,8 @@ def run(engine: Engine, save, share=None, meters=None) -> int:
         engine.start()
         if share is not None:
             share.start()
+    if api is not None:
+        api.start()
     win.show()
     code = app.exec()
     win.deleteLater()  # the window gone before the interpreter takes Qt down (else PySide6 may crash on exit)

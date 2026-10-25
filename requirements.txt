@@ -3,4 +3,4 @@ ifaddr>=0.2   # optional: broadcast discovery on every network adapter
 # mcculw     # optional: lasers on a Measurement Computing analog output board (Windows, InstaCal)
 numpy         # the laser's model, fitted to its maps (lasermodel.py)
 scipy>=1.9
-# numba      # optional: the laser's model fitted, and parked by, ten times as fast (pip install numba)
+numba         # the laser's model fitted, and parked by, ten times as fast (compiled.py)

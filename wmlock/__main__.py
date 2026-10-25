@@ -7,6 +7,7 @@ import zlib
 from pathlib import Path
 
 from . import config as cfgfile
+from . import rpc
 from .engine import DAC_LOCK, Engine
 from .lock import LockParams
 from .meters import Meter, Meters
@@ -56,6 +57,7 @@ def main(argv=None) -> int:
     logging.getLogger("wmlock.dropouts").setLevel(logging.INFO)  # (its hourly summaries too)
     logging.getLogger("wmlock.share").setLevel(logging.INFO)  # (the other PCs found, their adjustments here)
     logging.getLogger("wmlock.meters").setLevel(logging.INFO)  # (this PC's wavemeters, which settings are whose)
+    logging.getLogger("wmlock.rpc").setLevel(logging.INFO)  # (what ARTIQ's calls adjust)
 
     path = args.config or cfgfile.default_path(args.sim)
     held = cfgfile.FileLock(cfgfile.lock_path(path))  # one copy of the program at a time with these settings
@@ -147,10 +149,11 @@ def main(argv=None) -> int:
                               subscribe=False))
 
     meters = Meters(config, Meter(engine, share), backend, make)
+    api = rpc.Server(rpc.Api(lambda: list(meters.items), share), shared, rpc.SIM_PORT if args.sim else rpc.PORT)
     try:
         from .gui import run
 
-        return run(engine, lambda: cfgfile.save(path, meters.to_config()), share, meters)
+        return run(engine, lambda: cfgfile.save(path, meters.to_config()), share, meters, api)
     finally:
         if demo:
             demo.close()

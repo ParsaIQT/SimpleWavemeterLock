@@ -2,6 +2,7 @@ import base64
 import ctypes
 import importlib
 import json
+import logging
 import math
 import sys
 import threading
@@ -858,3 +859,221 @@ def test_server_says_a_channel_in_detail(monkeypatch):
             assert lib.exported[0] is False and server.EXPORT == {}
     finally:
         sys.modules.pop("server", None)
+
+
+# ----------------------------------------------------------------- the WLM software stuck or gone: restarted
+class WlmApp(FakeLib):
+    """wlmData with the WLM software behind it, which may get stuck (frozen readings), hang (ask it to close and it
+    does not), close, and be started again (not measuring at first)."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.live = True        # measuring: each reading new
+        self.measuring = 2      # GetOperationState: 2 measuring, 0 stopped
+        self.hung = False       # asked to close, it does not
+        self.calls = []         # ControlWLM(Ex) and Operation, in order
+        self.k = 0
+
+    def GetFrequencyNum(self, ch, _):
+        v = super().GetFrequencyNum(ch, _)
+        if self.live and v > 0 and self.running:
+            self.k += 1
+            v += self.k * 1e-9
+        return v
+
+    def GetOperationState(self, _):
+        return self.measuring
+
+    def Operation(self, op):
+        self.calls.append(("Operation", op))
+        self.measuring = op
+        return 0
+
+    def ControlWLM(self, action, app, ver):
+        self.calls.append(("ControlWLM", action, ver))
+        if action == wavemeter.C_CTRL_EXIT and not self.hung:
+            self.running = 0
+        return 0
+
+    def ControlWLMEx(self, action, app, ver, delay, res):
+        self.calls.append(("ControlWLMEx", action, ver))
+        threading.Timer(0.3, self._started).start()  # (it takes a moment)
+        return 0
+
+    def _started(self):
+        self.running, self.measuring, self.hung = 1, 0, False
+
+
+def restartable(lib, **attrs):
+    w = fake_wlm(lib)
+    w.has |= {"GetOperationState", "Operation", "ControlWLM", "ControlWLMEx"}
+    sink = Sink()
+    hub = wavemeter.WlmHub()
+    hub.wlm = w
+    src = DllSource(sink, interval=0.002, hub=hub)
+    for k, v in {**dict(CHECK_S=0.05, STALL_S=0.5, GONE_S=0.4, RESTART_GAP_S=0.0, EXIT_S=1.0, START_S=3.0),
+                 **attrs}.items():
+        setattr(src, k, v)
+    return src, sink
+
+
+def test_a_stuck_wlm_is_restarted_and_measures_again(caplog):
+    lib = WlmApp()
+    src, sink = restartable(lib)
+    src.start()
+    try:
+        assert wait_for(lambda: len(sink.readings) > 20, 2)
+        time.sleep(0.8)
+        assert not lib.calls  # (new readings: fine)
+        lib.live = False  # stuck: an exception of its own, its dialog waiting for a click
+        with caplog.at_level(logging.WARNING, logger="wmlock.wavemeter"):
+            assert wait_for(lambda: ("ControlWLMEx", 0x61, 0) in lib.calls, 3)
+            assert lib.calls[0] == ("ControlWLM", wavemeter.C_CTRL_EXIT, 0)  # asked to close, then started again
+            lib.live = True
+            assert wait_for(lambda: ("Operation", 2) in lib.calls and src.restarted, 4)  # and its measurement
+        assert src.restarted.startswith("the WLM software restarted (it was stuck (no new reading for 1 s, its "
+                                        "last ones frozen)) (")
+        assert any(not ok and msg == "restarting the WLM software: it was stuck (no new reading for 1 s, its last "
+                   "ones frozen)" for ok, msg in sink.states) and sink.states[-1] == (True, "")
+        n = len(sink.readings)
+        assert wait_for(lambda: len(sink.readings) > n + 20, 2)  # (readings again)
+        time.sleep(1.0)
+        assert sum(c[0] == "ControlWLMEx" for c in lib.calls) == 1  # (once: STALL_S anew after it)
+        said = [r.getMessage() for r in caplog.records]
+        assert "wlmData.dll: the WLM software is stuck (no new reading for 1 s, its last ones frozen): restarting " \
+            "it" in said
+        assert any("the WLM software restarted" in m for m in said)
+    finally:
+        src.stop()
+
+
+def test_a_wlm_that_will_not_close_is_killed(monkeypatch):
+    lib = WlmApp()
+    killed = []
+    monkeypatch.setattr(wavemeter, "wlm_processes", lambda serial: [(4242, r"C:\HighFinesse\Wavelength Meter WS7 "
+                                                                             r"1234\wlm_ws7.exe")])
+
+    def kill(pid):
+        killed.append(pid)
+        lib.running = 0
+        return True
+
+    monkeypatch.setattr(wavemeter, "kill_process", kill)
+    src, sink = restartable(lib, EXIT_S=0.5)
+    src.start()
+    try:
+        assert wait_for(lambda: len(sink.readings) > 5, 2)
+        lib.live, lib.hung = False, True
+        assert wait_for(lambda: killed == [4242] and ("ControlWLMEx", 0x61, 0) in lib.calls, 4)
+        lib.live = True
+        assert wait_for(lambda: src.restarted.startswith("the WLM software restarted"), 4)
+    finally:
+        src.stop()
+
+
+def test_no_restart_without_a_frozen_frequency_when_stopped_or_told_not_to():
+    for case in ("dark", "stopped", "off"):
+        lib = WlmApp()
+        src, sink = restartable(lib)
+        if case == "dark":  # no light on any channel: error codes, unchanged, are not stuck
+            lib.freqs = {1: -3.0, 2: -3.0, 4: 0.0}
+        elif case == "stopped":  # someone stopped its measurement
+            lib.measuring = 0
+        else:
+            src.restart = False
+        lib.live = False
+        src.start()
+        try:
+            assert wait_for(lambda: sink.states and sink.states[-1] == (True, ""), 2)
+            time.sleep(1.2)
+            assert lib.calls == [] and src.restarted == "", case
+        finally:
+            src.stop()
+
+
+def test_restarts_that_bring_no_readings_back_are_given_up(caplog):
+    lib = WlmApp()
+    src, sink = restartable(lib, GIVE_UP=2)
+    src.start()
+    try:
+        assert wait_for(lambda: len(sink.readings) > 5, 2)
+        lib.live = False  # (and it never measures again)
+        with caplog.at_level(logging.ERROR, logger="wmlock.wavemeter"):
+            assert wait_for(lambda: sum(c[0] == "ControlWLMEx" for c in lib.calls) == 2, 6)
+            assert wait_for(lambda: any("brought no readings back" in r.getMessage() for r in caplog.records), 5)
+            time.sleep(1.0)
+        assert sum(c[0] == "ControlWLMEx" for c in lib.calls) == 2  # (given up)
+        said = [r.getMessage() for r in caplog.records if "brought no readings back" in r.getMessage()]
+        assert len(said) == 1 and said[0].startswith("wlmData.dll: the WLM software is stuck (no new reading for")
+        assert said[0].endswith("but 2 restarts in a row brought no readings back: not restarted again until "
+                                "readings come")
+        lib.live = True  # readings again: a stuck one would be restarted again
+        assert wait_for(lambda: src._restarts == 0, 2)
+    finally:
+        src.stop()
+    src2, sink2 = restartable(WlmApp(), RESTART_GAP_S=60.0)
+    lib2 = src2.hub.wlm.lib
+    src2.start()
+    try:
+        assert wait_for(lambda: len(sink2.readings) > 5, 2)
+        lib2.live = False
+        assert wait_for(lambda: sum(c[0] == "ControlWLMEx" for c in lib2.calls) == 1, 4)
+        time.sleep(1.5)
+        assert sum(c[0] == "ControlWLMEx" for c in lib2.calls) == 1  # (one in RESTART_GAP_S at most)
+    finally:
+        src2.stop()
+
+
+def test_a_wlm_gone_is_started_again_but_never_one_never_seen():
+    lib = WlmApp()
+    src, sink = restartable(lib)
+    src.start()
+    try:
+        assert wait_for(lambda: len(sink.readings) > 5, 2)
+        lib.running = 0  # (it crashed, or was closed)
+        assert wait_for(lambda: ("ControlWLMEx", 0x61, 0) in lib.calls, 3)
+        assert not any(c[0] == "ControlWLM" for c in lib.calls)  # (nothing to close)
+        assert wait_for(lambda: src.restarted.startswith("the WLM software restarted (it was gone (not running "
+                                                         "for"), 4)
+        assert wait_for(lambda: sink.states[-1] == (True, ""), 2)
+    finally:
+        src.stop()
+    lib = WlmApp()
+    lib.running = 0  # (not running when this program starts: left as it is)
+    src, sink = restartable(lib)
+    src.start()
+    try:
+        assert wait_for(lambda: sink.states and sink.states[-1] == (False, "wlmServer is not running"), 2)
+        time.sleep(1.0)
+        assert lib.calls == []
+    finally:
+        src.stop()
+
+
+def test_the_wlm_software_of_that_wavemeter_is_the_one_killed():
+    procs = [(1, r"C:\Program Files\HighFinesse\Wavelength Meter WS7 1234\wlm_ws7.exe"),
+             (2, r"C:\Program Files\HighFinesse\Wavelength Meter WS6 5678\wlm_ws.exe")]
+    assert wavemeter.wavemeters_own(procs, 5678) == [procs[1]]
+    assert wavemeter.wavemeters_own(procs, 234) == []  # (not part of another number; of two, neither says: neither)
+    assert wavemeter.wavemeters_own(procs, None) == [] and wavemeter.wavemeters_own(procs[:1], 99) == procs[:1]
+    assert wavemeter.wlm_processes(1234) == [] or sys.platform == "win32"
+
+
+def test_the_simulated_wlm_restarts_when_stuck():
+    from wmlock.sim import Demo
+
+    demo = Demo(discovery_port=0)
+    sink = Sink()
+    src = demo.make_source(sink)
+    src.STALL_S, src.RESTART_S = 0.5, 0.3
+    src.start()
+    try:
+        assert wait_for(lambda: len(sink.readings) > 10, 3)
+        src.stall()
+        assert wait_for(lambda: src.restarted.startswith("the WLM software restarted (it was stuck"), 4)
+        assert not src.stuck and sink.states[-1] == (True, "")
+        n = len(sink.readings)
+        assert wait_for(lambda: len(sink.readings) > n + 5, 2)
+    finally:
+        src.stop()
+        demo.close()

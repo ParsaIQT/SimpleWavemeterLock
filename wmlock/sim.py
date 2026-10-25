@@ -1571,6 +1571,8 @@ class SimSource(Source):
     model = "simulated WS7"
     switchable = True
     details = True
+    restartable = True
+    RESTART_S = 2.0  # s its simulated WLM software takes to restart
 
     def __init__(self, sink, lasers, exposure=0.02, wavemeter=None, serial=None, model=None, demo=None):
         """serial, model: the simulated wavemeter's (serial None: it does not say); demo: where select() finds
@@ -1584,6 +1586,7 @@ class SimSource(Source):
         self._again = set()  # ticked again: shows its old value once more, then is measured
         self.wanted, self._model, self.demo = serial, model or type(self).model, demo
         self._selects = []   # another simulated wavemeter to read (select), on this thread
+        self.stuck = False   # its WLM software stuck (stall): its readings frozen until it is restarted
 
     def select(self, serial):
         """Read that simulated wavemeter (of the demo's) from now on, in a moment."""
@@ -1600,6 +1603,20 @@ class SimSource(Source):
         self._shown, self._again = {}, set()
         self._last, self._stale, self._active, self._off = {}, {}, None, None
         self._set_meter(self._model, serial)
+
+    def stall(self):
+        """Its WLM software stops measuring (an exception of its own, its dialog waiting for a click): the readings it
+        shows stay as they are, until it is restarted."""
+        self.stuck = True
+
+    def _restart_wlm(self, why: str):
+        """Its simulated WLM software restarted: RESTART_S, then measuring again."""
+        self._restarting(why)
+        if self._stop_ev.wait(self.RESTART_S):
+            return
+        self.stuck = False
+        self._set_state(True)
+        self._restart_over(True, f"the WLM software restarted (it was {why})")
 
     def cavity_laser(self):
         return next((laser for laser in self.lasers if laser.cavity), None)
@@ -1634,13 +1651,19 @@ class SimSource(Source):
             self._set_meter(self._model, self.wanted)
         self._channels()
         self._set_state(True)
-        i = 0
+        i, next_check = 0, 0.0
         while not self._stop_ev.wait(self.interval):
             if self._selects:
                 self._select_now()
             self._do_switches(self._use)
             used = self._channels()
-            if not used:
+            if time.monotonic() >= next_check:  # (its WLM software stuck: restarted)
+                next_check = time.monotonic() + 1.0
+                why = self._stuck(time.monotonic())
+                if why:
+                    self._restart_wlm(why)
+                    continue
+            if not used or self.stuck:
                 continue
             laser = used[i % len(used)]
             i += 1

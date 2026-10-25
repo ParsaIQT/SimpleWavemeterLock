@@ -213,17 +213,19 @@ def test_a_setpoint_overtaken_on_the_way_is_not_done():
     a = PC("Lab A").start()
     try:
         assert wait_for(lambda: 1 in a.engine.rows(), 5)
-        ok, why = a.share._do("x", 5, 1, "setpoint", {"nm": 396.9592}, None, "Lab B")
-        assert ok and why == ""
-        ok, why = a.share._do("x", 4, 1, "setpoint", {"nm": 396.9}, None, "Lab B")  # sent before, came after
+        ok, why, found = a.share._do("x", 5, 1, "setpoint", {"nm": 396.9592}, None, "Lab B")
+        assert ok and why == "" and found == {"was": None}  # (the setpoint it had)
+        ok, why, _ = a.share._do("x", 4, 1, "setpoint", {"nm": 396.9}, None, "Lab B")  # sent before, came after
         assert ok and why == "superseded"
         assert a.engine.channels[1].setpoint_nm == 396.9592
-        assert a.share._do("x", 6, 1, "setpoint", {"nm": "x"}, None, "Lab B") == (False, "not a wavelength: 'x'")
-        assert a.share._do("x", 7, 1, "format", {}, None, "Lab B") == (False, "cannot 'format' from another PC")
+        assert a.share._do("x", 6, 1, "setpoint", {"nm": "x"}, None, "Lab B") == (
+            False, "not a wavelength: 'x'", None)
+        assert a.share._do("x", 7, 1, "format", {}, None, "Lab B") == (False, "cannot 'format' from another PC", None)
         a.share._key = secret("k")  # with a key, an adjustment stamped long ago (replayed?) is refused
         assert not a.share._do("x", 8, 1, "setpoint", {"nm": 396.95}, time.time() - 600, "Lab B")[0]
-        assert a.share._do("x", 9, 1, "setpoint", {"nm": 396.95}, time.time(), "Lab B") == (True, "")
-        assert a.share._do("x", 10, 9, "lock", {}, time.time(), "Lab B") == (False, "no channel 9 shown there")
+        assert a.share._do("x", 9, 1, "setpoint", {"nm": 396.95}, time.time(), "Lab B") == (
+            True, "", {"was": 396.9592})
+        assert a.share._do("x", 10, 9, "lock", {}, time.time(), "Lab B") == (False, "no channel 9 shown there", None)
     finally:
         a.close()
 

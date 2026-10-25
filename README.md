@@ -38,6 +38,12 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
   others by itself. Each window shows every wavemeter, framed under its name, and the other
   PCs' lasers can be adjusted from it (setpoint, Lock, Relock, Continue…), by the PC they
   belong to. A few kB/s, UDP (see *Several PCs*).
+* **The WLM software restarted when it gets stuck** (on by default): an exception of its own and its
+  readings freeze, or it closes by itself: closed (killed if it hangs), started again, measuring
+  again, by itself (see *When the WLM software gets stuck*).
+* **ARTIQ** (on by default): every copy of the program answers ARTIQ's calls (sipyco) for every laser on
+  every PC: setpoints (to the digit), Lock, readings, *are these lasers okay?*, and their lock dropouts
+  over a stretch of time. No server of its own, nothing to install on the ARTIQ side (see *ARTIQ*).
 * **Several wavemeters on one PC**: one copy of the program reads them all, each framed under its
   own name with its own channels, lasers and settings, told apart by their serial numbers (see
   *Several wavemeters on one PC*).
@@ -56,11 +62,12 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
 Python ≥ 3.8 and one Qt binding (PySide6 preferred; PyQt5 and PyQt6 also work):
 
 ```
-pip install PySide6 ifaddr numpy scipy
+pip install PySide6 ifaddr numpy scipy numba
 ```
 
-numpy and scipy are for the laser's model, fitted to its maps (*Laser maps*): the rest runs without them.
-`pip install numba` as well, and the model is fitted ten times as fast.
+(or `pip install -r requirements.txt`). numpy, scipy and numba are for the laser's model, fitted to its maps
+(*Laser maps*): the rest runs without them. numba compiles its inner loops, ten times as fast; without it the
+model is fitted all the same, in numpy.
 
 For lasers on an analog output board (*Lasers on an analog output*), also `pip install mcculw`, with
 MCC's InstaCal installed (Windows).
@@ -358,6 +365,68 @@ each in a frame of its own too, and adjust each.
 * **Through `server/server.py`** (`--http`): it serves each wavemeter of its PC, and the program shows
   each of them.
 * **In the demo** (`--sim`) there are two simulated wavemeters, each with its own lasers.
+
+## ARTIQ
+
+Every copy of the program answers ARTIQ's calls, for every laser it shows: its own PC's, and the
+other PCs' (*Several PCs*), whose own PC does what is asked, as if clicked there. There is no
+server of its own: put any one of the PCs in ARTIQ's `device_db.py`, best one that is always on:
+
+```python
+device_db["wavemeter"] = {"type": "controller", "host": "lab-pc-1", "port": 3280}
+```
+
+and call it from an experiment's host code (not a kernel):
+
+```python
+self.setattr_device("wavemeter")
+self.wavemeter.set_setpoint(398.91121)                # the laser near 398.91121 nm: to exactly that
+self.wavemeter.wait("398.91XXX", mhz=1.0, timeout=10) # until it is locked within 1 MHz of it
+ok, why = self.wavemeter.is_ok("399", "369", "935")   # before an oven run: (True, '') or (False, why)
+obs = self.wavemeter.observe("Mulungu")               # its lock watched from now...
+drops = self.wavemeter.end_observe(obs)               # ...until now: numpy array [[unix time, s], ...]
+```
+
+[examples/artiq_wavemeter.py](examples/artiq_wavemeter.py) has three experiments to copy: an oven run
+cancelled (or stopped) when a laser is not fine, a scan whose points taken while a laser was not
+locked are marked bad, and a setpoint scan.
+
+| call | what it does |
+|---|---|
+| `set_setpoint(nm, laser=None, force=False)` | its setpoint to exactly `nm` (vacuum); `laser` None: the one nearest `nm`. Returns which laser, and its setpoint before (`was_nm`) |
+| `set_frequency(thz, laser=None, force=False)`, `shift_setpoint(mhz, laser)` | the same, in THz; moved by `mhz` (+: bluer) |
+| `lock(laser)`, `unlock(laser)` | as Lock (a laser its DLC pro locks: Relock) and Locked clicked |
+| `wait(laser, mhz=1.0, timeout=10.0, hold=0.0)` | until it is locked within `mhz` of its setpoint (for `hold` s); its deviation then. TimeoutError, or RuntimeError at once if it is not locked |
+| `is_ok(*lasers, mhz=20.0)` | `(True, '')` if each is locked, lasing, its reading within `mhz` of its setpoint and not older than 3 s, nothing being recovered or mapped; else `(False, what is wrong, laser by laser)` |
+| `observe(laser, mhz=None)` → number, `end_observe(number)` | the times it was not locked in between: its lock dropouts (a laser its DLC pro locks, from its dropout monitor: ms on), and every unlock (unlocked, locking, being recovered, mapped); given `mhz`, also its readings further than that from its setpoint. A numpy array, n × 2: [unix time it began, s], in order, overlapping ones as one. One still going on at the end lasts until then; one that began before `observe`, from when it began |
+| `get_wavelength(laser)`, `get_frequency(laser)` | its latest reading (nm, vacuum; THz); RuntimeError if none of the last 3 s |
+| `get_setpoint(laser)`, `get_deviation(laser)`, `is_locked(laser)` | its setpoint (nm, None: none); its reading less its setpoint (MHz); locked? |
+| `status(laser)`, `lasers()` | all about one laser, or every laser shown: name, wavemeter, PC, channel, setpoint, reading, deviation, its state, the line under its digits |
+
+* **Which laser.** By its name, as its row has it (`"399"`, any case; part of a name only one has:
+  `"cool"`), by its wavelength (a number: the laser whose setpoint, or reading, is nearest, within 30
+  GHz; digits as text: the one whose setpoint begins with them, `"398.91"` or `"398.91XXX"`), or by
+  wavemeter channel (`"#5"`, `"lab-pc-2#5"`, `"WS7 1234#5"`). Two that fit are refused, naming both:
+  say which by name or channel.
+* **Exactly.** A setpoint is taken as given (`398.91121` is 398.91121 nm, not rounded). One more
+  than 30 GHz from where it was is refused (a typo? 389 for 398) unless `force=True`. Each call
+  returns once it is done: another PC's laser too, by that PC, its row here showing it.
+* **Errors** reach the experiment as what they are: LookupError (no such laser, or two),
+  ValueError, RuntimeError (refused there, and why), PermissionError (that PC lets no other PC
+  adjust its lasers: its *Network…*), TimeoutError.
+* **Its row says so** for 10 minutes: *⇄ setpoint 398.91121 nm from ARTIQ (10.0.0.5)* (*via
+  Lab 1* for another PC's laser), and the console logs it.
+* **Times** (`end_observe`) are by the clock of the PC whose laser it is: keep the PCs' clocks
+  set (NTP), to compare them with the ARTIQ PC's.
+* **Settings**: right-click › *Network…*: answer ARTIQ's calls (on), *ARTIQ port* (TCP 3280; the
+  demo's 3281, this PC alone), *ARTIQ from* (only these PCs may call, names or addresses; this
+  PC always). The status bar says *ARTIQ :3280* (and how many clients), or why it cannot (the
+  port taken by another copy of the program). Another PC's laser is adjusted only if that PC
+  lets other PCs adjust its lasers; observing it needs nothing.
+* **The protocol** is sipyco's pc_rpc, both of its encodings (pyon v1, ARTIQ until 2025; pyon v2,
+  JSON, after): any ARTIQ calls it, and nothing needs installing on these PCs. `sipyco_rpctool
+  lab-pc-1 3280 list-methods` lists the calls; `sipyco_rpctool lab-pc-1 3280 call is_ok "'399'"`
+  tries one.
 
 ## Mode-hop recovery
 
@@ -1660,6 +1729,31 @@ at a few piezo voltages, patterns at every point) and open its file: its pattern
 WLM window's, and the map's exposures like the WLM's. The pattern export is switched on while a map
 wants patterns, and off again after.
 
+## When the WLM software gets stuck
+
+HighFinesse's WLM program can throw an exception of its own and stop measuring, its readings frozen
+(its dialog waiting for a click), until it is closed and opened again. The program does that by
+itself, as you would:
+
+* **Stuck**: no new reading for 30 s while it shows one, a frequency at least (lasers all off, or
+  blocked, show no frequency: not stuck), and while it says it measures (stopped by someone: not
+  stuck). **Gone**: not running for 15 s, after it ran while this program read it (closed by
+  itself, crashed; one not running when the program starts is left as it is).
+* **The restart**: it is asked to close; if it has not after 15 s (it hangs), its process is killed
+  (`wlm*.exe`: the one there is, or of several the one in that wavemeter's folder, *Wavelength Meter
+  WS7 1234*; never another wavemeter's); it is started again through wlmData (the same wavemeter's,
+  by its serial number; else the program it ran from), its measurement started, and the program
+  reads it again. Meanwhile the status bar says
+  *restarting the WLM software: it was stuck (no new reading for 31 s, its last ones frozen)*; the
+  locks hold where they are (a laser its DLC pro locks stays watched by what its DLC pro says).
+  Afterwards the status bar says *⟲ WLM 03:12* for an hour (its tooltip: why), and the console logs
+  it.
+* **At most** one restart every 10 minutes, and none after three in a row that brought no readings
+  back (said in the console), until readings come again.
+* **Off**: right-click › untick *Restart the WLM software if it gets stuck* (remembered). The
+  wavemeter read through `--http` (server/server.py on its own PC) is not restarted by this one.
+* **In the demo**: right-click › *Simulate a fault* › *WLM software stuck*: 30 s later, restarted.
+
 ## Troubleshooting
 
 * **No controllers in the menu**: discovery replies are UDP, so allow Python
@@ -1674,6 +1768,9 @@ wants patterns, and off again after.
 * **An analog output shows *offline: mcculw cannot be used***: `pip install mcculw`, and install
   InstaCal, with the board in it (*offline: MCC board 0: … is it in InstaCal?*). *cannot lock: output
   2: its voltage is not known*: set it once by hand (right-click › *Analog output…* › *Set*).
+* **The readings froze, *restarting the WLM software* in the status bar**: the WLM program got
+  stuck, and is being restarted (*When the WLM software gets stuck*). Restarted again and again (*not
+  restarted again until readings come*): look at the WLM program, and at the wavemeter's USB cable.
 * **`cannot load wlmData`**: 64-bit Python needs the 64-bit `wlmData.dll`
   (System32), 32-bit Python the 32-bit one (SysWOW64). Point `--dll` at the
   right one if it isn't found.
@@ -1745,9 +1842,12 @@ wmlock/engine.py     threads and state: source → lock → per-controller worke
 wmlock/meters.py     this PC's wavemeters, an engine each: found, settings kept, swapped, hidden
 wmlock/view.py       what a row shows (Qt-free): painted here, and sent to the other PCs
 wmlock/share.py      the other PCs: found, their rows shown, adjustments asked and done (UDP)
+wmlock/rpc.py        ARTIQ's calls (sipyco's pc_rpc, both encodings), for every laser on every PC
+wmlock/observe.py    a laser's lock observed for ARTIQ: its dropouts and unlocks, as [unix time, s]
 wmlock/gui.py        Qt window
 wmlock/sim.py        simulated wavemeter, mode-hopping lasers (and TAs), fake DLC pros (demo and tests)
 server/server.py     optional HTTP server for the wavemeter PC
+examples/artiq_wavemeter.py  ARTIQ experiments that call it: an oven run, a scan marked by dropouts, a setpoint scan
 ```
 
 The DLC pro protocol and discovery handshake follow TOPTICA's own Python SDK
@@ -1782,7 +1882,15 @@ process, each with its own simulated wavemeter and DLC pros, over the loopback i
 directly and through another, rows shown as they are, adjustments done once (also when tries
 are lost, overtaken or stale), refused when not allowed, keys and groups that keep others out,
 PCs gone quiet, closed and restarted, the traffic measured; and in the window, another PC's
-wavemeter framed under its name, adjusted from it, folded away. Lasers on an analog output are
+wavemeter framed under its name, adjusted from it, folded away. ARTIQ's calls are tested with
+sipyco's client as its source has it (the handshake, both encodings, its errors, numpy arrays; a
+call in pyon v1 never evaluated), against two copies of the program: setpoints set exactly here and
+on the other PC, lasers chosen by name, wavelength and channel (and two that fit refused), locks
+waited for, *okay?*, dropouts and unlocks observed here and there; with sipyco installed, its own
+client too. The WLM software stuck or gone is restarted against a stand-in for wlmData: asked to
+close, killed when it hangs, started again and measuring; never with no frequency shown, when
+someone stopped it, or when told not to; no more often than allowed, and given up. Lasers on an
+analog output are
 locked through a simulated board, end to end: never locked from an output not known, set back after
 a restart, kept within their limits, the output fed forward, a refused write unlocking them; the MCC
 board through a stand-in for mcculw (nothing written but what is asked, each output in its range).

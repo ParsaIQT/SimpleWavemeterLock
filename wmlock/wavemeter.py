@@ -47,6 +47,15 @@ server/server.py, the simulation) say more of each new reading of a channel
                its analysis on, 4 and 5: the spectrum it computes, x and y)
 
 and exposure(ch) says a detailed channel's exposure now, between readings.
+
+The WLM software stuck (an exception of its own, say, its dialog waiting for a click: it shows readings, but no new
+one comes) or gone (closed, or crashed): where a source can (`restartable`: the DLL, the simulation), and unless told
+not to (`restart`), it restarts it, as you would: asked to close, killed if it will not, started again (the same
+wavemeter's, by its serial number), its measurement started. Stuck is the readings it shows not changing for STALL_S,
+one of them at least a frequency (no light anywhere is not stuck), while it says it measures (stopped by someone is
+not stuck either). Gone is not running for GONE_S once it ran. At most once every RESTART_GAP_S, and no more after
+GIVE_UP restarts that brought no readings back, until readings come again. Each is said in the log, and in
+`restarted`.
 """
 from __future__ import annotations
 
@@ -55,6 +64,9 @@ import ctypes
 import http.client
 import json
 import logging
+import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -83,6 +95,8 @@ PATTERNS = (0, 1)          # cSignal1Interferometers, cSignal1WideInterferometer
 ANALYSIS = (4, 5)          # cSignalAnalysisX, cSignalAnalysisY: the spectrum its analysis computes, if it is on
 ITEM = {2: ("H", ctypes.c_uint16), 4: ("I" if array("I").itemsize == 4 else "L", ctypes.c_uint32),
         8: ("d", ctypes.c_double)}  # a pattern's item size in bytes: its array typecode, its ctypes type
+C_CTRL_SHOW, C_CTRL_EXIT, C_CTRL_START_SILENT, C_CTRL_SILENT = 0x1, 0x3, 0x20, 0x40  # ControlWLM's (wlmConst.py)
+C_MEASUREMENT = 2  # GetOperationState's, and Operation's cCtrlStartMeasurement (wlmConst.py)
 # Return codes of SetSwitcherSignalStates (wlmConst.py, ResERR_...)
 WLM_SET_ERRORS = {
     -1: "WLM missing", -2: "could not set", -3: "parameter out of range", -4: "WLM out of resources",
@@ -129,6 +143,11 @@ class Source(threading.Thread):
     serial = None       # its serial number, once known
     switchable = False  # it can switch channels on and off (switch)
     details = False     # it can say more of a channel's readings (detail)
+    restartable = False  # it can restart the WLM software when it is stuck or gone (the module's docstring)
+    STALL_S = 30.0      # s: no new reading this long, while showing one (a frequency at least), is stuck
+    GONE_S = 15.0       # s: not running this long, once it ran, is gone
+    RESTART_GAP_S = 600.0  # s between restarts at least
+    GIVE_UP = 3         # restarts in a row that brought no readings back: no more, until readings come again
 
     def __init__(self, sink, interval: float):
         super().__init__(daemon=True, name=type(self).__name__)
@@ -144,6 +163,15 @@ class Source(threading.Thread):
         self._detail = {}         # ch -> its readings said in detail, with their patterns (True) or without
         self._exposure = {}       # ch -> s, a detailed channel's exposure as last seen
         self.pattern_info = {}    # kind -> (items, bytes an item) of the patterns it reads, once known
+        self.restart = True       # restart the WLM software when stuck or gone, if restartable
+        self.restarted = ""       # the last restart (or try), said ('' none yet)...
+        self.restarted_t = 0.0    # ...and when (time.time())
+        self.new_t = time.monotonic()  # the last new reading (or the last time it could be read again)
+        self._restart_t = -1e9    # monotonic: the last restart tried
+        self._restarts = 0        # restarts in a row that brought no readings back...
+        self._gave_up = False     # ...as many as GIVE_UP: said
+        self._ran = False         # the WLM software ran, while this source read it
+        self._gone_t = None       # monotonic: since then it is not running (None: it runs)
 
     def stop(self):
         self._stop_ev.set()
@@ -210,8 +238,67 @@ class Source(threading.Thread):
 
     def _set_state(self, ok: bool, msg: str = ""):
         if (ok, msg) != self._state:
+            if ok and not (self._state or (False,))[0]:
+                self.new_t = time.monotonic()  # (readable again: STALL_S from now for a new reading)
             self._state = (ok, msg)
             self.sink.on_state(ok, msg)
+
+    # ------------------------------------------------------- the WLM software stuck or gone (the module's docstring)
+    def _stuck(self, now: float, measuring=True) -> str:
+        """Why the WLM software looks stuck and is to be restarted now ('' if it does not, or is not to be): the
+        readings it shows, a frequency among them, unchanged for STALL_S, while it measures (measuring: what it says;
+        None: it does not say)."""
+        if measuring is False or not (self.restart and self.restartable):
+            return ""
+        shown = [self._last.get(ch, NAN) for ch in self._active or ()]
+        if not any(v > 0 for v in shown if isinstance(v, (int, float))):
+            return ""  # (no light on any channel: nothing to measure, not stuck)
+        quiet = now - self.new_t
+        if quiet < self.STALL_S:
+            return ""
+        why = f"stuck (no new reading for {quiet:.0f} s, its last ones frozen)"
+        return why if self._may_restart(now, why) else ""
+
+    def _gone(self, now: float, running: bool) -> str:
+        """Why the WLM software looks gone and is to be started again now ('' if not): not running for GONE_S once
+        it ran."""
+        if running:
+            self._ran, self._gone_t = True, None
+            return ""
+        if not self._ran:
+            return ""  # (never seen running by this source: left as it is)
+        if self._gone_t is None:
+            self._gone_t = now
+        quiet = now - self._gone_t
+        if quiet < self.GONE_S or not (self.restart and self.restartable):
+            return ""
+        why = f"gone (not running for {quiet:.0f} s)"
+        return why if self._may_restart(now, why) else ""
+
+    def _may_restart(self, now: float, why: str) -> bool:
+        """Not within RESTART_GAP_S of the last restart, nor after GIVE_UP that brought no readings back (said)."""
+        if now - self._restart_t < self.RESTART_GAP_S:
+            return False
+        if self._restarts >= self.GIVE_UP:
+            if not self._gave_up:
+                self._gave_up = True
+                log.error("%s: the WLM software is %s, but %d restarts in a row brought no readings back: not "
+                          "restarted again until readings come", self.name or self.label, why, self._restarts)
+            return False
+        return True
+
+    def _restarting(self, why: str):
+        """A restart begins (why: stuck (...) or gone (...)): counted, said."""
+        self._restart_t = time.monotonic()
+        self._restarts += 1
+        log.warning("%s: the WLM software is %s: restarting it", self.name or self.label, why)
+        self._set_state(False, f"restarting the WLM software: it was {why}")
+
+    def _restart_over(self, ok: bool, text: str):
+        """It is over: said (restarted), and in the log; STALL_S from now for a new reading."""
+        self.new_t, self._gone_t = time.monotonic(), None
+        self.restarted, self.restarted_t = f"{text} ({time.strftime('%H:%M:%S')})", time.time()
+        (log.warning if ok else log.error)("%s: %s", self.name or self.label, text)
 
     def _set_active(self, chans, off=()):
         chans = list(chans)
@@ -236,6 +323,7 @@ class Source(threading.Thread):
             if last.get(ch, NAN) != v:
                 changed.append(ch)
         if changed:
+            self.new_t, self._restarts, self._gave_up = t, 0, False  # (a new reading: it measures)
             for ch in changed:
                 last[ch] = raw[ch]
             out = []
@@ -248,6 +336,96 @@ class Source(threading.Thread):
 
     def _decode(self, ch, raw, t) -> Reading:
         return decode_wlm(ch, raw, t)
+
+
+# --------------------------------------------------------------------------- the WLM software's processes
+def wlm_processes(serial=None) -> list:
+    """The WLM software running on this PC: [(pid, its .exe's path)] of the processes named wlm*.exe (wlm_ws7.exe,
+    say), those whose path has the wavemeter's serial number if any has (its folder: 'Wavelength Meter WS7 1234').
+    [] where it cannot tell (not Windows)."""
+    if sys.platform != "win32":
+        return []
+    try:
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class Entry(ctypes.Structure):  # PROCESSENTRY32W
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", ctypes.c_wchar * 260)]
+
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.OpenProcess.restype = wintypes.HANDLE
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # (TH32CS_SNAPPROCESS)
+        if not snap or snap == ctypes.c_void_p(-1).value:
+            return []
+        found = []
+        try:
+            e = Entry()
+            e.dwSize = ctypes.sizeof(Entry)
+            more = k32.Process32FirstW(snap, ctypes.byref(e))
+            while more:
+                if re.fullmatch(r"wlm.*\.exe", e.szExeFile, re.IGNORECASE):
+                    found.append(int(e.th32ProcessID))
+                more = k32.Process32NextW(snap, ctypes.byref(e))
+        finally:
+            k32.CloseHandle(snap)
+        out = []
+        for pid in found:
+            path = ""
+            h = k32.OpenProcess(0x1000, False, pid)  # (PROCESS_QUERY_LIMITED_INFORMATION)
+            if h:
+                try:
+                    buf, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+                    if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                        path = buf.value
+                finally:
+                    k32.CloseHandle(h)
+            out.append((pid, path))
+    except (OSError, AttributeError, ValueError):
+        return []
+    return wavemeters_own(out, serial)
+
+
+def wavemeters_own(procs: list, serial) -> list:
+    """Of the WLM software's processes [(pid, path)], that wavemeter's: those with its serial number in their path
+    (its folder: 'Wavelength Meter WS7 1234'), if any has; else the one there is; [] if there are several and none
+    says (another wavemeter's is never killed)."""
+    mine = [x for x in procs if serial and re.search(rf"(?<!\d){int(serial)}(?!\d)", x[1])]
+    return mine or (list(procs) if len(procs) == 1 else [])
+
+
+def kill_process(pid: int) -> bool:
+    """Ended at once (TerminateProcess): False if it could not be."""
+    if sys.platform != "win32":
+        return False
+    try:
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        h = k32.OpenProcess(0x1, False, int(pid))  # (PROCESS_TERMINATE)
+        if not h:
+            return False
+        try:
+            return bool(k32.TerminateProcess(h, 1))
+        finally:
+            k32.CloseHandle(h)
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
+def start_process(path: str) -> bool:
+    """That program started, on its own (it outlives this one), in its folder: False if it could not be."""
+    try:
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen([path], cwd=os.path.dirname(path) or None, close_fds=True, creationflags=flags)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 # --------------------------------------------------------------------------- DLL
@@ -285,6 +463,10 @@ class WlmDll:
             ("GetAnalysisItemCount", [L], L, False),
             ("GetAnalysisData", [L, ctypes.c_void_p], L, False),
             ("SetAnalysis", [L, L], L, False),
+            ("GetOperationState", [ctypes.c_ushort], ctypes.c_ushort, False),  # (the WLM software stuck or gone:
+            ("Operation", [ctypes.c_ushort], L, False),                         # restarted)
+            ("ControlWLM", [L, ctypes.c_ssize_t, L], L, False),
+            ("ControlWLMEx", [L, ctypes.c_ssize_t, L, L, L], L, False),
         ):
             try:
                 f = getattr(lib, name)
@@ -299,6 +481,37 @@ class WlmDll:
 
     def running(self) -> bool:
         return self.count() > 0
+
+    def measuring(self):
+        """The wavemeter addressed measures (True), or has been stopped (False); None: it does not say."""
+        if "GetOperationState" not in self.has:
+            return None
+        return self.lib.GetOperationState(0) == C_MEASUREMENT
+
+    def start_measuring(self):
+        """Its measurement started (as Start clicked)."""
+        if "Operation" in self.has:
+            self.lib.Operation(C_MEASUREMENT)
+
+    def exit_server(self, version: int) -> bool:
+        """That wavemeter's WLM software asked to close (its serial number: version; 0 the one there is); False if
+        this DLL cannot ask."""
+        if "ControlWLM" not in self.has:
+            return False
+        self.lib.ControlWLM(C_CTRL_EXIT, 0, int(version or 0))
+        return True
+
+    def start_server(self, version: int) -> bool:
+        """That wavemeter's WLM software started (as its installation has it; not waited for); False if this DLL
+        cannot."""
+        how = C_CTRL_SHOW | C_CTRL_START_SILENT | C_CTRL_SILENT  # (no message boxes waiting for a click)
+        if "ControlWLMEx" in self.has:
+            self.lib.ControlWLMEx(how, 0, int(version or 0), 0, 0)
+        elif "ControlWLM" in self.has:
+            self.lib.ControlWLM(how, 0, int(version or 0))
+        else:
+            return False
+        return True
 
     def count(self) -> int:
         """How many wavemeters run on this PC (their WLM software)."""
@@ -570,7 +783,10 @@ class DllSource(Source):
 
     switchable = True
     details = True
+    restartable = True
     CHECK_S = 1.0  # s between looks at which wavemeters run, and at the switch
+    EXIT_S = 15.0  # s for the WLM software to close when asked (else it is killed)...
+    START_S = 60.0  # ...and to start again
 
     def __init__(self, sink, path: str | None = None, interval: float = 0.002, channels=None, serial=None,
                  model: str = "", hub: WlmHub | None = None, choose=None):
@@ -613,6 +829,12 @@ class DllSource(Source):
                     if now >= next_check:
                         next_check = now + self.CHECK_S
                         why = self._check(wlm)
+                        missing = why == "wlmServer is not running" or " is not running" in why
+                        gone = self._gone(now, not why) if not why or missing else ""
+                        if gone:  # (closed, or crashed: started again)
+                            self._restart_wlm(wlm, gone, running=False)
+                            next_check = 0.0
+                            continue
                         if why:
                             self._set_state(False, why)
                             self._stop_ev.wait(self.CHECK_S)
@@ -621,8 +843,14 @@ class DllSource(Source):
                             aimed = self._aim(wlm)
                             if aimed:
                                 active, off = (self.fixed, []) if self.fixed else wlm.channels()
+                                measuring = wlm.measuring()
                         if aimed:
                             self._set_active(active, off)
+                            stuck = self._stuck(now, measuring)
+                            if stuck:  # (an exception of its own, say: restarted)
+                                self._restart_wlm(wlm, stuck, running=True)
+                                next_check = 0.0
+                                continue
                             self._set_state(True)
                     raw, mine, extras = {}, False, None
                     with hub.lock:
@@ -653,6 +881,55 @@ class DllSource(Source):
                     except OSError:
                         pass
             hub.give(self.serial, self)
+
+    def _running(self) -> bool:
+        """Its wavemeter's WLM software runs (as the DLL lists them)."""
+        try:
+            found = self.hub.scan()
+        except OSError:
+            return False
+        serial = self.serial or self.wanted
+        return any(f.serial == serial for f in found) if serial else bool(found)
+
+    def _waits(self, cond, seconds: float) -> bool:
+        """Until cond(), seconds at most: False if it never was (or this source stops)."""
+        end = time.monotonic() + seconds
+        while not cond():
+            if time.monotonic() >= end or self._stop_ev.wait(0.25):
+                return False
+        return True
+
+    def _restart_wlm(self, wlm, why: str, running: bool):
+        """Its wavemeter's WLM software restarted (the module's docstring): asked to close and, if it will not, killed
+        (running), then started again, and its measurement."""
+        self._restarting(why)
+        version = self.serial or self.wanted or 0
+        procs = wlm_processes(version)
+        if running:
+            with self.hub.lock:
+                wlm.exit_server(version)
+            if not self._waits(lambda: not self._running(), self.EXIT_S):
+                killed = [pid for pid, _ in procs if kill_process(pid)]
+                if not killed or not self._waits(lambda: not self._running(), 10.0):
+                    self._restart_over(False, f"the WLM software ({why}) would not close, nor be killed")
+                    return
+                log.warning("%s: the WLM software would not close: killed (process %s)", self.name or self.label,
+                            ", ".join(map(str, killed)))
+        with self.hub.lock:
+            started = wlm.start_server(version)
+        if not started:  # (a DLL that cannot: the program, where it ran from)
+            started = any(start_process(path) for _, path in procs if path)
+        if not started or not self._waits(lambda: self._running() and not self._check(wlm), self.START_S):
+            self._restart_over(False, f"the WLM software ({why}) did not start again")
+            return
+        for _ in range(5):  # (it may take a moment to take orders)
+            with self.hub.lock:
+                if self._aim(wlm) and wlm.measuring() is not False:
+                    break
+                if self._aim(wlm):
+                    wlm.start_measuring()
+            self._stop_ev.wait(1.0)
+        self._restart_over(True, f"the WLM software restarted (it was {why})")
 
     def _details(self, wlm, raw: dict) -> dict:
         """The extras of the detailed channels' new readings (and each one's exposure now); its patterns exported

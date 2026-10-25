@@ -97,6 +97,7 @@ from .dropouts import log as drop_log
 from .lasermap import FOLDER, LOOK, MODEL_MIN, MapFile, MapPlan, Mapper, MapRunner, file_name, fmt_time
 from .lock import Lock, LockParams
 from .modehop import SEED_FLOOR, Guard, HopParams, Recenter, Runner, perform
+from .observe import Observation
 from .relock import TRANS, says_locked, setup_report, transmission_input, transmission_signal, usable_zero, volts
 from .reference import Reference, RefParams
 from .wavemeter import C_NM_THZ, NAN
@@ -113,6 +114,8 @@ SHG_INTRA = "nlo:pd:shg-int:photodiode"
 WATCHED = (CURRENT_ACT, CAVITY_LOCK, "dl:lock:state-txt", SHG_STATE, SHG_INTRA, SCAN_OUT)  # (and its piezo, current)
 FINE_N = 600   # polls: a level locked as usual is the median of the last this many running as it should...
 FINE_MIN = 10  # ...once there are this many (until then, the one learned before)
+OBSERVING = ("observe", "observe_end", "observed")  # remote(): a channel's lock observed, nothing changed
+OBSERVED_PART = 20  # [began, s] at most, of an observation's times asked from another PC at a time (one datagram)
 DAC_LOCK = dict(kp=0.0, ki=0.01, max_step=0.02, v_min=-1.2, v_max=1.2, excursion=0.8)  # a laser on an analog output:
 #                Epimetheus's limits (±1.2 V; its PID's output ±0.8 V), a gentle start for the gain
 
@@ -153,7 +156,9 @@ class Channel:
         self.raw = NAN        # THz, as the wavemeter read it
         self.status = "no data"
         self.t = 0.0          # monotonic time of the last new reading
-        self.state = "off"    # off | engaging | on (locked, or for a cavity-locked laser: watched) | recovering
+        self._state = "off"   # off | engaging | on (locked, or for a cavity-locked laser: watched) | recovering
+        self.state_t = time.time()  # ...since then
+        self.observers = []   # its lock observed (observe.py): each told of every change of its state
         self.message = ""     # why the lock is off, or what to do
         self.offset = None    # last known scan offset (its piezo's set value)
         self.unit = "V"
@@ -235,6 +240,18 @@ class Channel:
         self.model_dict = m if isinstance(m, dict) and isinstance(m.get("model"), dict) else None  # {model, from,
         self._model = None     # (the LaserModel, made of model_dict once asked for)          laser, t, right}
         self.model_note = ""   # how taking its laser's model from a map's file went, or is going
+
+    @property
+    def state(self) -> str:
+        """off | engaging | on (locked, or for a cavity-locked laser: watched) | recovering | mapping"""
+        return self._state
+
+    @state.setter
+    def state(self, value: str):
+        if value != self._state:
+            self._state, self.state_t = value, time.time()
+            for o in self.observers:
+                o.state(self.state_t, value)
 
     @property
     def param(self) -> str:
@@ -484,6 +501,11 @@ class Engine:
     LOOK_N = 5       # readings in a row on target (its locks saying locked) end a look; off target, it is relocked
     WAIT_S = 10.0    # s a recovery waits for readings once its wavemeter channel is switched on for it
     FINE_S = 900.0   # s: where it was last on target as it should be, if that recent, is where its right mode is
+    OBSERVE_N = 32          # lasers' locks observed at once at most (observe.py; the oldest dropped)
+    OBSERVE_S = 7 * 86400.0  # s an observation not ended is kept at most
+    OBSERVED_S = 600.0      # s an ended one is kept, to be fetched
+    END_S = 6.0             # s an ended one waits for its dropouts up to its end to be read, at most...
+    PAST_S = 0.25           # ...read until this long past its end (its recorder starts a moment after it is told)
 
     def __init__(self, config: dict, make_source, discovery_targets=None, extra_devices=(), log_path=None,
                  drop_path=None):
@@ -492,6 +514,7 @@ class Engine:
         self.config = config
         self.log_path, self.drop_path = log_path, drop_path
         self.monitors = {}  # channel -> its DropoutMonitor
+        self.observations = {}  # tag -> an Observation of a channel's lock (observe.py), oldest first
         self.started = time.time()
         self.lock = threading.RLock()
         self.channels = {int(k): Channel(int(k), c) for k, c in (config.get("channels") or {}).items()}
@@ -516,6 +539,8 @@ class Engine:
         self.reference = Reference.from_config(ref) if ref else None
         self.dirty = False       # settings changed since the last save
         self.source = make_source(self)
+        if self.source is not None:  # (the WLM software stuck or gone: restarted, where the source can)
+            self.source.restart = config.get("wlm_restart", True) is not False
 
     # ------------------------------------------------------------- lifecycle
     def start(self):
@@ -824,6 +849,10 @@ class Engine:
                     ch.gaps.append(r.t - ch.t)
                 ch.raw, ch.status, ch.t = r.freq, r.status, r.t
                 ch.freq = r.freq if ref is None or r.ch == ref.channel else ref.correct(r.freq)
+                if ch.observers:  # (its lock observed: how far it was)
+                    wall = time.time() - (time.monotonic() - r.t)
+                    for o in ch.observers:
+                        o.reading(wall, ch.error_mhz if ch.freq > 0 else None)
                 if ch.mapper is not None:  # (a map has it: nothing else)
                     ch.mapper.on_reading(r)
                     continue
@@ -1026,6 +1055,14 @@ class Engine:
     def rename(self, n: int, name: str):
         with self.lock:
             self.channels[n].name = name
+            self.dirty = True
+
+    def set_wlm_restart(self, on: bool):
+        """Restart the WLM software when it is stuck or gone (wavemeter.py), or not."""
+        with self.lock:
+            self.config["wlm_restart"] = bool(on)
+            if self.source is not None:
+                self.source.restart = bool(on)
             self.dirty = True
 
     def set_hidden(self, n: int, hidden: bool):
@@ -1521,6 +1558,8 @@ class Engine:
             while ch.drops and d.t - ch.drops[0][0] > 3600.0:
                 ch.drops.popleft()
             ch.drops_total += 1
+            for o in ch.observers:
+                o.drop(d.t, d.duration)
             usual = ch.hop.trans_locked
             how = f"{d.duration * 1e3:.1f} ms" if d.duration < 1.0 else f"{d.duration:.2f} s"
             if d.method == "polling":
@@ -2355,15 +2394,20 @@ class Engine:
 
     # ------------------------------------------------- adjustments from other PCs
     def remote(self, n: int, do: str, args: dict, who: str) -> tuple:
-        """An adjustment of channel n asked by another PC (share.py), done as if clicked here: (done, why not). who:
-        that PC, said on the row for a while (Channel.remote_note). Done but nothing changed: (True, 'unchanged')."""
+        """An adjustment of channel n asked by another PC (share.py) or by ARTIQ (rpc.py), done as if clicked here:
+        (done, why not). who: that PC, said on the row for a while (Channel.remote_note). Done but nothing changed:
+        (True, 'unchanged'). Its lock observed (observe, observe_end, observed: observe.py, nothing changed): (done,
+        why not, what it found)."""
         with self.lock:
             ch = self.channels.get(n)
             if ch is None or n not in self.rows():
                 return False, f"no channel {n} shown there"
+            if do in OBSERVING:
+                return self._remote_observe(n, do, args)
             if ch.state == "mapping" and do not in ("rename", "lock_params"):
                 return False, "it is being mapped (stopped there, it goes back where it began)"
             ref = self._is_reference(ch)
+            found = None  # (what it says besides: the setpoint it had)
             if do == "setpoint":
                 nm = args.get("nm")
                 if ref:
@@ -2371,7 +2415,8 @@ class Engine:
                 if nm is not None and not (_num(nm) and nm > 0):
                     return False, f"not a wavelength: {nm!r}"
                 if nm == ch.setpoint_nm:
-                    return True, "unchanged"
+                    return True, "unchanged", {"was": nm}
+                found = {"was": ch.setpoint_nm}
                 self.set_setpoint(n, nm)
                 what = f"setpoint {nm} nm" if nm else "setpoint cleared"
             elif do == "lock":
@@ -2430,7 +2475,91 @@ class Engine:
             else:
                 return False, f"cannot {do!r} from another PC"
             ch.remote_note, ch.remote_t, ch.remote_wall = f"{what} from {who}", time.monotonic(), time.time()
-            return True, ""
+            return (True, "") if found is None else (True, "", found)
+
+    def _remote_observe(self, n: int, do: str, args: dict) -> tuple:
+        tag = str(args.get("tag") or "")[:64]
+        if not tag:
+            return False, "which observation (no tag)"
+        if do == "observe":
+            mhz = args.get("mhz")
+            if mhz is not None and not (_num(mhz) and mhz > 0):
+                return False, f"not MHz: {mhz!r}"
+            why = self.observe(n, tag, mhz)
+            return (False, why, None) if why else (True, "", None)
+        if do == "observe_end":
+            return (True, "", None) if self.end_observe(tag) else (False, "no such observation (over long ago?)", None)
+        start, count = args.get("start", 0), args.get("count", 0)
+        if not all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in (start, count)):
+            return False, "not a part of it", None
+        got = self.observed(tag, start, min(count or OBSERVED_PART, OBSERVED_PART))
+        return (True, "", got) if got is not None else (False, "no such observation (over long ago?)", None)
+
+    # -------------------------------------------------------------- lock observed (observe.py)
+    def observe(self, n: int, tag: str, mhz=None) -> str:
+        """Observe channel n's lock from now on, as tag (the caller's name for it): '' if it is, else why not."""
+        with self.lock:
+            ch = self.channels.get(n)
+            if ch is None or n not in self.rows():
+                return f"no channel {n} shown there"
+            self._forget_observations()
+            old = self.observations.pop(tag, None)
+            if old is not None and old in ch.observers:
+                ch.observers.remove(old)
+            while len(self.observations) >= self.OBSERVE_N:
+                self._unobserve(next(iter(self.observations)))
+            o = Observation(n, tag, time.time(), ch.state, ch.state_t, mhz)
+            self.observations[tag] = o
+            ch.observers.append(o)
+            return ""
+
+    def end_observe(self, tag: str) -> bool:
+        """It ends now (its dropouts up to now are waited for: observed); False if there is no such."""
+        with self.lock:
+            o = self.observations.get(tag)
+            if o is None:
+                return False
+            if o.t1 is None:
+                o.end(time.time())
+                o.ended = time.monotonic()
+                o.deadline = o.ended + self.END_S
+                self.observations[tag] = self.observations.pop(tag)  # (the newest, now: kept the longest)
+            return True
+
+    def observed(self, tag: str, start: int = 0, count: int = 0):
+        """An ended observation's times (observe.py): None if there is no such; else {ready: its dropouts up to its
+        end read (or no longer waited for), total, times: [[began, s], ...] from start, count of them (0: all)},
+        ready, else without times."""
+        with self.lock:
+            o = self.observations.get(tag)
+            if o is None or o.t1 is None:
+                return None
+            if o.result is None:
+                m = self.monitors.get(o.n)
+                caught_up = m is None or not m.is_alive() or (getattr(m, "seen", 0.0) >= o.t1 + self.PAST_S and (
+                    getattr(m, "open_since", None) is None or m.open_since > o.t1))
+                if not caught_up and time.monotonic() < o.deadline:
+                    return {"ready": False, "total": 0}
+                o.result = o.merged()
+                ch = self.channels.get(o.n)
+                if ch is not None and o in ch.observers:
+                    ch.observers.remove(o)
+            times = o.result[start:start + count] if count > 0 else o.result[start:]
+            return {"ready": True, "total": len(o.result), "times": [list(x) for x in times], "lost": o.lost}
+
+    def _unobserve(self, tag: str):
+        o = self.observations.pop(tag, None)
+        ch = self.channels.get(o.n) if o is not None else None
+        if ch is not None and o in ch.observers:
+            ch.observers.remove(o)
+
+    def _forget_observations(self):
+        """Those ended long enough ago to have been fetched, and those never ended."""
+        now, wall = time.monotonic(), time.time()
+        for tag, o in list(self.observations.items()):
+            over = now - o.ended > self.OBSERVED_S if o.t1 is not None else wall - o.t0 > self.OBSERVE_S
+            if over:
+                self._unobserve(tag)
 
     # -------------------------------------------------------------- discovery
     def start_discovery(self):

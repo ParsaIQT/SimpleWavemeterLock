@@ -24,8 +24,9 @@ set only datagrams signed with it are taken, without one only unsigned ones; the
          (and to one that has just asked for it); with the order of the rows
   fast   the new readings (f, dev) of the rows whose reading changed, at most every TICK, to those that want fast
   cmd    an adjustment of a row (setpoint, lock, unlock, stop, continue, setpoint_to_reading, recenter, rename,
-         lock_params; Engine.remote), sent again every RETRY_S until answered (TRIES at most), done once
-  ack    its answer: done, or why not
+         lock_params; Engine.remote), or a look at it (observe, observe_end, observed: its lock observed for ARTIQ,
+         rpc.py), sent again every RETRY_S until answered (TRIES at most), done once
+  ack    its answer: done, or why not (and what a look found: r)
   bye    it closes
 
 What it costs (measured, 7 channels, 5 of them locked): about 2.5 kB/s to each PC that shows them, 0.3 kB/s to
@@ -62,7 +63,9 @@ COLORS = ("fg", "dim", "ok", "warn", "err", "accent")
 STATES = ("off", "error", "on", "engaging", "recovering", "asking", "mapping", "ref", "ref-hold", "ref-moved")
 FAST = ("f", "dev")  # what a fast datagram carries (and age: 0, it is new)
 ACTIONS = ("setpoint", "lock", "unlock", "stop", "continue", "setpoint_to_reading", "recenter", "rename",
-           "lock_params")
+           "lock_params", "observe", "observe_end", "observed")
+LOOKS = ("observe", "observe_end", "observed")  # actions that change nothing (a lock observed: observe.py): taken
+#                                                 from other PCs even where adjusting is off
 
 
 def secret(key: str) -> bytes:
@@ -195,10 +198,15 @@ class Peer:
         self.sub_until = 0.0      # ...until then
         self.needs_full = False   # all of it at once (it has just asked)
         self.wanted = "fast" if share.subscribe else ""  # what this instance wants of it (the window says)
+        self.watched_until = 0.0  # its readings wanted at once (fast) until then, whatever the window wants (rpc.py)
         self.feedback = {}        # n -> (text, until): an adjustment of it that was not done, and why
 
     def age(self, now: float) -> float:
         return now - self.heard
+
+    def want_now(self, now: float) -> str:
+        """What this instance asks of it: what the window wants, or fast while ARTIQ's calls want its readings."""
+        return "fast" if self.watched_until > now else self.wanted
 
     def status(self, now: float) -> str:
         """live | late | lost | closed"""
@@ -241,9 +249,19 @@ class Settings:
 
 
 class _Cmd:
-    def __init__(self, pid: str, n: int, do: str, msg: dict):
+    def __init__(self, pid: str, n: int, do: str, msg: dict, answer=None):
         self.pid, self.n, self.do, self.msg = pid, n, do, msg
         self.tries, self.next = 0, 0.0
+        self.answer = answer  # (Event, list): its answer waited for (ask), put in the list; None: said in feedback
+
+    def settle(self, ok: bool, why: str, r=None) -> bool:
+        """Its answer (and what a look found) to the one waiting for it: False if no one is."""
+        if self.answer is None:
+            return False
+        event, box = self.answer
+        box.append((ok, why, r))
+        event.set()
+        return True
 
 
 class Share:
@@ -370,24 +388,51 @@ class Share:
             if self.peers.pop(pid, None) is not None:
                 self.version += 1
 
-    def command(self, pid: str, n: int, do: str, **args):
+    def command(self, pid: str, n: int, do: str, *, by: str = "", answer=None, **args) -> bool:
         """Ask that instance to adjust its row n (an action of ACTIONS, with its arguments); a refusal, or no answer,
-        is said in Peer.feedback."""
+        is said in Peer.feedback (or to answer: see ask). by: who asks, as its row and log say ('': this instance).
+        False if it was not sent (that instance gone, or no network)."""
         now = time.monotonic()
         with self.lock:
             p = self.peers.get(pid)
             if p is None or self.own is None:
-                return
+                return False
             if do == "setpoint":  # the latest wins: one still unanswered is not sent again
                 for cid, c in list(self._pending.items()):
                     if c.pid == pid and c.n == n and c.do == do:
                         del self._pending[cid]
+                        c.settle(False, "another setpoint was sent after it")
             self._cid += 1
-            c = _Cmd(pid, n, do, {"k": "cmd", "c": self._cid, "ch": n, "do": do, "a": args, "by": self.who,
-                                  "t": round(time.time(), 3)})
+            c = _Cmd(pid, n, do, {"k": "cmd", "c": self._cid, "ch": n, "do": do, "a": args, "by": by or self.who,
+                                  "t": round(time.time(), 3)}, answer)
             self._pending[self._cid] = c
-            p.feedback.pop(n, None)
+            if answer is None:
+                p.feedback.pop(n, None)
             self._send_cmd(c, p, now)
+            return True
+
+    def ask(self, pid: str, n: int, do: str, *, by: str = "", **args) -> tuple:
+        """command(), its answer waited for (RETRY_S × TRIES at most): (done, why not, what a look found)."""
+        answer = (threading.Event(), [])
+        if not self.command(pid, n, do, by=by, answer=answer, **args):
+            with self.lock:
+                gone = pid not in self.peers
+            return False, "that PC is gone" if gone else (self.error or "this PC is not on the network"), None
+        answer[0].wait(self.RETRY_S * self.TRIES + 1.0)
+        return answer[1][0] if answer[1] else (False, "no answer", None)
+
+    def watch(self, pid: str, seconds: float):
+        """That instance's readings wanted at once (fast) for so long, whatever the window wants (ARTIQ's calls
+        that read them: rpc.py)."""
+        now = time.monotonic()
+        with self.lock:
+            p = self.peers.get(pid)
+            if p is None:
+                return
+            was = p.want_now(now)
+            p.watched_until = max(p.watched_until, now + seconds)
+        if was != "fast":
+            self._hello(p)  # at once
 
     # ------------------------------------------------------------------ loop
     def start(self):
@@ -518,7 +563,7 @@ class Share:
         msg = {"k": "hello", "v": 1, "label": self.label, "host": self.host, "ctl": self.control,
                "src": self._src()}
         if p is not None:
-            msg["want"] = p.wanted
+            msg["want"] = p.want_now(time.monotonic())
             with self.lock:
                 msg["knows"] = [f"{o.addr[0]}:{o.addr[1]}" for o in self.peers.values()
                                 if o is not p and not o.bye and not o.lost][:16]
@@ -647,8 +692,10 @@ class Share:
         c = self._pending.pop(_int(msg.get("c")), None)
         if c is None or c.pid != p.id:
             return
-        if not msg.get("ok"):
-            p.feedback[c.n] = (f"not done on {p.label}: {msg.get('why') or 'refused'}", now + 10.0)
+        why = str(msg.get("why") or "")
+        if not c.settle(bool(msg.get("ok")), why or ("" if msg.get("ok") else "refused"), msg.get("r")) and not \
+                msg.get("ok"):
+            p.feedback[c.n] = (f"not done on {p.label}: {why or 'refused'}", now + 10.0)
 
     def _on_cmd(self, msg: dict, addr, now: float):
         sender, cid, n, do = msg["id"], _int(msg.get("c")), _int(msg.get("ch")), str(msg.get("do", ""))
@@ -659,34 +706,38 @@ class Share:
                 p.heard = now
             done = self._done.get((sender, cid))
         if done is None:
-            ok, why = self._do(sender, cid, n, do, msg.get("a") or {}, msg.get("t"), who)
+            ok, why, r = self._do(sender, cid, n, do, msg.get("a") or {}, msg.get("t"), who)
             with self.lock:
-                self._done[(sender, cid)] = (ok, why, now)
+                self._done[(sender, cid)] = (ok, why, now, r)
         else:
-            ok, why = done[0], done[1]  # (sent again: answered again, not done again)
-        self._send({"k": "ack", "c": cid, "ok": ok, "why": why}, addr)
+            ok, why, r = done[0], done[1], done[3]  # (sent again: answered again, not done again)
+        ack = {"k": "ack", "c": cid, "ok": ok, "why": why}
+        if r is not None:
+            ack["r"] = r
+        self._send(ack, addr)
 
-    def _do(self, sender: str, cid, n, do: str, args: dict, stamp, who: str):
-        if not self.control:
-            return False, "adjusting from other PCs is off there"
+    def _do(self, sender: str, cid, n, do: str, args: dict, stamp, who: str) -> tuple:
+        """(done, why not, what a look found)."""
+        if not self.control and do not in LOOKS:
+            return False, "adjusting from other PCs is off there", None
         if do not in ACTIONS or n is None or cid is None or not isinstance(args, dict):
-            return False, f"cannot {do!r} from another PC"
+            return False, f"cannot {do!r} from another PC", None
         if self._key and not (_num(stamp) and abs(time.time() - stamp) < self.CLOCK_S):
-            return False, "its clock and this PC's differ by over 2 min (or an old message replayed)"
+            return False, "its clock and this PC's differ by over 2 min (or an old message replayed)", None
         last = self._last_cid.get((sender, n, do))
         if do == "setpoint" and last is not None and cid < last:
-            return True, "superseded"  # (an older one, overtaken on the way)
+            return True, "superseded", None  # (an older one, overtaken on the way)
         self._last_cid[(sender, n, do)] = cid
         try:
-            ok, why = self.engine.remote(n, do, args, who)
+            ok, why, *found = self.engine.remote(n, do, args, who)
         except Exception as e:  # (a bad argument, say: refused, never the end of this thread)
             log.exception("channel %s: %s from %s", n, do, who)
-            ok, why = False, f"cannot {do}: {e}"
-        if ok and why != "unchanged":
+            ok, why, found = False, f"cannot {do}: {e}", []
+        if ok and why != "unchanged" and do not in LOOKS:
             log.info("channel %d: %s", n, self.engine.channels[n].remote_note or f"{do} from {who}")
         elif not ok:
             log.info("channel %s: %s from %s refused: %s", n, do, who, why)
-        return ok, "" if why == "unchanged" else why
+        return ok, "" if why == "unchanged" else why, found[0] if found else None
 
     # ------------------------------------------------------------- the tick
     def _tick(self, now: float):
@@ -745,12 +796,14 @@ class Share:
                 p = self.peers.get(c.pid)
                 if p is None:
                     del self._pending[cid]
+                    c.settle(False, "that PC is gone")
                 elif c.tries >= self.TRIES:
                     del self._pending[cid]
-                    p.feedback[c.n] = (f"not done: no answer from {p.label}", now + 10.0)
+                    if not c.settle(False, f"no answer from {p.label}"):
+                        p.feedback[c.n] = (f"not done: no answer from {p.label}", now + 10.0)
                 else:
                     self._send_cmd(c, p, now)
-            for key, (_, _, t) in list(self._done.items()):
+            for key, (_, _, t, _) in list(self._done.items()):
                 if now - t > self.DONE_S:
                     del self._done[key]
             for a, t in list(self._tried.items()):
