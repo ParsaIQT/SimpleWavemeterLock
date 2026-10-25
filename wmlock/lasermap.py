@@ -2227,6 +2227,87 @@ def export_csv(m: LaserMap, path) -> int:
     return len(m.points)
 
 
+SEND_BRANCH = "maps"   # the branch of this program's own repository that --send sends maps to
+SEND_MOST = 95e6       # bytes: the most a map sent may be, gzipped (GitHub takes no file over 100 MB)
+
+
+def send(path, branch: str = SEND_BRANCH, remote: str = "origin", repo=None) -> str:
+    """Send a map's file to `branch` of the git repository this program was cloned from (repo: that clone, None: the
+    one it runs from), for someone elsewhere to fetch (git fetch REMOTE BRANCH): a copy of it without its
+    interference patterns (most of a file, and nothing a model needs), gzipped, committed there beside the maps sent
+    before (one of the same name replaced) and pushed, by git's own plumbing, so that nothing of the clone changes:
+    not its files, its index or the branch checked out. Returns what it did; RuntimeError if it cannot (git not
+    found, not a clone, the push refused...)."""
+    import gzip
+    import os
+    import subprocess
+    import tempfile
+
+    if shutil.which("git") is None:
+        raise RuntimeError("git is not installed (or not on the PATH)")
+    repo = Path(repo) if repo is not None else Path(__file__).resolve().parent.parent
+    name = Path(path).name + ".gz"
+    env = dict(os.environ)
+
+    def git(*args, data=None) -> str:
+        try:
+            r = subprocess.run(["git", *args], cwd=repo, input=data, capture_output=True, env=env)
+        except OSError as exc:  # (its folder gone, say)
+            raise RuntimeError(f"git {args[0]}: {exc}") from None
+        if r.returncode:
+            raise RuntimeError(f"git {args[0]}: " + (r.stderr or r.stdout).decode(errors="replace").strip())
+        return r.stdout.decode(errors="replace").strip()
+
+    try:
+        git("rev-parse", "--show-toplevel")
+    except RuntimeError:
+        raise RuntimeError(f"this program does not run from a git clone ({repo}): there is nowhere to send it") \
+            from None
+    url = git("remote", "get-url", remote)
+    try:
+        git("config", "user.email")
+    except RuntimeError:  # (no one is set for its commits: they are made in this program's name)
+        env.update(GIT_AUTHOR_NAME="SimpleWavemeterLock", GIT_AUTHOR_EMAIL="wmlock@localhost",
+                   GIT_COMMITTER_NAME="SimpleWavemeterLock", GIT_COMMITTER_EMAIL="wmlock@localhost")
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / "map.sqlite"
+        src = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+        dst = sqlite3.connect(str(copy))
+        try:
+            src.backup(dst)  # (as it is now, were it being written)
+            dst.execute("DELETE FROM patterns")
+            dst.commit()
+            dst.execute("VACUUM")
+        finally:
+            dst.close()
+            src.close()
+        data = gzip.compress(copy.read_bytes(), 6, mtime=0)
+        if len(data) > SEND_MOST:
+            raise RuntimeError(f"{name} is {len(data) / 1e6:.0f} MB even so: too big to send this way")
+        blob = git("hash-object", "-w", "--stdin", "--no-filters", data=data)
+        env["GIT_INDEX_FILE"] = str(Path(tmp) / "index")  # (an index of its own: the clone's is not touched)
+        for attempt in (1, 2):  # (again, if someone sent one meanwhile)
+            tip = git("ls-remote", remote, f"refs/heads/{branch}").split()
+            parent = []
+            if tip:
+                git("fetch", "--no-tags", remote, f"refs/heads/{branch}")
+                git("read-tree", tip[0])
+                parent = ["-p", tip[0]]
+            else:
+                git("read-tree", "--empty")
+            git("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}")
+            tree = git("write-tree")
+            commit = git("commit-tree", tree, *parent, "-m", f"{name}: a laser map ({len(data) / 1e6:.1f} MB)")
+            try:
+                git("push", remote, f"{commit}:refs/heads/{branch}")
+                break
+            except RuntimeError:
+                if attempt == 2:
+                    raise
+    return (f"sent: {name} ({len(data) / 1e6:.1f} MB; its interference patterns left out) to the {branch!r} branch "
+            f"of {url}")
+
+
 def brief(m: LaserMap) -> str:
     """A map's file in a line: its name, its laser, the temperatures it was made at."""
     laser = m.meta.get("laser", {})
@@ -2349,6 +2430,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m wmlock.lasermap", description="What a laser map's file holds.")
     ap.add_argument("files", nargs="+", metavar="FILE")
     ap.add_argument("--csv", action="store_true", help="write each one's points as FILE.csv")
+    ap.add_argument("--send", action="store_true",
+                    help=f"send it (its interference patterns left out, gzipped) to the {SEND_BRANCH!r} branch of "
+                         f"the git repository this program was cloned from, for someone elsewhere to look at")
     ap.add_argument("--model", action="store_true",
                     help="fit the laser's model to it (lasermodel.py; needs numpy and scipy) and say its facts")
     ap.add_argument("--save-model", action="store_true",
@@ -2372,6 +2456,7 @@ def main(argv=None) -> int:
     if args.model or args.park is not None:  # (minutes: a click in its window must not hold it)
         quick_edit_off()
 
+    failed = False
     for name in args.files:
         with load(name) as m:
             print(describe(m) if args.park is None or args.verbose else brief(m))
@@ -2402,7 +2487,13 @@ def main(argv=None) -> int:
                         print("  the laser, as its model fitted now has it:")
                         print("\n".join(f"   - {fact}" for fact in model.facts()))
                 print(park_text(m, args.park, model, note, args.temp, args.robust, args.verbose))
-    return 0
+        if args.send:  # (with the model, if it was kept just now)
+            try:
+                print(f"  {send(name)}")
+            except (RuntimeError, sqlite3.Error) as exc:
+                print(f"  not sent: {exc}")
+                failed = True
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

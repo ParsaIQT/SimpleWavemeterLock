@@ -669,6 +669,72 @@ def test_the_command_line_says_what_a_map_holds_and_writes_its_points_as_csv(tmp
     assert rows[0][:5] == ["id", "line_id", "leg", "k", "t"] and "dl:pd:photodiode" in rows[0]
 
 
+def test_a_map_is_sent_to_a_branch_of_its_repository_and_nothing_of_the_clone_changes(tmp_path, capsys,
+                                                                                      monkeypatch):
+    """--send: the file, its patterns left out, gzipped, committed to the 'maps' branch of the clone's origin beside
+    those sent before, by git's own plumbing: the clone's files, index and branch as they were."""
+    import gzip
+    import shutil
+    import subprocess
+
+    from wmlock import lasermap
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+
+    def git(*args, cwd=tmp_path, raw=False):
+        out = subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=True).stdout
+        return out if raw else out.decode().strip()
+
+    origin, clone = tmp_path / "origin.git", tmp_path / "clone"
+    git("init", "-q", "--bare", str(origin))
+    git("clone", "-q", str(origin), str(clone))
+    (clone / "code.py").write_text("print('the program')\n")
+    git("add", "code.py", cwd=clone)
+    git("-c", "user.name=lab", "-c", "user.email=lab@example.org", "commit", "-qm", "the program", cwd=clone)
+    git("push", "-q", "origin", "HEAD", cwd=clone)
+    (clone / "notes.txt").write_text("someone's, not committed\n")
+    (clone / "code.py").write_text("print('the program, changed')\n")
+    git("add", "code.py", cwd=clone)  # (staged: the clone's own index)
+    head, branch = git("rev-parse", "HEAD", cwd=clone), git("rev-parse", "--abbrev-ref", "HEAD", cwd=clone)
+    status = git("status", "--porcelain", cwd=clone)
+    b = MapBench()
+    out = MapFile(tmp_path / "map_one.sqlite")
+    r = b.run(Mapper(plan(v_lo=68.0, v_hi=72.0, i_lo=140.0, i_step=1.0), out, {"laser": {"channel": 3}}))
+    out.close()
+    assert r.state == "done", r.error
+    said = lasermap.send(out.path, repo=clone)
+    assert said.startswith("sent: map_one.sqlite.gz (") and f"to the 'maps' branch of {origin}" in said
+    second = tmp_path / "second.sqlite"
+    second.write_bytes(out.path.read_bytes())
+    lasermap.send(second, repo=clone)
+    assert git("ls-tree", "--name-only", "maps", cwd=origin).split() == ["map_one.sqlite.gz", "second.sqlite.gz"]
+    assert git("rev-list", "--count", "maps", cwd=origin) == "2"  # (one after the other, the first kept)
+    sent = tmp_path / "sent.sqlite"
+    sent.write_bytes(gzip.decompress(git("show", "maps:map_one.sqlite.gz", cwd=origin, raw=True)))
+    with load(sent) as f, load(out.path) as g:
+        assert len(f.points) == len(g.points) > 0 and f.meta["laser"] == g.meta["laser"]
+        assert f.db.execute("SELECT COUNT(*) FROM patterns").fetchone()[0] == 0  # (left out)
+        assert g.db.execute("SELECT COUNT(*) FROM patterns").fetchone()[0] > 0  # (the map itself as it was)
+    assert git("rev-parse", "HEAD", cwd=clone) == head
+    assert git("rev-parse", "--abbrev-ref", "HEAD", cwd=clone) == branch
+    assert git("status", "--porcelain", cwd=clone) == status  # (its files and its index as they were)
+    with pytest.raises(RuntimeError, match="does not run from a git clone"):
+        lasermap.send(out.path, repo=tmp_path / "nowhere")
+    calls = []  # (the command line: sent, or why not)
+    monkeypatch.setattr(lasermap, "send", lambda path: calls.append(path) or "sent: here")
+    capsys.readouterr()
+    assert lasermap.main([str(out.path), "--send"]) == 0 and calls == [str(out.path)]
+    assert "  sent: here" in capsys.readouterr().out
+
+    def refused(path):
+        raise RuntimeError("git push: denied")
+
+    monkeypatch.setattr(lasermap, "send", refused)
+    assert lasermap.main([str(out.path), "--send"]) == 1
+    assert "  not sent: git push: denied" in capsys.readouterr().out
+
+
 def test_a_wavemeter_that_says_nothing_more_stops_the_map_and_it_is_put_back(tmp_path):
     b = MapBench(patterns=False)
     p = plan(patterns="off")

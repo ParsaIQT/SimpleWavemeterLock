@@ -1620,6 +1620,11 @@ with load("map_2026-10-24_171230_ch3_854.sqlite") as m:
 `python -m wmlock.lasermap FILE…` says what a map holds (its plan, where it began, how many points,
 lasing, hops each way, its feedforward, the ideal one each map found, how it ended, its model's facts if
 kept); `--csv` writes its points as `FILE.csv` too, `--model` fits the laser's model to it (above).
+`--send` sends it to the `maps` branch of the git repository the program was cloned from, for someone elsewhere
+to look at (`git fetch origin maps`): a copy without its interference patterns (most of a file; nothing a model
+needs: the 650 nm map's 375 MB is 7 MB so), gzipped, committed beside the maps sent before, by git's own plumbing,
+so that the clone's files, its index and the branch checked out stay as they were. In a public repository the
+maps are public too.
 
 **How long, how big**: a point takes the settling time, a round trip to the DLC pro and its readings.
 With 2 ms exposures that's about 70 ms with the defaults; where the laser is dim, much longer. 100 mA
