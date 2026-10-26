@@ -31,6 +31,7 @@ from .modehop import HopParams
 from .qt import Qt, QtCore, QtGui, QtWidgets
 from .reference import ACQUIRING, HOLD, MOVED, TRACKING, RefParams, fmt_duration
 from .relock import usable_zero, volts
+from .sls import KINDS, PORT, SlsParams, probe
 from .view import NOTE_S, STALE_S, decimals, fmt_mhz, fmt_nm  # noqa: F401  (NOTE_S, STALE_S: as before)
 from .wavemeter import C_NM_THZ
 
@@ -257,6 +258,13 @@ class Row(QtWidgets.QFrame):
                   "if it is not locked on target now, relock it now. It does nothing else: the piezo\n"
                   "is its lock's. Watching: click to stop watching.")
     LOCK_TIP = "Lock to the wavemeter: the piezo (its scan offset, as a rule) follows the reading onto the setpoint."
+    SLS_TIP = ("An SLS unit locks it (SLS lock…); this does not lock it to the wavemeter.\n"
+               "Relock: watch it (its lock's dropouts are logged in any case). A slave an SLS PLL\n"
+               "beat-locks with its manual lock is guarded: its PLL released the moment its master's\n"
+               "lock or its beat is lost (before it runs the slave's current and piezo away), the slave\n"
+               "recovered if it stopped lasing, brought back to its beat point by the wavemeter once\n"
+               "its master holds again, and its PLL engaged there. If its PLL does not hold it now, it\n"
+               "is relocked now. Watching: click to stop watching (its PLL is left as it is).")
 
     def __init__(self, win: "MainWindow", n: int):
         super().__init__()
@@ -269,6 +277,7 @@ class Row(QtWidgets.QFrame):
         self._menu = None
         self._is_ref = False
         self._relock = None  # the button arms the relock of a cavity-locked laser (else: the wavemeter lock)
+        self._sls = ""       # ...or of a laser an SLS unit locks ('pdh', 'pll')
         self._prompt = ""
         self._where = ""     # (another PC's row: on which, for the button's tooltip)
 
@@ -356,15 +365,15 @@ class Row(QtWidgets.QFrame):
             self._prompt = prompt
             self.info.setToolTip(prompt)
         self.info.paint(v.get("info", ""), v.get("info_c", "dim") if live else "dim")
-        self._set_relock(bool(v.get("relock")))
+        self._set_relock(bool(v.get("relock")), v.get("sls") or "")
         self._set_state(v.get("state") or "off")
         self.name.paint(v.get("name", ""), "dim")
 
-    def _set_relock(self, relock: bool):
-        if relock == self._relock:
+    def _set_relock(self, relock: bool, sls: str = ""):
+        if (relock, sls) == (self._relock, self._sls):
             return
-        self._relock = relock
-        self.btn.setToolTip((self.RELOCK_TIP if relock else self.LOCK_TIP) + self._where)
+        self._relock, self._sls = relock, sls
+        self.btn.setToolTip((self.SLS_TIP if sls else self.RELOCK_TIP if relock else self.LOCK_TIP) + self._where)
         state, self._state = self._state, None
         if state is not None:
             self._set_state(state)  # the label
@@ -382,7 +391,8 @@ class Row(QtWidgets.QFrame):
         elif state == "mapping":
             label = "Mapping"
         elif self._relock:
-            label = {"on": "Watching", "recovering": "Recentering", "asking": "Continue"}.get(state, "Relock")
+            label = {"on": "Watching", "recovering": "Relocking" if self._sls else "Recentering",
+                     "asking": "Continue"}.get(state, "Relock")
         else:
             label = {"on": "Locked", "engaging": "Locking", "recovering": "Recentering",
                      "asking": "Continue"}.get(state, "Lock")
@@ -500,6 +510,8 @@ class ChannelRow(Row):
         m.addSeparator()
         m.addAction("Setpoint = current reading", lambda: e.setpoint_to_current(self.n)).setEnabled(ch.freq > 0)
         m.addAction("Lock settings…", self.settings_dialog)
+        m.addAction("SLS lock…" + (f" ({'PLL' if ch.sls.kind == 'pll' else 'Laser Servo'} {ch.sls.unit})"
+                                   if ch.sls.on else ""), self.sls_dialog)
         self._hop_actions(m, ch)
         m.addAction("Use as reference laser" + (f" (instead of channel {ref.channel})" if ref else ""),
                     lambda: self.win.use_as_reference(self.n, e))
@@ -570,6 +582,12 @@ class ChannelRow(Row):
         d = LockDialog(self, ch)
         if d.exec():
             self.engine.set_params(self.n, d.params())
+
+    def sls_dialog(self):
+        ch = self.engine.channels[self.n]
+        d = SlsDialog(self, self.engine, ch)
+        if d.exec():
+            self.engine.set_sls(self.n, d.params())
 
     def hop_dialog(self):
         ch = self.engine.channels[self.n]
@@ -1180,6 +1198,152 @@ class LockDialog(QtWidgets.QDialog):
 
     def params(self) -> LockParams:
         return LockParams(**{k: sb.value() for k, sb in self.boxes.items()})
+
+
+class SlsDialog(QtWidgets.QDialog):
+    """What locks a channel's laser if an SLS unit does (sls.py): its Laser Servo to the cavity, or a PLL to a master
+    (its manual lock guarded)."""
+
+    KIND = (("", "nothing of SLS's: this program, or its DLC pro, locks it"),
+            ("pdh", "an SLS Laser Servo locks it to the cavity (PDH)"),
+            ("pll", "an SLS PLL beat-locks it to a master (it is the slave)"))
+    SERVO = ("a one-channel PLL (SuperHeterodyne Laser PLL)", "a 3-channel PLL: servo 1", "a 3-channel PLL: servo 2",
+             "a 3-channel PLL: servo 3")
+
+    def __init__(self, parent, engine: Engine, ch):
+        super().__init__(parent)
+        self.setWindowTitle(f"SLS lock · channel {ch.n}")
+        self.p = p = ch.sls
+        self.n = ch.n
+        form = QtWidgets.QFormLayout(self)
+
+        def number(value, lo, hi, dec, step, unit):
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setLocale(QtCore.QLocale.c())
+            sb.setRange(lo, hi)
+            sb.setDecimals(dec)
+            sb.setSingleStep(step)
+            sb.setValue(value)
+            box = QtWidgets.QHBoxLayout()
+            box.addWidget(sb)
+            box.addWidget(Text(unit, "dim"))
+            box.addStretch(1)
+            return sb, box
+
+        self.kind = QtWidgets.QComboBox()
+        self.kind.addItems([label for _, label in self.KIND])
+        self.kind.setCurrentIndex(next((k for k, (name, _) in enumerate(self.KIND) if name == p.kind), 0))
+        form.addRow("Its lock", self.kind)
+        self.host = QtWidgets.QLineEdit(p.host)
+        self.host.setPlaceholderText("P1029H (its serial number: its name on the LAN), or its address")
+        self.port = QtWidgets.QSpinBox()
+        self.port.setRange(1, 65535)
+        self.port.setValue(p.port or PORT)
+        box = QtWidgets.QHBoxLayout()
+        box.addWidget(self.host, 1)
+        box.addWidget(Text("port", "dim"))
+        box.addWidget(self.port)
+        form.addRow("The unit", box)
+        self.servo = QtWidgets.QComboBox()
+        self.servo.addItems(self.SERVO)
+        self.servo.setCurrentIndex(max(0, min(p.servo, 3)))
+        form.addRow("Which PLL", self.servo)
+        self.master = QtWidgets.QComboBox()
+        self.masters = [0] + sorted(k for k in engine.channels if k != ch.n)
+        names = {k: engine.channels[k].name for k in self.masters[1:]}
+        self.master.addItems(["none on this wavemeter: its setpoint is its beat point"]
+                             + [f"channel {k}" + (f" {names[k]}" if names[k] else "") for k in self.masters[1:]])
+        self.master.setCurrentIndex(self.masters.index(p.master) if p.master in self.masters else 0)
+        form.addRow("Its master", self.master)
+        self.beat, box = number(p.beat, -1e5, 1e5, 2, 0.1,
+                                "MHz: its frequency less its master's, as the wavemeter reads them (0: learned, its "
+                                "PLL holding it)")
+        form.addRow("Beat", box)
+        self.guard = QtWidgets.QCheckBox(
+            "Guard it (Relock): release its PLL at once when its master's lock or its beat is lost,\nbefore it runs "
+            "the slave's current and piezo away; relock it once the master holds again")
+        self.guard.setChecked(p.guard)
+        form.addRow("", self.guard)
+        self.capture, box = number(p.capture, 0.05, 100.0, 2, 0.1,
+                                   "MHz: brought this close to its beat point by the wavemeter, its PLL is engaged")
+        form.addRow("Capture", box)
+        self.tries = QtWidgets.QSpinBox()
+        self.tries.setRange(1, 50)
+        self.tries.setValue(p.tries)
+        box = QtWidgets.QHBoxLayout()
+        box.addWidget(self.tries)
+        box.addWidget(Text("tries in a row that fail, then it waits 5 min and tries again", "dim"))
+        box.addStretch(1)
+        form.addRow("Tries", box)
+        self.off_mhz, box = number(p.off_mhz, 0.5, 1e4, 1, 1.0,
+                                   "MHz: the wavemeter reads it further from its beat point (twice): lost")
+        form.addRow("Lost beyond", box)
+        self.slow_max, box = number(p.slow_max, 0.0, 100.0, 2, 0.5,
+                                    "V either way: its slow output's range; at 95 % of it, lost (0: not watched)")
+        form.addRow("Slow output", box)
+        test = QtWidgets.QPushButton("Test")
+        test.clicked.connect(self._test)
+        self.found = Text("", "dim")
+        self.found.setWordWrap(True)
+        box = QtWidgets.QHBoxLayout()
+        box.addWidget(test)
+        box.addWidget(self.found, 1)
+        form.addRow("", box)
+        form.addRow(Text("Every SLS unit answers on its LAN port (8080) with what its front USB console shows. A\n"
+                         "slave its PLL beat-locks needs its laser linked (its DLC pro) for the wavemeter to bring it\n"
+                         "back to its beat point, and Mode-hop recovery… set up to be recovered if it stops lasing.",
+                         "dim"))
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+        self.kind.currentIndexChanged.connect(self._enable)
+        self._enable()
+        self._result = None
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._tested)
+
+    def _enable(self):
+        kind = self.KIND[self.kind.currentIndex()][0]
+        for w in (self.host, self.port):
+            w.setEnabled(bool(kind))
+        for w in (self.servo, self.master, self.beat, self.guard, self.capture, self.tries, self.off_mhz,
+                  self.slow_max):
+            w.setEnabled(kind == "pll")
+
+    def _test(self):
+        kind = self.KIND[self.kind.currentIndex()][0] or "pll"
+        host, port, servo = self.host.text().strip(), self.port.value(), self.servo.currentIndex()
+        if not host:
+            self.found.paint("which unit?", "warn")
+            return
+        self.found.paint(f"asking {host}…", "dim")
+        self._result = None
+
+        def run():
+            self._result = probe(host, port, kind, servo)
+
+        import threading
+
+        threading.Thread(target=run, daemon=True).start()
+        self._timer.start(100)
+
+    def _tested(self):
+        if self._result is not None:
+            self._timer.stop()
+            self.found.paint(self._result, "dim")
+
+    def params(self) -> SlsParams:
+        kind = self.KIND[self.kind.currentIndex()][0]
+        d = self.p.to_dict()
+        d.update(kind=kind if kind in KINDS else "", host=self.host.text().strip(), port=self.port.value(),
+                 servo=self.servo.currentIndex(), master=self.masters[self.master.currentIndex()],
+                 beat=round(self.beat.value(), 2), guard=self.guard.isChecked(), capture=self.capture.value(),
+                 tries=self.tries.value(), off_mhz=self.off_mhz.value(), slow_max=self.slow_max.value())
+        if d["servo"] != self.p.servo or d["host"] != self.p.host or d["master"] != self.p.master:
+            d["amp_usual"] = 0.0  # (another unit or master: learned afresh)
+        return SlsParams.from_dict(d)
 
 
 class HopDialog(QtWidgets.QDialog):
@@ -3189,6 +3353,20 @@ class MainWindow(QtWidgets.QWidget):
                               functools.partial(las.go_multimode, 1))
                 sim.addAction(f"{who}: error signal DC drifts +20 mV",
                               functools.partial(setattr, las.lock, "pdh_dc", las.lock.pdh_dc + 0.02))
+            pll = getattr(las, "beat", None)
+            if pll is not None:  # (a slave an SLS PLL beat-locks: simsls.py)
+                if pll.master_lock is not None:
+                    sim.addAction(f"{who}: its master's SLS lock drops for 0.5 s (its PLL runs away)",
+                                  functools.partial(pll.master_lock.drop, 0.5))
+                    sim.addAction(f"{who}: its master's SLS lock drops for 8 s",
+                                  functools.partial(pll.master_lock.drop, 8.0))
+                sim.addAction(f"{who}: its PLL's unit off the LAN for 20 s",
+                              functools.partial(MainWindow._sls_down, pll.sls, 20.0))
+
+    @staticmethod
+    def _sls_down(unit, seconds: float):
+        unit.down = "close"
+        QtCore.QTimer.singleShot(int(seconds * 1000), functools.partial(setattr, unit, "down", ""))
 
     def confirm(self, title: str, text: str) -> bool:
         box = QtWidgets.QMessageBox.question(self, title, text)

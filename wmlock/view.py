@@ -14,7 +14,10 @@ row(engine, n, now) is a dict:
   prompt    step by step: what the recovery waits to be allowed ('' if nothing)
   state     the look of the row and its button: off, error, on, engaging, recovering, asking, mapping, ref, ref-hold,
             ref-moved
-  relock    the button relocks a laser its DLC pro locks to a cavity (Relock, Watching), else Lock (Locked)
+  relock    the button relocks a laser its DLC pro locks to a cavity, or an SLS unit locks (Relock, Watching), else
+            Lock (Locked)
+  sls       what SLS unit locks it (sls.py): 'pdh' (its Laser Servo, to the cavity), 'pll' (a PLL, beat-locked), ''
+            none
 Colours are names: fg, dim, ok, warn, err, accent. tip(engine, n, digits) is the tooltip of its digits.
 """
 from __future__ import annotations
@@ -25,6 +28,7 @@ import time
 from .engine import Engine
 from .reference import ACQUIRING, HOLD, MOVED, TRACKING, fmt_duration
 from .relock import volts
+from .sls import TITLES
 from .wavemeter import C_NM_THZ
 
 STALE_S = 3.0  # a channel without a new reading for this long is greyed out
@@ -71,7 +75,8 @@ def row(e, n: int, now: float) -> dict:
     if state == "recovering" and ch.hop_prompt:
         state = "asking"
     v["state"] = state if state != "off" else ("error" if ch.message else "off")
-    v["relock"] = ch.relock
+    v["relock"] = ch.relock or ch.sls.on
+    v["sls"] = ch.sls.kind if ch.sls.on else ""
     return v
 
 
@@ -136,30 +141,87 @@ def _info(e, ch, now: float):
         return _mapping(ch, now)
     if ch.message:
         return ch.message, "err", ""
-    if not ch.device:
+    if not ch.device and not ch.sls.on:
         return "right-click to link a laser" + remote_text(ch, now), "dim", ""
-    ctrl = e.controllers.get(ch.device)
-    where = e.where(ch)
-    more = hop_text(ch, now) + lock_text(ch, now) + remote_text(ch, now)
+    ctrl = e.controllers.get(ch.device) if ch.device else None
+    where = e.where(ch) if ch.device else f"locked by {TITLES[ch.sls.kind].split(' (')[0]}"
+    more = hop_text(ch, now) + sls_text(e, ch, now) + lock_text(ch, now) + remote_text(ch, now)
     if ctrl is not None and ctrl.online is False:
         return f"{where}   offline" + (f": {ctrl.error}" if ch.dac and ctrl.error else ""), "err", ""
     if ch.lasing is False and ch.hop.enabled:
         return f"{where}   NOT LASING: seed {ch.seed:.2f} mW{more}", "err", ""
+    flag = sls_flag(ch)
+    if flag:
+        return f"{where}   {flag}{more}", "err", ""
     if slipping(ch):
         return f"{where}   CAVITY LOCK SLIPPING{more}", "warn", ""
     if shg_gone(ch):
         return f"{where}   SHG SIGNAL GONE{more}", "warn", ""
     if ch.look_why:
         return f"{where}   looking, its wavemeter channel switched on for it: {ch.look_why}{more}", "warn", ""
-    if ch.off and (ch.state in ("on", "engaging") or ch.relock):
-        if ch.relock:
+    if ch.off and (ch.state in ("on", "engaging") or ch.relock or ch.sls.on):
+        if ch.sls.on:
+            what = f"watched by {'its PLL' if ch.sls.kind == 'pll' else 'its SLS servo'}"
+        elif ch.relock:
             what = "watched by what its DLC pro says" if ch.state == "on" else \
                 "Relock has it watched (and a look, the channel switched on for it)"
         else:
             what = f"lock held at {ch.offset:.3f} {ch.unit}" if ch.offset is not None else "lock held"
         return f"{where}   wavemeter channel off: {what}{more}", "dim", ""
+    if not ch.device:
+        return f"{where}{more}", "dim", ""
     off = "…" if ch.offset is None else f"{ch.offset:.3f} {ch.unit}"
     return f"{where}   {off}{more}", "dim", ""
+
+
+def sls_text(e, ch, now: float) -> str:
+    """What the SLS unit that locks it says, and what its guard did last."""
+    p = ch.sls
+    if not p.on:
+        return ""
+    text = f"   {'PLL' if p.kind == 'pll' else 'SLS'} {p.unit}: "
+    if ch.sls_error:
+        text += f"not answering ({ch.sls_error})"
+    elif ch.sls_view is None:
+        text += "…"
+    else:
+        text += ch.sls_view.said()
+    if p.kind == "pll" and p.master:
+        text += f" · master channel {p.master}" + (f", beat {p.beat:+.2f} MHz" if p.beat else ", beat not learned yet")
+    g = ch.sls_guard
+    if g is not None and g.stage == "failed":
+        text += f" · {g.said(time.time())}"
+    elif ch.beat_slave and p.guard and ch.state == "off":
+        text += " · not guarded: Relock guards it"
+    if ch.sls_note and now - ch.sls_note_t < NOTE_S:
+        text += f"   ⟲ {ch.sls_note}, {fmt_duration(now - ch.sls_note_t)} ago"
+    if not ch.hop.enabled and ch.drops:
+        wall = time.time()
+        k = sum(1 for t, _ in ch.drops if wall - t <= 3600.0)
+        if k:
+            text += f"   {k} lock dropout{'s' if k != 1 else ''} in the last hour"
+    return text
+
+
+def sls_flag(ch) -> str:
+    """What is wrong with the lock an SLS unit has on it ('': nothing): its unit not answering, its lock off (watched),
+    not holding (a dropout going on), or its guard gave up."""
+    p = ch.sls
+    if not p.on:
+        return ""
+    if ch.sls_error:
+        return "SLS UNIT NOT ANSWERING"
+    g = ch.sls_guard
+    if g is not None and g.stage == "failed":
+        return "BEAT LOCK LOST"
+    v = ch.sls_view
+    if v is None:
+        return ""
+    if not v.mode:
+        return ("PLL OFF" if p.kind == "pll" else "SLS LOCK OFF") if ch.state == "on" else ""
+    if v.holds is False or ch.sls_drop is not None:
+        return "BEAT LOCK LOST" if p.kind == "pll" else "SLS LOCK LOST"
+    return ""
 
 
 def lock_text(ch, now: float) -> str:
@@ -263,6 +325,21 @@ def notes(e, n: int) -> str:
                  + (", step by step" if hop.confirm else ""))
     if getattr(ch, "model_note", ""):
         text += f"\nits laser's model: {ch.model_note}"
+    if ch.sls.on:
+        p = ch.sls
+        text += f"\nlocked by {TITLES[p.kind]}: {p.unit}, http://{p.host.strip()}:{p.port}"
+        if p.kind == "pll":
+            text += (f"\nits master: channel {p.master}" if p.master else
+                     "\nits master: not on this wavemeter (its setpoint is its beat point)")
+            text += (f"; its beat {p.beat:+.2f} MHz, as the wavemeter reads them (learned, its PLL holding it)"
+                     if p.beat else "; its beat not learned yet (its PLL holding it, it is)")
+            text += ("\nguarded (Relock): its PLL released at once when its master's lock or its beat is lost, and "
+                     "relocked once the master holds again" if p.guard else "\nwatched only: not guarded")
+        v = ch.sls_view
+        if v is not None:
+            text += f"\nits unit says: {v.said()} (a poll takes {v.took * 1e3:.0f} ms)"
+    if ch.sls_note:
+        text += f"\nits SLS lock, last: {ch.sls_note}"
     if ch.off:
         text += "\nits wavemeter channel is switched off ('Use' unticked in the WLM software)"
     if ch.note:

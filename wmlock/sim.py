@@ -62,7 +62,11 @@ class FakeDLCPro:
 
     Its temperature controller: dl:tc:temp-act follows dl:tc:temp-set (its config's "temp", °C) with
     a time constant of temp_tau s on `clock` (as a TEC would, roughly), within its limits (a write
-    outside them is refused); the piezo's limits are dl:pc:voltage-min and -max."""
+    outside them is refused); the piezo's limits are dl:pc:voltage-min and -max.
+
+    external[n]: () -> (V, mA) that something outside adds to laser n's piezo voltage and current through
+    its controller's inputs (an SLS PLL's outputs, simsls.py): in what it runs at (piezo(), current_act(),
+    voltage-act), not in what is set."""
 
     _REF = re.compile(r"\(param-ref '([\w:-]+)\)$")
     _SET = re.compile(r"\(param-set! '([\w:-]+) (\S+)\)$")
@@ -91,7 +95,7 @@ class FakeDLCPro:
                 p + "scan:amplitude": float(d.get("amplitude", 2.5)), p + "scan:frequency": 20.0,
                 p + "emission": True,
                 p + PIEZO_SET: float(d.get("offset", 70.0)),
-                p + "dl:pc:voltage-act": lambda n=n: self.offset(n),
+                p + "dl:pc:voltage-act": lambda n=n: self.piezo(n),
                 p + "dl:cc:current-set": float(d.get("current", 150.0)),
                 p + "dl:cc:current-act": lambda n=n: self.current_act(n),
                 p + "dl:cc:current-offset": 0.0,
@@ -108,6 +112,7 @@ class FakeDLCPro:
                 p + "dl:tc:limits:temp-max": float(d.get("temp_max", 35.0)),
             })
         self.bias = {n: float(d.get("act_offset", 0.0)) for n, d in lasers.items()}
+        self.external = {}  # laser -> () -> (V, mA) added to its piezo and current from outside
         self.ff_from = {n: d.get("ff_from", 0.0) for n, d in lasers.items()}  # V (None: it adds nothing at rest)
         self.sets = 0
         self.log = []  # every accepted write: (parameter, value); every command: (name, args)
@@ -137,10 +142,13 @@ class FakeDLCPro:
         return (SCAN_OFFSET if out == OUT_PC else PIEZO_SET), (SCAN_OFFSET if out == OUT_CC else CURRENT_SET)
 
     def offset(self, n: int) -> float:
-        """Its piezo voltage (V): the scan's offset, as a rule."""
+        """Its piezo voltage as set (V): the scan's offset, as a rule."""
         return self.params[f"laser{n}:{self.drives(n)[0]}"]
 
-    piezo = offset
+    def piezo(self, n: int) -> float:
+        """Its piezo voltage (V): as set, plus what comes in from outside (external)."""
+        ext = self.external.get(n)
+        return self.offset(n) + (ext()[0] if ext is not None else 0.0)
 
     def current(self, n: int) -> float:
         """Its set current (mA)."""
@@ -148,6 +156,11 @@ class FakeDLCPro:
 
     def current_act(self, n: int) -> float:
         """The diode current, as measured: what the laser runs at."""
+        ext = self.external.get(n)
+        return self.current_own(n) + (ext()[1] if ext is not None else 0.0)
+
+    def current_own(self, n: int) -> float:
+        """The diode current as this controller sets it (without what comes in from outside)."""
         p, d = f"laser{n}:", self.params
         i = self.current(n) + d[p + "dl:cc:current-offset"] + self.bias.get(n, 0.0)
         ref = self.ff_from.get(n, 0.0)
@@ -1442,7 +1455,9 @@ class SimLaser:
         self._unlocked_until = self._dark_until = 0.0
         self.ecdl = None
         self.lock = lock          # SimLocked: its DLC pro locks it to a cavity
-        self._mutex = threading.Lock()
+        self.beat = None          # simsls.SimPll: an SLS PLL beat-locks it to another laser
+        self.wobble = 0.0         # MHz: its own drift, as last worked out
+        self._mutex = threading.RLock()  # (its PLL settles it too, from another thread: simsls.SimPll.update)
         self.ccd = SimCCD(seed=seed)  # the wavemeter's view of it, in detail
         self.t_ref = None         # °C: its controller's temperature when this was made (ECDL.T is from there)
         if dlc is not None:
@@ -1511,9 +1526,12 @@ class SimLaser:
                 return self.f0 + ghz * 1e-3 + wobble * 1e-6
             if self.ecdl is None:
                 return self.f0 + wobble * 1e-6
+            self.wobble = wobble
             v, i = self.dlc.piezo(self.n), self.dlc.current_act(self.n)
             self._warm()
             f = self.ecdl.freq(v, i, wobble) if self.lock is None else self.lock.frequency(wobble)
+            if self.beat is not None and math.isfinite(f):
+                f = self.beat.held(now, f)  # (its PLL holding it: its master's frequency plus the beat)
             return f if math.isfinite(f) else None  # not lasing
 
     # faults of a laser with a controller
@@ -1718,11 +1736,15 @@ class Demo:
         (3, 638.610400, +0.40, None, 0, "638"),
     ]
     MODELS = ("simulated WS7", "simulated WS6")
+    MASTER, SLAVE = 9, 10  # beat=True: the 739 SHG's sisters on the SLS cavity: a master an SLS Laser Servo locks to
+    MASTER_NM = 739.050800  # it (P1029D), a slave an SLS PLL beat-locks BEAT_MHZ above the master (P1029H; or a
+    BEAT_MHZ = 80.0         # 3-channel PLL's servo beat_servo), with its manual lock; the slave a TA-SHG pro whose TA
+    #                         switches itself off after 3 s without seed, that stops lasing 1.3 mA below its current
 
     def __init__(self, discovery_port=DISCOVERY_PORT, wavemeter=None, exposure=0.02, dac=False, meters=1,
-                 serials=None):
+                 serials=None, beat=False, beat_servo=0):
         """meters: 2, a second simulated wavemeter on this PC (SECOND); serials: the simulated wavemeters' serial
-        numbers (else 1001, 1002)."""
+        numbers (else 1001, 1002); beat: the master and slave of an SLS beat lock (MASTER, SLAVE: simsls.py)."""
         self.dlcs = [
             FakeDLCPro("SIM-000123", "Ca+ blue", {1: {"product": "DL pro 397"}, 2: {"product": "DL pro 866"}}),
             FakeDLCPro("SIM-000456", "Ca+ red", {1: {"product": "DL pro 854"},
@@ -1733,6 +1755,10 @@ class Demo:
         if meters > 1:
             self.dlcs.append(FakeDLCPro("SIM-000999", "Yb+ cooling", {1: {"product": "DL pro 369"},
                                                                       2: {"product": "DL pro 399"}}))
+        self.sister = None
+        if beat:
+            self.sister = FakeDLCPro("SIM-000555", "Yb+ SHG sister", {1: {"product": "TA-SHG pro 739 (slave)"}})
+            self.dlcs.append(self.sister)
         try:
             self.responder = FakeDiscovery(self.dlcs, port=discovery_port)
         except OSError:  # port taken: the GUI gets the devices directly instead
@@ -1766,6 +1792,9 @@ class Demo:
             ch, nm, ghz, ao, ff, ff_ghz, name = self.DAC_LASER
             self.lasers.append(SimLaser(ch, nm, ghz, offset0=0.3, drift=3.0, dac=(self.board, ao, ff, ff_ghz)))
             self.names[ch] = name
+        self.sls, self.pdh, self.pll, self.beat_nm = [], None, None, {}
+        if beat:
+            self._beat_pair(beat_servo)
         self.serials = list(serials or [1001 + k for k in range(meters)])[:meters]
         self.meters = {self.serials[0]: (self.MODELS[0], self.lasers, self.wavemeter)}
         self.second_names = {}
@@ -1774,6 +1803,25 @@ class Demo:
                       for ch, wl, k, c, n, _ in self.SECOND]
             self.meters[self.serials[1]] = (self.MODELS[1], lasers, SimWavemeter())
             self.second_names = {ch: name for ch, *_, name in self.SECOND}
+
+    def _beat_pair(self, servo: int):
+        from .simsls import FakeSls, SimPdh, SimPll
+
+        f_m = C_NM_THZ / self.MASTER_NM
+        slave_nm = C_NM_THZ / (f_m + (self.BEAT_MHZ + 25.0) * 1e-6)  # (by itself 25 MHz off its beat point)
+        master = SimLaser(self.MASTER, self.MASTER_NM, 0.0, None, 0, cavity=True)
+        slave = SimLaser(self.SLAVE, slave_nm, +0.40, self.sister, 1, drift=0.5)
+        e = slave.ecdl
+        e.i_stop, e.i_start = e.i0 - 1.3, e.i0 + 2.4  # (stops lasing 1.3 mA below, starts again only 2.4 mA above)
+        SimTA(self.sister, 1, e, delay=3.0)
+        self.pdh = SimPdh(master, FakeSls("P1029D"))
+        self.pll = SimPll(FakeSls("P1029F" if servo else "P1029H"), slave, master, self.pdh, beat=self.BEAT_MHZ,
+                          servo=servo)
+        self.pll.hold()
+        self.sls = [self.pdh.sls, self.pll.sls]
+        self.lasers += [master, slave]
+        self.names.update({self.MASTER: "739 master", self.SLAVE: "739 slave"})
+        self.beat_nm = {self.MASTER: self.MASTER_NM, self.SLAVE: C_NM_THZ / (f_m + self.BEAT_MHZ * 1e-6)}
 
     def make_source(self, sink, serial=None, model="", interval=None, channels=None):
         """A source for the sink: of the first simulated wavemeter, or of the one with that serial number."""
@@ -1805,9 +1853,13 @@ class Demo:
     def wavelength(self, ch: int) -> float:
         if self.board is not None and ch == self.DAC:
             return self.DAC_LASER[1]
+        if ch in self.beat_nm:
+            return self.beat_nm[ch]
         return next(wl for c, wl, *_ in self.CHANNELS if c == ch)
 
     def close(self):
+        for unit in self.sls:
+            unit.close()
         if self.responder:
             self.responder.close()
         for d in self.dlcs:

@@ -149,6 +149,8 @@ def clean(v) -> dict:
     for k in ("ref_unit", "relock", "linked"):
         if k in v:
             out[k] = bool(v[k])
+    if v.get("sls") in ("pdh", "pll"):
+        out["sls"] = v["sls"]
     if "refch" in v:
         out["refch"] = v["refch"] if isinstance(v["refch"], int) and not isinstance(v["refch"], bool) else None
     if isinstance(v.get("lp"), dict):

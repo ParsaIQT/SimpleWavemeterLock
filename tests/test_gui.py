@@ -948,3 +948,70 @@ def _menu_actions(row):
     acts = [a for a in m.actions()]
     m.close()
     return acts
+
+
+def test_sls_dialog_round_trip_and_its_test(app):
+    """SLS lock…: what locks the laser, its unit, a PLL's master and guard; Test asks the unit what it is."""
+    from wmlock.sim import Demo
+    from wmlock.sls import SlsParams
+
+    demo = Demo(discovery_port=0, beat=True)
+    try:
+        e = Engine({"channels": {"9": {"name": "739 master"}, "10": {"name": "739 slave"}, "3": {}}},
+                   demo.make_source)
+        ch = e.channels[10]
+        d = gui.SlsDialog(None, e, ch)
+        assert d.params() == SlsParams() and not d.host.isEnabled() and not d.master.isEnabled()
+        d.kind.setCurrentIndex(2)
+        assert d.host.isEnabled() and d.master.isEnabled() and d.guard.isChecked()
+        d.host.setText(" 127.0.0.1 ")
+        d.port.setValue(demo.pll.sls.port)
+        d.master.setCurrentIndex(d.masters.index(9))
+        d.capture.setValue(0.8)
+        p = d.params()
+        assert p == SlsParams(kind="pll", host="127.0.0.1", port=demo.pll.sls.port, master=9, capture=0.8)
+        d._test()
+        assert wait_for(lambda: (app.processEvents(), "manual lock (MANUAL)" in d.found.text())[1], 5), d.found.text()
+        ch.sls = SlsParams(kind="pll", host="P1029F", servo=2, master=9, beat=80.1, amp_usual=0.9)
+        d = gui.SlsDialog(None, e, ch)
+        assert d.servo.currentIndex() == 2 and d.beat.value() == 80.1 and d.params() == ch.sls
+        d.servo.setCurrentIndex(3)
+        assert d.params().amp_usual == 0.0  # (another PLL: learned afresh)
+    finally:
+        demo.close()
+
+
+def test_rows_of_lasers_sls_units_lock(app, tmp_path):
+    """The master's row and the slave's: Relock and Watching, the unit's state on the line under the digits, and
+    Relocking while the guard has the slave."""
+    from wmlock.sim import Demo, SimWavemeter
+
+    demo = Demo(discovery_port=0, beat=True, wavemeter=SimWavemeter(noise=0.05), exposure=0.004)
+    cfg = {"channels": {
+        "9": {"name": "739 master", "sls": {"kind": "pdh", "host": "127.0.0.1", "port": demo.pdh.sls.port}},
+        "10": {"name": "739 slave", "link": {"device": demo.sister.key, "laser": 1},
+               "hop": {"enabled": True, "i_nom": 150.0},
+               "sls": {"kind": "pll", "host": "127.0.0.1", "port": demo.pll.sls.port, "master": 9, "beat": 80.0}}}}
+    e = Engine(cfg, demo.make_source, discovery_targets=["127.0.0.1"])
+    win = gui.MainWindow(e, lambda: None)
+    e.start()
+    win.show()
+    try:
+        assert wait_for(lambda: (app.processEvents(), 10 in win.rows and e.channels[10].sls_view is not None)[1], 5)
+        spin(app, 0.3)
+        row = win.rows[10]
+        assert row.btn.text() == "Relock" and "SLS unit locks it" in row.btn.toolTip()
+        assert "PLL 127.0.0.1: manual lock (MANUAL)" in row.info.text() and "not guarded" in row.info.text()
+        assert "SLS 127.0.0.1: Locked: 1" in win.rows[9].info.text()
+        row.btn.click()
+        win.rows[9].btn.click()
+        assert wait_for(lambda: (app.processEvents(), row.btn.text() == "Watching")[1], 3)
+        demo.pdh.drop(0.5)
+        assert wait_for(lambda: (app.processEvents(), row.btn.text() == "Relocking")[1], 3)
+        assert "its master's lock was lost" in row.info.text()
+        assert wait_for(lambda: (app.processEvents(), row.btn.text() == "Watching")[1], 25), row.info.text()
+        assert "relocked: its PLL holds it again" in row.info.text()
+    finally:
+        win.close()
+        e.stop()
+        demo.close()

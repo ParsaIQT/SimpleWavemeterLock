@@ -62,6 +62,13 @@ Currents are shown, and the nominal current given, as measured (current-act);
 the set current (current-set) is what a recovery writes, and is watched for
 changes by hand.
 
+A laser an SLS unit locks (sls.py; Channel.sls): its unit polled by a watch of its own (SlsWatch), its lock's
+dropouts logged as the dropout monitor's are; armed (Relock), a slave an SLS PLL's manual lock beat-locks to a master
+is guarded (sls.Guard): its PLL released the moment its master's lock or its beat is lost, the slave recovered if it
+stopped lasing (its mode-hop recovery), brought to its beat point by the wavemeter lock (steering, Channel.steering)
+once its master holds, and its PLL engaged again. Meanwhile its state is 'recovering'. Its setpoint is its beat point:
+its master's reading plus the beat (as learned, its PLL holding it).
+
 A wavemeter channel switched off ('Use' unticked in the WLM software, by someone
 who wants a faster rate on theirs) gives no readings; the source can switch it
 on again. A laser its DLC pro locks to a cavity stays watched meanwhile, by what
@@ -100,6 +107,8 @@ from .modehop import SEED_FLOOR, Guard, HopParams, Recenter, Runner, perform
 from .observe import Observation
 from .relock import TRANS, says_locked, setup_report, transmission_input, transmission_signal, usable_zero, volts
 from .reference import Reference, RefParams
+from .sls import Guard as BeatGuard
+from .sls import Look, SlsParams, SlsWatch
 from .wavemeter import C_NM_THZ, NAN
 
 log = logging.getLogger(__name__)
@@ -116,6 +125,8 @@ FINE_N = 600   # polls: a level locked as usual is the median of the last this m
 FINE_MIN = 10  # ...once there are this many (until then, the one learned before)
 OBSERVING = ("observe", "observe_end", "observed")  # remote(): a channel's lock observed, nothing changed
 OBSERVED_PART = 20  # [began, s] at most, of an observation's times asked from another PC at a time (one datagram)
+BEAT_N = 200          # readings its beat is learned from (their median)
+STEADY_MHZ = 3.0      # MHz: a reading this far from the one before, its laser was not steady
 DAC_LOCK = dict(kp=0.0, ki=0.01, max_step=0.02, v_min=-1.2, v_max=1.2, excursion=0.8)  # a laser on an analog output:
 #                Epimetheus's limits (±1.2 V; its PID's output ±0.8 V), a gentle start for the gain
 
@@ -216,6 +227,29 @@ class Channel:
         self.hold_since = None  # monotonic: since when its lock should hold (on, no recovery)
         # where it was on target as it should be (the catch: its right mode is there)
         self.fine_at = None    # (monotonic, scan offset, set current) when last polled so
+        # an SLS unit locks it (sls.py)
+        self.sls = SlsParams.from_dict(cfg.get("sls"))
+        self.sls_view = None   # sls.View: its unit's last poll
+        self.sls_error = ""    # its unit does not answer: why ('': it does)
+        self.sls_since = None  # time.time(): holding since then, by its unit's polls (None: not holding)
+        self.sls_held_t = None  # time.time(): the last poll it held at (a dropout begins there)
+        self.sls_count = None  # its unit's relock count at the last poll
+        self.sls_drop = None   # (time.time(), why): a dropout of its lock going on, since then
+        self.sls_bad_t = None  # time.time(): the last poll it did not hold at
+        self.sls_guard = None  # sls.Guard: armed, the guard of a slave its PLL beat-locks
+        self.sls_note = ""     # what the guard did last, said (and when, monotonic)
+        self.sls_note_t = 0.0
+        self.steering = None   # MHz: the wavemeter lock brings it to its beat point plus this (None: not steering)
+        self.steer_fail = ""   # ...and could not: why
+        self.beat_e = None     # MHz: its last reading from its beat point (None: no telling)
+        self.beat_off_n = 0    # readings in a row further than SlsParams.off_mhz from its beat point
+        self.near_n = 0        # readings in a row within capture of where it is steered
+        self.beat_seen = deque(maxlen=BEAT_N)  # MHz: its readings less its master's, its PLL holding it
+        self.amp_seen = deque(maxlen=BEAT_N)  # V: its beat amplitude (a one-channel PLL's), holding it
+        self.recovered = None  # its mode-hop recovery, for the guard, just ended: '' it did, else why not
+        self.steady_t = 0.0    # monotonic: its readings steady (no jump of STEADY_MHZ) since then...
+        self.steady_f = NAN    # ...the last of them (THz)
+        self.recent = deque(maxlen=3)  # THz: its last few valid readings (a slave's beat point goes by their median)
         # the last adjustment made from another PC (share.py)
         self.remote_note = ""  # what, and from where
         self.remote_t = 0.0    # monotonic...
@@ -284,6 +318,8 @@ class Channel:
             d["map"] = self.map_plan.to_dict()
         if self.model_dict is not None:
             d["model"] = self.model_dict
+        if self.sls.kind:
+            d["sls"] = self.sls.to_dict()
         return d
 
     def laser_model(self):
@@ -320,11 +356,18 @@ class Channel:
         return self.hop.cavity
 
     @property
+    def beat_slave(self) -> bool:
+        """An SLS PLL beat-locks it to a master."""
+        return self.sls.on and self.sls.kind == "pll"
+
+    @property
     def hop_stage(self) -> str:
         if self.state != "recovering":
             return ""
         if self.runner is not None:
             return self.runner.stage
+        if self.sls_guard is not None and self.sls_guard.relocking:
+            return self.sls_guard.said(time.time())
         if self.borrowed and (self.off or self.pending is not None):
             return "its wavemeter channel switched on: waiting for readings"
         return "reading the laser's settings"
@@ -514,6 +557,7 @@ class Engine:
         self.config = config
         self.log_path, self.drop_path = log_path, drop_path
         self.monitors = {}  # channel -> its DropoutMonitor
+        self.sls_watches = {}  # channel -> its SlsWatch (an SLS unit locks its laser)
         self.observations = {}  # tag -> an Observation of a channel's lock (observe.py), oldest first
         self.started = time.time()
         self.lock = threading.RLock()
@@ -548,12 +592,17 @@ class Engine:
             for ch in self.channels.values():
                 if ch.device:
                     self._watch(ch)
+                if ch.sls.on:
+                    self._watch_sls(ch)
         self.source.start()
         self.start_discovery()
 
     def stop(self):
         with self.lock:
             monitors, self.monitors = list(self.monitors.values()), {}
+            watches, self.sls_watches = list(self.sls_watches.values()), {}
+        for w in watches:
+            w.stop()  # (no more releases or engagements: its PLL is left as it is)
         for m in monitors:
             m.stop()  # (each puts its recorder's settings back)
         with self.lock:
@@ -576,7 +625,7 @@ class Engine:
         while getattr(self.source, "switching", False) and self.source.is_alive() and time.monotonic() < end:
             time.sleep(0.02)
         self.source.stop()
-        for m in monitors:
+        for m in monitors + watches:
             m.join(max(0.0, end + 5.0 - time.monotonic()))
         with self.lock:
             controllers = list(self.controllers.values())
@@ -683,7 +732,7 @@ class Engine:
         with self.lock:
             chs = self.channels
             shown = set(self.active) | {n for n in self.off if chs[n].state != "off" or (
-                chs[n].relock and chs[n].hop.enabled and chs[n].device)}
+                chs[n].relock and chs[n].hop.enabled and chs[n].device) or chs[n].sls.on}
             return [n for n in sorted(shown) if not chs[n].hidden]
 
     # ------------------------------------------------ its channel switched off
@@ -856,8 +905,17 @@ class Engine:
                 if ch.mapper is not None:  # (a map has it: nothing else)
                     ch.mapper.on_reading(r)
                     continue
+                if ch.freq > 0:  # (steady: no jump of STEADY_MHZ from the reading before)
+                    if not abs(ch.freq - ch.steady_f) * 1e6 <= STEADY_MHZ:
+                        ch.steady_t = r.t
+                    ch.steady_f = ch.freq
+                    ch.recent.append(ch.freq)
+                else:
+                    ch.steady_t, ch.steady_f = r.t, NAN
                 withheld = self._hop_reading(ch, r.t) if ch.hop.enabled or ch.runner else False
-                if ch.state == "on" and ch.freq > 0 and not withheld and not ch.relock:
+                if ch.beat_slave:
+                    self._beat_reading(ch)
+                elif ch.state == "on" and ch.freq > 0 and not withheld and not ch.relock and not ch.sls.on:
                     self._step(ch)
                 if ch.pending is not None and ch.freq > 0:  # the readings it waited for
                     args, ch.pending = ch.pending, None
@@ -914,6 +972,9 @@ class Engine:
                 return
             if self.reference is not None and self.reference.channel == n:
                 return  # the reference laser is locked to its cavity, not to the wavemeter
+            if ch.sls.on:  # an SLS unit locks it: watched (a PLL's slave, guarded)
+                self._arm_sls(ch)
+                return
             if not ch.device:
                 ch.message = "right-click to link a laser first"
                 return
@@ -1004,6 +1065,13 @@ class Engine:
                 self._disengage(ch, message)
 
     def _disengage(self, ch: Channel, message: str):
+        if ch.sls_guard is not None:  # (a PLL's slave: guarded no more, its PLL left as it is)
+            if ch.sls_guard.stage in ("released", "recover", "steer", "engage", "failed"):
+                ch.sls_note, ch.sls_note_t = "its PLL left released: stopped while it was being relocked", \
+                    time.monotonic()
+            ch.sls_guard = None
+        if ch.steering is not None:
+            self._unsteer(ch)
         if ch.runner is not None:  # a recovery: it puts current and offset back, then reports
             ch.resume = False
             ch.runner.cancel(message or "stopped")
@@ -1029,6 +1097,10 @@ class Engine:
     def set_setpoint(self, n: int, nm):
         with self.lock:
             ch = self.channels[n]
+            if self._follows(ch):
+                ch.sls_note, ch.sls_note_t = (f"its setpoint is its beat point (channel {ch.sls.master}'s reading "
+                                              f"{ch.sls.beat:+.1f} MHz): not set by hand"), time.monotonic()
+                return
             ch.set_setpoint(nm)
             ch.guard.reset()  # not a hop: the guard waits for the laser to settle there
             ch.guard.track = 0.0
@@ -1201,10 +1273,12 @@ class Engine:
         log.info("channel %d: its scan drives %s: its piezo is set by %s, its current by %s", ch.n, output_name(out),
                  piezo, cc)
         why = f"its scan now drives {output_name(out)}: the piezo is {piezo}"
+        if ch.steering is not None:
+            self._unsteer(ch, why)
         if ch.runner is not None:
             ch.resume = False
             ch.runner.cancel(why, keep=True)
-        elif ch.state == "on" and not ch.relock:
+        elif ch.state == "on" and not ch.relock and not ch.sls.on:
             self._disengage(ch, f"unlocked: {why}")
         c = self.controllers.get(ch.device)
         if c is not None:
@@ -1470,9 +1544,10 @@ class Engine:
 
     def _armed(self, ch: Channel) -> bool:
         """Watched for hops (and for losing lasing): locked to the wavemeter by this program, or Relock
-        armed while its DLC pro has its cavity lock on (the reference laser: always, it has no button)."""
+        armed while its DLC pro has its cavity lock on (the reference laser: always, it has no button). Not a laser
+        an SLS unit locks: its guard calls its recoveries."""
         hop = ch.hop
-        if not hop.enabled or not ch.device:
+        if not hop.enabled or not ch.device or ch.sls.on:
             return False
         if hop.cavity:
             return ch.state == ("off" if self._is_reference(ch) else "on") and bool(ch.cavity_on)
@@ -1607,6 +1682,367 @@ class Engine:
         drop_log.info("%s: %d lock dropout%s in the last hour%s (%d since %s); watched by %s", who, n,
                       "" if n == 1 else "s", f", the longest {most}" if n else "", total, since, figures)
 
+    # ---------------------------------------------------------- an SLS unit locks it (sls.py)
+    SLS_STALE_S = 2.0   # s: a unit's poll older than this (it does not answer) tells nothing
+    BEAT_FRESH_S = 2.0  # s: its master's reading goes with its own if at most this old
+    BEAT_LEARN_S = 10.0  # s its PLL must have held before its beat is learned from the readings
+    BEAT_MIN = 20       # readings it is learned from, at least
+
+    def set_sls(self, n: int, params: SlsParams):
+        """What locks channel n's laser: an SLS unit (params.kind 'pdh', 'pll'), or none (kind '')."""
+        with self.lock:
+            ch = self.channels[n]
+            old = ch.sls
+            if ch.state != "off" and (params.kind != old.kind or not params.same_unit(old) or not params.on):
+                self._disengage(ch, "")
+            if params.kind != "pll" or params.master != old.master:
+                ch.beat_seen.clear()
+            ch.sls = params
+            if ch.sls_guard is not None:
+                ch.sls_guard.p = params
+            self._watch_sls(ch)
+            self.layout_version += 1
+            self.dirty = True
+
+    def _watch_sls(self, ch: Channel):
+        """Its unit polled by a watch of its own while it has one (a new watch for a new unit)."""
+        w = self.sls_watches.get(ch.n)
+        if w is not None and (not ch.sls.on or not w.p.same_unit(ch.sls)):
+            w.stop()
+            del self.sls_watches[ch.n]
+            w = None
+            ch.sls_view, ch.sls_error, ch.sls_since, ch.sls_held_t, ch.sls_count = None, "", None, None, None
+            if ch.sls_drop is not None:
+                self._sls_drop_over(ch, time.time())
+        if w is not None:
+            w.p = ch.sls  # (its settings, as they are now)
+            return
+        if ch.sls.on:
+            name = f"channel {ch.n}" + (f" {ch.name}" if ch.name else "")
+            w = SlsWatch(ch.sls, step=lambda watch, view, fresh: self._sls_step(ch, watch, view, fresh),
+                         wrote=lambda watch, action, err: self._sls_wrote(ch, watch, action, err), name=name)
+            w.seen = 0.0  # time.time(): the last poll it went by
+            self.sls_watches[ch.n] = w
+            w.start()
+
+    def _arm_sls(self, ch: Channel):
+        """Relock clicked on a laser an SLS unit locks: watched (a PLL's slave, guarded: if its PLL does not hold it on
+        its beat point now, it is relocked now)."""
+        ch.state, ch.message = "on", ""
+        ch.token += 1
+        if ch.beat_slave and ch.sls.guard:
+            ch.sls_guard = BeatGuard(ch.sls)
+            w = self.sls_watches.get(ch.n)
+            if w is not None:
+                w.wake()
+
+    def _follows(self, ch: Channel) -> bool:
+        """Its setpoint is its beat point (its master's reading plus the beat), not its own."""
+        return ch.beat_slave and bool(ch.sls.master) and bool(ch.sls.beat)
+
+    def _master(self, ch: Channel):
+        m = self.channels.get(ch.sls.master) if ch.sls.master else None
+        return m if m is not None and m is not ch else None
+
+    def _beat_point(self, ch: Channel):
+        """THz: where its PLL holds it, its master's reading of the last BEAT_FRESH_S plus the beat; with no master
+        here, its setpoint. None: not known now."""
+        p = ch.sls
+        if not p.master:
+            return ch.f_set if ch.f_set > 0 else None
+        m = self._master(ch)
+        if m is None or not m.freq > 0 or not p.beat or time.monotonic() - m.t > self.BEAT_FRESH_S:
+            return None
+        return statistics.median(m.recent or [m.freq]) + p.beat * 1e-6  # (one odd reading of the master: not it)
+
+    def _beat_reading(self, ch: Channel):
+        """A reading of a laser a PLL beat-locks: its beat learned (its PLL holding it), how far it is from its beat
+        point (two in a row too far: its guard releases it), and, steered there, the wavemeter lock's step."""
+        p, v = ch.sls, ch.sls_view
+        m = self._master(ch)
+        if (m is not None and m.freq > 0 and ch.freq > 0 and time.monotonic() - m.t <= self.BEAT_FRESH_S
+                and v is not None and v.holds and ch.sls_since is not None and ch.steering is None
+                and time.time() - ch.sls_since >= self.BEAT_LEARN_S
+                and (ch.sls_guard is None or ch.sls_guard.stage in ("hold", "auto"))):
+            ch.beat_seen.append((ch.freq - m.freq) * 1e6)
+            if len(ch.beat_seen) >= self.BEAT_MIN:
+                beat = round(statistics.median(ch.beat_seen), 2)
+                if not p.beat or abs(beat - p.beat) > 0.3:
+                    if not p.beat:
+                        log.info("channel %d: its beat with channel %d learned: %+.2f MHz", ch.n, m.n, beat)
+                    p.beat = beat
+                    self.dirty = True
+        point = self._beat_point(ch)
+        if point is None or not ch.freq > 0:
+            ch.beat_e, ch.beat_off_n, ch.near_n = None, 0, 0
+        else:
+            e = (ch.freq - point) * 1e6
+            ch.beat_e = e
+            ch.beat_off_n = ch.beat_off_n + 1 if abs(e) > p.off_mhz else 0
+            near = ch.steering is not None and abs(e - ch.steering) <= p.capture
+            ch.near_n = ch.near_n + 1 if near else 0
+            if p.master:  # (its setpoint: its beat point, or where it is steered)
+                ch.f_set = point + (ch.steering or 0.0) * 1e-6
+                ch.setpoint_nm = C_NM_THZ / ch.f_set
+        if ch.steering is not None and ch.lock.active and ch.freq > 0 and point is not None:
+            self._steer_step(ch, point)
+
+    def _steer(self, ch: Channel, mhz: float):
+        """The wavemeter lock brings it to its beat point plus mhz (its PLL released), from where its piezo is."""
+        ch.steering, ch.steer_fail, ch.near_n = mhz, "", 0
+        ch.lock.disengage("")
+        if not ch.device:
+            ch.steer_fail = "no laser linked to steer it with"
+            return
+        ch.token += 1
+        tok, key, laser, on_dac = ch.token, ch.device, ch.laser, ch.dac
+
+        def job(client):
+            piezo = ACTUATOR if on_dac else self._drives(ch, client, key, laser)[0]
+            v = client.get_float(f"laser{laser}:{piezo}")
+            with self.lock:
+                if ch.token == tok and ch.steering is not None and ch.piezo == piezo:
+                    ch.offset = v
+                    ch.lock.engage(v)
+
+        def failed(exc):
+            with self.lock:
+                if ch.token == tok and ch.steering is not None:
+                    ch.steer_fail = f"cannot steer it: {exc}"
+
+        self._controller(key).submit(job, failed)
+
+    def _steer_step(self, ch: Channel, point: float):
+        """The wavemeter lock's step, steering it to point (THz) plus Channel.steering."""
+        u = ch.lock.update((ch.freq - point) * 1e6 - ch.steering)
+        if not ch.lock.active:
+            ch.steer_fail = ch.lock.message or "the wavemeter lock let go"
+            return
+        if u is not None:
+            ch.offset = u
+            tok = ch.token
+
+            def failed(exc):
+                with self.lock:
+                    if ch.token == tok and ch.steering is not None:
+                        ch.steer_fail = f"cannot steer it: {exc}"
+
+            self._controller(ch.device).set(ch.param, u, failed)
+
+    def _unsteer(self, ch: Channel, why: str = ""):
+        """No more steering (its piezo left where the wavemeter lock had it)."""
+        ch.steering, ch.near_n = None, 0
+        ch.steer_fail = why
+        ch.lock.disengage("")
+        c = self.controllers.get(ch.device)
+        if c is not None:
+            c.cancel(ch.param)
+
+    def _sls_look(self, ch: Channel, view, fresh: bool) -> Look:
+        """What its guard is told now."""
+        now, mono = time.time(), time.monotonic()
+        m = self._master(ch)
+        master = master_s = None
+        if m is not None:
+            mv = m.sls_view if m.sls.on and m.sls.kind == "pdh" else None
+            if mv is not None and not m.sls_error and now - mv.t <= self.SLS_STALE_S and mv.holds is not None:
+                master = mv.holds
+                master_s = now - m.sls_since if mv.holds and m.sls_since is not None else 0.0
+            elif m.freq > 0 and mono - m.t <= self.BEAT_FRESH_S:
+                master_s = mono - m.steady_t  # (not watched: its readings steady that long)
+        far = ""
+        cap = ch.lock.p.capture if ch.lock.p.capture > 0 else 3000.0
+        if ch.beat_e is not None and abs(ch.beat_e) > cap:
+            far = f"{ch.beat_e / 1e3:+.3f} GHz from its beat point"
+        elif not ch.off and ch.t > 0 and not ch.freq > 0 and mono - ch.t <= self.BEAT_FRESH_S and (
+                m is None or m.freq > 0):
+            far = f"no reading ({ch.status or 'none'}): it may not lase"
+        hop = ch.hop
+        k = Look(now=now, armed=ch.sls_guard is not None and ch.state in ("on", "recovering"),
+                 pll=view if view is not None and now - view.t <= self.SLS_STALE_S and not ch.sls_error else None,
+                 fresh=fresh, master=master, master_s=master_s,
+                 beat_off=(f"{ch.beat_e:+.1f} MHz from its beat point" if ch.beat_off_n >= 2 and ch.beat_e is not None
+                           else ""),
+                 near_n=ch.near_n, lasing=ch.lasing, far=far,
+                 can_steer=bool(ch.device) and self._beat_point(ch) is not None and not ch.off,
+                 can_recover=hop.enabled and bool(ch.device) and not ch.dac, recovering=ch.runner is not None,
+                 recovered=ch.recovered)
+        if ch.steer_fail and ch.sls_guard is not None and ch.sls_guard.stage == "steer":
+            k.far = k.far or ch.steer_fail
+        ch.recovered = None
+        return k
+
+    def _sls_step(self, ch: Channel, watch, view, fresh: bool) -> list:
+        """From its watch (its thread): its unit's poll (fresh), or a look at once (woken), or none (no answer). Its
+        lock's dropouts kept; a PLL's slave armed, its guard's step: what to do here done, the writes returned for
+        the watch to make."""
+        wake = []
+        with self.lock:
+            if self.sls_watches.get(ch.n) is not watch:
+                return []
+            ch.sls_error = watch.error
+            if view is not None and fresh:
+                was = ch.sls_view.holds if ch.sls_view is not None else None
+                ch.sls_view = view
+                self._sls_track(ch, view)
+                watch.seen = view.t
+                if (view.amp is not None and view.holds and ch.sls_since is not None and ch.steering is None
+                        and view.t - ch.sls_since >= self.BEAT_LEARN_S
+                        and (ch.sls_guard is None or ch.sls_guard.stage in ("hold", "auto"))):
+                    ch.amp_seen.append(view.amp)  # (its beat amplitude, holding: learned)
+                    if len(ch.amp_seen) >= self.BEAT_MIN:
+                        amp = round(statistics.median(ch.amp_seen), 3)
+                        if abs(amp - ch.sls.amp_usual) > 0.05 * amp:
+                            ch.sls.amp_usual = amp
+                            self.dirty = True
+                if ch.sls.kind == "pdh" and was and view.holds is False:  # its slaves told at once
+                    wake = [w for k, w in self.sls_watches.items()
+                            if self.channels[k].beat_slave and self.channels[k].sls.master == ch.n]
+            elif watch.error:
+                watch.seen = time.time()  # (nothing more will be known of it for a while)
+            out = []
+            if ch.beat_slave and ch.sls_guard is not None:
+                g = ch.sls_guard
+                k = self._sls_look(ch, view, fresh)
+                for a in g.step(k):
+                    out += self._sls_act(ch, g, a)
+                if ch.sls_guard is g and ch.state in ("on", "recovering") and ch.runner is None:
+                    state = "recovering" if g.relocking else "on"
+                    if state == "recovering" and ch.state == "on":  # (a relock begins)
+                        ch.hop_why, ch.hop_t = g.why, time.monotonic()
+                    ch.state = state
+        for w in wake:
+            w.wake()
+        return out
+
+    def _sls_act(self, ch: Channel, g: BeatGuard, a: tuple) -> list:
+        """One of its guard's actions: done here, or (a write to its PLL) returned."""
+        what = a[0]
+        mono = time.monotonic()
+        if what == "release":
+            if ch.steering is not None:
+                self._unsteer(ch)
+            ch.sls_note, ch.sls_note_t = f"its PLL released: {a[1]}", mono
+            log.warning("channel %d: its PLL released: %s", ch.n, a[1])
+            return [a]
+        if what == "engage":
+            return [a]
+        if what == "steer":
+            self._steer(ch, a[1])
+        elif what == "unsteer":
+            self._unsteer(ch)
+        elif what == "recover":
+            log.warning("channel %d: %s, its PLL released: recovered", ch.n, a[1])
+            self._start_recovery(ch, a[1], budget=False, urgent=bool(a[2]))
+        elif what == "held":
+            ch.message = ""
+            took = mono - ch.hop_t if ch.hop_t else 0.0
+            ch.sls_note = f"relocked: its PLL holds it again ({ch.hop_why or 'relock'}, {took:.0f} s)"
+            ch.sls_note_t = mono
+            log.info("channel %d: %s", ch.n, ch.sls_note)
+        elif what == "gave_up":
+            if ch.steering is not None:
+                self._unsteer(ch)
+            ch.sls_note, ch.sls_note_t = f"gave up for now: {a[1]}", mono
+            log.warning("channel %d: beat lock: %s; tries again in %.0f s", ch.n, a[1], g.RETRY_S)
+        elif what == "disarm":
+            self._disengage(ch, f"watching stopped: {a[1]}")
+        return []
+
+    def _sls_wrote(self, ch: Channel, watch, action: tuple, err: str):
+        """Its watch made a write its guard asked for (err: why it did not take, '' it did)."""
+        with self.lock:
+            if self.sls_watches.get(ch.n) is not watch or not err:
+                return
+            ch.sls_note, ch.sls_note_t = f"its PLL: {action[0]} not done: {err}", time.monotonic()
+
+    def _sls_track(self, ch: Channel, v):
+        """A poll of its unit: its lock's dropouts. One begins at the last poll that held, ends at the first that holds
+        again; a relock counted between two polls that both held is one between them (as its unit says when)."""
+        g = ch.sls_guard
+        relocking = g is not None and g.relocking
+        held = bool(v.holds) and not relocking and not (ch.beat_slave and ch.beat_off_n >= 2)
+        expect = bool(v.mode) or (g is not None and g.stage != "idle")  # (its lock on, or its guard has it: switched
+        #                                                                  off by hand, it is no dropout)
+        if held:
+            if ch.sls_drop is not None:
+                self._sls_drop_over(ch, v.t)
+            elif (ch.sls_count is not None and v.count is not None and v.count > ch.sls_count
+                  and ch.sls_held_t is not None):  # (relocked between two polls)
+                end = v.t - v.held if v.held is not None and ch.sls_held_t < v.t - v.held < v.t else v.t
+                self._sls_dropped(ch, ch.sls_held_t, end, f"relocked between two polls (its count {ch.sls_count} → "
+                                                          f"{v.count})")
+                ch.sls_since = end
+            if ch.sls_since is None:  # (by its unit's own count of how long it has held, if it has one)
+                ch.sls_since = max(v.t - v.held, ch.sls_bad_t or 0.0) if v.held is not None and v.held >= 0 else v.t
+            ch.sls_held_t = v.t
+        else:
+            ch.sls_since, ch.sls_bad_t = None, v.t
+            if expect and ch.sls_drop is None:
+                why = (g.why if relocking and g.why else v.why or (
+                    f"the wavemeter reads it {ch.beat_e:+.1f} MHz from its beat point" if ch.beat_e is not None
+                    else "not holding"))
+                ch.sls_drop = (ch.sls_held_t if ch.sls_held_t is not None else v.t, why)
+            elif not expect and ch.sls_drop is not None:  # (its lock switched off: over there)
+                self._sls_drop_over(ch, v.t)
+        ch.sls_count = v.count
+
+    def _sls_drop_over(self, ch: Channel, t1: float):
+        t0, why = ch.sls_drop
+        ch.sls_drop = None
+        self._sls_dropped(ch, t0, t1, why)
+
+    def _sls_dropped(self, ch: Channel, t0: float, t1: float, why: str):
+        """A dropout of the lock an SLS unit has on it, t0 to t1 (time.time(), by its polls): kept, told its
+        observations, said (at most one a second), logged to drop_path."""
+        s = max(t1 - t0, 0.0)
+        ch.drops.append((t0, s))
+        while ch.drops and t1 - ch.drops[0][0] > 3600.0:
+            ch.drops.popleft()
+        ch.drops_total += 1
+        for o in ch.observers:
+            o.drop(t0, s)
+        how = f"{s * 1e3:.0f} ms" if s < 1.0 else f"{s:.1f} s"
+        unit = f"{'its PLL' if ch.sls.kind == 'pll' else 'its SLS servo'} {ch.sls.unit}"
+        at = time.strftime("%H:%M:%S", time.localtime(t0)) + f".{int(t0 % 1 * 1000):03d}"
+        ch.drop_last = f"{time.strftime('%H:%M:%S', time.localtime(t0))} {how}: {why}"
+        text = f"lock dropout {how} ({unit}: {why}), at {at}; {len(ch.drops)} in the last hour"
+        say = t0 - ch.drop_said >= 1.0
+        if say:
+            if ch.drop_unsaid:
+                text += f" ({ch.drop_unsaid} more since the last one said here)"
+            ch.drop_said, ch.drop_unsaid = t0, 0
+        else:
+            ch.drop_unsaid += 1
+        who = f"channel {ch.n}" + (f" {ch.name}" if ch.name else "")
+        if say:
+            drop_log.warning("%s: %s", who, text)
+        if self.drop_path:
+            rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0)) + f".{int(t0 % 1 * 1000):03d}",
+                   "channel": ch.n, "name": ch.name, "duration_ms": round(s * 1e3, 1), "method": f"sls-{ch.sls.kind}",
+                   "unit": ch.sls.unit, "why": why,
+                   "resolution_ms": round(SlsWatch.POLL_S * 1e3, 1)}
+            try:
+                with open(self.drop_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n")
+            except OSError as exc:
+                drop_log.warning("cannot log the dropout: %s", exc)
+
+    def _sls_recovered(self, ch: Channel, why: str) -> bool:
+        """A mode-hop recovery its guard called is over (why: '' it recovered it, else how not): its guard goes on
+        with it. True if so."""
+        g = ch.sls_guard
+        if g is None or g.stage != "recover":
+            return False
+        ch.recovered = why
+        ch.state, ch.pending = "recovering", None
+        ch.hop_why = g.why
+        self._release(ch)
+        w = self.sls_watches.get(ch.n)
+        if w is not None:
+            w.wake()
+        return True
+
     def _controller(self, key: str) -> Controller:
         c = self.controllers.get(key)
         if c is None:
@@ -1709,7 +2145,7 @@ class Engine:
         """How far the locked lasers would be moved if correct(raw THz) replaced the present correction."""
         with self.lock:
             return max((abs(correct(ch.raw) - ch.freq) * 1e6 for ch in self.channels.values()
-                        if ch.state == "on" and ch.raw > 0 and not ch.relock), default=0.0)
+                        if ch.state == "on" and ch.raw > 0 and not ch.relock and not ch.sls.on), default=0.0)
 
     def tick(self):
         """Call now and then from the GUI: keeps the reference's state current when readings stop,
@@ -2090,6 +2526,8 @@ class Engine:
         if ch.runner is not None:
             ch.runner.on_reading(t, e - ch.guard.track)
             return True
+        if ch.sls.on:  # (an SLS unit locks it: its guard calls its recoveries)
+            return False
         hop = ch.hop
         if not hop.enabled or not ch.device or ch.state == "recovering":
             return False
@@ -2230,6 +2668,8 @@ class Engine:
 
     def _recovery_failed(self, ch: Channel, why: str):
         """Before anything was touched."""
+        if self._sls_recovered(ch, why):
+            return
         if ch.upkeeping:  # (an upkeep that did not begin: watched again)
             ch.upkeeping, ch.state = False, "off"
             ch.note, ch.note_t = f"upkeep: none, {why}", time.monotonic()
@@ -2254,6 +2694,8 @@ class Engine:
         took = f"{r.now - ch.hop_t:.0f} s"
         why = f"{ch.hop_why}: " if ch.hop_why else ""
         rec = r.rec
+        if self._sls_recovered(ch, "" if r.state == "done" else r.error or "failed"):
+            pass  # (its guard goes on with it; what it did is noted below all the same)
         if r.state == "done":
             res = r.result
             if res.kv:
@@ -2412,6 +2854,9 @@ class Engine:
                 nm = args.get("nm")
                 if ref:
                     return False, "the reference laser has no setpoint"
+                if self._follows(ch):
+                    return False, (f"its setpoint is its beat point (channel {ch.sls.master}'s reading "
+                                   f"{ch.sls.beat:+.1f} MHz): an SLS PLL holds it there")
                 if nm is not None and not (_num(nm) and nm > 0):
                     return False, f"not a wavelength: {nm!r}"
                 if nm == ch.setpoint_nm:
@@ -2427,14 +2872,14 @@ class Engine:
                 self.engage(n)
                 if ch.state == "off":
                     return False, ch.message or "not locked"
-                what = "Relock clicked" if ch.relock else "locked"
+                what = "Relock clicked" if ch.relock or ch.sls.on else "locked"
             elif do == "unlock":
                 if ch.state == "recovering":
                     return False, "it is recovering: stop that instead"
                 if ch.state == "off":
                     return True, "unchanged"
                 self.disengage(n)
-                what = "watching stopped" if ch.relock else "unlocked"
+                what = "watching stopped" if ch.relock or ch.sls.on else "unlocked"
             elif do == "stop":
                 if ch.state != "recovering":
                     return True, "unchanged"
@@ -2538,10 +2983,14 @@ class Engine:
                 m = self.monitors.get(o.n)
                 caught_up = m is None or not m.is_alive() or (getattr(m, "seen", 0.0) >= o.t1 + self.PAST_S and (
                     getattr(m, "open_since", None) is None or m.open_since > o.t1))
+                w = self.sls_watches.get(o.n)  # (its SLS unit polled since its end)
+                caught_up = caught_up and (w is None or not w.is_alive() or bool(w.error) or w.seen >= o.t1)
                 if not caught_up and time.monotonic() < o.deadline:
                     return {"ready": False, "total": 0}
-                o.result = o.merged()
                 ch = self.channels.get(o.n)
+                if ch is not None and ch.sls_drop is not None and ch.sls_drop[0] <= o.t1 and o in ch.observers:
+                    o.drop(ch.sls_drop[0], o.t1 - ch.sls_drop[0])  # (a dropout going on: until its end)
+                o.result = o.merged()
                 if ch is not None and o in ch.observers:
                     ch.observers.remove(o)
             times = o.result[start:start + count] if count > 0 else o.result[start:]

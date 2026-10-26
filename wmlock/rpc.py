@@ -967,7 +967,8 @@ class Api:
             return {"off": "not locked", "engaging": "locking", "recovering": "being recovered (a mode hop?)",
                     "asking": "being recovered, step by step", "mapping": "being mapped",
                     "error": info or "not locked"}.get(state, state)
-        for flag in ("NOT LASING", "CAVITY LOCK SLIPPING", "SHG SIGNAL GONE"):
+        for flag in ("NOT LASING", "CAVITY LOCK SLIPPING", "SHG SIGNAL GONE", "BEAT LOCK LOST", "SLS LOCK LOST",
+                     "SLS LOCK OFF", "PLL OFF", "SLS UNIT NOT ANSWERING"):
             if flag in info:
                 return flag.lower()
         if v.get("bad") == "off" and v.get("relock"):
@@ -980,7 +981,7 @@ class Api:
         if v.get("anchor") is not None:
             return ""
         if dev is None:
-            return "no setpoint"
+            return "" if v.get("sls") else "no setpoint"  # (an SLS unit's lock, without one: as its lock says)
         if abs(dev) > mhz:
             return f"{dev:+.1f} MHz from its setpoint"
         return ""

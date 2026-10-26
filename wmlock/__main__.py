@@ -77,7 +77,7 @@ def main(argv=None) -> int:
     if args.sim:
         from .sim import Demo
 
-        demo = Demo(dac=True, meters=2, serials=sim_serials(path))
+        demo = Demo(dac=True, meters=2, serials=sim_serials(path), beat=True)
         for ch, name in demo.names.items():
             config.setdefault("channels", {}).setdefault(str(ch), {"name": name})
         config.setdefault("reference", {"channel": demo.REFERENCE})
@@ -93,6 +93,13 @@ def main(argv=None) -> int:
         last = config.setdefault("dac", {}).setdefault("last", {})  # (the simulated board starts at 0 V: where it is)
         last.setdefault(f"{demo.dac_key[4:]}/{ao}", 0.3)
         last.setdefault(f"{demo.dac_key[4:]}/{ff}", 0.0)
+        master = config["channels"][str(demo.MASTER)]  # an SLS Laser Servo locks it to the cavity...
+        master.setdefault("sls", {"kind": "pdh"}).update(host=demo.pdh.sls.host, port=demo.pdh.sls.port)  # (new ports)
+        slave = config["channels"][str(demo.SLAVE)]  # ...and an SLS PLL beat-locks this one to it, its manual lock
+        slave["link"] = {"device": demo.sister.key, "laser": 1}
+        slave.setdefault("hop", {"enabled": True, "i_nom": 150.0})  # (recovered if it stops lasing)
+        pll = slave.setdefault("sls", {"kind": "pll", "master": demo.MASTER})
+        pll.update(host=demo.pll.sls.host, port=demo.pll.sls.port)
         second = config.setdefault("other_wavemeters", {}).setdefault(str(demo.serials[1]), {})
         for ch, name in demo.second_names.items():  # the other simulated wavemeter on this simulated PC
             second.setdefault("channels", {}).setdefault(str(ch), {"name": name})

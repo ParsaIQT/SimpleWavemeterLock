@@ -45,6 +45,11 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
   program answers them for every laser on every PC, from any Python program (`sipyco.pc_rpc.Client`)
   or ARTIQ experiment: setpoints (to the digit), Lock, readings, *are these lasers okay?*, and their
   lock dropouts over a stretch of time. No server of its own (see *ARTIQ*).
+* **SLS lock electronics** (Stable Laser Systems' Laser Servos and PLLs, on the LAN): a laser one of them locks is
+  watched, its lock's dropouts logged; a slave a PLL's manual lock beat-locks to a master is **guarded**: its PLL
+  released the moment the master's lock or the beat is lost (before it runs the slave's current away and the slave
+  stops lasing, its TA switching itself off), the slave recovered if it stopped, and its PLL engaged again on the beat
+  once the master holds (see *SLS locks*).
 * **Several wavemeters on one PC**: one copy of the program reads them all, each framed under its
   own name with its own channels, lasers and settings, told apart by their serial numbers (see
   *Several wavemeters on one PC*).
@@ -413,8 +418,8 @@ From an ARTIQ experiment, the same through its `device_db`: `device_db["wavemete
 | `set_frequency(thz, laser=None, force=False)`, `shift_setpoint(mhz, laser)` | the same, in THz; moved by `mhz` (+: bluer) |
 | `lock(laser)`, `unlock(laser)` | as Lock (a laser its DLC pro locks: Relock) and Locked clicked |
 | `wait(laser, mhz=1.0, timeout=10.0, hold=0.0)` | until it is locked within `mhz` of its setpoint (for `hold` s); its deviation then. TimeoutError, or RuntimeError at once if it is not locked |
-| `is_ok(*lasers, mhz=20.0)` | `(True, '')` if each is locked, lasing, its reading within `mhz` of its setpoint and not older than 3 s, nothing being recovered or mapped; else `(False, what is wrong, laser by laser)` |
-| `observe(laser, mhz=None)` → number, `end_observe(number)` | the times it was not locked in between: its lock dropouts (a laser its DLC pro locks, from its dropout monitor: ms on), and every unlock (unlocked, locking, being recovered, mapped); given `mhz`, also its readings further than that from its setpoint. A numpy array, n × 2: [unix time it began, s], in order, overlapping ones as one. One still going on at the end lasts until then; one that began before `observe`, from when it began |
+| `is_ok(*lasers, mhz=20.0)` | `(True, '')` if each is locked (one an SLS unit locks: holding, as its unit says), lasing, its reading within `mhz` of its setpoint and not older than 3 s, nothing being recovered or mapped; else `(False, what is wrong, laser by laser)` |
+| `observe(laser, mhz=None)` → number, `end_observe(number)` | the times it was not locked in between: its lock dropouts (a laser its DLC pro locks, from its dropout monitor: ms on; one an SLS unit locks, from its polls: 0.1 s on), and every unlock (unlocked, locking, being recovered, mapped); given `mhz`, also its readings further than that from its setpoint. A numpy array, n × 2: [unix time it began, s], in order, overlapping ones as one. One still going on at the end lasts until then; one that began before `observe`, from when it began |
 | `get_wavelength(laser)`, `get_frequency(laser)` | its latest reading (nm, vacuum; THz); RuntimeError if none of the last 3 s |
 | `get_setpoint(laser)`, `get_deviation(laser)`, `is_locked(laser)` | its setpoint (nm, None: none); its reading less its setpoint (MHz); locked? |
 | `status(laser)`, `lasers()` | all about one laser, or every laser shown: name, wavemeter, PC, channel, setpoint, reading, deviation, its state, the line under its digits |
@@ -1286,6 +1291,96 @@ Things to know:
   simulated one offers lockpoint candidates only after `find-candidates`; after a hop its lock
   searches for 1.5 s before it catches a peak again.
 
+## SLS locks: a master on the cavity, a slave beat-locked to it
+
+Stable Laser Systems' lock electronics answer on the LAN: every unit (a Raspberry Pi with an FPGA, known by its serial
+number: P1029A … P1029H) has an HTTP server on port 8080 that gets and sets every parameter its front panel and its USB
+console do (their manuals, *HTTP control*):
+
+```
+http://P1029H:8080/?getValues                                   every parameter, Name=value a line
+http://P1029H:8080/?parameter=PLLLockState                      PLLLockState=AUTO_LOCKED
+http://P1029H:8080/?parameter=PLLManualLockEnable&value=false   its manual lock off
+```
+
+That is all this program uses of them (not their SSH or VNC). In the package you sent, P1029A–E are **SLS Laser
+Servos** (PDH to the 4-bore cavity: *AutoLockState* `Locked: 3 (0d 01:00:21)`, *Transmission* and its threshold, its
+relock count), P1029H is a **one-channel PLL** (the SuperHeterodyne Laser PLL, lock frequency 80 MHz: *PLLAmplitude*,
+the beat note in its IF band, with its threshold; *PZTServoOutput* ±5 V), and P1029F and G are **3-channel PLLs**
+(*Servo1…3*; no amplitude; their saved state says *Feature Acquire Failed* / *Aborting:STATE_FAIL*: the autolock
+that does not work).
+
+### Setting it up
+
+* **The master** (its row): right-click › *SLS lock…* › *an SLS Laser Servo locks it to the cavity*, the unit
+  (`P1029D`, or its address), *Test*. No DLC pro needs linking. Click *Relock* (*Watching*): its lock's state shows on
+  its row; *is_ok* goes by it.
+* **The slave** (its row): *SLS lock…* › *an SLS PLL beat-locks it to a master*, the unit (`P1029H`; on a 3-channel
+  PLL, which servo), its master's channel. Link its DLC pro (*Link laser*: the wavemeter steers it back by its piezo),
+  and set up *Mode-hop recovery…* for it (its nominal current, and its TA's seed watched: *auto*), so that it can be
+  recovered if it stops lasing. Click *Relock* (*Watching*): it is **guarded** (*Guard it*, on by default).
+* **Its beat** is learned while its PLL holds it (the median of its reading less its master's, 10 s after it locked;
+  *Beat*, or type it in): its setpoint is then its beat point, its master's reading plus the beat, and its row's
+  deviation the beat as the wavemeter sees it. On the row: its PLL's state, beat amplitude, slow and fast outputs, its
+  master, and what its guard did last.
+
+### What it watches
+
+Each unit is polled ten times a second, on a connection of its own (*a poll takes … ms*, in its tooltip). The master's
+lock holds while its servo says *Locked* (and its transmission is above its threshold); the slave's while its PLL is on
+(its manual lock, or its autolock) and its beat amplitude is above its threshold (a one-channel PLL), its slow output is
+neither at its rail nor running away (faster than 1 V/s), and the wavemeter reads it within 10 MHz of its beat point
+(two readings in a row). A **dropout** runs from the last poll that held to the first that holds again, and is logged
+as the DLC pro's are (the console, `~/.simplewavemeterlock-dropouts.jsonl` with `"method": "sls-pll"`, *N lock dropouts
+in the last hour*, and ARTIQ's `observe`); a relock between two polls shows as its unit's relock count gone up (the
+dropout then from the poll before to when its unit says it relocked). The row says **BEAT LOCK LOST**, **SLS LOCK
+LOST**, **PLL OFF** or **SLS UNIT NOT ANSWERING**, and `is_ok` says the same.
+
+### The guard
+
+The PLL's manual lock knows nothing of whether it holds: when the master's lock drops even for a moment, the beat goes
+out of its band, its integrators run the slave's current and piezo to their rails, the slave stops lasing (and starts
+again only well above its current), its TA, without seed, switches itself off, and the SHG with it, for the rest of the
+night. Guarded:
+
+1. **Released at once**: its master's servo saying it lost the lock (its watch tells the slave's at once), or two polls
+   of the slave not holding: its manual lock off (its outputs back to zero, the slave back where its DLC pro has it).
+   In the simulation, the PLL is released 0.1–0.2 s after the master's lock drops, before the slave stops lasing.
+2. **Lasing first**: a slave that stopped lasing anyway (its seed power, or no reading) is recovered at once by its
+   mode-hop recovery: its current jumped up until it lases, brought back down slowly (before its TA's delay is up),
+   onto its beat point. Without *Mode-hop recovery…* set up it is waited for, 90 s at most.
+3. **The master first**: nothing more until the master has held 3 s (watched; else its readings steady that long).
+4. **Steered**: the wavemeter lock brings the slave to its beat point (its PLL still off); a one-channel PLL is engaged
+   the moment its beat amplitude shows the beat in its band (0.7 of its usual), else a half capture either side in turn
+   (±0.3, ±0.6, ±0.9, ±1.2 MHz with a capture of 0.6 MHz); a 3-channel PLL once three readings are within *Capture* of
+   it.
+5. **Engaged**: its manual lock on, and released again at the first poll it does not hold (0.15 s on); holding 1.5 s,
+   it is locked: *relocked: its PLL holds it again*.
+6. **Again**: an engagement that does not hold (and stops the slave lasing: recovered again) is tried again, a little
+   either side; after *Tries* (6) in a row, it gives up for 5 minutes, the slave left lasing, free, where it is
+   (**BEAT LOCK LOST** · *gave up: … tries again in …*), then tries again; given up three times in a row, it tries no
+   more until you click *Relock* (something else is wrong: look at it).
+
+Meanwhile the row says *Relocking*, and what it is doing; click it to stop (its PLL is left as it is: released). Its PLL
+switched off at its box stops the guard (*watching stopped: its PLL was switched off at its box*); its autolock
+switched on, the autolock has it (watched, not guarded).
+
+**One thing to set at the slave's DLC pro, guard or no guard**: if the PLL's fast output reaches its current through
+the DLC pro's external input (`dl:cc:external-input`), make its factor small enough that the PLL's whole fast range
+(±1 V) moves the current by less than the slave's margin above where it stops lasing (1.3 mA, on the demo's). A
+runaway then cannot stop it lasing; the guard still releases it and relocks it.
+
+Not tried on the real units yet: the parameter names are their manuals' and their own saved settings' (`P1029H.gsi`);
+what a PLL's state says in its manual lock is not known, so nothing goes by it but its autolock's; that releasing the
+manual lock sets its outputs back to zero is the manual's word for it (the row shows its outputs: look after the first
+release); the PLL's capture range (*Capture*) is a guess, and so is how fast its integrators run away. The first night
+with it, look at the console in the morning.
+
+**In the demo** (`--sim`), channel 9 (*739 master*) is locked by a simulated Laser Servo, channel 10 (*739 slave*) by a
+simulated one-channel PLL's manual lock, 80 MHz above, as primitive as the lab's: right-click empty space › *Simulate a
+fault* › *Channel 10: its master's SLS lock drops for 0.5 s (its PLL runs away)*: unguarded (not *Watching*), the slave
+stops lasing and its TA switches itself off 3 s later; guarded, it is relocked within seconds.
+
 ## Laser maps
 
 A laser map sweeps a laser's current and piezo, and if you ask its temperature too, over all the ground
@@ -1774,6 +1869,8 @@ itself, as you would:
 
 ## Troubleshooting
 
+* **SLS UNIT NOT ANSWERING**: its name (`P1029H`) is not known to this PC's DNS: give its address instead (its
+  *Settings › System Control* shows it); or a firewall between them (TCP 8080). *SLS lock…* › *Test* says what it finds.
 * **No controllers in the menu**: discovery replies are UDP, so allow Python
   through the Windows firewall on the lab network (Windows asks on first run).
   Controllers behind a router won't hear the broadcast; use *Enter IP address…*,
@@ -1851,6 +1948,7 @@ wmlock/reference.py  wavemeter referencing to a cavity-locked laser, pure maths
 wmlock/modehop.py    mode-hop recovery: lasing watch and panic, the catch, the walk, the current map, driver
 wmlock/relock.py     taking over and handing back a DLC pro's cavity and SHG locks; setup check
 wmlock/dropouts.py   lock dropouts: the DLC pro's recorder (or polling) read, dropouts found
+wmlock/sls.py        SLS lock electronics over HTTP (Laser Servo, PLLs): watched; a beat-locked slave's guard
 wmlock/lasermap.py   laser maps: the plan, the sweeps both ways, the file (SQLite), reading it back; python -m wmlock.lasermap
 wmlock/lasermodel.py the laser's model from its map: two combs and a rule, fitted (numpy, scipy), its facts
 wmlock/parking.py    where to park a laser for a wavelength by its model, on the mode that holds most widely
@@ -1864,6 +1962,7 @@ wmlock/rpc.py        calls from other programs (sipyco's pc_rpc, both encodings)
 wmlock/observe.py    a laser's lock observed for ARTIQ: its dropouts and unlocks, as [unix time, s]
 wmlock/gui.py        Qt window
 wmlock/sim.py        simulated wavemeter, mode-hopping lasers (and TAs), fake DLC pros (demo and tests)
+wmlock/simsls.py     simulated SLS units: their HTTP server, a Laser Servo that drops out, a PLL that runs away
 server/server.py     optional HTTP server for the wavemeter PC
 examples/sipyco_client.py    calling it from any Python program (sipyco's Client): setpoints, okay?, dropouts...
 examples/artiq_wavemeter.py  ARTIQ experiments that call it: an oven run, a scan marked by dropouts, a setpoint scan
@@ -1896,7 +1995,11 @@ content, its TA's seed photodiode and seed protection, the SHG cavity's sweep an
 reference cavity's transmission and PDH error signal with a DC level, a lock that cannot hold a
 master on two modes (ReLock catching it again and again), the FALC pro's input
 offset, lockpoint candidates and selection; the synchronous tests drive them through the real
-client and protocol, without sockets. Several PCs are tested with two or three copies in one
+client and protocol, without sockets. SLS lock electronics are simulated as HTTP servers: a Laser Servo
+whose lock drops out now and then, and one- and 3-channel PLLs whose manual lock runs a slave's current
+and piezo to their rails once its master's lock is lost, the slave stopping lasing and its TA switching
+itself off; the guard is tested step by step, and end to end on that night (released before the slave
+stops, recovered when it has, relocked). Several PCs are tested with two or three copies in one
 process, each with its own simulated wavemeter and DLC pros, over the loopback interface: found
 directly and through another, rows shown as they are, adjustments done once (also when tries
 are lost, overtaken or stale), refused when not allowed, keys and groups that keep others out,
