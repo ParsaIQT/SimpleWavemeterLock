@@ -1059,7 +1059,8 @@ def test_rows_of_lasers_sls_units_lock(app, tmp_path):
         assert wait_for(lambda: (app.processEvents(), row.btn.text() == "Watching")[1], 3)
         demo.pdh.drop(0.5)
         assert wait_for(lambda: (app.processEvents(), row.btn.text() == "Relocking")[1], 3)
-        assert "its master's lock was lost" in row.info.text()
+        text = f"{row.info.text()} | {e.channels[10].sls_note}"  # (on its row; or, its simulated PLL having run it
+        assert "its PLL released: its master's lock was lost" in text, text  # dark first, its recovery on its row)
         assert wait_for(lambda: (app.processEvents(), row.btn.text() == "Watching")[1], 25), row.info.text()
         assert "relocked: its PLL holds it again" in row.info.text()
     finally:
