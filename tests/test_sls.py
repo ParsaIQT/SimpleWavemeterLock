@@ -515,6 +515,86 @@ def test_a_slave_that_stopped_lasing_is_recovered_before_its_ta_switches_off(lab
         e.stop()
 
 
+def test_recenter_releases_its_pll_first_and_engages_it_again_after(lab, tmp_path):
+    """Recenter clicked on a slave its PLL holds (Sirius, 27 October: its manual lock had to be switched off and on
+    again by hand after recentering): its guard releases its PLL first (the recovery would fight it), the recovery
+    runs, and then the slave is steered to its beat point and its PLL engaged again: watched and holding after. Not
+    watched when clicked: it is from then on."""
+    e = make_engine(lab, tmp_path)
+    s = e.channels[lab.SLAVE]
+    try:
+        e.engage(lab.MASTER)
+        e.engage(lab.SLAVE)
+        assert wait_for(lambda: s.sls_guard is not None and s.sls_guard.stage == "hold", 3)
+        engages = lab.pll.engages
+        e.recenter(lab.SLAVE)
+        assert wait_for(lambda: not lab.pll.manual, 2), "not released"
+        assert wait_for(lambda: s.runner is not None, 3), (s.sls_guard.stage, s.sls_note)
+        assert s.hop_why == "recenter now" and "its PLL released: recenter now" in s.sls_note
+        assert wait_for(lambda: s.sls_guard.stage == "hold" and s.state == "on", 60), (s.sls_guard.stage, s.message)
+        assert lab.pll.locked and lab.pll.manual and lab.pll.engages > engages
+        assert s.last["why"] == "recenter now" and s.last["ok"], s.last["outcome"]
+        e.disengage(lab.SLAVE)  # (not watched: Recenter watches it from then on, by its guard all the same)
+        assert wait_for(lambda: s.state == "off", 2)
+        engages = lab.pll.engages
+        e.recenter(lab.SLAVE)
+        assert s.state == "on" and s.sls_guard is not None
+        assert wait_for(lambda: s.runner is not None, 5), (s.sls_guard.stage, s.sls_note)
+        assert wait_for(lambda: s.sls_guard.stage == "hold" and s.state == "on", 60), (s.sls_guard.stage, s.message)
+        assert lab.pll.locked and lab.pll.engages > engages
+    finally:
+        e.stop()
+
+
+def test_watched_lasers_are_watched_again_after_a_restart(lab, tmp_path):
+    """Sirius, 27 October: the program restarted at 08:56, and the slave was not watched again until Relock was
+    clicked at 11:43; its lock lost at 10:19 was left lost. A laser an SLS unit locks, watched when the program
+    stops, is watched (guarded) again when it starts; one Relock was stopped on (Watching clicked) is not."""
+    e = make_engine(lab, tmp_path)
+    s = e.channels[lab.SLAVE]
+    try:
+        e.engage(lab.MASTER)
+        e.engage(lab.SLAVE)
+        assert wait_for(lambda: s.sls_guard is not None and s.sls_guard.stage == "hold", 3)
+        assert e.dirty
+    finally:
+        e.stop()
+    cfg = e.to_config()
+    assert cfg["channels"][str(lab.SLAVE)]["watching"] and cfg["channels"][str(lab.MASTER)]["watching"]
+    e = Engine(cfg, lab.make_source, discovery_targets=["127.0.0.1"], drop_path=tmp_path / "drops.jsonl")
+    e.start()
+    s, m = e.channels[lab.SLAVE], e.channels[lab.MASTER]
+    try:
+        assert s.state == "on" and m.state == "on" and s.sls_guard is not None
+        assert wait_for(lambda: s.sls_guard.stage == "hold", 5), s.sls_guard.stage
+        e.disengage(lab.SLAVE)
+        assert wait_for(lambda: s.state == "off", 2)
+    finally:
+        e.stop()
+    cfg = e.to_config()
+    assert "watching" not in cfg["channels"][str(lab.SLAVE)] and cfg["channels"][str(lab.MASTER)]["watching"]
+
+
+def test_a_lock_switched_off_by_hand_ends_its_dropout_and_the_next_begins_afresh(lab, tmp_path):
+    """Sirius, 27 October: its PLL switched off ended a dropout begun at 11:06:37, and when Relock was clicked again
+    another began at 11:06:37 as well: one outage logged twice. One begun after the lock was switched off begins when
+    it is wanted again (its guard has it)."""
+    e = Engine({"channels": {str(lab.SLAVE): {"name": "Sirius", "sls": {"kind": "pll", "host": "127.0.0.1",
+                                                                        "port": lab.pll.sls.port}}}},
+               lab.make_source, discovery_targets=["127.0.0.1"], drop_path=tmp_path / "drops.jsonl")
+    s = e.channels[lab.SLAVE]
+    with e.lock:
+        e._sls_track(s, pv(t=100.0))
+        e._sls_track(s, pv(holds=False, why="its fast output far", t=101.0))  # (lost: a dropout from 100)
+        e._sls_track(s, pv(mode="", holds=None, why="its PLL is off", t=110.0))  # (switched off by hand: over)
+        s.sls_guard = Guard(s.sls)
+        s.sls_guard._go("released", 111.0)  # (Relock clicked: its guard relocks it)
+        e._sls_track(s, pv(mode="", holds=None, why="its PLL is off", t=112.0))
+        s.sls_guard._go("hold", 119.0)
+        e._sls_track(s, pv(t=120.0))
+    assert [(t0, round(dt, 3)) for t0, dt in s.drops] == [(100.0, 10.0), (112.0, 8.0)]
+
+
 def test_three_channel_pll_relocked_by_the_wavemeter_alone(tmp_path):
     """A 3-channel PLL's servo has no beat amplitude: lost, by its slow output running away (and the wavemeter);
     relocked where the wavemeter puts it on its beat point."""

@@ -1717,10 +1717,11 @@ def test_cancelled_mid_walk_with_the_feedforward_everything_goes_back_in_small_s
 
 
 # ------------------------------------------------- the catch: back onto the right mode
-def near_bench(seed=40, ff=0.0, i_stop=None, i_start=None, **ecdl):
+def near_bench(seed=40, ff=0.0, i_stop=None, i_start=None, collapse=False, **ecdl):
     """A TA-SHG pro like the 739 nm one: its master's modes 2.2 GHz (4 pm) apart, going multimode near their edges,
     locked by hand to the cavity peak at its target (as is its SHG cavity); optionally its feedforward on (ff mA/V,
-    as ff_bench) and stopping lasing below i_stop, starting again above i_start."""
+    as ff_bench), stopping lasing below i_stop, starting again above i_start, and its light broadband where a second
+    mode begins (collapse: SimLocked)."""
     kw = dict(fsr=2.2, hysteresis=0.3, multimode=0.4, mm_noise=0.004)
     kw.update(ecdl)
     laser = ECDL(400.0, seed=seed, i_stop=i_stop, i_start=i_start, **kw)
@@ -1729,7 +1730,7 @@ def near_bench(seed=40, ff=0.0, i_stop=None, i_start=None, **ecdl):
         d = b.dlc.params
         d["laser1:dl:cc:feedforward-enabled"], d["laser1:dl:cc:feedforward-factor"] = True, ff
         b.dlc.bias[1] = -ff * V0
-    lock = b.lock_it(seed=seed, shg=True, lockpoints=True, pdh_dc=0.009)
+    lock = b.lock_it(seed=seed, shg=True, lockpoints=True, pdh_dc=0.009, collapse=collapse)
     lock.settle()
     assert lock.locked() and abs(b.off_mhz()) < 1 and b.act == pytest.approx(I0)
     b.shg_usual = lock._intra_now()
@@ -1834,6 +1835,21 @@ def test_a_laser_on_its_mode_has_its_current_parked_at_the_top_end_of_its_best_a
                         r"end of where it is at its best, then the piezo onto the target", n) for n in rec.notes)
     assert re.match(r"relocked, on the right mode: the current to the top end of where it is at its best, 150\.00 → "
                     r"150\.\d0 mA measured, the piezo 70\.00 → 70\.\d\d V", r.result.summary), r.result.summary
+
+
+def test_a_flat_shg_sweep_the_wavemeter_reads_through_is_the_top_of_its_mode():
+    """Sirius, 27 October: parking its current high, its SHG sweep went flat where a second mode began (its light
+    broadband: coherence collapse at the top of its mode) while the wavemeter still read it and its seed power stayed
+    up. Taken for a laser that does not lase, its current jumped 3.5 mA up, and every recovery after failed from there.
+    A flat sweep the wavemeter reads through is the top of its mode: the current back off it, and it is relocked."""
+    b, lock = near_bench(seed=41, collapse=True)
+    lock.jump(1)
+    b, rec, r = recover(b.laser, b.target, optimum(b, kv=400.0), cavity=True, bench=b)
+    assert r.state == "done", (r.error, rec.notes)
+    assert rec.panics == 0 and max(b.writes("dl:cc:current-set")) < I0 + 1.0, rec.notes
+    assert lock.locked() and lock.peak == pytest.approx(b.target, abs=1e-12) and b.single_mode()
+    assert 0 <= below_second_mode(b, lock) < 0.25
+    assert any(n.startswith("parked the current high") for n in rec.notes), rec.notes
 
 
 def test_a_relock_brings_a_current_the_feedforward_sank_back_up_to_the_top_end_of_its_best():

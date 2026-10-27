@@ -729,6 +729,7 @@ class Guard:
         self.steer_to = 0.0  # MHz from the beat point, being steered to...
         self.search_j = 0    # ...the search's point (a beat amplitude to go by: looked for there, not engaged)
         self.tried_recovery = False
+        self.asked = ""      # a recentering asked for (by hand): why, its PLL being released for it
 
     @property
     def relocking(self) -> bool:
@@ -797,6 +798,16 @@ class Guard:
                 return out
             if mode == "auto":
                 self._go("auto", now)
+                return out
+            if self.asked and not k.can_recover:  # (released for a recentering asked for: none set up, relocked)
+                self.asked = ""
+            if self.asked:  # (...its recovery, once its unit shows it released)
+                if p is None or mode != "":
+                    return out
+                why, self.asked = self.asked, ""
+                self.tried_recovery = True
+                out.append(("recover", why, False, False))
+                self._go("recover", now)
                 return out
             if self._rescue(k, out):
                 return out
@@ -875,6 +886,16 @@ class Guard:
                 self.tries = 0
                 self.tried_recovery = False
                 self._go("released", now)
+        return out
+
+    def recenter(self, now: float, why: str) -> list:
+        """Recentering asked for (by hand): its PLL released first (the recovery would fight it), then, its unit
+        showing it released, its mode-hop recovery as if it had called it; after it, steered to its beat point and
+        engaged again (its manual lock off, then on), as after any recovery of its."""
+        out = [("unsteer",)] if self.stage == "steer" else []
+        self.tries = self.gave_up = 0
+        self._release(out, now, why)
+        self.asked = why
         return out
 
     def _release(self, out: list, now: float, why: str, write: bool = True):

@@ -860,11 +860,14 @@ class SimLocked:
                  falc_in_trace: bool = True, falc_sign: int = 1, seed=None, ta: bool | None = None,
                  clock=time.monotonic, t_dc: float = 0.0, hop_search: float = 0.0, recorder: bool = True,
                  sideband: float = 20.0, pdh_sb: float = 0.5, pdh_phase: float = 0.0, pdh_sign: int = 1,
-                 carriers=(), falc_gain: float | None = None, t_noise: float = 0.002, e_noise: float = 0.002):
+                 carriers=(), falc_gain: float | None = None, t_noise: float = 0.002, e_noise: float = 0.002,
+                 collapse: bool = False):
         """falc_in_trace: the error signal on the scope includes the FALC's input offset, which adds
         to it (falc_sign 1) or subtracts (-1), times falc_gain if given (V of error signal per V of offset,
         its sign included). ta: a TA between master and SHG cavity (by default with an SHG stage); clock:
-        its time, for its protection."""
+        its time, for its protection. collapse: where a second mode begins, the master's light goes
+        broadband (coherence collapse at the top of its mode, as Sirius's did): the SHG cavity resonates
+        with none of it, its sweep flat, though it lases (the wavemeter reads it, its seed power is up)."""
         self.dlc, self.n, self.ecdl = dlc, n, ecdl
         self.p = p = f"laser{n}:"
         self.f_res, self.fsr, self.lw, self.tem, self.t00, self.t_dc = f_res, fsr, lw, tuple(tem), t00, t_dc
@@ -895,6 +898,7 @@ class SimLocked:
         self.shg_fsr, self.shg_vfsr, self.shg_finesse = 1.37, 9.0, 150.0
         self.shg_tem = ((0.31, 0.06), (0.62, 0.035))
         self.shg_h, self.shg_floor = 1.2, 0.03
+        self.collapse = collapse
         self.shg_phase = self.rng.random()
         self.shg_jitter = 0.0   # rms: each sweep shows its resonances this much taller or shorter (a real one, ±7 %)
         self.scan_owned = False  # its lock enabled, it refuses its scan being switched (as the 739 nm one's seemed to)
@@ -1248,12 +1252,18 @@ class SimLocked:
             if not self._get("nlo:shg:lock:lock-enabled"):
                 return 0, "off"
             comps = self._comps()
-            if not comps or max(p for p, _ in comps) < 0.6:
+            if not comps or max(p for p, _ in comps) < 0.6 or self._broad(comps):
                 return 6, "relocking"
             return 5, "locked"
 
+    def _broad(self, comps) -> bool:
+        """Its light broadband (collapse: running on two modes at once)?"""
+        return self.collapse and len(comps) > 1
+
     def _intra(self, s: float, comps) -> float:
         """Intra-cavity signal at SHG piezo voltage s, for the master's modes [(power, GHz)]."""
+        if self._broad(comps):
+            return self.shg_floor
         w = 1.0 / self.shg_finesse
         out = 0.0
         for power, ghz in comps:

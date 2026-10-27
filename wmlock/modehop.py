@@ -757,6 +757,7 @@ class Recenter(CavitySteps):
         self.slope = 0.0                    # MHz/mA within a mode, once mapped
         self.t = math.nan
         self.e = math.nan
+        self.e_at = None                    # (current, piezo) where it was read last
         self.stage = "starting"
         self.maps = 0
         self.readings = 0
@@ -859,9 +860,14 @@ class Recenter(CavitySteps):
 
     def _got(self, reading):
         self.t, self.e = reading
+        self.e_at = (self.I, self.V)
         self.readings += 1
         self.seen_lasing |= math.isfinite(self.e)
         return self.e
+
+    def read_here(self) -> bool:
+        """The wavemeter read it where it is now (a valid reading since it was last moved): it lases."""
+        return math.isfinite(self.e) and self.e_at == (self.I, self.V)
 
     def stopped(self) -> NotLasing:
         """It does not lase: where it stopped, if it has been seen lasing in this recovery."""
@@ -1015,23 +1021,43 @@ class Recenter(CavitySteps):
                     self.lasing = True
                     return True
                 if m is not None and self.flat_is_dark():
-                    self.lasing = False
-                    return False
+                    self.lasing = bool((yield from self.read_through()))
+                    return self.lasing
         return (yield from self.lasing_now())
 
+    def read_through(self):
+        """Its SHG sweep flat: does the wavemeter read it here all the same (it lases, its light too broad for the
+        SHG cavity)? Read afresh if it has not been since it was moved, unless its seed power says it does not lase
+        (no time lost then: with too little seed its TA switches itself off). A laser that does not lase gives the
+        wavemeter nothing to read."""
+        if self.read_here():
+            return True
+        if (yield from self.lasing_now()) is False:
+            return False
+        yield from self.read()
+        return self.read_here()
+
     def flat_is_dark(self) -> bool:
-        """Does a flat SHG sweep mean it does not lase (rather than a scan that misses the resonances)?
-        Yes if the sweep has shown resonances (in this recovery, or locked at the start, or as learned),
-        or if the wavemeter has no valid reading of it either."""
+        """Does a flat SHG sweep mean no narrow-band light reaches the SHG cavity (rather than a scan that misses
+        the resonances)? Yes if the sweep has shown resonances (in this recovery, or locked at the start, or as
+        learned), or if the wavemeter has no valid reading of it either."""
         return self.sweep_tells or not math.isfinite(self.e)
 
     def dark(self):
-        """The SHG sweep is flat where it should not be: no narrow-band light reaches the SHG cavity.
-        Its TA off: say so (Failed); else the laser does not lase: NotLasing."""
+        """The SHG sweep is flat where it should not be: no narrow-band light reaches the SHG cavity. Its TA off:
+        say so (Failed). The wavemeter reading it here, it lases, its light too broad for the SHG cavity (at the top
+        of its mode, a second mode beginning, it can collapse into broadband light, as Sirius's did): said, and the
+        sweep goes for one that is not single-mode. Else the laser does not lase: NotLasing (a laser that does not
+        lase gives the wavemeter nothing to read)."""
         on, emits = yield Get((TA_ON, TA_EMISSION))
         if on is False or emits is False:
             raise Failed(f"its TA is off (no light reaches the SHG cavity): switch it on again (the laser was left at "
                          f"{self.mA(self.I):.2f} mA)", keep=True)
+        if (yield from self.read_through()):
+            self.note(f"at {self.mA(self.I):.2f} mA the SHG sweep is flat, but the wavemeter reads it "
+                      f"({self.e:+.0f} MHz from the target): it lases, its light too broad for the SHG cavity (a "
+                      f"second mode beginning?)")
+            return
         self.note(f"at {self.mA(self.I):.2f} mA the SHG sweep is flat: it does not lase")
         raise self.stopped()
 

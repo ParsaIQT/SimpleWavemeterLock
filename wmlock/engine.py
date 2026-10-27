@@ -319,6 +319,8 @@ class Channel:
         self.off_t = None      # holding it by all it shows, and since when (monotonic): a step of its beat, or lost?
         self.beat_step = False  # ...being told: its readings off its beat point do not count meanwhile
         self.steps = deque(maxlen=8)  # monotonic: its beat learned again so (a step of it)
+        self.recenter_ask = ""  # Recenter clicked: its guard to release its PLL for the recovery (_sls_step)
+        self.watching = bool(cfg.get("watching"))  # an SLS unit locks it, and it is watched (Relock): again on start
         # its piezo trimmed to keep its PLL's fast output near 0 (SlsParams.trim: its slow servo unused)
         self.trim_seen = []    # (time.time(), V): its fast output since its last step settled...
         self.trim_from = 0.0   # ...looked at from then on (monotonic)
@@ -404,6 +406,8 @@ class Channel:
             d["model"] = self.model_dict
         if self.sls.kind:
             d["sls"] = self.sls.to_dict()
+            if self.watching and self.sls.on:
+                d["watching"] = True
         return d
 
     def laser_model(self):
@@ -692,6 +696,7 @@ class Engine:
         ref = config.get("reference")
         self.reference = Reference.from_config(ref) if ref else None
         self.dirty = False       # settings changed since the last save
+        self.stopping = False    # stop() under way
         self.source = make_source(self)
         if self.source is not None:  # (the WLM software stuck or gone: restarted, where the source can)
             self.source.restart = config.get("wlm_restart", True) is not False
@@ -704,11 +709,15 @@ class Engine:
                     self._watch(ch)
                 if ch.sls.on:
                     self._watch_sls(ch)
+                    if ch.watching:  # (watched when the program last stopped: watched again, guarded)
+                        log.info("channel %d: watched again, as it was when the program stopped", ch.n)
+                        self._arm_sls(ch)
         self.source.start()
         self.start_discovery()
 
     def stop(self):
         with self.lock:
+            self.stopping = True  # (what is watched stays so in its settings: watched again on start)
             monitors, self.monitors = list(self.monitors.values()), {}
             watches, self.sls_watches = list(self.sls_watches.values()), {}
             watches += list(self.master_watches.values())
@@ -1197,6 +1206,9 @@ class Engine:
                 self._disengage(ch, message)
 
     def _disengage(self, ch: Channel, message: str):
+        if ch.watching and not self.stopping:  # (watched no more, not even after a restart)
+            ch.watching = False
+            self.dirty = True
         if ch.sls_guard is not None:  # (a PLL's slave: guarded no more, its PLL left as it is)
             if ch.sls_guard.stage in ("released", "recover", "steer", "engage", "failed"):
                 ch.sls_note, ch.sls_note_t = "its PLL left released: stopped while it was being relocked", \
@@ -1931,9 +1943,12 @@ class Engine:
 
     def _arm_sls(self, ch: Channel):
         """Relock clicked on a laser an SLS unit locks: watched (a PLL's slave, guarded: if its PLL does not hold it on
-        its beat point now, it is relocked now)."""
+        its beat point now, it is relocked now), and again after a restart (Channel.watching)."""
         ch.state, ch.message = "on", ""
         ch.token += 1
+        if not ch.watching:
+            ch.watching = True
+            self.dirty = True
         ch.upkeep_t = time.monotonic()
         ch.trim_moved, ch.trim_said, ch.trim_last = 0.0, "", None
         hop = ch.hop
@@ -2218,6 +2233,10 @@ class Engine:
             out = []
             if ch.beat_slave and ch.sls_guard is not None:
                 g = ch.sls_guard
+                if ch.recenter_ask:  # (Recenter clicked: its guard releases its PLL for it first)
+                    for a in g.recenter(time.time(), ch.recenter_ask):
+                        out += self._sls_act(ch, g, a)
+                    ch.recenter_ask = ""
                 k = self._sls_look(ch, view, fresh)
                 for a in g.step(k):
                     out += self._sls_act(ch, g, a)
@@ -2457,7 +2476,7 @@ class Engine:
             self._unsteer(ch)
         elif what == "recover":
             log.warning("channel %d: %s, its PLL released: recovered", ch.n, a[1])
-            self._start_recovery(ch, a[1], budget=False, urgent=bool(a[2]))
+            self._start_recovery(ch, a[1], quick=a[3] if len(a) > 3 else True, budget=False, urgent=bool(a[2]))
         elif what == "held":
             ch.message = ""
             took = mono - ch.hop_t if ch.hop_t else 0.0
@@ -2510,8 +2529,9 @@ class Engine:
                     f"the wavemeter reads it {ch.beat_e:+.1f} MHz from its beat point" if ch.beat_e is not None
                     else "not holding"))
                 ch.sls_drop = (ch.sls_held_t if ch.sls_held_t is not None else v.t, why)
-            elif not expect and ch.sls_drop is not None:  # (its lock switched off: over there)
-                self._sls_drop_over(ch, v.t)
+            elif not expect and ch.sls_drop is not None:  # (its lock switched off: over there, and one after, its
+                self._sls_drop_over(ch, v.t)              # lock not holding since, begins when it is wanted again)
+                ch.sls_held_t = None
         ch.sls_count = v.count
 
     def _sls_drop_over(self, ch: Channel, t1: float):
@@ -3022,7 +3042,9 @@ class Engine:
         self._controller(key).submit(job)
 
     def recenter(self, n: int):
-        """Recenter now, even without a hop: always maps, so it finds the best mode."""
+        """Recenter now, even without a hop: always maps, so it finds the best mode. A laser an SLS PLL holds,
+        guarded: by its guard (watched now, if it was not), which releases its PLL first, and after the recovery
+        steers it to its beat point and engages its PLL again (off, then on)."""
         with self.lock:
             ch = self.channels[n]
             if ch.state in ("recovering", "engaging", "mapping"):
@@ -3031,6 +3053,13 @@ class Engine:
                 ch.message = "right-click to link a laser first"
             elif ch.dac:
                 ch.message = "recenter: not on an analog output (it needs a DLC pro)"
+            elif ch.beat_slave and ch.sls.guard and ch.hop.enabled:
+                if ch.state == "off":
+                    self._arm_sls(ch)
+                ch.recenter_ask = "recenter now"
+                w = self.sls_watches.get(ch.n)
+                if w is not None:
+                    w.wake()
             elif not (math.isfinite(self._hop_error(ch)) or (ch.off and ch.f_set > 0)):
                 ch.message = "recenter: needs a setpoint and a valid reading"
             else:

@@ -571,8 +571,14 @@ back does not start it again: it needs a good deal more current first. What tell
   sends broadband light (an AR-coated chip without its feedback), and the sweep **flat-lines**. A
   flat sweep where there should be resonances (they have been seen in this recovery, it was locked
   when the recovery began, or its usual look or signal is known) means it does not lase, unless its
-  TA is off (then the row says so). The wavemeter has nothing to read then either: whenever it has
-  no valid reading of the laser after a move, the SHG sweep is asked.
+  TA is off (then the row says so), or the wavemeter reads it there all the same (read afresh if it
+  has not been since the last move, unless its seed power says it does not lase): at the top of its
+  mode, a second mode beginning, a laser can collapse into light too broad for the SHG cavity that
+  still lases (Sirius did, 27 October: taken for one that does not lase, its current was jumped
+  3.5 mA up, and each recovery after failed from there). That sweep is one that is not single-mode:
+  parking the current high, the top of its mode, backed off from. The wavemeter has nothing to read
+  when it does not lase: whenever it has no valid reading of the laser after a move, the SHG sweep
+  is asked.
 * **its TA's seed power** (TA pro, TA-SHG pro): below half of what it is while the laser lases on
   target (learned as it is watched), and below the TA's own `power-min` in any case, it is not
   lasing. The broadband light of a laser that does not lase can keep the seed power well up,
@@ -1414,6 +1420,12 @@ night. Guarded:
 Meanwhile the row says *Relocking*, and what it is doing; click it to stop (its PLL is left as it is: released). Its PLL
 switched off at its box stops the guard (*watching stopped: its PLL was switched off at its box*); its autolock
 switched on, the autolock has it (watched, not guarded).
+
+**Recenter** on a slave its PLL holds goes by its guard: its PLL released first (a recovery would fight it: *its PLL
+released: recenter now*), then its mode-hop recovery, and after it, as after any of its guard's, the slave steered to
+its beat point and its PLL engaged again (its manual lock off, then on); not watched when you click it, it is from
+then on. **Watched across restarts**: a laser an SLS unit locks, watched (*Relock*) when the program stops, is watched
+and guarded again when it starts, until you stop watching it (*Watching* clicked).
 
 ### Its slow servo unused: its piezo trimmed (Sirius)
 
