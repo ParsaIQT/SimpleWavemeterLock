@@ -1457,6 +1457,7 @@ class SimLaser:
         self.lock = lock          # SimLocked: its DLC pro locks it to a cavity
         self.beat = None          # simsls.SimPll: an SLS PLL beat-locks it to another laser
         self.wobble = 0.0         # MHz: its own drift, as last worked out
+        self.misread = 0.0        # MHz the wavemeter reads it off by, it alone (its channel's calibration, say)
         self._mutex = threading.RLock()  # (its PLL settles it too, from another thread: simsls.SimPll.update)
         self.ccd = SimCCD(seed=seed)  # the wavemeter's view of it, in detail
         self.t_ref = None         # °C: its controller's temperature when this was made (ECDL.T is from there)
@@ -1491,7 +1492,7 @@ class SimLaser:
                 v, i = self._vi()
                 comps = self.ecdl.components(v, i) if f is not None else []
                 mw, f0 = self.ecdl.power(i), self.ecdl.f0
-        raw = wavemeter.read(f, now) if f is not None else math.nan
+        raw = wavemeter.read(f + self.misread * 1e-6, now) if f is not None else math.nan
         value, extra, ms = self.ccd.measure(comps, mw, i, raw, f0, patterns)
         return value, extra, ms / 1e3
 
@@ -1703,7 +1704,8 @@ class SimSource(Source):
                 self._push({laser.ch: value}, time.monotonic(), {laser.ch: extra})
                 continue
             f = laser.true_freq(now)
-            value = self._shown[laser.ch] = -1.0 if f is None else self.wavemeter.read(f, now)  # -1: no signal
+            value = self._shown[laser.ch] = (-1.0 if f is None  # -1: no signal
+                                             else self.wavemeter.read(f + laser.misread * 1e-6, now))
             self._push({laser.ch: value}, now)
 
 

@@ -1340,7 +1340,11 @@ nothing there at all. A unit whose whole list of values (*getValues*) is too slo
   master's *as the wavemeters read them*, not the PLL's lock frequency: a PLL at 80 MHz whose beat path has an AOM
   shifting the master's light by 80 MHz holds the slave on its master's frequency, a beat near 0 (plus whatever the two
   wavemeters disagree by). It is learned again each time the program starts: the one from before steers the slave back
-  meanwhile, but the wavemeter reading it off that one is not held against it. Its setpoint is then its beat point, its master's reading plus
+  meanwhile, but the wavemeter reading it off that one is not held against it. A wavemeter recalibrated (its readings
+  stepping by tens of MHz) moves the beat: the slave read off its beat point while its PLL holds it by all it shows,
+  steady there for 2 s, is no lost lock: its beat is learned again (*its beat moved from +47.10 to +12.30 MHz … one
+  of the wavemeters recalibrated?*). Read off it and still moving after 6 s, or after three such steps in ten minutes,
+  it is lost. Its setpoint is then its beat point, its master's reading plus
   the beat, and its row's deviation the beat as the wavemeters see it. On the row: its PLL's state, slow and fast
   outputs (and beat amplitude, a one-channel PLL's), its master (and its lock, if lost), and what its guard did last.
 

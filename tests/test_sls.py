@@ -759,3 +759,67 @@ def test_a_slow_unit_is_polled_a_value_at_a_time_and_its_slave_still_guarded(tmp
             e.stop()
     finally:
         demo.close()
+
+
+def test_a_wavemeter_recalibrating_moves_the_beat_and_is_no_lost_lock(tmp_path):
+    """Its PLL holding it, its master's wavemeter recalibrated (its readings of the master 30 MHz higher from now on,
+    the lasers where they were): the slave read 30 MHz off its beat point, steady there, its PLL holding it by all it
+    shows: its beat learned again, its PLL never released, no dropout."""
+    demo = Demo(discovery_port=0, beat=True, beat_servo=1, beat_offset=0.0, wavemeter=SimWavemeter(noise=0.05),
+                exposure=0.004)
+    try:
+        e = make_engine(demo, tmp_path, servo=1, beat=0.0)
+        e.BEAT_LEARN_S = 1.0
+        s = e.channels[demo.SLAVE]
+        try:
+            e.engage(demo.SLAVE)
+            assert wait_for(lambda: s.sls_guard.stage == "hold" and s.beat_ok, 10), (s.sls_guard.stage, s.beat_ok)
+            assert abs(s.sls.beat) < 0.5
+            demo.laser(demo.MASTER).misread = 30.0
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 7.0 and abs(s.sls.beat + 30.0) > 1.5:
+                assert demo.pll.manual and s.sls_guard.stage == "hold", s.sls_guard.why
+                time.sleep(0.02)
+            assert abs(s.sls.beat + 30.0) < 1.5, s.sls.beat
+            assert re.match(r"its beat moved from [+-]0\.\d\d to -(29|30)\.\d\d MHz, its PLL holding it all along "
+                            r"\(one of the wavemeters recalibrated\?\)", s.sls_note), s.sls_note
+            time.sleep(1.0)
+            assert demo.pll.manual and demo.pll.locked and s.sls_guard.stage == "hold" and s.beat_off_n == 0
+            assert s.drops_total == 0 and s.sls_drop is None  # (no dropout: it held all along)
+        finally:
+            e.stop()
+    finally:
+        demo.close()
+
+
+def test_a_slave_read_moving_off_its_beat_point_is_still_lost(tmp_path):
+    """Read off its beat point and still moving there (no step of its beat: something wrong that its PLL does not
+    show), after BEAT_STEP_S it counts: its PLL released."""
+    import threading
+
+    demo = Demo(discovery_port=0, beat=True, beat_servo=1, beat_offset=0.0, wavemeter=SimWavemeter(noise=0.05),
+                exposure=0.004)
+    stop = threading.Event()
+    try:
+        e = make_engine(demo, tmp_path, servo=1, beat=0.0)
+        e.BEAT_LEARN_S, e.BEAT_STEP_S = 1.0, 3.0
+        s = e.channels[demo.SLAVE]
+        try:
+            e.engage(demo.SLAVE)
+            assert wait_for(lambda: s.sls_guard.stage == "hold" and s.beat_ok, 10)
+            master = demo.laser(demo.MASTER)
+
+            def drift():  # (the master read further and further off: 40 MHz/s)
+                while not stop.wait(0.05):
+                    master.misread += 2.0
+
+            master.misread = 15.0
+            threading.Thread(target=drift, daemon=True).start()
+            assert wait_for(lambda: not demo.pll.manual, 6), "not released"
+            assert "MHz from its beat point" in s.sls_guard.why or "the wavemeter reads it" in (s.sls_note or ""), \
+                s.sls_guard.why
+        finally:
+            stop.set()
+            e.stop()
+    finally:
+        demo.close()

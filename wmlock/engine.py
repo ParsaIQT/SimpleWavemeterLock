@@ -295,6 +295,10 @@ class Channel:
         self.fast_seen = deque(maxlen=BEAT_N)   # V: its PLL's fast output, holding it...
         self.phase_seen = deque(maxlen=BEAT_N)  # ...and its phase error
         self.band_t = None     # time.time(): they read far from there since (the wavemeter reading it where it should)
+        self.off_seen = deque(maxlen=BEAT_N)  # MHz: its readings from its beat point since they went off it, its PLL
+        self.off_t = None      # holding it by all it shows, and since when (monotonic): a step of its beat, or lost?
+        self.beat_step = False  # ...being told: its readings off its beat point do not count meanwhile
+        self.steps = deque(maxlen=8)  # monotonic: its beat learned again so (a step of it)
         # the last adjustment made from another PC (share.py)
         self.remote_note = ""  # what, and from where
         self.remote_t = 0.0    # monotonic...
@@ -1734,6 +1738,10 @@ class Engine:
     SLS_STALE_S = 2.0   # s: a unit's poll older than this (it does not answer) tells nothing
     BEAT_FRESH_S = 2.0  # s: its master's reading goes with its own if at most this old
     BEAT_LEARN_S = 10.0  # s its PLL must have held before its beat is learned from the readings
+    BEAT_STEP_S = 6.0    # s a slave read off its beat point, its PLL holding it by all it shows, has to read steady
+    STEP_N = 10          # there (this many readings at least, STEP_MIN_S at least): its beat moved (a wavemeter
+    STEP_MIN_S = 2.0     # recalibrated), learned again; not steady by then, it is lost. STEPS of them in STEPS_S at
+    STEPS, STEPS_S = 3, 600.0  # most (more: no recalibration, something is wrong)
     BAND_STALE_S = 3.0   # s its PLL's outputs may read far from where they sat holding it, the wavemeter reading it
     #                      on its beat point all along, before where they sit is learned afresh
     BEAT_MIN = 20       # readings it is learned from, at least
@@ -1896,7 +1904,7 @@ class Engine:
         mono = time.monotonic()
         if (row is not None and row["f"] and row["t"] is not None and ch.freq > 0
                 and mono - row["t"] <= self.BEAT_FRESH_S and v is not None and v.holds and ch.sls_since is not None
-                and ch.steering is None and time.time() - ch.sls_since >= self.BEAT_LEARN_S
+                and ch.steering is None and time.time() - ch.sls_since >= self.BEAT_LEARN_S and not ch.off_seen
                 and (ch.sls_guard is None or ch.sls_guard.stage in ("hold", "auto"))):
             ch.beat_seen.append((ch.freq - row["f"]) * 1e6)  # (kept learned: two wavemeters' disagreement drifts)
             if len(ch.beat_seen) >= self.BEAT_MIN:
@@ -1912,10 +1920,14 @@ class Engine:
         point = self._beat_point(ch, look=False)
         if point is None or not ch.freq > 0:
             ch.beat_e, ch.beat_off_n, ch.near_n = None, 0, 0
+            self._beat_step(ch, None)
         else:
             e = (ch.freq - point) * 1e6
             ch.beat_e = e
             ch.beat_off_n = ch.beat_off_n + 1 if abs(e) > p.off_mhz and ch.beat_ok else 0
+            self._beat_step(ch, e)
+            if not ch.beat_off_n:
+                point = self._beat_point(ch, look=False)  # (its beat learned again, just now)
             near = ch.steering is not None and abs(e - ch.steering) <= p.capture
             ch.near_n = ch.near_n + 1 if near else 0
             if p.master:  # (its setpoint: its beat point, or where it is steered)
@@ -1923,6 +1935,64 @@ class Engine:
                 ch.setpoint_nm = C_NM_THZ / ch.f_set
         if ch.steering is not None and ch.lock.active and ch.freq > 0 and point is not None:
             self._steer_step(ch, point)
+
+    def _beat_step(self, ch: Channel, e):
+        """A reading e (MHz from its beat point; None: none) of a slave its PLL holds by all it shows (its own
+        signals, holding, not just engaged): off its beat point and steady there (STEP_N readings, spread no more than
+        three times as its readings less its master's do), its beat moved (one of the wavemeters recalibrated):
+        learned again; still moving after BEAT_STEP_S, it counts (lost)."""
+        p, v, g = ch.sls, ch.sls_view, ch.sls_guard
+        holding = (v is not None and v.holds and not v.band and ch.sls_since is not None
+                   and (g is None or g.stage in ("hold", "auto")))
+        if e is None or ch.beat_off_n < 2 or not holding:
+            ch.off_seen.clear()
+            ch.off_t, ch.beat_step = None, False
+            return
+        mono = time.monotonic()
+        if ch.off_t is None:
+            ch.off_t = mono
+        ch.off_seen.append(e)
+        recent = sum(1 for t in ch.steps if mono - t <= self.STEPS_S)
+        if (len(ch.off_seen) >= self.STEP_N and mono - ch.off_t >= self.STEP_MIN_S and recent < self.STEPS
+                and self._steady(ch.off_seen, max(3 * self._beat_spread(ch), 0.5))):
+            old = p.beat
+            p.beat = round(old + statistics.median(ch.off_seen), 2)
+            ch.beat_seen.clear()
+            ch.off_seen.clear()
+            ch.off_t, ch.beat_step, ch.beat_off_n = None, False, 0
+            ch.steps.append(mono)
+            self.dirty = True
+            ch.sls_note = (f"its beat moved from {old:+.2f} to {p.beat:+.2f} MHz, its PLL holding it all along (one of "
+                           f"the wavemeters recalibrated?): learned again")
+            ch.sls_note_t = mono
+            log.warning("channel %d: %s", ch.n, ch.sls_note)
+            return
+        ch.beat_step = mono - ch.off_t <= self.BEAT_STEP_S
+
+    @staticmethod
+    def _steady(values, tol: float) -> bool:
+        """Readings that sit still: their spread (robust) within tol, and no drift (their two halves' medians within
+        tol of each other)."""
+        x = list(values)
+        m = statistics.median(x)
+        half = len(x) // 2
+        return (1.4826 * statistics.median(abs(v - m) for v in x) <= tol
+                and abs(statistics.median(x[half:]) - statistics.median(x[:half])) <= tol)
+
+    @staticmethod
+    def _beat_spread(ch: Channel) -> float:
+        """MHz: how much its readings less its master's spread, its PLL holding it (1 MHz until known)."""
+        seen = list(ch.beat_seen)
+        if len(seen) < Engine.BEAT_MIN:
+            return 1.0
+        m = statistics.median(seen)
+        return 1.4826 * statistics.median(abs(x - m) for x in seen)
+
+    @staticmethod
+    def _beat_lost(ch: Channel) -> bool:
+        """The wavemeter reads it off its beat point (two readings in a row), and that counts (not while a step of
+        its beat is told from a loss)."""
+        return ch.beat_off_n >= 2 and not ch.beat_step
 
     def _steer(self, ch: Channel, mhz: float):
         """The wavemeter lock brings it to its beat point plus mhz (its PLL released), from where its piezo is."""
@@ -2001,7 +2071,7 @@ class Engine:
         k = Look(now=now, armed=ch.sls_guard is not None and ch.state in ("on", "recovering"),
                  pll=view if view is not None and now - view.t <= self.SLS_STALE_S and not ch.sls_error else None,
                  fresh=fresh, master=master, master_s=master_s,
-                 beat_off=(f"{ch.beat_e:+.1f} MHz from its beat point" if ch.beat_off_n >= 2 and ch.beat_e is not None
+                 beat_off=(f"{ch.beat_e:+.1f} MHz from its beat point" if self._beat_lost(ch) and ch.beat_e is not None
                            else ""),
                  near_n=ch.near_n, lasing=ch.lasing, far=far,
                  can_steer=bool(ch.device) and self._beat_point(ch, look=False) is not None and not ch.off,
@@ -2154,7 +2224,7 @@ class Engine:
         again; a relock counted between two polls that both held is one between them (as its unit says when)."""
         g = ch.sls_guard
         relocking = g is not None and g.relocking
-        held = bool(v.holds) and not relocking and not (ch.beat_slave and ch.beat_off_n >= 2)
+        held = bool(v.holds) and not relocking and not (ch.beat_slave and self._beat_lost(ch))
         expect = bool(v.mode) or (g is not None and g.stage != "idle")  # (its lock on, or its guard has it: switched
         #                                                                  off by hand, it is no dropout)
         if held:
