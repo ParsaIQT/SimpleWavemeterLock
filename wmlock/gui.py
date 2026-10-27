@@ -593,7 +593,7 @@ class ChannelRow(Row):
 
     def hop_dialog(self):
         ch = self.engine.channels[self.n]
-        d = HopDialog(self, ch, take=lambda: self.engine.take_optimum(self.n))
+        d = HopDialog(self, ch, take=lambda shg=None: self.engine.take_optimum(self.n, shg))
         if d.exec():
             self.engine.set_hop_params(self.n, d.params())
 
@@ -1301,6 +1301,15 @@ class SlsDialog(QtWidgets.QDialog):
             "the slave's current and piezo away; relock it once the master holds again")
         self.guard.setChecked(p.guard)
         form.addRow("", self.guard)
+        self.trim = QtWidgets.QCheckBox(
+            "Trim its piezo to keep the PLL's fast output near 0, very slowly (its PLL's slow servo unused,\nas on "
+            "Sirius): else the fast output runs out of range as the slave drifts")
+        self.trim.setChecked(p.trim)
+        self.trim.setToolTip("Its fast output looked at for a few s at a time and, off 0, the slave's piezo moved a "
+                             "little to take half of it off\n(how its fast output follows the piezo learned first, by "
+                             "small steps either way); only while its PLL holds it\nand its guard holds it (Guard it, "
+                             "above). With Mode-hop recovery's upkeep, its piezo moves with its current.")
+        form.addRow("", self.trim)
         self.capture, box = number(p.capture, 0.05, 100.0, 2, 0.1,
                                    "MHz: brought this close to its beat point by the wavemeter, its PLL is engaged")
         form.addRow("Capture", box)
@@ -1366,7 +1375,8 @@ class SlsDialog(QtWidgets.QDialog):
         kind = self.KIND[self.kind.currentIndex()][0]
         for w in (self.host, self.port):
             w.setEnabled(bool(kind))
-        for w in (self.servo, self.master, self.guard, self.capture, self.tries, self.off_mhz, self.slow_max):
+        for w in (self.servo, self.master, self.guard, self.trim, self.capture, self.tries, self.off_mhz,
+                  self.slow_max):
             w.setEnabled(kind == "pll")
         master = kind == "pll" and self.masters[self.master.currentIndex()][1] > 0
         for w in (self.master_host, self.master_port):
@@ -1446,10 +1456,11 @@ class SlsDialog(QtWidgets.QDialog):
         d.update(kind=kind if kind in KINDS else "", host=self.host.text().strip(), port=self.port.value(),
                  servo=self.servo.currentIndex(), master=master, master_on=master_on,
                  master_host=self.master_host.text().strip(), master_port=self.master_port.value(),
-                 guard=self.guard.isChecked(), capture=self.capture.value(), tries=self.tries.value(),
-                 off_mhz=self.off_mhz.value(), slow_max=self.slow_max.value())
+                 guard=self.guard.isChecked(), trim=self.trim.isChecked(), capture=self.capture.value(),
+                 tries=self.tries.value(), off_mhz=self.off_mhz.value(), slow_max=self.slow_max.value())
         if d["servo"] != self.p.servo or d["host"] != self.p.host or (master, master_on) != old:
-            d.update(amp_usual=0.0, beat=0.0, beat_known=False)  # (another unit or master: learned afresh)
+            d.update(amp_usual=0.0, beat=0.0, beat_known=False, trim_gain=0.0, trim_cur=0.0)  # (another unit or
+            #                                                                                   master: learned afresh)
         return SlsParams.from_dict(d)
 
 
@@ -1590,7 +1601,9 @@ class HopDialog(QtWidgets.QDialog):
         self.upkeep.setToolTip("Every this many minutes, while it is locked and steady (both locks left on): the "
                                "current up in small steps\nuntil its SHG signal dips (the top of its mode), then down "
                                "until it is back up, and kept that much below.\nAnything amiss: the current back "
-                               "where it was. 0: never.")
+                               "where it was. 0: never.\nA laser an SLS PLL holds (Sirius), its piezo trimmed (SLS "
+                               "lock…): its piezo moves with its current, its PLL\nholding it on its frequency all "
+                               "along (as learned: how its PLL's fast output follows each).")
         self.optimum = Text("", "dim")
         self._cleared = False
         self._opt_seen = None
@@ -1599,8 +1612,8 @@ class HopDialog(QtWidgets.QDialog):
         take_btn.setToolTip("The laser as it is now is at its optimum, set by hand: its current, piezo voltage and SHG "
                             "signal locked\nare what the catch goes back to (taken by itself the first time Relock is "
                             "clicked).")
-        if take is not None:
-            take_btn.clicked.connect(take)
+        if take is not None:  # (with an SHG stage as ticked here, OK'd or not)
+            take_btn.clicked.connect(lambda: take(self.shg.isChecked()))
         clear = QtWidgets.QPushButton("Clear")
         clear.setToolTip("Forget it: taken again the next time Relock is clicked")
         clear.clicked.connect(self._clear_optimum)
@@ -1740,7 +1753,8 @@ class HopDialog(QtWidgets.QDialog):
             self.optimum.paint("not taken: taken when Relock is first clicked on the laser set up by hand", "dim")
         else:
             self.optimum.paint(f"{p.opt_i:.2f} mA, {p.opt_v:.2f} {self.ch.unit}"
-                               + (f", SHG {p.opt_shg:.3f} V locked" if p.opt_shg else ", SHG level not known")
+                               + (f", SHG {p.opt_shg:.3f} V locked" if p.opt_shg else ", SHG level not known"
+                                  + (f": {self.ch.opt_why}" if getattr(self.ch, "opt_why", "") else ""))
                                + (f" ({p.opt_t})" if p.opt_t else ""), "fg")
 
     def _clear_optimum(self):

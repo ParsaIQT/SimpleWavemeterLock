@@ -197,7 +197,9 @@ class SimPdh:
 class SimPll:
     """An SLS PLL beat-locking `slave` to `master` (see the module); master_lock: the master's SimPdh (its lock lost,
     the beat is lost); beat: MHz, its lock frequency; offset: MHz, the slave less its master while it holds it (an AOM
-    in the beat's path makes up the difference: 0, the slave on its master's frequency; None: beat)."""
+    in the beat's path makes up the difference: 0, the slave on its master's frequency; None: beat); slow_servo:
+    False, its slow servo unused (as on Sirius): its fast output alone holds the slave, and runs out of range as the
+    slave drifts, unless something else (this program's trim) moves its piezo."""
 
     CAPTURE_MHZ = 1.0   # its manual lock engaged with the slave this near its beat point: it locks
     AUTO_MHZ = 30.0     # its autolock catches it this near
@@ -209,11 +211,12 @@ class SimPll:
 
     def __init__(self, sls: FakeSls, slave, master, master_lock: SimPdh | None = None, beat: float = 80.0,
                  servo: int = 0, fast_ma: float = 4.0, slow_v: float = 2.0, run_sign: int = -1,
-                 clock=time.monotonic, seed=None, offset: float | None = None):
+                 clock=time.monotonic, seed=None, offset: float | None = None, slow_servo: bool = True):
         self.sls, self.slave, self.master, self.master_lock = sls, slave, master, master_lock
-        self.beat, self.servo = beat, servo
+        self.beat, self.servo, self.slow_servo = beat, servo, slow_servo
         self.offset = beat if offset is None else offset
-        self.fast_ma, self.slow_v, self.run_sign = fast_ma, slow_v, run_sign
+        self.fast_ma, self.run_sign = fast_ma, run_sign
+        self.slow_v = slow_v if slow_servo else 0.0  # V of piezo a V of its slow output adds (unused: none)
         self.clock = clock
         self.rng = random.Random(seed)
         self.mutex = threading.RLock()
@@ -301,6 +304,24 @@ class SimPll:
         """V of slow output that puts the slave on its beat point."""
         return -free * 1e-3 / (self.slave.ecdl.kv * self.slow_v)
 
+    def _need_fast(self, free: float) -> float:
+        """V of fast output that does (its slow servo unused)."""
+        return -free * 1e-3 / (self.slave.ecdl.ki * self.fast_ma)
+
+    def _holding(self, free: float) -> bool:
+        """It holds the slave there: its outputs where they must be, within their rails."""
+        if self.slow_servo:
+            need = self._need(free)
+            if abs(need) < self.SLOW_RAIL:
+                self.slow, self.fast = need, self.rng.gauss(0.0, 0.002)
+                return True
+            return False
+        need = self._need_fast(free)
+        if abs(need) < self.FAST_RAIL:
+            self.slow, self.fast = 0.0, need + self.rng.gauss(0.0, 0.002)
+            return True
+        return False
+
     def update(self):
         """Where it is now: holding the slave (its slow output where it must be), or running away."""
         with self.slave._mutex, self.mutex:
@@ -311,9 +332,7 @@ class SimPll:
                 return
             if self.locked:
                 free = self._free(now)
-                need = self._need(free) if free is not None else math.inf
-                if self._master_ok() and abs(need) < self.SLOW_RAIL:
-                    self.slow, self.fast = need, self.rng.gauss(0.0, 0.002)
+                if free is not None and self._master_ok() and self._holding(free):
                     return
                 self._lose(now)
             if self.auto and self._master_ok():  # its autolock catches it when near
@@ -339,7 +358,10 @@ class SimPll:
 
     def _lock(self, now: float, free: float):
         self.locked, self.lost_t = True, None
-        self.slow, self.fast = self._need(free), 0.0
+        if self.slow_servo:
+            self.slow, self.fast = self._need(free), 0.0
+        else:
+            self.slow, self.fast = 0.0, self._need_fast(free)
         self.count += 1
         self.since = now
 

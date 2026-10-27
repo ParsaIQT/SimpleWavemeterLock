@@ -770,6 +770,39 @@ class SimTA:
         return bool(self.dlc.params[self.p + "cc:enabled"])
 
 
+class SimShg:
+    """The SHG cavity of a TA-SHG pro, its DLC pro keeping it locked to the laser, for a laser not locked to a cavity
+    (an SLS PLL holds it on its master: SimLocked has the rest): locked while the laser runs on one mode mostly and its
+    TA amplifies, its intra-cavity signal then up with the power in that mode (down near the top of the mode, a
+    second one beginning to lase)."""
+
+    def __init__(self, laser: "SimLaser", ta: "SimTA | None" = None, h: float = 1.2, floor: float = 0.03, seed=None):
+        self.laser, self.ta, self.h, self.floor = laser, ta, h, floor
+        self.rng = random.Random(seed)
+        self.p = p = f"laser{laser.n}:nlo:"
+        laser.dlc.params.update({
+            p + "shg:lock:lock-enabled": True, p + "shg:lock:state": lambda: self.state()[0],
+            p + "shg:lock:state-txt": lambda: f'"{self.state()[1]}"', p + "pd:shg-int:photodiode": self.intra,
+        })
+
+    def main(self) -> float:
+        """The part of the light in its main mode that reaches the SHG cavity (0: none)."""
+        if self.ta is not None and not self.ta.on():
+            return 0.0
+        s = self.laser
+        with s._mutex:
+            return max((p for p, _ in s.ecdl.components(*s._vi())), default=0.0)
+
+    def state(self):
+        if not self.laser.dlc.params[self.p + "shg:lock:lock-enabled"]:
+            return 0, "off"
+        return (5, "locked") if self.main() >= 0.6 else (6, "relocking")
+
+    def intra(self) -> float:
+        main = self.main()
+        return self.floor + (self.h * main if main >= 0.6 else 0.0) + self.rng.gauss(0.0, 0.003)
+
+
 class SimLocked:
     """A laser its DLC pro locks to a reference cavity, optionally frequency-doubled in an SHG
     cavity its DLC pro locks to it (a TA-SHG pro): everything the DLC pro shows of it and every
@@ -1745,9 +1778,11 @@ class Demo:
     #                         switches itself off after 3 s without seed, that stops lasing 1.3 mA below its current
 
     def __init__(self, discovery_port=DISCOVERY_PORT, wavemeter=None, exposure=0.02, dac=False, meters=1,
-                 serials=None, beat=False, beat_servo=0, beat_offset=None):
+                 serials=None, beat=False, beat_servo=0, beat_offset=None, beat_slow=True, beat_shg=False):
         """meters: 2, a second simulated wavemeter on this PC (SECOND); serials: the simulated wavemeters' serial
-        numbers (else 1001, 1002); beat: the master and slave of an SLS beat lock (MASTER, SLAVE: simsls.py)."""
+        numbers (else 1001, 1002); beat: the master and slave of an SLS beat lock (MASTER, SLAVE: simsls.py), its PLL
+        with its slow servo unused if not beat_slow (as on Sirius), its slave with an SHG stage with beat_shg
+        (slave_shg)."""
         self.dlcs = [
             FakeDLCPro("SIM-000123", "Ca+ blue", {1: {"product": "DL pro 397"}, 2: {"product": "DL pro 866"}}),
             FakeDLCPro("SIM-000456", "Ca+ red", {1: {"product": "DL pro 854"},
@@ -1795,9 +1830,9 @@ class Demo:
             ch, nm, ghz, ao, ff, ff_ghz, name = self.DAC_LASER
             self.lasers.append(SimLaser(ch, nm, ghz, offset0=0.3, drift=3.0, dac=(self.board, ao, ff, ff_ghz)))
             self.names[ch] = name
-        self.sls, self.pdh, self.pll, self.beat_nm = [], None, None, {}
+        self.sls, self.pdh, self.pll, self.beat_nm, self.slave_shg = [], None, None, {}, None
         if beat:
-            self._beat_pair(beat_servo, beat_offset)
+            self._beat_pair(beat_servo, beat_offset, beat_slow, beat_shg)
         self.serials = list(serials or [1001 + k for k in range(meters)])[:meters]
         self.meters = {self.serials[0]: (self.MODELS[0], self.lasers, self.wavemeter)}
         self.second_names = {}
@@ -1807,7 +1842,7 @@ class Demo:
             self.meters[self.serials[1]] = (self.MODELS[1], lasers, SimWavemeter())
             self.second_names = {ch: name for ch, *_, name in self.SECOND}
 
-    def _beat_pair(self, servo: int, offset=None):
+    def _beat_pair(self, servo: int, offset=None, slow: bool = True, shg: bool = False):
         from .simsls import FakeSls, SimPdh, SimPll
 
         offset = self.BEAT_MHZ if offset is None else offset
@@ -1817,10 +1852,12 @@ class Demo:
         slave = SimLaser(self.SLAVE, slave_nm, +0.40, self.sister, 1, drift=0.5)
         e = slave.ecdl
         e.i_stop, e.i_start = e.i0 - 1.3, e.i0 + 2.4  # (stops lasing 1.3 mA below, starts again only 2.4 mA above)
-        SimTA(self.sister, 1, e, delay=3.0)
+        ta = SimTA(self.sister, 1, e, delay=3.0)
+        if shg:
+            self.slave_shg = SimShg(slave, ta)
         self.pdh = SimPdh(master, FakeSls("P1029D"))
         self.pll = SimPll(FakeSls("P1029F" if servo else "P1029H"), slave, master, self.pdh, beat=self.BEAT_MHZ,
-                          servo=servo, offset=offset)
+                          servo=servo, offset=offset, slow_servo=slow)
         self.pll.hold()
         self.sls = [self.pdh.sls, self.pll.sls]
         self.lasers += [master, slave]

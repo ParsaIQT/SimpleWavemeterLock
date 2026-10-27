@@ -365,6 +365,13 @@ def notes(e, n: int) -> str:
                      if p.beat_known else "; its beat not learned yet (its PLL holding it, it is)")
             text += ("\nguarded (Relock): its PLL released at once when its master's lock or its beat is lost, and "
                      "relocked once the master holds again" if p.guard else "\nwatched only: not guarded")
+            if p.trim:
+                text += ("\nits piezo trimmed to keep its PLL's fast output near 0 (its slow servo unused): "
+                         + (f"its fast output moves {p.trim_gain:+.4g} V for a V of piezo" if p.trim_gain else
+                            "how its fast output follows its piezo not learned yet")
+                         + (f", {p.trim_cur:+.4g} V for a mA of current" if p.trim_cur else "")
+                         + (f"; moved {ch.trim_moved * 1e3:+.0f} mV since Relock" if ch.trim_moved else "")
+                         + (f"; last: {ch.trim_said}" if ch.trim_said else ""))
         v = ch.sls_view
         if v is not None:
             text += f"\nits unit says: {v.said()} (a poll takes {v.took * 1e3:.0f} ms)"

@@ -141,6 +141,26 @@ def round_sig(x: float, digits: int = 9) -> float:
     return round(x, digits - 1 - math.floor(math.log10(abs(x))))
 
 
+def step_fit(before, after) -> tuple:
+    """Two windows of readings ((t, y) pairs) either side of a step: (how far a straight line through `after` sits
+    from one through `before`, the two sharing their slope (a drift, taken off: what the step did by itself), its
+    uncertainty, that slope)."""
+    sides = []
+    for pts in (before, after):
+        t = statistics.fmean(t for t, _ in pts)
+        y = statistics.fmean(y for _, y in pts)
+        sides.append((len(pts), t, y, [(tk - t, yk - y) for tk, yk in pts]))
+    sxx = sum(dt * dt for *_, d in sides for dt, _ in d)
+    sxy = sum(dt * dy for *_, d in sides for dt, dy in d)
+    syy = sum(dy * dy for *_, d in sides for _, dy in d)
+    (n0, t0, y0, _), (n1, t1, y1, _) = sides
+    b = sxy / sxx if sxx > 0 else 0.0
+    dof = n0 + n1 - 3
+    s2 = max(syy - b * sxy, 0.0) / dof if dof > 0 else math.inf
+    var = s2 * (1 / n0 + 1 / n1 + ((t1 - t0) ** 2 / sxx if sxx > 0 else 0.0))
+    return (y1 - y0) - b * (t1 - t0), math.sqrt(var), b
+
+
 class Track:
     """Another laser's readings as followed (a beat lock's master: its reading, on any PC): the last few, and since when
     they have been steady (no jump of STEADY_MHZ)."""
@@ -299,12 +319,27 @@ class Channel:
         self.off_t = None      # holding it by all it shows, and since when (monotonic): a step of its beat, or lost?
         self.beat_step = False  # ...being told: its readings off its beat point do not count meanwhile
         self.steps = deque(maxlen=8)  # monotonic: its beat learned again so (a step of it)
+        # its piezo trimmed to keep its PLL's fast output near 0 (SlsParams.trim: its slow servo unused)
+        self.trim_seen = []    # (time.time(), V): its fast output since its last step settled...
+        self.trim_from = 0.0   # ...looked at from then on (monotonic)
+        self.trim_last = None  # (the readings before, 'piezo' or 'current', V or mA moved): the last step, its effect
+        self.trim_level = math.inf  # V: its fast output over the last look (inf: not trimmed of late)
+        self.trim_size = 0.0   # V: its next step to learn by (0: Engine.TRIM_PROBE)...
+        self.cur_size = 0.0    # mA: ...and its current's (0: Engine.CUR_PROBE)
+        self.trim_probes = []  # (kind, V or mA moved, V its fast output moved by it, give or take): what they did
+        self.trim_sign = 1     # (their direction, every other one the other way)
+        self.trim_cur_want = False  # how its fast output follows its current is wanted (an upkeep due: trim_cur)
+        self.trim_odd = 0      # steps in a row that moved its fast output the other way from what was learned
+        self.trim_busy = False  # a step on its way (its piezo read and set, in its controller's thread)
+        self.trim_moved = 0.0  # V its piezo was moved so, since Relock
+        self.trim_said = ""    # what it did last
         # the last adjustment made from another PC (share.py)
         self.remote_note = ""  # what, and from where
         self.remote_t = 0.0    # monotonic...
         self.remote_wall = 0.0  # ...and time.time(): when
         # the upkeep (HopParams.upkeep): the top of its mode found now and then, and backed off from
         self.upkeeping = False  # the recovery in progress is that
+        self.opt_why = ""      # its optimum taken last: why its SHG level was not (as its DLC pro said)
         self.upkeep_t = 0.0    # monotonic: when it was armed, recovered or upkept last
         # what its wavemeter lock last did by itself (it ran away: its gains reversed)
         self.lock_note = ""
@@ -558,6 +593,10 @@ class _HopIO:
             with e.lock:
                 failed(exc)
 
+        r = e._piezo_per_ma(ch) if op[0] == "set" and op[1] == CURRENT and ch.upkeeping and ch.beat_slave else 0.0
+        if r and ch.current_set is not None:  # an upkeep of a laser an SLS PLL holds: its piezo moves with its
+            self.ctrl.submit(self._with_piezo(op[2], op[2] - ch.current_set, r, ok), err)  # current, its frequency
+            return                                                                          # kept
         if op[0] == "set" and op[1] in (CURRENT, ACTUATOR):
             self.ctrl.set(f"laser{self.laser}:{self.names[op[1]]}", op[2], on_error=err, on_done=ok)
             return
@@ -565,6 +604,26 @@ class _HopIO:
         if op[0] == "get":
             wire = ("get", tuple(self.names.get(name, name) for name in op[1]))
         self.ctrl.submit(lambda client: ok(perform(client, laser, wire)), err)
+
+    def _with_piezo(self, current: float, di: float, r: float, ok):
+        """A job: its current set to `current` (di mA from where it was set) and its piezo moved r*di V from where it
+        is (read afresh), within its lock's limits: its PLL holds it on the same frequency all the while, its fast
+        output where it was, and where on its mode it runs moves (as a cavity lock would have it)."""
+        e, ch = self.engine, self.ch
+        cc, piezo = f"laser{self.laser}:{self.names[CURRENT]}", f"laser{self.laser}:{self.names[ACTUATOR]}"
+        lo, hi = ch.lock.p.v_min, ch.lock.p.v_max
+
+        def job(client):
+            client.set(cc, current)
+            v = client.get_float(piezo)
+            new = round(min(max(v + r * di, lo), hi), 5)
+            if abs(new - v) > 1e-9:
+                client.set(piezo, new)
+            with e.lock:
+                ch.offset = new
+            ok()
+
+        return job
 
     def think(self, fn, done, failed):
         """Work fn out in a thread of its own, the engine's lock not held (seconds of numpy: the laser's model);
@@ -923,16 +982,37 @@ class Engine:
 
     def _upkeep_due(self, ch: Channel, now: float) -> bool:
         """A laser its DLC pro locks, with an SHG stage, watched, locked and steady (on target a while, its locks
-        saying locked, its transmission up): is its upkeep due (HopParams.upkeep minutes since it was armed,
-        recovered, or upkept)?"""
+        saying locked, its transmission up), or one an SLS PLL holds, its piezo trimmed (_beat_upkeep_due): is its
+        upkeep due (HopParams.upkeep minutes since it was armed, recovered, or upkept)?"""
         hop = ch.hop
-        if not (hop.enabled and hop.cavity and hop.shg and hop.upkeep > 0) or self._is_reference(ch):
+        if not (hop.enabled and hop.shg and hop.upkeep > 0) or self._is_reference(ch):
             return False
         if ch.state != "on" or ch.runner is not None or ch.pending is not None or ch.look_why or ch.off:
             return False
-        if not (ch.guard.armed and ch.cavity_on and says_locked(ch.cavity_txt) and says_locked(ch.shg_txt)):
+        if ch.beat_slave:
+            return self._beat_upkeep_due(ch, now)
+        if not (hop.cavity and ch.guard.armed and ch.cavity_on and says_locked(ch.cavity_txt)
+                and says_locked(ch.shg_txt)):
             return False
         return now - ch.upkeep_t >= 60.0 * hop.upkeep and not self._slipping(ch)
+
+    def _beat_upkeep_due(self, ch: Channel, now: float) -> bool:
+        """The same of a laser an SLS PLL holds on its beat point (its guard holding it, its SHG cavity locked, its beat
+        learned this session): its piezo trimmed (SlsParams.trim), its fast output near 0, and how that follows its
+        piezo and its current learned (its current then moves with its piezo, its frequency kept: _HopIO); else the
+        trim learns that first."""
+        p, g, v = ch.sls, ch.sls_guard, ch.sls_view
+        if not (p.trim and g is not None and g.stage == "hold") or now - ch.upkeep_t < 60.0 * ch.hop.upkeep:
+            return False
+        if not (v is not None and v.holds and ch.steering is None and not self._beat_lost(ch)
+                and says_locked(ch.shg_txt)):
+            return False
+        if self._beat_point(ch, look=False) is None or (p.master and not ch.beat_ok):
+            return False  # (its beat point not known for sure: released meanwhile, it could not be steered back)
+        if p.trim_gain and not p.trim_cur:
+            ch.trim_cur_want = True  # (its trim's next step: its current's)
+            return False
+        return bool(self._piezo_per_ma(ch)) and abs(ch.trim_level) <= 2.0 * self.TRIM_DEAD
 
     def on_readings(self, readings):
         with self.lock:
@@ -1580,6 +1660,10 @@ class Engine:
         if hop.cavity:
             if not (ch.cavity_on and says_locked(ch.cavity_txt)):
                 return False
+        elif ch.beat_slave:  # (an SLS PLL holds it: holding it on its beat point, its SHG cavity locked)
+            v = ch.sls_view
+            return (v is not None and bool(v.holds) and ch.sls_since is not None and ch.steering is None
+                    and not self._beat_lost(ch) and (not hop.shg or says_locked(ch.shg_txt)))
         elif not (self._armed(ch) and ch.guard.armed):
             return False
         e = self._hop_error(ch) - ch.guard.track
@@ -1738,6 +1822,22 @@ class Engine:
     SLS_STALE_S = 2.0   # s: a unit's poll older than this (it does not answer) tells nothing
     BEAT_FRESH_S = 2.0  # s: its master's reading goes with its own if at most this old
     BEAT_LEARN_S = 10.0  # s its PLL must have held before its beat is learned from the readings
+    TRIM_HOLD_S = 3.0    # s its PLL must have held before its piezo is trimmed...
+    TRIM_S = 2.5         # ...its fast output looked at this long before each step (TRIM_N readings at least; a
+    TRIM_N = 5           # straight line through them, it drifting)...
+    TRIM_SETTLE_S = 0.5  # ...from this long after the step before
+    TRIM_DEAD = 0.02     # V: its fast output this near 0 on average (or within 3 times its uncertainty), left as it is
+    TRIM_FRAC = 0.5      # of its fast output's average taken off at a step, its piezo moved at most TRIM_STEP V and
+    TRIM_STEP = 0.05     # its fast output at most TRIM_FAST V by it (as learned: its guard's band moves along, well
+    TRIM_FAST = 0.02     # within its width even if what was learned is twice what it is); twice that with its fast
+    TRIM_FAR = 0.1       # output this far off
+    TRIM_PROBE = 0.002   # V: a step to learn by how its fast output follows its piezo (every other one the other way,
+    TRIM_PROBE_MAX = 0.032  # doubled while it hardly shows, up to this)...
+    CUR_PROBE = 0.02     # mA: ...likewise its current (for an upkeep: how its piezo follows it, its frequency kept)...
+    CUR_PROBE_MAX = 0.16  # ...up to this
+    TRIM_SURE = 8.0      # ...learned once what they did together is this many times its uncertainty
+    TRIM_SHOWS = 0.002   # V: a step moved its fast output at least this much (and 4 times its uncertainty), or it did
+    #                      not (what is learned kept up to date by those that did)
     BEAT_STEP_S = 6.0    # s a slave read off its beat point, its PLL holding it by all it shows, has to read steady
     STEP_N = 10          # there (this many readings at least, STEP_MIN_S at least): its beat moved (a wavemeter
     STEP_MIN_S = 2.0     # recalibrated), learned again; not steady by then, it is lost. STEPS of them in STEPS_S at
@@ -1834,6 +1934,11 @@ class Engine:
         its beat point now, it is relocked now)."""
         ch.state, ch.message = "on", ""
         ch.token += 1
+        ch.upkeep_t = time.monotonic()
+        ch.trim_moved, ch.trim_said, ch.trim_last = 0.0, "", None
+        hop = ch.hop
+        if hop.enabled and ch.device and not ch.dac and not hop.optimum:  # (as on a laser its DLC pro locks: its
+            self._take_optimum(ch)                                         # optimum, the first time)
         if ch.beat_slave and ch.sls.guard:
             ch.sls_guard = BeatGuard(ch.sls)
             w = self.sls_watches.get(ch.n)
@@ -2097,6 +2202,8 @@ class Engine:
                 if ch.beat_slave:
                     self._outputs_band(ch, view)
                 self._sls_track(ch, view)
+                if ch.beat_slave:
+                    self._trim(ch, view)
                 watch.seen = view.t
                 if (ch.beat_slave and view.holds and ch.sls_since is not None and ch.steering is None
                         and ch.beat_off_n == 0 and view.t - ch.sls_since >= self.BEAT_LEARN_S
@@ -2122,6 +2229,158 @@ class Engine:
         for w in wake:
             w.wake()
         return out
+
+    def _trim(self, ch: Channel, view):
+        """A PLL with its slow servo unused (SlsParams.trim), holding its slave, its guard armed and holding it (or
+        an upkeep under way): its fast output looked at over TRIM_S, and nulled bit by bit by the slave's piezo (a
+        step every few s, as if its slow servo, very slow). How its fast output follows the piezo is learned by small
+        steps first (what each did by itself, a drift taken off: step_fit), and kept learned by every step after (the
+        other way twice in a row: learned again); how it follows its current likewise, wanted for an upkeep."""
+        p, g, mono = ch.sls, ch.sls_guard, time.monotonic()
+        on = (p.trim and ch.device and not ch.dac and view.holds and view.mode and view.fast is not None
+              and ch.sls_since is not None and time.time() - ch.sls_since >= self.TRIM_HOLD_S and g is not None
+              and g.stage in ("hold", "auto") and ch.steering is None and not ch.lock.active
+              and (ch.runner is None or ch.upkeeping))
+        if not on:
+            ch.trim_seen = []
+            ch.trim_from, ch.trim_last, ch.trim_level = mono, None, math.inf
+            return
+        if ch.trim_busy or mono < ch.trim_from:
+            return
+        ch.trim_seen.append((view.t, view.fast))
+        if mono - ch.trim_from < self.TRIM_S or len(ch.trim_seen) < self.TRIM_N:
+            return
+        seen, ch.trim_seen, ch.trim_from = ch.trim_seen, [], mono  # (the next look begins now, unless a step comes)
+        ys = [y for _, y in seen]
+        mean, sem = statistics.fmean(ys), statistics.stdev(ys) / math.sqrt(len(ys))
+        ch.trim_level = mean
+        last, ch.trim_last = ch.trim_last, None
+        if last is not None and not ch.upkeeping:  # (an upkeep moves its current and piezo meanwhile: nothing learned)
+            self._trim_learn(ch, last[1], last[2], *step_fit(last[0], seen)[:2])
+        if ch.trim_cur_want and p.trim_gain and not ch.upkeeping:
+            ch.trim_sign = -ch.trim_sign
+            self._trim_step(ch, "current", ch.trim_sign * (ch.cur_size or self.CUR_PROBE), seen, mean)
+        elif not p.trim_gain:
+            ch.trim_sign = -ch.trim_sign
+            self._trim_step(ch, "piezo", ch.trim_sign * (ch.trim_size or self.TRIM_PROBE), seen, mean)
+        elif abs(mean) > max(self.TRIM_DEAD, 3.0 * sem):
+            cap = min(self.TRIM_STEP, self.TRIM_FAST / abs(p.trim_gain)) * (2.0 if abs(mean) >= self.TRIM_FAR else 1.0)
+            self._trim_step(ch, "piezo", min(max(-self.TRIM_FRAC * mean / p.trim_gain, -cap), cap), seen, mean)
+
+    def _trim_learn(self, ch: Channel, kind: str, moved: float, step: float, noise: float):
+        """The step before (kind 'piezo': moved V of its piezo; 'current': mA of its current) moved its fast output
+        step V by itself, give or take noise: learned (SlsParams.trim_gain, trim_cur). Not learned yet, the steps to
+        learn by are taken together (each by how well it tells) until what they did is clear (TRIM_SURE: one that
+        noise happened to make look big does not make it), bigger while it hardly shows; learned, every step that
+        shows keeps it up to date."""
+        p, piezo = ch.sls, kind == "piezo"
+        name = "trim_gain" if piezo else "trim_cur"
+        old = getattr(p, name)
+        noise = max(noise, self.TRIM_SHOWS / 4)
+        if not old:
+            ch.trim_probes = [x for x in ch.trim_probes if x[0] == kind][-7:] + [(kind, moved, step, noise)]
+            sxx = sum((m / s) ** 2 for _, m, _, s in ch.trim_probes)
+            gain = sum(m * c / s ** 2 for _, m, c, s in ch.trim_probes) / sxx
+            sure = abs(gain) * math.sqrt(sxx)  # (how many times its uncertainty)
+            if sure < self.TRIM_SURE or abs(gain * moved) <= self.TRIM_SHOWS:
+                if sure < 4.0 and piezo:
+                    ch.trim_size = min(2 * abs(moved), self.TRIM_PROBE_MAX)
+                    if abs(moved) >= self.TRIM_PROBE_MAX - 1e-9 and len(ch.trim_probes) >= 4:
+                        ch.trim_said = (f"its fast output does not follow its piezo (steps of ±"
+                                        f"{self.TRIM_PROBE_MAX * 1e3:.0f} mV): is the PLL's fast output on its "
+                                        f"current, and that the slave's piezo?")
+                elif sure < 4.0:
+                    ch.cur_size = min(2 * abs(moved), self.CUR_PROBE_MAX)
+                return
+            setattr(p, name, round_sig(gain, 4))
+            ch.trim_probes, ch.trim_odd = [], 0
+            if not piezo:
+                ch.trim_cur_want = False
+            ch.trim_said = (f"learned: its fast output moves {gain:+.4g} V for a "
+                            f"{'V of its piezo' if piezo else 'mA of its current'}")
+            log.info("channel %d: its piezo trim: %s", ch.n, ch.trim_said)
+            self.dirty = True
+            return
+        if abs(step) <= max(4.0 * noise, self.TRIM_SHOWS):  # (it did not show)
+            return
+        gain = step / moved
+        if gain * old < 0:
+            ch.trim_odd += 1
+            if ch.trim_odd >= 2:
+                ch.trim_said = (f"its fast output went the other way ({gain:+.4g} V for a "
+                                f"{'V of its piezo' if piezo else 'mA of its current'}, learned {old:+.4g}): learned "
+                                f"again")
+                log.warning("channel %d: its piezo trim: %s", ch.n, ch.trim_said)
+                setattr(p, name, 0.0)
+                ch.trim_size = ch.cur_size = 0.0
+                ch.trim_odd, ch.trim_probes = 0, []
+                self.dirty = True
+        else:
+            ch.trim_odd = 0
+            seen = min(max(gain / old, 1 / 3), 3.0) * old  # (one odd look: not too much)
+            setattr(p, name, round_sig(0.7 * old + 0.3 * seen, 4))
+
+    def _trim_step(self, ch: Channel, kind: str, d: float, seen: list, mean: float):
+        """Its piezo (kind 'piezo': d V, within its lock's limits) or its current ('current': d mA) moved from where
+        it is now (read afresh: no step from a stale value), in its controller's thread; where its PLL's fast output
+        sits holding it moved along by what was learned (its guard's band)."""
+        key, laser, tok, p, piezo = ch.device, ch.laser, ch.token, ch.sls, kind == "piezo"
+        param = ch.param if piezo else f"laser{laser}:{ch.cc}"
+        lo, hi = (ch.lock.p.v_min, ch.lock.p.v_max) if piezo else (0.0, math.inf)
+        what = "its piezo" if piezo else "its current"
+        ch.trim_busy = True
+
+        def job(client):
+            v = client.get_float(param)
+            new = round(min(max(v + d, lo), hi), 5)
+            if abs(new - v) > 1e-9:
+                client.set(param, new)
+            with self.lock:
+                ch.trim_busy = False
+                moved = new - v
+                if ch.device != key or ch.laser != laser:
+                    return
+                if piezo:
+                    ch.offset = new
+                    ch.trim_moved += moved
+                else:
+                    ch.current_set = new
+                self._shift_band(ch, (p.trim_gain if piezo else p.trim_cur) * moved)
+                if ch.token != tok:
+                    return
+                if abs(moved) < 1e-9:
+                    ch.trim_said = f"{what} at its limit, {new:.3f} {'V' if piezo else 'mA'}: no trim"
+                    return
+                ch.trim_last = (seen, kind, moved)
+                ch.trim_from = time.monotonic() + self.TRIM_SETTLE_S
+                ch.trim_seen = []
+                if piezo and p.trim_gain:
+                    ch.trim_said = f"{moved * 1e3:+.1f} mV, its fast output {mean:+.3f} V on average"
+
+        def failed(exc):
+            with self.lock:
+                ch.trim_busy = False
+                ch.trim_said = f"cannot move {what}: {exc}"
+
+        self._controller(key).submit(job, failed)
+
+    @staticmethod
+    def _shift_band(ch: Channel, d: float):
+        """Its PLL's fast output moved d V (expected, by a step of its trim's): where it sits holding it moves along
+        (else its guard would see it far from there, and release it)."""
+        if not d:
+            return
+        ch.fast_seen = deque((x + d for x in ch.fast_seen), maxlen=ch.fast_seen.maxlen)
+        p = ch.sls
+        if p.fast_dev:
+            p.fast_mid = round(p.fast_mid + d, 6)
+
+    @staticmethod
+    def _piezo_per_ma(ch: Channel) -> float:
+        """V its piezo moves for a mA of its current to keep its frequency (its PLL's fast output where it is), as
+        its trim learned (0: not yet)."""
+        p = ch.sls
+        return -p.trim_cur / p.trim_gain if p.trim_gain and p.trim_cur else 0.0
 
     def _outputs_band(self, ch: Channel, view):
         """Where its PLL's outputs sit holding it, learned afresh when its PLL is off or relocked (engaged again,
@@ -2178,9 +2437,11 @@ class Engine:
                 setattr(p, dev, round(d, 6))
 
     def _sls_act(self, ch: Channel, g: BeatGuard, a: tuple) -> list:
-        """One of its guard's actions: done here, or (a write to its PLL) returned."""
+        """One of its guard's actions: done here, or (a write to its PLL) returned. An upkeep under way stops first."""
         what = a[0]
         mono = time.monotonic()
+        if ch.upkeeping:
+            self._end_upkeep(ch, a[1] if len(a) > 1 and isinstance(a[1], str) else what)
         if what == "release":
             if ch.steering is not None:
                 self._unsteer(ch)
@@ -2715,9 +2976,10 @@ class Engine:
 
         self._controller(key).submit(job)
 
-    def take_optimum(self, n: int):
+    def take_optimum(self, n: int, shg=None):
         """The laser as it is now is at its optimum (set by hand): its current, piezo voltage and SHG signal locked
-        are what the catch goes back to."""
+        are what the catch goes back to. shg: it has an SHG stage (None: as its settings say; the dialog says as it
+        is ticked there, not yet OK'd)."""
         with self.lock:
             ch = self.channels[n]
             if not ch.device:
@@ -2727,10 +2989,11 @@ class Engine:
             elif ch.state in ("recovering", "mapping"):
                 ch.message = f"take the optimum: not while it {'recovers' if ch.state == 'recovering' else 'is mapped'}"
             else:
-                self._take_optimum(ch)
+                self._take_optimum(ch, shg)
 
-    def _take_optimum(self, ch: Channel):
-        key, laser, shg = ch.device, ch.laser, ch.hop.shg
+    def _take_optimum(self, ch: Channel, shg=None):
+        key, laser = ch.device, ch.laser
+        shg = ch.hop.shg if shg is None else bool(shg)
 
         def job(client):
             piezo, _ = self._drives(ch, client, key, laser)
@@ -2747,9 +3010,12 @@ class Engine:
                 hop.opt_t = time.strftime("%Y-%m-%d %H:%M")
                 level = got[3] if shg and says_locked(got[2]) and _num(got[3]) and got[3] > 0 else 0.0
                 hop.opt_shg = round(level, 4)
+                ch.opt_why = ("" if level else "no SHG stage ticked" if not shg else
+                              f"its SHG cavity says “{got[2] or '?'}”, not locked" if not says_locked(got[2]) else
+                              f"its SHG signal reads {got[3]!r}")
                 self.dirty = True
                 ch.note = (f"optimum taken: {act:.2f} mA, {v:.2f} {ch.unit}" + (
-                    f", SHG {level:.3f} V locked" if level else ", SHG not locked: its level not known" if shg else ""))
+                    f", SHG {level:.3f} V locked" if level else f", SHG level not known: {ch.opt_why}" if shg else ""))
                 ch.note_t = time.monotonic()
                 log.info("channel %d: %s", ch.n, ch.note)
 
@@ -2950,6 +3216,8 @@ class Engine:
         self._release(ch)
 
     def _recovery_done(self, ch: Channel, r: Runner):
+        if getattr(r, "abandoned", False):  # (an upkeep its PLL's guard stopped to act itself: said there, _end_upkeep)
+            return
         ch.runner = None
         ch.guard.reset()
         ch.state = "off"
@@ -2960,6 +3228,9 @@ class Engine:
         took = f"{r.now - ch.hop_t:.0f} s"
         why = f"{ch.hop_why}: " if ch.hop_why else ""
         rec = r.rec
+        if upkeep and ch.beat_slave and ch.sls_guard is not None:
+            self._beat_upkept(ch, r, took)
+            return
         if self._sls_recovered(ch, "" if r.state == "done" else r.error or "failed"):
             pass  # (its guard goes on with it; what it did is noted below all the same)
         if r.state == "done":
@@ -3009,6 +3280,37 @@ class Engine:
         ch.message = f"{head} ({where})"
         log.warning("channel %d: %s", ch.n, ch.message)
         self._keep_record(ch, r, ch.message)
+
+    def _beat_upkept(self, ch: Channel, r: Runner, took: str):
+        """An upkeep of a laser an SLS PLL holds is over (its PLL held it on its beat point all along, its piezo moving
+        with its current): its guard goes on with it, its piezo trimmed as before."""
+        ch.state = "on"  # (its guard's to tell from here: _sls_step)
+        rec = r.rec
+        if r.state == "done":
+            ch.current_set = r.result.current
+            ch.message = ""
+            ch.note = f"upkeep: {r.result.summary}, its piezo with it ({ch.offset:.3f} V), {took}"
+        else:
+            ch.current_set = r.i_written
+            ch.note = f"upkeep: {r.error}" + ("" if r.restored else f" (left at {rec.mA(r.i_written):.3f} mA)")
+        ch.note_t = time.monotonic()
+        log.log(logging.INFO if r.state == "done" else logging.WARNING, "channel %d: %s", ch.n, ch.note)
+        self._keep_record(ch, r, ch.note)
+
+    def _end_upkeep(self, ch: Channel, why: str):
+        """Its PLL's guard acts (its PLL released, say) during an upkeep: the upkeep stops at once, its current and
+        piezo left where they are (the guard has it from here)."""
+        r = ch.runner
+        if r is None or not ch.upkeeping:
+            return
+        r.abandoned = True
+        ch.runner, ch.upkeeping, ch.state = None, False, "on"
+        ch.upkeep_t = time.monotonic()
+        ch.token += 1
+        r.cancel(f"its PLL's guard: {why}", keep=True)
+        ch.note, ch.note_t = f"upkeep stopped: {why}", time.monotonic()
+        log.warning("channel %d: %s", ch.n, ch.note)
+        self._keep_record(ch, r, ch.note)
 
     def _recenter_target(self, ch: Channel, lock_e: float) -> str:
         """Relocked to its cavity, lock_e MHz from its target as the wavemeter reads it: the target (its setpoint)

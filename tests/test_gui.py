@@ -284,12 +284,15 @@ def test_hop_dialog_shows_the_optimum_and_takes_it(app):
     ch = Channel(7, {"hop": {"enabled": True, "cavity": True, "shg": True, "i_nom": 150.0, "shg_ratio": 0.98}})
     ch.device = "192.168.1.20"
     taken = []
-    d = gui.HopDialog(None, ch, take=lambda: taken.append(1))
+    d = gui.HopDialog(None, ch, take=lambda shg=None: taken.append(shg))
     assert d.optimum.text().startswith("not taken: taken when Relock is first clicked")
     assert "SHG peak in a sweep 0.98 of the signal locked" in d.learned.toolTip()
     take = next(b for b in d.findChildren(QtWidgets.QPushButton) if b.text() == "Take now")
     take.click()
-    assert taken == [1]
+    d.shg.setChecked(False)
+    take.click()  # (with its SHG stage as ticked in the dialog, not yet OK'd)
+    d.shg.setChecked(True)
+    assert taken == [True, False]
     ch.hop.opt_i, ch.hop.opt_v, ch.hop.opt_shg, ch.hop.opt_t = 150.31, 70.12, 1.231, "2026-10-19 21:03"
     ch.hop.i_nom = 150.31  # (as the engine takes it, a moment later)
     spin(app, 0.5)
@@ -970,15 +973,20 @@ def test_sls_dialog_round_trip_and_its_test(app):
         d.master.setCurrentIndex(next(k for k, (_, n, on) in enumerate(d.masters) if (n, on) == (9, "")))
         assert d.master_host.isEnabled() and d.beat.text() == "not learned yet"  # (learned, never typed)
         d.capture.setValue(0.8)
+        assert d.trim.isEnabled() and not d.trim.isChecked()
+        d.trim.setChecked(True)  # (its slow servo unused, as on Sirius: its piezo trimmed)
         p = d.params()
-        assert p == SlsParams(kind="pll", host="127.0.0.1", port=demo.pll.sls.port, master=9, capture=0.8)
+        assert p == SlsParams(kind="pll", host="127.0.0.1", port=demo.pll.sls.port, master=9, capture=0.8, trim=True)
         d._test()
         assert wait_for(lambda: (app.processEvents(), "manual lock (MANUAL)" in d.found.text())[1], 5), d.found.text()
-        ch.sls = SlsParams(kind="pll", host="P1029F", servo=2, master=9, beat=80.1, beat_known=True, amp_usual=0.9)
+        ch.sls = SlsParams(kind="pll", host="P1029F", servo=2, master=9, beat=80.1, beat_known=True, amp_usual=0.9,
+                           trim=True, trim_gain=0.41, trim_cur=-0.26)
         d = gui.SlsDialog(None, e, ch)
         assert d.servo.currentIndex() == 2 and d.beat.text() == "+80.10 MHz, as last learned" and d.params() == ch.sls
+        assert d.trim.isChecked()
         d.servo.setCurrentIndex(3)
-        assert d.params().amp_usual == 0.0 and not d.params().beat_known  # (another PLL: learned afresh)
+        p = d.params()  # (another PLL: learned afresh)
+        assert p.amp_usual == 0.0 and not p.beat_known and p.trim and p.trim_gain == 0.0 and p.trim_cur == 0.0
     finally:
         demo.close()
 

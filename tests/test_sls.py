@@ -2,15 +2,19 @@
 PLL beat-locks (its steps, then the whole night failure in the simulation: the master's lock drops, the PLL's manual
 lock runs the slave away and stops it lasing, its TA switches itself off; guarded, none of that)."""
 import json
+import math
+import random
 import re
 import socket
+import statistics
+import threading
 import time
 
 import pytest
 
 from conftest import wait_for
 from wmlock import sls, view
-from wmlock.engine import Engine, Track
+from wmlock.engine import Engine, Track, step_fit
 from wmlock.meters import Elsewhere, Meter, row_holds
 from wmlock.rpc import Api
 from wmlock.share import Share, clean
@@ -404,13 +408,13 @@ def lab():
     demo.close()
 
 
-def make_engine(demo, tmp_path, guard=True, hop=True, beat=80.0, **sls_kw):
+def make_engine(demo, tmp_path, guard=True, hop=True, beat=80.0, hop_kw=None, **sls_kw):
     m, s = demo.MASTER, demo.SLAVE
     slave = {"name": "739 slave", "link": {"device": demo.sister.key, "laser": 1},
              "sls": {"kind": "pll", "host": "127.0.0.1", "port": demo.pll.sls.port, "master": m, "beat": beat,
                      "guard": guard, **sls_kw}}
     if hop:
-        slave["hop"] = {"enabled": True, "i_nom": 150.0}
+        slave["hop"] = {"enabled": True, "i_nom": 150.0, **(hop_kw or {})}
     cfg = {"channels": {str(m): {"name": "739 master", "sls": {"kind": "pdh", "host": "127.0.0.1",
                                                                "port": demo.pdh.sls.port}},
                         str(s): slave}}
@@ -820,6 +824,158 @@ def test_a_slave_read_moving_off_its_beat_point_is_still_lost(tmp_path):
                 s.sls_guard.why
         finally:
             stop.set()
+            e.stop()
+    finally:
+        demo.close()
+
+
+def test_its_optimum_taken_as_on_a_laser_its_dlc_pro_locks(tmp_path):
+    """Mode-hop recovery set up on a slave a PLL holds: Relock takes its optimum the first time, as on a laser its DLC
+    pro locks; one taken with an SHG stage ticked (in the dialog, not yet OK'd) says why its SHG level is not known."""
+    demo = Demo(discovery_port=0, beat=True, wavemeter=SimWavemeter(noise=0.05), exposure=0.004)
+    try:
+        e = make_engine(demo, tmp_path)
+        s = e.channels[demo.SLAVE]
+        try:
+            assert s.hop.enabled and not s.hop.optimum
+            e.engage(demo.SLAVE)
+            assert wait_for(lambda: s.hop.optimum, 3), s.note
+            assert s.hop.opt_i == pytest.approx(150.0, abs=0.5) and s.hop.opt_shg == 0.0
+            assert s.opt_why == "no SHG stage ticked" and "SHG" not in s.note  # (none set up: not said on its row)
+            e.take_optimum(demo.SLAVE, shg=True)  # (the simulated slave has no SHG stage)
+            assert wait_for(lambda: s.opt_why != "no SHG stage ticked", 3)
+            assert s.opt_why == "its SHG cavity says “?”, not locked" and "SHG level not known: its SHG" in s.note
+        finally:
+            e.stop()
+    finally:
+        demo.close()
+
+
+# --------------------------------------------------------------------- its piezo trimmed (Sirius: no slow servo)
+def test_a_step_told_from_a_drift():
+    """What a step did by itself, from the readings either side of it: a drift through both taken off."""
+    rng = random.Random(1)
+    before = [(0.1 * k, 0.5 + 0.02 * 0.1 * k + rng.gauss(0, 0.002)) for k in range(25)]
+    after = [(3.0 + 0.1 * k, 0.49 + 0.02 * (3.0 + 0.1 * k) + rng.gauss(0, 0.002)) for k in range(25)]
+    step, sigma, slope = step_fit(before, after)
+    assert step == pytest.approx(-0.01, abs=4 * sigma) and sigma < 0.002 and slope == pytest.approx(0.02, abs=0.003)
+    naive = statistics.fmean(y for _, y in after) - statistics.fmean(y for _, y in before)
+    assert naive == pytest.approx(0.05, abs=0.005)  # (the drift alone: a step five times as big, the other way)
+
+
+def no_slow_servo(shg=False, below=None) -> Demo:
+    """Sirius by itself: its PLL's slow servo unused (as in the lab: it unlocks the laser), its fast output alone
+    holding it (and running out of range as it drifts, untrimmed); with an SHG stage (shg); below: GHz below where a
+    second mode begins to lase (as near the top of its mode), else in its middle."""
+    demo = Demo(discovery_port=0, beat=True, beat_servo=1, beat_offset=0.0, beat_slow=False, beat_shg=shg,
+                wavemeter=SimWavemeter(noise=0.05), exposure=0.004)
+    if below is not None:
+        slave = demo.laser(demo.SLAVE)
+        e = slave.ecdl
+        with slave._mutex:
+            e.nudge(e.misalignment(e.m, *slave._vi()) - (e.zone(1.0)[0] - below))
+    return demo
+
+
+def misalignment(demo) -> float:
+    slave = demo.laser(demo.SLAVE)
+    with slave._mutex:
+        return slave.ecdl.misalignment(slave.ecdl.m, *slave._vi())
+
+
+def test_its_piezo_trimmed_keeps_its_fast_output_near_0(tmp_path):
+    """Sirius's PLL with its slow servo unused: its piezo trimmed (SlsParams.trim). How its fast output follows the
+    piezo is learned by small steps (what each did by itself, the slave drifting meanwhile), and the piezo then brings
+    it near 0 and keeps it there as the slave drifts on, a small step every few s; its PLL never released (its guard's
+    band moving along with each step)."""
+    demo = no_slow_servo()
+    slave = demo.laser(demo.SLAVE)
+    with slave._mutex:
+        slave.ecdl.f0 += 120e-6  # (120 MHz off: its fast output at +0.15 V to begin with)
+    stop = threading.Event()
+    try:
+        e = make_engine(demo, tmp_path, beat=0.0, servo=1, trim=True)
+        e.TRIM_S = 1.5
+        s = e.channels[demo.SLAVE]
+        try:
+            assert wait_for(lambda: s.sls_view.fast > 0.12, 3)
+            e.engage(demo.SLAVE)
+            assert wait_for(lambda: s.sls.trim_gain, 40), s.trim_said
+            assert 0.3 < s.sls.trim_gain < 0.5, s.trim_said  # (0.4 V for a V: 0.4 GHz/V of piezo, 1 GHz/V of fast)
+            assert wait_for(lambda: abs(s.trim_level) <= 0.03, 20), (s.trim_level, s.trim_said)
+
+            def drift():  # (4 MHz/s: its fast output up 0.05 V in 12 s, untrimmed)
+                while not stop.wait(0.1):
+                    with slave._mutex:
+                        slave.ecdl.f0 += 0.4e-6
+
+            v0 = demo.sister.offset(1)
+            threading.Thread(target=drift, daemon=True).start()
+            time.sleep(12.0)
+            stop.set()
+            assert abs(s.trim_level) < 0.04, (s.trim_level, s.trim_said)
+            assert demo.sister.offset(1) - v0 == pytest.approx(-0.12, abs=0.07)  # (48 MHz at 0.4 GHz/V)
+            assert demo.pll.losses == 0 and s.sls_guard.stage == "hold" and s.state == "on"
+            text = view.notes(e, demo.SLAVE)
+            assert "its piezo trimmed to keep its PLL's fast output near 0" in text and "V for a V of piezo" in text
+        finally:
+            e.stop()
+    finally:
+        stop.set()
+        demo.close()
+
+
+def test_an_upkeep_of_a_slave_its_pll_holds(tmp_path):
+    """Mode-hop recovery's upkeep on Sirius, its piezo trimmed: its PLL holds it on its frequency all along, so its
+    current moves with its piezo (by what was learned of how its fast output follows each: its current's by small
+    steps, for the upkeep), up to where its SHG signal dips (the top of its mode) and back off it, as on a laser its
+    DLC pro locks to a cavity."""
+    demo = no_slow_servo(shg=True, below=0.3)
+    try:
+        e = make_engine(demo, tmp_path, beat=0.0, servo=1, trim=True, trim_gain=0.4,
+                        hop_kw={"shg": True, "upkeep": 0.05})
+        e.TRIM_S = 1.5
+        s = e.channels[demo.SLAVE]
+        try:
+            assert misalignment(demo) == pytest.approx(2.4, abs=0.15) and demo.slave_shg.main() == 1.0
+            e.engage(demo.SLAVE)
+            assert wait_for(lambda: s.sls.trim_cur, 40), s.trim_said
+            assert -0.35 < s.sls.trim_cur < -0.18, s.trim_said  # (-0.25 V for a mA: 4 mA for a V of fast output)
+            assert wait_for(lambda: s.note.startswith("upkeep:"), 30), s.note
+            assert "the top of its mode at" in s.note and "its piezo with it" in s.note, s.note
+            assert wait_for(lambda: s.state == "on", 5)
+            a = misalignment(demo)
+            assert 2.5 < a < 2.72, a  # (a second mode begins at 2.7 GHz: just below, as by hand)
+            assert demo.slave_shg.main() > 0.99 and demo.pll.losses == 0 and s.sls_guard.stage == "hold"
+            assert s.last["outcome"] == s.note and s.last["upkeep"]["top"] > s.last["upkeep"]["from"]
+        finally:
+            e.stop()
+    finally:
+        demo.close()
+
+
+def test_an_upkeep_stops_when_its_pll_is_released(tmp_path):
+    """An upkeep under way when its master's lock drops: its PLL's guard releases it at once, and the upkeep stops
+    (its guard has it from there: recovered if its PLL ran it dark meanwhile, relocked once the master holds again);
+    untrimmed meanwhile."""
+    demo = no_slow_servo(shg=True)
+    try:
+        e = make_engine(demo, tmp_path, beat=0.0, servo=1, trim=True, trim_gain=0.4, trim_cur=-0.25,
+                        hop_kw={"shg": True, "upkeep": 0.05})
+        e.TRIM_S, e.BEAT_LEARN_S = 1.5, 2.0
+        s = e.channels[demo.SLAVE]
+        try:
+            e.engage(demo.SLAVE)
+            assert wait_for(lambda: s.upkeeping, 30), s.note
+            assert s.beat_ok  # (not before its beat is learned: released meanwhile, it is steered back by it)
+            demo.pdh.drop(1.0)
+            assert wait_for(lambda: s.note.startswith("upkeep stopped"), 5), s.note
+            assert "its master's lock was lost" in s.note and not s.upkeeping
+            assert wait_for(lambda: s.trim_level == math.inf, 2)
+            assert wait_for(lambda: s.sls_guard.stage == "hold" and s.state == "on" and demo.pll.locked, 30), (
+                s.sls_guard.stage, s.state, s.sls_note)
+            assert "relocked: its PLL holds it again" in s.sls_note and s.runner is None
+        finally:
             e.stop()
     finally:
         demo.close()

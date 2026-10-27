@@ -235,6 +235,10 @@ class SlsParams:
     fast_dev: float = 0.0     # ...and how far from it it goes (learned; 0: not yet): far beyond, it has lost the beat
     phase_mid: float = 0.0    # pll: likewise its phase error (its unit's units)
     phase_dev: float = 0.0
+    trim: bool = False        # pll: its slow servo unused (as on Sirius): the slave's piezo moved a little at a time to
+    #                           keep its PLL's fast output near 0 (else that runs out of range as the slave drifts)
+    trim_gain: float = 0.0    # pll: V its fast output moves for a V of the slave's piezo (learned; 0: not yet)...
+    trim_cur: float = 0.0     # ...and for a mA of its current (learned for an upkeep: its piezo then moves with it)
     FRESH = ("fast_mid", "fast_dev", "phase_mid", "phase_dev")  # (learned afresh each time its PLL holds it: not kept)
 
     @classmethod

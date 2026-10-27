@@ -1359,6 +1359,7 @@ wavemeter): on Sirius's PC, its row › *SLS lock…*:
 | Its master | the other SHG, as the list names it: *its wavemeter's name · channel N its name* |
 | Its master's servo | the Laser Servo that locks the other SHG (*Find units*: the one saying *Locked*), or empty |
 | Beat | nothing to enter: learned (near 0) |
+| Trim its piezo | ticked: its PLL's slow servo is unused (*Its slow servo unused*, below) |
 
 *Test* says *3-channel PLL, firmware …* and servo 1 *manual lock*; OK; then *Relock*. The other SHG's PC runs this
 program on the same network (its frame shows on Sirius's PC), its row set to its own Laser Servo (*SLS lock…* there):
@@ -1413,6 +1414,42 @@ night. Guarded:
 Meanwhile the row says *Relocking*, and what it is doing; click it to stop (its PLL is left as it is: released). Its PLL
 switched off at its box stops the guard (*watching stopped: its PLL was switched off at its box*); its autolock
 switched on, the autolock has it (watched, not guarded).
+
+### Its slow servo unused: its piezo trimmed (Sirius)
+
+Sirius's PLL runs with its slow servo off (on, it unlocks the laser): its fast output alone holds the slave, on its
+current through the DC MOD input, and as the slave drifts it runs towards the end of its range (and the current away
+from where the mode is at its best). *SLS lock…* › **Trim its piezo to keep the PLL's fast output near 0** does the
+slow servo's job, very slowly, through the DLC pro (the piezo: the scan's offset, or `dl:pc:voltage-set`):
+
+* Its fast output is looked at for 2.5 s (a straight line through its readings: it drifts meanwhile); further from 0
+  than 0.02 V (and than three times its uncertainty), the piezo is moved to take half of it off, by at most 0.02 V of
+  fast output a step (0.04 V while it is beyond 0.1 V) and 0.05 V of piezo: a step every 3 s at most. Where its guard
+  has the fast output sitting moves along with each step, so that a trim never reads as a lost beat.
+* How far the fast output moves for a volt of piezo is learned first, by small steps either way (2 mV, doubled while
+  they hardly show, up to 32 mV), what each did by itself told from the drift (the readings before and after it, one
+  slope through both), until it is clear (eight times its uncertainty): *learned: its fast output moves +0.40 V for a V
+  of its piezo*. It is kept (in its settings), and every step after keeps it up to date; two in a row that move it
+  the other way, it is learned again; another unit or servo, likewise.
+* Only while its PLL holds it by all it shows (3 s at least) and its guard holds it: not while it is released, steered,
+  relocked or recovered.
+* Its tooltip says what it learned, how far the piezo moved since *Relock*, and its last step (*-20.1 mV, its fast
+  output +0.092 V on average*).
+
+In the simulation (a fast output of 1 GHz/V, a piezo of 0.4 GHz/V): learned within 20 s, the slave drifting 1 MHz/s,
+and its fast output kept within ±0.02 V from then on; untrimmed, it runs out of range in minutes (at 20 MHz/s, 25 s).
+
+**Mode-hop recovery on Sirius**, as on Mulungu: *Mode-hop recovery…* with *its SHG stage* ticked, its nominal current,
+*Take now* (or *Relock*: its optimum is taken the first time), and its upkeep (*looked for every … min*). Now and then,
+its PLL holding it and its SHG cavity locked, its current goes up in small steps until its SHG signal dips (the top of
+its mode), then down until it is back up, and is kept *that much* below. Its PLL holds its frequency all along, so its
+current alone would move nothing (the PLL takes it straight back off through its fast output): its piezo moves with it,
+by what the trim learned (how its fast output follows a volt of piezo and a mA of current, that one learned by small
+steps of its current the first time an upkeep is due), as its cavity lock moves Mulungu's: *upkeep: the top of its mode
+at 150.245 mA, the current 150.040 → 150.220 mA (+0.180), its piezo with it (70.049 V)*. Not before its beat is learned
+this session (released meanwhile, it is steered back by it); its PLL released during an upkeep, the upkeep stops at
+once and its guard has it (*upkeep stopped: its master's lock was lost*). *Take now* takes its SHG level too with *its
+SHG stage* ticked in the dialog (OK'd or not); not taken, it says why (*its SHG cavity says “relocking”, not locked*).
 
 **The slave's DC MOD input**: the PLL's fast output reaches the slave's current through the DC MOD input, an analogue
 BNC with no factor to set in software: what a volt does to its current is fixed. If the PLL's whole fast range (±5 V)
