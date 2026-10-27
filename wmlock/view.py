@@ -18,6 +18,8 @@ row(engine, n, now) is a dict:
             Lock (Locked)
   sls       what SLS unit locks it (sls.py): 'pdh' (its Laser Servo, to the cavity), 'pll' (a PLL, beat-locked), ''
             none
+  holds     its lock holds, as far as this program knows (True, False, None: no telling), and holds_why why not: a
+            slave on another PC goes by it when this laser is its master
 Colours are names: fg, dim, ok, warn, err, accent. tip(engine, n, digits) is the tooltip of its digits.
 """
 from __future__ import annotations
@@ -77,6 +79,10 @@ def row(e, n: int, now: float) -> dict:
     v["state"] = state if state != "off" else ("error" if ch.message else "off")
     v["relock"] = ch.relock or ch.sls.on
     v["sls"] = ch.sls.kind if ch.sls.on else ""
+    holds, why = e.holds_of(ch)
+    if holds is not False and slipping(ch):
+        holds, why = False, "its cavity lock slipping"
+    v["holds"], v["holds_why"] = holds, why
     return v
 
 
@@ -187,7 +193,8 @@ def sls_text(e, ch, now: float) -> str:
     else:
         text += ch.sls_view.said()
     if p.kind == "pll" and p.master:
-        text += f" · master channel {p.master}" + (f", beat {p.beat:+.2f} MHz" if p.beat else ", beat not learned yet")
+        text += f" · master {master_said(ch)}" + (f", beat {p.beat:+.2f} MHz" if p.beat_known else
+                                                  ", beat not learned yet")
     g = ch.sls_guard
     if g is not None and g.stage == "failed":
         text += f" · {g.said(time.time())}"
@@ -200,6 +207,20 @@ def sls_text(e, ch, now: float) -> str:
         k = sum(1 for t, _ in ch.drops if wall - t <= 3600.0)
         if k:
             text += f"   {k} lock dropout{'s' if k != 1 else ''} in the last hour"
+    return text
+
+
+def master_said(ch) -> str:
+    """A PLL's slave's master: which and where, and its lock if it is lost (or it is not seen)."""
+    p, row, mv = ch.sls, ch.master_row, ch.mview
+    name = row.get("name", "") if row else ""
+    text = f"{name} ({p.master_where})" if name else p.master_where
+    if row is None:
+        return text + ", not seen" + (" (its PC not heard from)" if p.master_on.strip() else "")
+    if mv is not None and mv.holds is False and not ch.m_error:
+        return text + f", its lock lost ({mv.why})" if mv.why else text + ", its lock lost"
+    if row.get("holds") is False:
+        return text + f", its lock lost ({row['why']})" if row.get("why") else text + ", its lock lost"
     return text
 
 
@@ -329,10 +350,14 @@ def notes(e, n: int) -> str:
         p = ch.sls
         text += f"\nlocked by {TITLES[p.kind]}: {p.unit}, http://{p.host.strip()}:{p.port}"
         if p.kind == "pll":
-            text += (f"\nits master: channel {p.master}" if p.master else
-                     "\nits master: not on this wavemeter (its setpoint is its beat point)")
-            text += (f"; its beat {p.beat:+.2f} MHz, as the wavemeter reads them (learned, its PLL holding it)"
-                     if p.beat else "; its beat not learned yet (its PLL holding it, it is)")
+            text += (f"\nits master: {master_said(ch)}" if p.master else
+                     "\nits master: none set (its setpoint is its beat point)")
+            if p.master and p.master_host.strip():
+                text += (f"; its SLS servo polled from here too, {p.master_host.strip()}:{p.master_port}"
+                         + (f" (not answering: {ch.m_error})" if ch.m_error else ""))
+            text += (f"; its beat {p.beat:+.2f} MHz, its frequency less its master's as the wavemeters read them "
+                     f"(learned, its PLL holding it, and kept learned)" if p.beat_known else
+                     "; its beat not learned yet (its PLL holding it, it is)")
             text += ("\nguarded (Relock): its PLL released at once when its master's lock or its beat is lost, and "
                      "relocked once the master holds again" if p.guard else "\nwatched only: not guarded")
         v = ch.sls_view

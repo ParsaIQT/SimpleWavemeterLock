@@ -66,6 +66,8 @@ PLL3 = {"auto": "Servo{n}AutoLockEnable", "manual": "Servo{n}ManualLockEnable", 
         "slow": "Servo{n}SlowServoOutput", "count": "Servo{n}LockCount", "held": "Servo{n}LockTime",
         "freq": "Servo{n}LockFrequency", "detect": "Servo{n}LockDetectEnable"}
 BAD_WORDS = ("UNLOCK", "FAIL", "LOST", "SEARCH", "ACQUIR", "SWEEP", "ABORT", "RELOCK")  # in a PLL's state: not holding
+BAND_K, FAST_FLOOR = 6.0, 0.05    # a PLL's fast output further than this many times its usual spread (and V) from
+PHASE_K, PHASE_FLOOR = 8.0, 0.1   # where it is holding: lost (likewise its phase error)
 
 
 def names(kind: str, servo: int = 0) -> dict:
@@ -116,6 +118,21 @@ def as_float(s):
     return x if math.isfinite(x) else None
 
 
+def lookup(host: str) -> str:
+    """A unit's address: its name (its serial number, P1029F) looked up; not found so, as it says it itself by mDNS
+    (P1029F.local: Windows 10 and on look such names up). socket.gaierror if neither is found."""
+    host = host.strip()
+    try:
+        return socket.gethostbyname(host)
+    except socket.gaierror as e:
+        if not host or "." in host or ":" in host:
+            raise
+        try:
+            return socket.gethostbyname(host + ".local")
+        except OSError:
+            raise e from None
+
+
 class Sls:
     """One unit's HTTP server, for one thread at a time (a connection kept open while it lets it)."""
 
@@ -139,7 +156,7 @@ class Sls:
             try:
                 if fresh:
                     if self._ip is None:
-                        self._ip = socket.gethostbyname(self.host)
+                        self._ip = lookup(self.host)
                     self._conn = http.client.HTTPConnection(self._ip, self.port, timeout=self.timeout)
                 self._conn.request("GET", "/?" + query)
                 r = self._conn.getresponse()
@@ -196,9 +213,13 @@ class SlsParams:
     host: str = ""            # the unit, by its name on the LAN (its serial number: P1029H) or address
     port: int = PORT
     servo: int = 0            # pll: 0 a one-channel PLL (SuperHeterodyne); 1..3 that channel of a 3-channel PLL
-    master: int = 0           # pll: its master's wavemeter channel, on this wavemeter (0: none here)
-    beat: float = 0.0         # pll: MHz, its frequency less its master's, as the wavemeter reads them locked (learned;
-    #                           0: not known yet; signed: a slave below its master, negative)
+    master: int = 0           # pll: its master's wavemeter channel (0: none)...
+    master_on: str = ""       # ...on that wavemeter, as the network names it ('': this one): another of this PC's, or
+    #                           another PC's
+    master_host: str = ""     # pll: its master's SLS Laser Servo, polled from here too ('': not; its master's PC may
+    master_port: int = PORT   # watch it, and say so on its row)
+    beat: float = 0.0         # pll: MHz, its frequency less its master's as the wavemeters read them, its PLL
+    beat_known: bool = False  # holding it (kept learned while it does: two wavemeters' disagreement drifts)
     guard: bool = True        # pll: armed (Relock), its PLL released when its master's lock or its beat is lost, and
     #                           relocked once the master holds again (else only watched)
     capture: float = 0.6      # pll: MHz: brought this close to its beat point by the wavemeter, its PLL is engaged
@@ -208,6 +229,11 @@ class SlsParams:
     fast_max: float = 0.0     # pll: V: likewise its fast output (0: not watched: what units it shows is not known)
     ramp: float = 1.0         # pll: V/s: its slow output running faster than this, it has lost it (0: not watched)
     amp_usual: float = 0.0    # one-channel PLL: V, its beat amplitude locked (learned)
+    fast_mid: float = 0.0     # pll: V, its fast output, holding: its usual (median)...
+    fast_dev: float = 0.0     # ...and how far from it it goes (learned; 0: not yet): far beyond, it has lost the beat
+    phase_mid: float = 0.0    # pll: likewise its phase error (its unit's units)
+    phase_dev: float = 0.0
+    FRESH = ("fast_mid", "fast_dev", "phase_mid", "phase_dev")  # (learned afresh each time its PLL holds it: not kept)
 
     @classmethod
     def from_dict(cls, d) -> "SlsParams":
@@ -221,10 +247,15 @@ class SlsParams:
                     pass
         if out.kind not in KINDS:
             out.kind = ""
+        if isinstance(d, dict) and "beat_known" not in d and out.beat:  # (settings from before beat_known)
+            out.beat_known = True
         return out
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        for k in self.FRESH:
+            d.pop(k, None)
+        return d
 
     @property
     def on(self) -> bool:
@@ -238,6 +269,13 @@ class SlsParams:
     def same_unit(self, other: "SlsParams") -> bool:
         return ((self.kind, self.host.strip(), self.port, self.servo)
                 == (other.kind, other.host.strip(), other.port, other.servo))
+
+    @property
+    def master_where(self) -> str:
+        """Its master as said: 'channel 9' (this wavemeter's), 'channel 3 on Lab B' ('': none)."""
+        if not self.master:
+            return ""
+        return f"channel {self.master}" + (f" on {self.master_on.strip()}" if self.master_on.strip() else "")
 
 
 # ------------------------------------------------------------------------------------------------- what it says
@@ -261,6 +299,7 @@ class View:
     slow: float | None = None
     phase: float | None = None
     freq: float | None = None   # pll: Hz, its lock frequency
+    band: bool = False          # pll: not holding by where its outputs sit (far from where they sat holding it)
 
     def said(self) -> str:
         """Its state, short, for the row."""
@@ -308,9 +347,10 @@ def pdh_view(t: float, values: dict, took: float = 0.0) -> View:
 
 
 def pll_view(t: float, values: dict, servo: int, p: SlsParams, prev: View | None = None, took: float = 0.0) -> View:
-    """A PLL's beat lock: on in its manual lock or its autolock; holding unless its state says otherwise, its beat
-    amplitude (a one-channel PLL) is below its threshold (else half its usual), its slow output is at its rail or
-    running away (since prev, the poll before), or its fast output at its rail (fast_max)."""
+    """A PLL's beat lock: on in its manual lock or its autolock; holding unless its autolock's state says otherwise,
+    its beat amplitude (a one-channel PLL) is below its threshold (else half its usual), its slow output is at its rail
+    or running away (since prev, the poll before), its fast output at its rail (fast_max), or its fast output or its
+    phase error far from where they sat while it held it (learned: a 3-channel PLL shows no amplitude)."""
     n = names("pll", servo)
     v = View("pll", t, took)
     manual = as_bool(values.get(n["manual"]))
@@ -330,7 +370,9 @@ def pll_view(t: float, values: dict, servo: int, p: SlsParams, prev: View | None
         v.holds, v.why = None, "its PLL is off"
         return v
     up = v.state.upper()
-    bad = next((w for w in BAD_WORDS if w in up), None) or ("IDLE" if v.mode == "auto" and "IDLE" in up else None)
+    bad = None
+    if v.mode == "auto":  # (its state is its autolock's: in its manual lock, maybe a failed autolock's, long gone)
+        bad = next((w for w in BAD_WORDS if w in up), None) or ("IDLE" if "IDLE" in up else None)
     if bad:
         v.holds, v.why = False, f"its PLL says “{v.state}”"
     elif v.amp is not None and v.amp_min and v.amp < v.amp_min:
@@ -339,6 +381,13 @@ def pll_view(t: float, values: dict, servo: int, p: SlsParams, prev: View | None
         v.holds, v.why = False, f"its slow output at its rail, {v.slow:+.2f} V"
     elif p.fast_max > 0 and v.fast is not None and abs(v.fast) >= 0.95 * p.fast_max:
         v.holds, v.why = False, f"its fast output at its rail, {v.fast:+.3f} V"
+    elif p.fast_dev > 0 and v.fast is not None and abs(v.fast - p.fast_mid) > max(BAND_K * p.fast_dev, FAST_FLOOR):
+        v.holds, v.band, v.why = False, True, (f"its fast output {v.fast:+.3f} V, far from where it holds it "
+                                               f"({p.fast_mid:+.3f} ± {p.fast_dev:.3f} V)")
+    elif (p.phase_dev > 0 and v.phase is not None
+          and abs(v.phase - p.phase_mid) > max(PHASE_K * p.phase_dev, PHASE_FLOOR)):
+        v.holds, v.band, v.why = False, True, (f"its phase error {v.phase:+.3f}, far from where it holds it "
+                                               f"({p.phase_mid:+.3f} ± {p.phase_dev:.3f})")
     elif (p.ramp > 0 and prev is not None and prev.mode and v.slow is not None and prev.slow is not None
           and 0.0 < v.t - prev.t < 2.0 and abs(v.slow - prev.slow) >= max(p.ramp * (v.t - prev.t), 0.05)):
         v.holds, v.why = False, (f"its slow output running away ({(v.slow - prev.slow) / (v.t - prev.t):+.1f} V/s, "
@@ -391,6 +440,49 @@ def probe(host: str, port: int = PORT, kind: str = "pll", servo: int = 0, timeou
             return head + ": a PLL, not a Laser Servo"
         view = pdh_view(time.time(), values)
     return f"{head}\n{view.said()}" + (f"\nnot holding: {view.why}" if view.holds is False else "")
+
+
+def survey(host: str, port: int = PORT, timeout: float = 1.5) -> str:
+    """What a unit is and what it says now, in a line (the settings dialog's Find units), or why not."""
+    c = Sls(host, port, timeout)
+    try:
+        values = c.values()
+    except (OSError, SlsError) as e:
+        text = str(e) or type(e).__name__
+        return "not found on the LAN" if "Name or service" in text or "getaddrinfo" in text or "11001" in text else text
+    finally:
+        c.close()
+    now = time.time()
+    if "Servo1LockState" in values:
+        parts = []
+        for k in (1, 2, 3):
+            v = pll_view(now, values, k, SlsParams(kind="pll"))
+            freq = f" at {v.freq / 1e6:g} MHz" if v.freq else ""
+            parts.append(f"servo {k} " + ({"manual": "manual lock", "auto": "autolock", "": "off"}[v.mode]) + freq)
+        return "3-channel PLL: " + "; ".join(parts)
+    if any(k.startswith("PLL") for k in values):
+        v = pll_view(now, values, 0, SlsParams(kind="pll"))
+        freq = f" at {v.freq / 1e6:g} MHz" if v.freq else ""
+        return f"one-channel PLL{freq}: {v.said()}"
+    if "AutoLockState" in values:
+        return f"Laser Servo (to the cavity): {pdh_view(now, values).said()}"
+    return f"answers, but is none of the units known here ({len(values)} values)"
+
+
+def units(prefix: str = "P1029", letters: str = "ABCDEFGH", port: int = PORT, timeout: float = 1.5) -> list:
+    """[(name, survey)] of the units named prefix + a letter (P1029A ... P1029H), asked at once."""
+    names = [prefix + c for c in letters]
+    found = {}
+
+    def ask(name):
+        found[name] = survey(name, port, timeout)
+
+    threads = [threading.Thread(target=ask, args=(n,), daemon=True) for n in names]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 2.0)
+    return [(n, found.get(n, "no answer")) for n in names]
 
 
 # ------------------------------------------------------------------------------------------------- the guard

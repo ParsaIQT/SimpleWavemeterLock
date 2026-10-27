@@ -225,3 +225,88 @@ class Meters:
             cfg.pop("other_wavemeters", None)
         self.dirty = False
         return cfg
+
+
+# ---------------------------------------------------------------------------------------- lasers elsewhere
+LOST_FLAGS = ("SLS LOCK LOST", "BEAT LOCK LOST", "NOT LASING", "CAVITY LOCK SLIPPING")  # on a row: its lock lost
+
+
+def row_holds(v: dict) -> tuple:
+    """Whether a laser's lock holds, by what its row shows (view.py; another PC's as it sends it): (True, False, None:
+    no telling), and why not. Its own PC says (holds); one running an older version, by its row's words."""
+    if "holds" in v:
+        return v["holds"] if isinstance(v["holds"], bool) else None, str(v.get("holds_why") or "")
+    state, info = v.get("state"), v.get("info") or ""
+    if state in ("recovering", "asking"):
+        return False, "being recovered"
+    flag = next((f for f in LOST_FLAGS if f in info), None)
+    if flag:
+        return False, flag.lower()
+    if state == "on" and "SLS UNIT NOT ANSWERING" not in info and "SLS LOCK OFF" not in info:
+        return True, ""
+    return None, ""
+
+
+class Elsewhere:
+    """Lasers on this PC's other wavemeters and on other PCs, as an engine follows one (a beat lock's master: sls.py).
+    row(label, n): {'f': THz or None, 't': monotonic time of that reading (None: none), 'holds': its lock, by what it
+    shows (True, False, None: no telling), 'why', 'name', 'label'}, or None (not shown, or its PC not heard from);
+    another PC's readings are asked for at once (fast) while followed. lasers(): [(label, n, name)] of them all. A
+    lock held by the caller is fine: no engine's lock is taken (another wavemeter's channel is read as it is), and
+    the network's only briefly."""
+
+    WATCH_S = 10.0  # s another PC's readings are asked for at once, after each look
+
+    def __init__(self, meters, share=None):
+        """meters: () -> this PC's wavemeters (Meter); share: this PC's instance on the network that hears the others'
+        rows (the first wavemeter's), None: none."""
+        self.meters, self.share = meters, share
+
+    def label_of(self, engine) -> str:
+        """The name on the network of that engine's wavemeter ('': none of this PC's)."""
+        return next((m.label for m in self.meters() if m.engine is engine), "")
+
+    def lasers(self) -> list:
+        out = []
+        for m in self.meters():
+            out += [(m.label, n, ch.name) for n, ch in sorted(m.engine.channels.items()) if not ch.hidden]
+        share = self.share
+        if share is not None and share.on:
+            now = time.monotonic()
+            for p in share.snapshot():
+                if p.status(now) not in ("live", "late"):
+                    continue
+                with share.lock:
+                    rows = [(n, (p.views.get(n) or {}).get("name", "")) for n in p.rows]
+                out += [(p.label, n, name) for n, name in rows]
+        return out
+
+    def row(self, label: str, n: int):
+        now = time.monotonic()
+        for m in self.meters():
+            if m.label == label:
+                ch = m.engine.channels.get(n)
+                if ch is None:
+                    return None
+                holds, why = m.engine.holds_of(ch)
+                f = ch.freq if ch.freq > 0 else None
+                return {"f": f, "t": ch.t if ch.t > 0 else None, "holds": holds, "why": why, "name": ch.name,
+                        "label": label}
+        share = self.share
+        if share is None or not share.on:
+            return None
+        for p in share.snapshot():
+            if p.label != label or p.status(now) not in ("live", "late"):
+                continue
+            with share.lock:
+                v, got = p.views.get(n), p.got.get(n)
+            if v is None:
+                return None
+            share.watch(p.id, self.WATCH_S)
+            age = v.get("age")
+            t = got - age if age is not None and got is not None else None
+            f = v.get("f")
+            holds, why = row_holds(v)
+            return {"f": f if f else None, "t": t, "holds": holds, "why": why, "name": v.get("name", ""),
+                    "label": label}
+        return None

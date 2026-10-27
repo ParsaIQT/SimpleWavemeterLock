@@ -135,7 +135,7 @@ def clean(v) -> dict:
     if not isinstance(v, dict):
         return {}
     out = {}
-    for k in ("name", "bad", "info", "prompt", "notes"):
+    for k in ("name", "bad", "info", "prompt", "notes", "holds_why"):
         if isinstance(v.get(k), str):
             out[k] = v[k][:2000]
     for k in ("bad_c", "info_c", "dev_c"):
@@ -151,6 +151,8 @@ def clean(v) -> dict:
             out[k] = bool(v[k])
     if v.get("sls") in ("pdh", "pll"):
         out["sls"] = v["sls"]
+    if "holds" in v:
+        out["holds"] = v["holds"] if isinstance(v["holds"], bool) else None
     if "refch" in v:
         out["refch"] = v["refch"] if isinstance(v["refch"], int) and not isinstance(v["refch"], bool) else None
     if isinstance(v.get("lp"), dict):

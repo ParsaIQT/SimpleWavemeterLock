@@ -49,7 +49,8 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
   watched, its lock's dropouts logged; a slave a PLL's manual lock beat-locks to a master is **guarded**: its PLL
   released the moment the master's lock or the beat is lost (before it runs the slave's current away and the slave
   stops lasing, its TA switching itself off), the slave recovered if it stopped, and its PLL engaged again on the beat
-  once the master holds (see *SLS locks*).
+  once the master holds. Its master may be read by another wavemeter, on another PC: picked from what the network
+  shows, and followed from there (see *SLS locks*).
 * **Several wavemeters on one PC**: one copy of the program reads them all, each framed under its
   own name with its own channels, lasers and settings, told apart by their serial numbers (see
   *Several wavemeters on one PC*).
@@ -1307,22 +1308,51 @@ That is all this program uses of them (not their SSH or VNC). In the package you
 Servos** (PDH to the 4-bore cavity: *AutoLockState* `Locked: 3 (0d 01:00:21)`, *Transmission* and its threshold, its
 relock count), P1029H is a **one-channel PLL** (the SuperHeterodyne Laser PLL, lock frequency 80 MHz: *PLLAmplitude*,
 the beat note in its IF band, with its threshold; *PZTServoOutput* ±5 V), and P1029F and G are **3-channel PLLs**
-(*Servo1…3*; no amplitude; their saved state says *Feature Acquire Failed* / *Aborting:STATE_FAIL*: the autolock
-that does not work).
+(*Servo1…3*; no amplitude; their fast and slow outputs and phase error ±5 V, by their own parameter lists; their saved
+debug messages say *Feature Acquire Failed* / *Aborting:STATE_FAIL*: the autolock that does not work).
 
 ### Setting it up
 
-* **The master** (its row): right-click › *SLS lock…* › *an SLS Laser Servo locks it to the cavity*, the unit
-  (`P1029D`, or its address), *Test*. No DLC pro needs linking. Click *Relock* (*Watching*): its lock's state shows on
-  its row; *is_ok* goes by it.
-* **The slave** (its row): *SLS lock…* › *an SLS PLL beat-locks it to a master*, the unit (`P1029H`; on a 3-channel
-  PLL, which servo), its master's channel. Link its DLC pro (*Link laser*: the wavemeter steers it back by its piezo),
-  and set up *Mode-hop recovery…* for it (its nominal current, and its TA's seed watched: *auto*), so that it can be
-  recovered if it stops lasing. Click *Relock* (*Watching*): it is **guarded** (*Guard it*, on by default).
-* **Its beat** is learned while its PLL holds it (the median of its reading less its master's, 10 s after it locked;
-  *Beat*, or type it in): its setpoint is then its beat point, its master's reading plus the beat, and its row's
-  deviation the beat as the wavemeter sees it. On the row: its PLL's state, beat amplitude, slow and fast outputs, its
-  master, and what its guard did last.
+**The unit**, in *SLS lock…*, is the box's serial number as on its label (`P1029F`): that is its name on the LAN
+(tried as `P1029F.local` too). If *Test* says it is not found, type its IP address instead: its touchscreen shows it
+under *Settings › System Control*. The port is 8080 on every unit. **Find units** asks P1029A … P1029H at once and
+lists those that answer with what each is doing (a Laser Servo *Locked: 3 (0d 01:00:00)*; a 3-channel PLL's servos,
+each in its manual lock or off, at its lock frequency): pick the one that locks the laser.
+
+* **The master** (on the PC whose wavemeter reads it): right-click its row › *SLS lock…* › *an SLS Laser Servo locks
+  it to the cavity*, its unit, *Test*. No DLC pro needs linking. Its lock's state then shows on its row, on every PC: a
+  slave on another PC goes by it. (*Relock*, *Watching*, for `is_ok` to go by it too.)
+* **The slave** (on the PC whose wavemeter reads it): *SLS lock…* › *an SLS PLL beat-locks it to a master*, its unit,
+  which PLL (a 3-channel PLL: which servo), and **its master**: any laser this program shows, this wavemeter's
+  channels, this PC's other wavemeters' and the other PCs' (*Lab A · channel 9 739 SHG*: that PC's frame must show
+  here). *Its master's servo* (optional): the master's Laser Servo, polled from the slave's PC too, which knows its
+  lock lost a few tenths of a second sooner than its row coming over the network does. Link the slave's DLC pro (*Link
+  laser*: the wavemeter steers it back by its piezo), and set up *Mode-hop recovery…* for it (its nominal current, and
+  its TA's seed watched: *auto*), so that it can be recovered if it stops lasing. Click *Relock* (*Watching*): it is
+  **guarded** (*Guard it*, on by default).
+* **Its beat**: leave *Beat* empty. It is learned while its PLL holds it (10 s after it locked, the median of its
+  readings less its master's), and kept learned: two wavemeters' disagreement drifts, and the beat follows it. It is
+  the slave's frequency less its master's *as the wavemeters read them*, not the PLL's lock frequency: a PLL at 80 MHz
+  whose beat path has an AOM shifting the master's light by 80 MHz holds the slave on its master's frequency, a beat
+  near 0 (plus whatever the two wavemeters disagree by). Its setpoint is then its beat point, its master's reading plus
+  the beat, and its row's deviation the beat as the wavemeters see it. On the row: its PLL's state, slow and fast
+  outputs (and beat amplitude, a one-channel PLL's), its master (and its lock, if lost), and what its guard did last.
+
+**Sirius** (beat-locked to the other SHG by the 3-channel PLL P1029F, servo 1; the other SHG read by another PC's
+wavemeter): on Sirius's PC, its row › *SLS lock…*:
+
+| | |
+|---|---|
+| Its lock | *an SLS PLL beat-locks it to a master (it is the slave)* |
+| The unit | `P1029F`, port 8080 (not found: its IP address, from its touchscreen's *Settings › System Control*) |
+| Which PLL | *a 3-channel PLL: servo 1* |
+| Its master | the other SHG, as the list names it: *its wavemeter's name · channel N its name* |
+| Its master's servo | the Laser Servo that locks the other SHG (*Find units*: the one saying *Locked*), or empty |
+| Beat | empty: learned (near 0) |
+
+*Test* says *3-channel PLL, firmware …* and servo 1 *manual lock*; OK; then *Relock*. The other SHG's PC runs this
+program on the same network (its frame shows on Sirius's PC), its row set to its own Laser Servo (*SLS lock…* there):
+that is how Sirius's PC knows its lock.
 
 ### What it watches
 
@@ -1330,7 +1360,11 @@ Each unit is polled ten times a second, on a connection of its own (*a poll take
 lock holds while its servo says *Locked* (and its transmission is above its threshold); the slave's while its PLL is on
 (its manual lock, or its autolock) and its beat amplitude is above its threshold (a one-channel PLL), its slow output is
 neither at its rail nor running away (faster than 1 V/s), and the wavemeter reads it within 10 MHz of its beat point
-(two readings in a row). A **dropout** runs from the last poll that held to the first that holds again, and is logged
+(two readings in a row). A 3-channel PLL shows no beat amplitude: where its fast output and its phase error sit while it
+holds is learned (10 s after it locked, afresh each time it is engaged), and far from there (its fast output further
+than six times its usual spread and 0.05 V, its phase error eight times), it has lost the beat. A master on another PC
+is followed as its row comes (its readings at their pace, its lock as its own PC says, a few tenths of a second
+late), or by its servo polled from here (*Its master's servo*). A **dropout** runs from the last poll that held to the first that holds again, and is logged
 as the DLC pro's are (the console, `~/.simplewavemeterlock-dropouts.jsonl` with `"method": "sls-pll"`, *N lock dropouts
 in the last hour*, and ARTIQ's `observe`); a relock between two polls shows as its unit's relock count gone up (the
 dropout then from the poll before to when its unit says it relocked). The row says **BEAT LOCK LOST**, **SLS LOCK
@@ -1343,13 +1377,15 @@ out of its band, its integrators run the slave's current and piezo to their rail
 again only well above its current), its TA, without seed, switches itself off, and the SHG with it, for the rest of the
 night. Guarded:
 
-1. **Released at once**: its master's servo saying it lost the lock (its watch tells the slave's at once), or two polls
-   of the slave not holding: its manual lock off (its outputs back to zero, the slave back where its DLC pro has it).
-   In the simulation, the PLL is released 0.1–0.2 s after the master's lock drops, before the slave stops lasing.
+1. **Released at once**: its master's servo saying it lost the lock (its watch tells the slave's at once; on another
+   PC, as its row says), or two polls of the slave not holding: its manual lock off (its outputs back to zero, the
+   slave back where its DLC pro has it). In the simulation, the PLL is released 0.1–0.2 s after the master's lock
+   drops, before the slave stops lasing.
 2. **Lasing first**: a slave that stopped lasing anyway (its seed power, or no reading) is recovered at once by its
    mode-hop recovery: its current jumped up until it lases, brought back down slowly (before its TA's delay is up),
    onto its beat point. Without *Mode-hop recovery…* set up it is waited for, 90 s at most.
-3. **The master first**: nothing more until the master has held 3 s (watched; else its readings steady that long).
+3. **The master first**: nothing more until the master has held 3 s (watched; else its readings steady that long; its
+   PC not heard from at all, 3 s after the release).
 4. **Steered**: the wavemeter lock brings the slave to its beat point (its PLL still off); a one-channel PLL is engaged
    the moment its beat amplitude shows the beat in its band (0.7 of its usual), else a half capture either side in turn
    (±0.3, ±0.6, ±0.9, ±1.2 MHz with a capture of 0.6 MHz); a 3-channel PLL once three readings are within *Capture* of
@@ -1365,16 +1401,17 @@ Meanwhile the row says *Relocking*, and what it is doing; click it to stop (its 
 switched off at its box stops the guard (*watching stopped: its PLL was switched off at its box*); its autolock
 switched on, the autolock has it (watched, not guarded).
 
-**One thing to set at the slave's DLC pro, guard or no guard**: if the PLL's fast output reaches its current through
-the DLC pro's external input (`dl:cc:external-input`), make its factor small enough that the PLL's whole fast range
-(±1 V) moves the current by less than the slave's margin above where it stops lasing (1.3 mA, on the demo's). A
-runaway then cannot stop it lasing; the guard still releases it and relocks it.
+**The slave's DC MOD input**: the PLL's fast output reaches the slave's current through the DC MOD input, an analogue
+BNC with no factor to set in software: what a volt does to its current is fixed. If the PLL's whole fast range (±5 V)
+moves the current further than the slave's margin above where it stops lasing (1.3 mA, on the demo's), a runaway can
+stop it lasing before the guard has released it; an attenuator on that BNC cable, with the PLL's fast gain turned up to
+make up for it, takes that away. The guard releases it and relocks it either way.
 
-Not tried on the real units yet: the parameter names are their manuals' and their own saved settings' (`P1029H.gsi`);
-what a PLL's state says in its manual lock is not known, so nothing goes by it but its autolock's; that releasing the
-manual lock sets its outputs back to zero is the manual's word for it (the row shows its outputs: look after the first
-release); the PLL's capture range (*Capture*) is a guess, and so is how fast its integrators run away. The first night
-with it, look at the console in the morning.
+Not tried on the real units yet: the parameter names are their manuals' and their own saved settings' (`P1029H.gsi`,
+`P1029F.gsi`); what a PLL's state says in its manual lock is not known, so nothing goes by it but its autolock's (a
+failed autolock's state may linger); that releasing the manual lock sets its outputs back to zero is the manual's word
+for it (the row shows its outputs: look after the first release); the PLL's capture range (*Capture*) is a guess, and so
+is how fast its integrators run away. The first night with it, look at the console in the morning.
 
 **In the demo** (`--sim`), channel 9 (*739 master*) is locked by a simulated Laser Servo, channel 10 (*739 slave*) by a
 simulated one-channel PLL's manual lock, 80 MHz above, as primitive as the lab's: right-click empty space › *Simulate a
@@ -1869,8 +1906,12 @@ itself, as you would:
 
 ## Troubleshooting
 
-* **SLS UNIT NOT ANSWERING**: its name (`P1029H`) is not known to this PC's DNS: give its address instead (its
-  *Settings › System Control* shows it); or a firewall between them (TCP 8080). *SLS lock…* › *Test* says what it finds.
+* **SLS UNIT NOT ANSWERING**: its name (`P1029F`, tried as `P1029F.local` too) is not known on this PC: give its IP
+  address instead (its touchscreen's *Settings › System Control* shows it); or a firewall between them (TCP 8080).
+  *SLS lock…* › *Test* says what it finds, *Find units* what answers.
+* **A slave's master *not seen (its PC not heard from)***: the master's PC is not running this program, or not on the
+  same network (its frame is missing here; see *Several PCs*). The slave's PLL is left as it is; if it drops, it is
+  relocked by its own signals, with nothing to steer it by.
 * **No controllers in the menu**: discovery replies are UDP, so allow Python
   through the Windows firewall on the lab network (Windows asks on first run).
   Controllers behind a router won't hear the broadcast; use *Enter IP address…*,

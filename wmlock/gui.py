@@ -12,9 +12,11 @@ from __future__ import annotations
 import functools
 import html
 import math
+import re
 import signal
 import socket
 import sys
+import threading
 import time
 import types
 import zlib
@@ -31,7 +33,7 @@ from .modehop import HopParams
 from .qt import Qt, QtCore, QtGui, QtWidgets
 from .reference import ACQUIRING, HOLD, MOVED, TRACKING, RefParams, fmt_duration
 from .relock import usable_zero, volts
-from .sls import KINDS, PORT, SlsParams, probe
+from .sls import KINDS, PORT, SlsParams, probe, units
 from .view import NOTE_S, STALE_S, decimals, fmt_mhz, fmt_nm  # noqa: F401  (NOTE_S, STALE_S: as before)
 from .wavemeter import C_NM_THZ
 
@@ -1202,7 +1204,7 @@ class LockDialog(QtWidgets.QDialog):
 
 class SlsDialog(QtWidgets.QDialog):
     """What locks a channel's laser if an SLS unit does (sls.py): its Laser Servo to the cavity, or a PLL to a master
-    (its manual lock guarded)."""
+    (its manual lock guarded). Its master may be on another wavemeter, of this PC or another (the network's rows)."""
 
     KIND = (("", "nothing of SLS's: this program, or its DLC pro, locks it"),
             ("pdh", "an SLS Laser Servo locks it to the cavity (PDH)"),
@@ -1215,7 +1217,10 @@ class SlsDialog(QtWidgets.QDialog):
         self.setWindowTitle(f"SLS lock · channel {ch.n}")
         self.p = p = ch.sls
         self.n = ch.n
-        form = QtWidgets.QFormLayout(self)
+        outer = QtWidgets.QVBoxLayout(self)
+        body = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(body)
+        outer.addWidget(scrolling(body), 1)  # (it may not all fit on the screen: OK and Cancel, below it, do)
 
         def number(value, lo, hi, dec, step, unit):
             sb = QtWidgets.QDoubleSpinBox()
@@ -1230,34 +1235,71 @@ class SlsDialog(QtWidgets.QDialog):
             box.addStretch(1)
             return sb, box
 
+        def port(value):
+            sb = QtWidgets.QSpinBox()
+            sb.setRange(1, 65535)
+            sb.setValue(value or PORT)
+            return sb
+
         self.kind = QtWidgets.QComboBox()
         self.kind.addItems([label for _, label in self.KIND])
         self.kind.setCurrentIndex(next((k for k, (name, _) in enumerate(self.KIND) if name == p.kind), 0))
         form.addRow("Its lock", self.kind)
         self.host = QtWidgets.QLineEdit(p.host)
-        self.host.setPlaceholderText("P1029H (its serial number: its name on the LAN), or its address")
-        self.port = QtWidgets.QSpinBox()
-        self.port.setRange(1, 65535)
-        self.port.setValue(p.port or PORT)
+        self.host.setPlaceholderText("P1029F: the serial number on its label (its name on the LAN), or its IP address")
+        self.port = port(p.port)
+        find = QtWidgets.QPushButton("Find units")
+        find.setToolTip("Ask the units named P1029A … P1029H on the LAN what they are and what they do now\n(another "
+                        "prefix: type one of its names first, e.g. P1100A)")
+        find.clicked.connect(self._find)
         box = QtWidgets.QHBoxLayout()
         box.addWidget(self.host, 1)
         box.addWidget(Text("port", "dim"))
         box.addWidget(self.port)
+        box.addWidget(find)
         form.addRow("The unit", box)
+        self.units = QtWidgets.QComboBox()  # (what Find units found: one chosen, its name goes above)
+        self.units.setVisible(False)
+        self.units.activated.connect(self._chosen)
+        self.found_units = []
+        form.addRow("", self.units)
         self.servo = QtWidgets.QComboBox()
         self.servo.addItems(self.SERVO)
         self.servo.setCurrentIndex(max(0, min(p.servo, 3)))
         form.addRow("Which PLL", self.servo)
         self.master = QtWidgets.QComboBox()
-        self.masters = [0] + sorted(k for k in engine.channels if k != ch.n)
-        names = {k: engine.channels[k].name for k in self.masters[1:]}
-        self.master.addItems(["none on this wavemeter: its setpoint is its beat point"]
-                             + [f"channel {k}" + (f" {names[k]}" if names[k] else "") for k in self.masters[1:]])
-        self.master.setCurrentIndex(self.masters.index(p.master) if p.master in self.masters else 0)
+        self.masters = self._masters(engine, ch)
+        self.master.addItems([label for label, *_ in self.masters])
+        now = (p.master, p.master_on.strip()) if p.master else (0, "")
+        self.master.setCurrentIndex(next((k for k, (_, n, on) in enumerate(self.masters) if (n, on) == now), 0))
+        long_items(self.master, 60)
         form.addRow("Its master", self.master)
-        self.beat, box = number(p.beat, -1e5, 1e5, 2, 0.1,
-                                "MHz: its frequency less its master's, as the wavemeter reads them (0: learned, its "
-                                "PLL holding it)")
+        self.master_host = QtWidgets.QLineEdit(p.master_host)
+        self.master_host.setPlaceholderText("optional: the SLS Laser Servo that locks its master (P1029D), polled from "
+                                            "here too")
+        self.master_host.setToolTip("Its master's lock is known from its row (its own PC watches it) within a few "
+                                    "tenths of a second;\npolled from here too, sooner. Leave empty if its master is "
+                                    "not locked by an SLS Laser Servo.")
+        self.master_port = port(p.master_port)
+        box = QtWidgets.QHBoxLayout()
+        box.addWidget(self.master_host, 1)
+        box.addWidget(Text("port", "dim"))
+        box.addWidget(self.master_port)
+        form.addRow("Its master's servo", box)
+        self.beat = QtWidgets.QLineEdit(f"{p.beat:+.2f}" if p.beat_known else "")
+        self.beat_text = self.beat.text()
+        valid = QtGui.QDoubleValidator(-1e5, 1e5, 2, self.beat)
+        valid.setLocale(QtCore.QLocale.c())
+        self.beat.setValidator(valid)
+        self.beat.setPlaceholderText("learned")
+        self.beat.setMaximumWidth(110)
+        box = QtWidgets.QHBoxLayout()
+        box.addWidget(self.beat)
+        box.addWidget(Text("MHz: its frequency less its master's, as the wavemeters read them; learned while its PLL "
+                           "holds it,\nand kept learned (empty: learned afresh). Near 0 if it sits on its master's "
+                           "frequency (an AOM\nmaking up the PLL's offset), plus how much the two wavemeters disagree.",
+                           "dim"))
+        box.addStretch(1)
         form.addRow("Beat", box)
         self.guard = QtWidgets.QCheckBox(
             "Guard it (Relock): release its PLL at once when its master's lock or its beat is lost,\nbefore it runs "
@@ -1289,20 +1331,41 @@ class SlsDialog(QtWidgets.QDialog):
         box.addWidget(test)
         box.addWidget(self.found, 1)
         form.addRow("", box)
-        form.addRow(Text("Every SLS unit answers on its LAN port (8080) with what its front USB console shows. A\n"
-                         "slave its PLL beat-locks needs its laser linked (its DLC pro) for the wavemeter to bring it\n"
-                         "back to its beat point, and Mode-hop recovery… set up to be recovered if it stops lasing.",
+        form.addRow(Text("Every SLS unit answers on the LAN, port 8080, by its serial number (P1029F) or its IP "
+                         "address (on its\ntouchscreen: Settings › System Control), with what its front USB console "
+                         "shows. A "
+                         "slave its PLL\nbeat-locks needs its laser linked (its DLC pro) for the wavemeter to bring it "
+                         "back to its beat point,\nand Mode-hop recovery… set up to be recovered if it stops lasing.",
                          "dim"))
         bb = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
-        form.addRow(bb)
+        outer.addWidget(bb)
         self.kind.currentIndexChanged.connect(self._enable)
+        self.master.currentIndexChanged.connect(self._enable)
         self._enable()
-        self._result = None
+        self._result = self._units = None
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._tested)
+        fit_screen(self, 900, 640)
+
+    @staticmethod
+    def _masters(engine: Engine, ch) -> list:
+        """[(as listed, channel, its wavemeter's name on the network: '' this one)]: none, this wavemeter's
+        channels, then the lasers of this PC's other wavemeters and of the other PCs heard from."""
+        p = ch.sls
+        out = [("none: its setpoint is its beat point", 0, "")]
+        out += [(f"channel {k}" + (f" {c.name}" if c.name else "") + " (this wavemeter)", k, "")
+                for k, c in sorted(engine.channels.items()) if k != ch.n and not c.hidden]
+        where = engine.elsewhere
+        own = where.label_of(engine) if where is not None else ""
+        if where is not None:
+            out += [(f"{label} · channel {n}" + (f" {name}" if name else ""), n, label)
+                    for label, n, name in where.lasers() if label != own]
+        if p.master and not any((n, on) == (p.master, p.master_on.strip()) for _, n, on in out):
+            out.append((p.master_where + " (not heard from now)", p.master, p.master_on.strip()))
+        return out
 
     def _enable(self):
         kind = self.KIND[self.kind.currentIndex()][0]
@@ -1311,12 +1374,15 @@ class SlsDialog(QtWidgets.QDialog):
         for w in (self.servo, self.master, self.beat, self.guard, self.capture, self.tries, self.off_mhz,
                   self.slow_max):
             w.setEnabled(kind == "pll")
+        master = kind == "pll" and self.masters[self.master.currentIndex()][1] > 0
+        for w in (self.master_host, self.master_port):
+            w.setEnabled(master)
 
     def _test(self):
         kind = self.KIND[self.kind.currentIndex()][0] or "pll"
         host, port, servo = self.host.text().strip(), self.port.value(), self.servo.currentIndex()
         if not host:
-            self.found.paint("which unit?", "warn")
+            self.found.paint("which unit? (Find units looks for them)", "warn")
             return
         self.found.paint(f"asking {host}…", "dim")
         self._result = None
@@ -1324,25 +1390,76 @@ class SlsDialog(QtWidgets.QDialog):
         def run():
             self._result = probe(host, port, kind, servo)
 
-        import threading
+        threading.Thread(target=run, daemon=True).start()
+        self._timer.start(100)
+
+    def _find(self):
+        m = re.fullmatch(r"(?i)\s*([a-z]+\d+)[a-z]\s*", self.host.text())
+        prefix = m.group(1).upper() if m else "P1029"
+        self.found.paint(f"asking {prefix}A … {prefix}H…", "dim")
+        self._units = None
+
+        def run():
+            self._units = units(prefix, port=self.port.value())
 
         threading.Thread(target=run, daemon=True).start()
         self._timer.start(100)
+
+    def _chosen(self, k: int):
+        if not 0 <= k < len(self.found_units):
+            return
+        name, said = self.found_units[k]
+        self.host.setText(name)
+        if said.startswith("3-channel PLL") and self.servo.currentIndex() == 0:
+            self.servo.setCurrentIndex(1)
+        elif said.startswith("one-channel PLL"):
+            self.servo.setCurrentIndex(0)
 
     def _tested(self):
         if self._result is not None:
             self._timer.stop()
             self.found.paint(self._result, "dim")
+            self._result = None
+        if self._units is not None:
+            self._timer.stop()
+            got, self._units = self._units, None
+            known = ("PLL", "Laser Servo")
+            self.found_units = [(n, s) for n, s in got if any(w in s for w in known)]
+            self.units.clear()
+            self.units.addItems([f"{n} · {s}" for n, s in self.found_units])
+            long_items(self.units, 60)
+            if hasattr(self.units, "setPlaceholderText"):  # (Qt 5.15 and on: none shown chosen until one is)
+                self.units.setPlaceholderText(f"found {len(self.found_units)}: pick the one that locks this laser")
+                self.units.setCurrentIndex(-1)
+            self.units.setVisible(bool(self.found_units))
+            if self.found_units:
+                self.found.paint(f"found {len(self.found_units)}: pick one from the list above", "dim")
+            else:
+                others = "; ".join(f"{n}: {s}" for n, s in got if s != "not found on the LAN")
+                self.found.paint(f"none of {got[0][0]} … {got[-1][0]} answers by name: type its IP address (on its "
+                                 f"touchscreen: Settings › System Control)" + (f" ({others})" if others else ""),
+                                 "warn")
 
     def params(self) -> SlsParams:
         kind = self.KIND[self.kind.currentIndex()][0]
+        _, master, master_on = self.masters[self.master.currentIndex()]
         d = self.p.to_dict()
+        text = self.beat.text().strip()
+        try:
+            beat = round(float(text), 2) if text else None
+        except ValueError:
+            beat = None
+        old = (self.p.master, self.p.master_on.strip()) if self.p.master else (0, "")
+        if (master, master_on) != old and text == self.beat_text:
+            beat = None  # (another master: learned afresh)
         d.update(kind=kind if kind in KINDS else "", host=self.host.text().strip(), port=self.port.value(),
-                 servo=self.servo.currentIndex(), master=self.masters[self.master.currentIndex()],
-                 beat=round(self.beat.value(), 2), guard=self.guard.isChecked(), capture=self.capture.value(),
-                 tries=self.tries.value(), off_mhz=self.off_mhz.value(), slow_max=self.slow_max.value())
-        if d["servo"] != self.p.servo or d["host"] != self.p.host or d["master"] != self.p.master:
-            d["amp_usual"] = 0.0  # (another unit or master: learned afresh)
+                 servo=self.servo.currentIndex(), master=master, master_on=master_on,
+                 master_host=self.master_host.text().strip(), master_port=self.master_port.value(),
+                 beat=beat if beat is not None else 0.0, beat_known=beat is not None, guard=self.guard.isChecked(),
+                 capture=self.capture.value(), tries=self.tries.value(), off_mhz=self.off_mhz.value(),
+                 slow_max=self.slow_max.value())
+        if d["servo"] != self.p.servo or d["host"] != self.p.host or (master, master_on) != old:
+            d.update(amp_usual=0.0, fast_mid=0.0, fast_dev=0.0, phase_mid=0.0, phase_dev=0.0)  # (learned afresh)
         return SlsParams.from_dict(d)
 
 

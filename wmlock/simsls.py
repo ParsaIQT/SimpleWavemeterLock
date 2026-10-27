@@ -192,7 +192,8 @@ class SimPdh:
 
 class SimPll:
     """An SLS PLL beat-locking `slave` to `master` (see the module); master_lock: the master's SimPdh (its lock lost,
-    the beat is lost)."""
+    the beat is lost); beat: MHz, its lock frequency; offset: MHz, the slave less its master while it holds it (an AOM
+    in the beat's path makes up the difference: 0, the slave on its master's frequency; None: beat)."""
 
     CAPTURE_MHZ = 1.0   # its manual lock engaged with the slave this near its beat point: it locks
     AUTO_MHZ = 30.0     # its autolock catches it this near
@@ -204,9 +205,10 @@ class SimPll:
 
     def __init__(self, sls: FakeSls, slave, master, master_lock: SimPdh | None = None, beat: float = 80.0,
                  servo: int = 0, fast_ma: float = 4.0, slow_v: float = 2.0, run_sign: int = -1,
-                 clock=time.monotonic, seed=None):
+                 clock=time.monotonic, seed=None, offset: float | None = None):
         self.sls, self.slave, self.master, self.master_lock = sls, slave, master, master_lock
         self.beat, self.servo = beat, servo
+        self.offset = beat if offset is None else offset
         self.fast_ma, self.slow_v, self.run_sign = fast_ma, slow_v, run_sign
         self.clock = clock
         self.rng = random.Random(seed)
@@ -289,7 +291,7 @@ class SimPll:
             return None
         v, i = s.dlc.offset(s.n), s.dlc.current_own(s.n)
         f = s.ecdl.f0 + (s.ecdl.mode_ghz(v, i) + s.wobble * 1e-3) * 1e-3
-        return (f - fm) * 1e6 - self.beat
+        return (f - fm) * 1e6 - self.offset
 
     def _need(self, free: float) -> float:
         """V of slow output that puts the slave on its beat point."""
@@ -366,7 +368,7 @@ class SimPll:
         if not self.locked:
             return f
         fm = self.master.true_freq(now)
-        return f if fm is None else fm + (self.beat + self.rng.gauss(0.0, 0.02)) * 1e-6
+        return f if fm is None else fm + (self.offset + self.rng.gauss(0.0, 0.02)) * 1e-6
 
     def _error(self, now: float):
         """MHz: the slave from its beat point, its outputs and all (None: either does not lase)."""

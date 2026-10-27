@@ -10,7 +10,7 @@ from . import config as cfgfile
 from . import rpc
 from .engine import DAC_LOCK, Engine
 from .lock import LockParams
-from .meters import Meter, Meters
+from .meters import Elsewhere, Meter, Meters
 from .share import SIM_PORT, Settings, Share
 from .wavemeter import Claims, DllSource, HttpMeters, NullSource, WlmHub
 
@@ -146,16 +146,21 @@ def main(argv=None) -> int:
         shared.setdefault("lan", False)
     siblings = set()  # (this PC's wavemeters' instances on the network: they ignore each other)
     share = Share(engine, shared, siblings=siblings)
+    found = []  # (this PC's wavemeters, once known)
+    elsewhere = Elsewhere(lambda: list(found[0].items) if found else [], share)  # (a beat lock's master: anywhere)
+    engine.elsewhere = elsewhere
 
     def make(section, serial, model):
         """Another wavemeter of this PC's: its engine (its settings: section) and its instance on the network."""
         rec, drops = log_paths(path, serial)
         e = Engine(section, lambda sink: backend.make_source(sink, serial, model), discovery_targets=targets,
                    extra_devices=[*extra, *engine.known], log_path=rec, drop_path=drops)
+        e.elsewhere = elsewhere
         return Meter(e, Share(e, Settings(section.setdefault("share", {}), shared), siblings=siblings,
                               subscribe=False))
 
     meters = Meters(config, Meter(engine, share), backend, make)
+    found.append(meters)
     api = rpc.Server(rpc.Api(lambda: list(meters.items), share), shared, rpc.SIM_PORT if args.sim else rpc.PORT)
     try:
         from .gui import run

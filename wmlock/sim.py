@@ -1738,11 +1738,12 @@ class Demo:
     MODELS = ("simulated WS7", "simulated WS6")
     MASTER, SLAVE = 9, 10  # beat=True: the 739 SHG's sisters on the SLS cavity: a master an SLS Laser Servo locks to
     MASTER_NM = 739.050800  # it (P1029D), a slave an SLS PLL beat-locks BEAT_MHZ above the master (P1029H; or a
-    BEAT_MHZ = 80.0         # 3-channel PLL's servo beat_servo), with its manual lock; the slave a TA-SHG pro whose TA
+    BEAT_MHZ = 80.0         # 3-channel PLL's servo beat_servo; beat_offset: MHz above it instead, an AOM making up the
+    #                         rest), with its manual lock; the slave a TA-SHG pro whose TA
     #                         switches itself off after 3 s without seed, that stops lasing 1.3 mA below its current
 
     def __init__(self, discovery_port=DISCOVERY_PORT, wavemeter=None, exposure=0.02, dac=False, meters=1,
-                 serials=None, beat=False, beat_servo=0):
+                 serials=None, beat=False, beat_servo=0, beat_offset=None):
         """meters: 2, a second simulated wavemeter on this PC (SECOND); serials: the simulated wavemeters' serial
         numbers (else 1001, 1002); beat: the master and slave of an SLS beat lock (MASTER, SLAVE: simsls.py)."""
         self.dlcs = [
@@ -1794,7 +1795,7 @@ class Demo:
             self.names[ch] = name
         self.sls, self.pdh, self.pll, self.beat_nm = [], None, None, {}
         if beat:
-            self._beat_pair(beat_servo)
+            self._beat_pair(beat_servo, beat_offset)
         self.serials = list(serials or [1001 + k for k in range(meters)])[:meters]
         self.meters = {self.serials[0]: (self.MODELS[0], self.lasers, self.wavemeter)}
         self.second_names = {}
@@ -1804,11 +1805,12 @@ class Demo:
             self.meters[self.serials[1]] = (self.MODELS[1], lasers, SimWavemeter())
             self.second_names = {ch: name for ch, *_, name in self.SECOND}
 
-    def _beat_pair(self, servo: int):
+    def _beat_pair(self, servo: int, offset=None):
         from .simsls import FakeSls, SimPdh, SimPll
 
+        offset = self.BEAT_MHZ if offset is None else offset
         f_m = C_NM_THZ / self.MASTER_NM
-        slave_nm = C_NM_THZ / (f_m + (self.BEAT_MHZ + 25.0) * 1e-6)  # (by itself 25 MHz off its beat point)
+        slave_nm = C_NM_THZ / (f_m + (offset + 25.0) * 1e-6)  # (by itself 25 MHz off its beat point)
         master = SimLaser(self.MASTER, self.MASTER_NM, 0.0, None, 0, cavity=True)
         slave = SimLaser(self.SLAVE, slave_nm, +0.40, self.sister, 1, drift=0.5)
         e = slave.ecdl
@@ -1816,12 +1818,12 @@ class Demo:
         SimTA(self.sister, 1, e, delay=3.0)
         self.pdh = SimPdh(master, FakeSls("P1029D"))
         self.pll = SimPll(FakeSls("P1029F" if servo else "P1029H"), slave, master, self.pdh, beat=self.BEAT_MHZ,
-                          servo=servo)
+                          servo=servo, offset=offset)
         self.pll.hold()
         self.sls = [self.pdh.sls, self.pll.sls]
         self.lasers += [master, slave]
         self.names.update({self.MASTER: "739 master", self.SLAVE: "739 slave"})
-        self.beat_nm = {self.MASTER: self.MASTER_NM, self.SLAVE: C_NM_THZ / (f_m + self.BEAT_MHZ * 1e-6)}
+        self.beat_nm = {self.MASTER: self.MASTER_NM, self.SLAVE: C_NM_THZ / (f_m + offset * 1e-6)}
 
     def make_source(self, sink, serial=None, model="", interval=None, channels=None):
         """A source for the sink: of the first simulated wavemeter, or of the one with that serial number."""

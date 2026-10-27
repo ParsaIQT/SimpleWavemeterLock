@@ -141,6 +141,41 @@ def round_sig(x: float, digits: int = 9) -> float:
     return round(x, digits - 1 - math.floor(math.log10(abs(x))))
 
 
+class Track:
+    """Another laser's readings as followed (a beat lock's master: its reading, on any PC): the last few, and since when
+    they have been steady (no jump of STEADY_MHZ)."""
+
+    def __init__(self, n: int = 3):
+        self.f = deque(maxlen=n)  # THz
+        self.t = None             # monotonic: when the last was read
+        self.steady = None        # monotonic: steady since
+
+    def feed(self, f, t):
+        """Its reading f (THz; None: none) as read at t (monotonic); one fed again is left out."""
+        if t is None or (self.t is not None and t <= self.t + 1e-4):
+            return
+        if f is None:
+            self.f.clear()
+            self.steady = None
+        else:
+            if not self.f or abs(f - self.f[-1]) * 1e6 > STEADY_MHZ:
+                self.steady = t
+            self.f.append(f)
+        self.t = t
+
+    def point(self, now: float, fresh: float):
+        """THz: the median of its last few readings, if the last is at most fresh s old (else None)."""
+        if not self.f or self.t is None or now - self.t > fresh:
+            return None
+        return statistics.median(self.f)
+
+    def steady_s(self, now: float, fresh: float):
+        """s its readings have been steady, None if its last is older than fresh s (or there is none)."""
+        if self.steady is None or self.t is None or now - self.t > fresh:
+            return None
+        return now - self.steady
+
+
 class Channel:
     """Settings and live state of one wavemeter channel."""
 
@@ -249,7 +284,14 @@ class Channel:
         self.recovered = None  # its mode-hop recovery, for the guard, just ended: '' it did, else why not
         self.steady_t = 0.0    # monotonic: its readings steady (no jump of STEADY_MHZ) since then...
         self.steady_f = NAN    # ...the last of them (THz)
-        self.recent = deque(maxlen=3)  # THz: its last few valid readings (a slave's beat point goes by their median)
+        self.mtrack = Track()  # a PLL's slave: its master's readings, followed (this PC's or another's)
+        self.master_row = None  # ...its master as last looked at (Elsewhere.row's), None: not found
+        self.mview = None      # ...its master's SLS servo, polled from here (sls.View), its error, holding since
+        self.m_error = ""
+        self.m_since = None
+        self.fast_seen = deque(maxlen=BEAT_N)   # V: its PLL's fast output, holding it...
+        self.phase_seen = deque(maxlen=BEAT_N)  # ...and its phase error
+        self.band_t = None     # time.time(): they read far from there since (the wavemeter reading it where it should)
         # the last adjustment made from another PC (share.py)
         self.remote_note = ""  # what, and from where
         self.remote_t = 0.0    # monotonic...
@@ -558,6 +600,8 @@ class Engine:
         self.log_path, self.drop_path = log_path, drop_path
         self.monitors = {}  # channel -> its DropoutMonitor
         self.sls_watches = {}  # channel -> its SlsWatch (an SLS unit locks its laser)
+        self.master_watches = {}  # channel -> the SlsWatch of its master's SLS servo (a PLL's slave, polled here)
+        self.elsewhere = None  # meters.Elsewhere: lasers on this PC's other wavemeters and on other PCs (a master)
         self.observations = {}  # tag -> an Observation of a channel's lock (observe.py), oldest first
         self.started = time.time()
         self.lock = threading.RLock()
@@ -601,6 +645,8 @@ class Engine:
         with self.lock:
             monitors, self.monitors = list(self.monitors.values()), {}
             watches, self.sls_watches = list(self.sls_watches.values()), {}
+            watches += list(self.master_watches.values())
+            self.master_watches = {}
         for w in watches:
             w.stop()  # (no more releases or engagements: its PLL is left as it is)
         for m in monitors:
@@ -909,7 +955,6 @@ class Engine:
                     if not abs(ch.freq - ch.steady_f) * 1e6 <= STEADY_MHZ:
                         ch.steady_t = r.t
                     ch.steady_f = ch.freq
-                    ch.recent.append(ch.freq)
                 else:
                     ch.steady_t, ch.steady_f = r.t, NAN
                 withheld = self._hop_reading(ch, r.t) if ch.hop.enabled or ch.runner else False
@@ -1098,7 +1143,7 @@ class Engine:
         with self.lock:
             ch = self.channels[n]
             if self._follows(ch):
-                ch.sls_note, ch.sls_note_t = (f"its setpoint is its beat point (channel {ch.sls.master}'s reading "
+                ch.sls_note, ch.sls_note_t = (f"its setpoint is its beat point ({ch.sls.master_where}'s reading "
                                               f"{ch.sls.beat:+.1f} MHz): not set by hand"), time.monotonic()
                 return
             ch.set_setpoint(nm)
@@ -1686,6 +1731,8 @@ class Engine:
     SLS_STALE_S = 2.0   # s: a unit's poll older than this (it does not answer) tells nothing
     BEAT_FRESH_S = 2.0  # s: its master's reading goes with its own if at most this old
     BEAT_LEARN_S = 10.0  # s its PLL must have held before its beat is learned from the readings
+    BAND_STALE_S = 3.0   # s its PLL's outputs may read far from where they sat holding it, the wavemeter reading it
+    #                      on its beat point all along, before where they sit is learned afresh
     BEAT_MIN = 20       # readings it is learned from, at least
 
     def set_sls(self, n: int, params: SlsParams):
@@ -1695,8 +1742,12 @@ class Engine:
             old = ch.sls
             if ch.state != "off" and (params.kind != old.kind or not params.same_unit(old) or not params.on):
                 self._disengage(ch, "")
-            if params.kind != "pll" or params.master != old.master:
+            if params.kind != "pll" or (params.master, params.master_on) != (old.master, old.master_on):
                 ch.beat_seen.clear()
+                ch.mtrack = Track()
+            if params.kind != "pll" or not params.same_unit(old):
+                ch.fast_seen.clear()
+                ch.phase_seen.clear()
             ch.sls = params
             if ch.sls_guard is not None:
                 ch.sls_guard.p = params
@@ -1716,14 +1767,53 @@ class Engine:
                 self._sls_drop_over(ch, time.time())
         if w is not None:
             w.p = ch.sls  # (its settings, as they are now)
-            return
-        if ch.sls.on:
+        elif ch.sls.on:
             name = f"channel {ch.n}" + (f" {ch.name}" if ch.name else "")
             w = SlsWatch(ch.sls, step=lambda watch, view, fresh: self._sls_step(ch, watch, view, fresh),
                          wrote=lambda watch, action, err: self._sls_wrote(ch, watch, action, err), name=name)
             w.seen = 0.0  # time.time(): the last poll it went by
             self.sls_watches[ch.n] = w
             w.start()
+        self._watch_master(ch)
+
+    def _watch_master(self, ch: Channel):
+        """A PLL's slave: its master's SLS servo polled from here, by a watch of its own, while it has one."""
+        p = ch.sls
+        want = SlsParams(kind="pdh", host=p.master_host.strip(), port=p.master_port) if (
+            ch.beat_slave and p.master_host.strip()) else None
+        w = self.master_watches.get(ch.n)
+        if w is not None and (want is None or not w.p.same_unit(want)):
+            w.stop()
+            del self.master_watches[ch.n]
+            w = None
+            ch.mview, ch.m_error, ch.m_since = None, "", None
+        if want is not None and w is None:
+            name = f"channel {ch.n}'s master" + (f" ({ch.name}'s)" if ch.name else "")
+            w = SlsWatch(want, step=lambda watch, view, fresh: self._master_step(ch, watch, view, fresh), name=name)
+            self.master_watches[ch.n] = w
+            w.start()
+
+    def _master_step(self, ch: Channel, watch, view, fresh: bool) -> list:
+        """From the watch of a slave's master's SLS servo: its lock as it says (lost: the slave's watch looks at
+        once)."""
+        wake = None
+        with self.lock:
+            if self.master_watches.get(ch.n) is not watch:
+                return []
+            ch.m_error = watch.error
+            if view is not None and fresh:
+                was = ch.mview.holds if ch.mview is not None else None
+                ch.mview = view
+                if view.holds:
+                    if ch.m_since is None:
+                        ch.m_since = view.t - view.held if view.held is not None and view.held >= 0 else view.t
+                else:
+                    ch.m_since = None
+                if was and view.holds is False:
+                    wake = self.sls_watches.get(ch.n)
+        if wake is not None:
+            wake.wake()
+        return []
 
     def _arm_sls(self, ch: Channel):
         """Relock clicked on a laser an SLS unit locks: watched (a PLL's slave, guarded: if its PLL does not hold it on
@@ -1738,41 +1828,73 @@ class Engine:
 
     def _follows(self, ch: Channel) -> bool:
         """Its setpoint is its beat point (its master's reading plus the beat), not its own."""
-        return ch.beat_slave and bool(ch.sls.master) and bool(ch.sls.beat)
+        return ch.beat_slave and bool(ch.sls.master) and ch.sls.beat_known
 
-    def _master(self, ch: Channel):
-        m = self.channels.get(ch.sls.master) if ch.sls.master else None
-        return m if m is not None and m is not ch else None
+    @staticmethod
+    def holds_of(ch: Channel) -> tuple:
+        """Whether a laser's lock holds, as far as this program knows (its SLS unit's last poll, else its state): (True,
+        False, None: no telling), and why not. Reads its channel as it is (no lock needed: another engine's, too)."""
+        v = ch.sls_view
+        if ch.sls.on and v is not None and not ch.sls_error and time.time() - v.t <= Engine.SLS_STALE_S:
+            return v.holds, v.why
+        if ch.state == "recovering":
+            return False, "being recovered"
+        if ch.lasing is False and ch.hop.enabled:
+            return False, "not lasing"
+        return (True, "") if ch.state == "on" else (None, "")
 
-    def _beat_point(self, ch: Channel):
-        """THz: where its PLL holds it, its master's reading of the last BEAT_FRESH_S plus the beat; with no master
-        here, its setpoint. None: not known now."""
+    def _master_look(self, ch: Channel):
+        """A PLL's slave's master as it is now, on this wavemeter or elsewhere (Elsewhere.row's dict; None: none, or not
+        found); its reading followed (Channel.mtrack)."""
+        p = ch.sls
+        if not p.master:
+            row = None
+        elif not p.master_on:
+            m = self.channels.get(p.master)
+            if m is None or m is ch:
+                row = None
+            else:
+                holds, why = self.holds_of(m)
+                row = {"f": m.freq if m.freq > 0 else None, "t": m.t if m.t > 0 else None, "holds": holds, "why": why,
+                       "name": m.name, "label": ""}
+        else:
+            row = self.elsewhere.row(p.master_on, p.master) if self.elsewhere is not None else None
+        ch.master_row = row
+        if row is not None:
+            ch.mtrack.feed(row["f"], row["t"])
+        return row
+
+    def _beat_point(self, ch: Channel, look: bool = True):
+        """THz: where its PLL holds it, its master's reading (the median of its last few, the last of the last
+        BEAT_FRESH_S) plus the beat; with no master, its setpoint. None: not known now. look: its master looked at
+        anew."""
         p = ch.sls
         if not p.master:
             return ch.f_set if ch.f_set > 0 else None
-        m = self._master(ch)
-        if m is None or not m.freq > 0 or not p.beat or time.monotonic() - m.t > self.BEAT_FRESH_S:
-            return None
-        return statistics.median(m.recent or [m.freq]) + p.beat * 1e-6  # (one odd reading of the master: not it)
+        if look:
+            self._master_look(ch)
+        f = ch.mtrack.point(time.monotonic(), self.BEAT_FRESH_S)
+        return f + p.beat * 1e-6 if f is not None and p.beat_known else None
 
     def _beat_reading(self, ch: Channel):
         """A reading of a laser a PLL beat-locks: its beat learned (its PLL holding it), how far it is from its beat
         point (two in a row too far: its guard releases it), and, steered there, the wavemeter lock's step."""
         p, v = ch.sls, ch.sls_view
-        m = self._master(ch)
-        if (m is not None and m.freq > 0 and ch.freq > 0 and time.monotonic() - m.t <= self.BEAT_FRESH_S
-                and v is not None and v.holds and ch.sls_since is not None and ch.steering is None
-                and time.time() - ch.sls_since >= self.BEAT_LEARN_S
+        row = self._master_look(ch)
+        mono = time.monotonic()
+        if (row is not None and row["f"] and row["t"] is not None and ch.freq > 0
+                and mono - row["t"] <= self.BEAT_FRESH_S and v is not None and v.holds and ch.sls_since is not None
+                and ch.steering is None and time.time() - ch.sls_since >= self.BEAT_LEARN_S
                 and (ch.sls_guard is None or ch.sls_guard.stage in ("hold", "auto"))):
-            ch.beat_seen.append((ch.freq - m.freq) * 1e6)
+            ch.beat_seen.append((ch.freq - row["f"]) * 1e6)  # (kept learned: two wavemeters' disagreement drifts)
             if len(ch.beat_seen) >= self.BEAT_MIN:
                 beat = round(statistics.median(ch.beat_seen), 2)
-                if not p.beat or abs(beat - p.beat) > 0.3:
-                    if not p.beat:
-                        log.info("channel %d: its beat with channel %d learned: %+.2f MHz", ch.n, m.n, beat)
-                    p.beat = beat
+                if not p.beat_known or abs(beat - p.beat) > 0.3:
+                    if not p.beat_known:
+                        log.info("channel %d: its beat with its master learned: %+.2f MHz", ch.n, beat)
+                    p.beat, p.beat_known = beat, True
                     self.dirty = True
-        point = self._beat_point(ch)
+        point = self._beat_point(ch, look=False)
         if point is None or not ch.freq > 0:
             ch.beat_e, ch.beat_off_n, ch.near_n = None, 0, 0
         else:
@@ -1841,21 +1963,24 @@ class Engine:
     def _sls_look(self, ch: Channel, view, fresh: bool) -> Look:
         """What its guard is told now."""
         now, mono = time.time(), time.monotonic()
-        m = self._master(ch)
         master = master_s = None
-        if m is not None:
-            mv = m.sls_view if m.sls.on and m.sls.kind == "pdh" else None
-            if mv is not None and not m.sls_error and now - mv.t <= self.SLS_STALE_S and mv.holds is not None:
-                master = mv.holds
-                master_s = now - m.sls_since if mv.holds and m.sls_since is not None else 0.0
-            elif m.freq > 0 and mono - m.t <= self.BEAT_FRESH_S:
-                master_s = mono - m.steady_t  # (not watched: its readings steady that long)
+        mv, row = ch.mview, self._master_look(ch)
+        if mv is not None and not ch.m_error and now - mv.t <= self.SLS_STALE_S and mv.holds is not None:
+            master = mv.holds  # (its SLS servo, polled from here)
+            master_s = now - ch.m_since if mv.holds and ch.m_since is not None else 0.0
+        elif row is not None and row["holds"] is not None:
+            master = row["holds"]  # (as its row says: its own PC watching its lock)
+            master_s = ch.mtrack.steady_s(mono, self.BEAT_FRESH_S) if row["holds"] else 0.0
+            if master and master_s is None:
+                master_s = 0.0
+        else:
+            master_s = ch.mtrack.steady_s(mono, self.BEAT_FRESH_S)  # (not watched: its readings steady that long)
         far = ""
         cap = ch.lock.p.capture if ch.lock.p.capture > 0 else 3000.0
         if ch.beat_e is not None and abs(ch.beat_e) > cap:
             far = f"{ch.beat_e / 1e3:+.3f} GHz from its beat point"
         elif not ch.off and ch.t > 0 and not ch.freq > 0 and mono - ch.t <= self.BEAT_FRESH_S and (
-                m is None or m.freq > 0):
+                row is None or row["f"]):
             far = f"no reading ({ch.status or 'none'}): it may not lase"
         hop = ch.hop
         k = Look(now=now, armed=ch.sls_guard is not None and ch.state in ("on", "recovering"),
@@ -1864,7 +1989,7 @@ class Engine:
                  beat_off=(f"{ch.beat_e:+.1f} MHz from its beat point" if ch.beat_off_n >= 2 and ch.beat_e is not None
                            else ""),
                  near_n=ch.near_n, lasing=ch.lasing, far=far,
-                 can_steer=bool(ch.device) and self._beat_point(ch) is not None and not ch.off,
+                 can_steer=bool(ch.device) and self._beat_point(ch, look=False) is not None and not ch.off,
                  can_recover=hop.enabled and bool(ch.device) and not ch.dac, recovering=ch.runner is not None,
                  recovered=ch.recovered)
         if ch.steer_fail and ch.sls_guard is not None and ch.sls_guard.stage == "steer":
@@ -1884,20 +2009,18 @@ class Engine:
             if view is not None and fresh:
                 was = ch.sls_view.holds if ch.sls_view is not None else None
                 ch.sls_view = view
+                if ch.beat_slave:
+                    self._outputs_band(ch, view)
                 self._sls_track(ch, view)
                 watch.seen = view.t
-                if (view.amp is not None and view.holds and ch.sls_since is not None and ch.steering is None
-                        and view.t - ch.sls_since >= self.BEAT_LEARN_S
+                if (ch.beat_slave and view.holds and ch.sls_since is not None and ch.steering is None
+                        and ch.beat_off_n == 0 and view.t - ch.sls_since >= self.BEAT_LEARN_S
                         and (ch.sls_guard is None or ch.sls_guard.stage in ("hold", "auto"))):
-                    ch.amp_seen.append(view.amp)  # (its beat amplitude, holding: learned)
-                    if len(ch.amp_seen) >= self.BEAT_MIN:
-                        amp = round(statistics.median(ch.amp_seen), 3)
-                        if abs(amp - ch.sls.amp_usual) > 0.05 * amp:
-                            ch.sls.amp_usual = amp
-                            self.dirty = True
-                if ch.sls.kind == "pdh" and was and view.holds is False:  # its slaves told at once
+                    self._learn_outputs(ch, view)
+                if ch.sls.kind == "pdh" and was and view.holds is False:  # its slaves here told at once
                     wake = [w for k, w in self.sls_watches.items()
-                            if self.channels[k].beat_slave and self.channels[k].sls.master == ch.n]
+                            if self.channels[k].beat_slave and self.channels[k].sls.master == ch.n
+                            and not self.channels[k].sls.master_on]
             elif watch.error:
                 watch.seen = time.time()  # (nothing more will be known of it for a while)
             out = []
@@ -1915,6 +2038,60 @@ class Engine:
             w.wake()
         return out
 
+    def _outputs_band(self, ch: Channel, view):
+        """Where its PLL's outputs sit holding it, learned afresh when its PLL is off or relocked (engaged again,
+        they may sit elsewhere), or when they read far from there for BAND_STALE_S while the wavemeter reads it on
+        its beat point all along (they moved, and it holds it there)."""
+        relocked = view.count is not None and ch.sls_count is not None and view.count > ch.sls_count
+        if not view.mode or relocked:
+            ch.band_t = None
+            self._forget_outputs(ch)
+        elif view.band and ch.beat_e is not None and ch.beat_off_n == 0:
+            if ch.band_t is None:
+                ch.band_t = view.t
+            elif view.t - ch.band_t >= self.BAND_STALE_S:
+                log.info("channel %d: %s, the wavemeter reading it on its beat point all along: where its PLL's "
+                         "outputs sit learned afresh", ch.n, view.why)
+                ch.band_t = None
+                self._forget_outputs(ch)
+        else:
+            ch.band_t = None
+
+    @staticmethod
+    def _forget_outputs(ch: Channel):
+        """Its PLL holding it anew: where its fast output and its phase error sit, learned afresh (engaged again, by
+        hand or by its guard, they may sit elsewhere)."""
+        ch.fast_seen.clear()
+        ch.phase_seen.clear()
+        p = ch.sls
+        p.fast_mid = p.fast_dev = p.phase_mid = p.phase_dev = 0.0
+
+    def _learn_outputs(self, ch: Channel, view):
+        """A PLL holding its slave: what it shows learned (its beat amplitude; how far its fast output and its phase
+        error go from where they sit: far beyond, it has lost the beat)."""
+        p = ch.sls
+        if view.amp is not None:
+            ch.amp_seen.append(view.amp)
+            if len(ch.amp_seen) >= self.BEAT_MIN:
+                amp = round(statistics.median(ch.amp_seen), 3)
+                if abs(amp - p.amp_usual) > 0.05 * amp:
+                    p.amp_usual = amp
+                    self.dirty = True
+        for seen, value, mid, dev in ((ch.fast_seen, view.fast, "fast_mid", "fast_dev"),
+                                      (ch.phase_seen, view.phase, "phase_mid", "phase_dev")):
+            if value is None:
+                continue
+            seen.append(value)
+            if len(seen) < self.BEAT_MIN:
+                continue
+            m = statistics.median(seen)
+            spread = sorted(abs(x - m) for x in seen)
+            d = max(spread[min(int(0.98 * len(spread)), len(spread) - 1)], 1e-6)
+            old = getattr(p, dev)
+            if not old or abs(d - old) > 0.25 * old or abs(m - getattr(p, mid)) > 0.5 * old:
+                setattr(p, mid, round(m, 6))  # (not kept in its settings: SlsParams.FRESH)
+                setattr(p, dev, round(d, 6))
+
     def _sls_act(self, ch: Channel, g: BeatGuard, a: tuple) -> list:
         """One of its guard's actions: done here, or (a write to its PLL) returned."""
         what = a[0]
@@ -1926,6 +2103,7 @@ class Engine:
             log.warning("channel %d: its PLL released: %s", ch.n, a[1])
             return [a]
         if what == "engage":
+            self._forget_outputs(ch)  # (engaged again, its outputs may sit elsewhere)
             return [a]
         if what == "steer":
             self._steer(ch, a[1])
@@ -1965,6 +2143,7 @@ class Engine:
         expect = bool(v.mode) or (g is not None and g.stage != "idle")  # (its lock on, or its guard has it: switched
         #                                                                  off by hand, it is no dropout)
         if held:
+            anew = ch.sls_since is None
             if ch.sls_drop is not None:
                 self._sls_drop_over(ch, v.t)
             elif (ch.sls_count is not None and v.count is not None and v.count > ch.sls_count
@@ -1972,9 +2151,11 @@ class Engine:
                 end = v.t - v.held if v.held is not None and ch.sls_held_t < v.t - v.held < v.t else v.t
                 self._sls_dropped(ch, ch.sls_held_t, end, f"relocked between two polls (its count {ch.sls_count} → "
                                                           f"{v.count})")
-                ch.sls_since = end
+                ch.sls_since, anew = end, True
             if ch.sls_since is None:  # (by its unit's own count of how long it has held, if it has one)
                 ch.sls_since = max(v.t - v.held, ch.sls_bad_t or 0.0) if v.held is not None and v.held >= 0 else v.t
+            if anew and ch.beat_slave:
+                self._forget_outputs(ch)
             ch.sls_held_t = v.t
         else:
             ch.sls_since, ch.sls_bad_t = None, v.t
@@ -2855,7 +3036,7 @@ class Engine:
                 if ref:
                     return False, "the reference laser has no setpoint"
                 if self._follows(ch):
-                    return False, (f"its setpoint is its beat point (channel {ch.sls.master}'s reading "
+                    return False, (f"its setpoint is its beat point ({ch.sls.master_where}'s reading "
                                    f"{ch.sls.beat:+.1f} MHz): an SLS PLL holds it there")
                 if nm is not None and not (_num(nm) and nm > 0):
                     return False, f"not a wavelength: {nm!r}"

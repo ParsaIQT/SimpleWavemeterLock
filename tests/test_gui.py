@@ -966,19 +966,64 @@ def test_sls_dialog_round_trip_and_its_test(app):
         assert d.host.isEnabled() and d.master.isEnabled() and d.guard.isChecked()
         d.host.setText(" 127.0.0.1 ")
         d.port.setValue(demo.pll.sls.port)
-        d.master.setCurrentIndex(d.masters.index(9))
+        assert not d.master_host.isEnabled()  # (no master yet)
+        d.master.setCurrentIndex(next(k for k, (_, n, on) in enumerate(d.masters) if (n, on) == (9, "")))
+        assert d.master_host.isEnabled() and d.beat.text() == "" and d.beat.placeholderText() == "learned"
         d.capture.setValue(0.8)
         p = d.params()
         assert p == SlsParams(kind="pll", host="127.0.0.1", port=demo.pll.sls.port, master=9, capture=0.8)
         d._test()
         assert wait_for(lambda: (app.processEvents(), "manual lock (MANUAL)" in d.found.text())[1], 5), d.found.text()
-        ch.sls = SlsParams(kind="pll", host="P1029F", servo=2, master=9, beat=80.1, amp_usual=0.9)
+        ch.sls = SlsParams(kind="pll", host="P1029F", servo=2, master=9, beat=80.1, beat_known=True, amp_usual=0.9)
         d = gui.SlsDialog(None, e, ch)
-        assert d.servo.currentIndex() == 2 and d.beat.value() == 80.1 and d.params() == ch.sls
+        assert d.servo.currentIndex() == 2 and d.beat.text() == "+80.10" and d.params() == ch.sls
         d.servo.setCurrentIndex(3)
         assert d.params().amp_usual == 0.0  # (another PLL: learned afresh)
+        d.beat.setText("")
+        assert not d.params().beat_known  # (emptied: learned afresh)
     finally:
         demo.close()
+
+
+def test_sls_dialog_masters_elsewhere_and_find_units(app):
+    """Its master picked among this wavemeter's channels and the lasers the network shows (this PC's other
+    wavemeters, the other PCs); Find units lists the units that answered, one picked fills in the unit."""
+    from wmlock.sls import SlsParams
+
+    class Far:  # (what meters.Elsewhere says: this wavemeter is Lab B on the network)
+        @staticmethod
+        def label_of(engine):
+            return "Lab B"
+
+        @staticmethod
+        def lasers():
+            return [("Lab B", 3, "638"), ("Lab A", 9, "739 SHG"), ("Lab A", 4, "")]
+
+    e = Engine({"channels": {"3": {"name": "638"}, "10": {"name": "Sirius"}}}, lambda sink: None)
+    e.elsewhere = Far()
+    ch = e.channels[10]
+    ch.sls = SlsParams(kind="pll", host="P1029F", servo=1, master=5, master_on="Lab C")
+    d = gui.SlsDialog(None, e, ch)
+    listed = [label for label, *_ in d.masters]
+    assert listed == ["none: its setpoint is its beat point", "channel 3 638 (this wavemeter)",
+                      "Lab A · channel 9 739 SHG", "Lab A · channel 4", "channel 5 on Lab C (not heard from now)"]
+    assert d.master.currentIndex() == 4 and d.params().master_on == "Lab C"  # (kept, its PC not heard from now)
+    d.master.setCurrentIndex(2)
+    d.master_host.setText(" P1029D ")
+    p = d.params()
+    assert (p.master, p.master_on, p.master_host, p.servo) == (9, "Lab A", "P1029D", 1) and not p.beat_known
+    d._units = [("P1029A", "not found on the LAN"), ("P1029D", "Laser Servo (to the cavity): Locked: 3 (0d 01:00:00)"),
+                ("P1029F", "3-channel PLL: servo 1 manual lock at 80 MHz; servo 2 off; servo 3 off")]
+    d._tested()
+    assert d.units.count() == 2 and not d.units.isHidden() and "found 2" in d.found.text()
+    d.servo.setCurrentIndex(0)
+    d.host.setText("")
+    d._chosen(1)
+    assert d.host.text() == "P1029F" and d.servo.currentIndex() == 1  # (a 3-channel PLL: its servo 1)
+    d._units = [("P1029A", "not found on the LAN"), ("P1029B", "not found on the LAN")]
+    d._tested()
+    assert d.units.count() == 0 and "type its IP address (on its touchscreen: Settings › System Control)" in \
+        d.found.text()
 
 
 def test_rows_of_lasers_sls_units_lock(app, tmp_path):

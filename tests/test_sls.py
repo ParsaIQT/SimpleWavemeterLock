@@ -2,15 +2,18 @@
 PLL beat-locks (its steps, then the whole night failure in the simulation: the master's lock drops, the PLL's manual
 lock runs the slave away and stops it lasing, its TA switches itself off; guarded, none of that)."""
 import json
+import re
+import socket
 import time
 
 import pytest
 
 from conftest import wait_for
 from wmlock import sls, view
-from wmlock.engine import Engine
-from wmlock.meters import Meter
+from wmlock.engine import Engine, Track
+from wmlock.meters import Elsewhere, Meter, row_holds
 from wmlock.rpc import Api
+from wmlock.share import Share, clean
 from wmlock.sim import Demo, SimWavemeter
 from wmlock.simsls import FakeSls
 from wmlock.sls import Guard, Look, SlsParams, View
@@ -93,6 +96,20 @@ def test_what_a_pll_says():
     v3 = sls.pll_view(0.0, three, 2, p)
     assert v3.mode == "manual" and v3.holds and v3.amp is None  # (no amplitude on a 3-channel PLL)
     assert sls.pll_view(0.0, three, 1, p).mode == ""
+    for stale in ("FAIL", "Aborting:STATE_FAIL", "IDLE"):  # (its autolock's state, from a failed try: not its manual
+        assert sls.pll_view(0.0, {**three, "Servo2LockState": stale}, 2, p).holds  # lock's)
+    tried = {**three, "Servo2ManualLockEnable": "0", "Servo2AutoLockEnable": "1", "Servo2LockState": "FAIL"}
+    assert sls.pll_view(0.0, tried, 2, p).holds is False  # (its autolock's: it goes by it)
+    # ...but where its fast output and its phase error sit holding it, learned: far from there, it has lost it
+    banded = SlsParams(kind="pll", host="x", fast_mid=0.002, fast_dev=0.004, phase_mid=0.0, phase_dev=0.1)
+    there = {**three, "Servo2FastServoOutput": "0.03", "Servo2PhaseError": "-0.6"}
+    assert sls.pll_view(0.0, there, 2, banded).holds  # (within 0.05 V (its floor), and 8 × 0.1)
+    far = sls.pll_view(0.0, {**there, "Servo2FastServoOutput": "-0.2"}, 2, banded)
+    assert far.holds is False and far.band and far.why == ("its fast output -0.200 V, far from where it holds it "
+                                                           "(+0.002 ± 0.004 V)")
+    lost = sls.pll_view(0.0, {**there, "Servo2PhaseError": "2.5"}, 2, banded)
+    assert lost.holds is False and lost.band and lost.why.startswith("its phase error +2.500, far from where")
+    assert sls.pll_view(0.0, {**there, "Servo2FastServoOutput": "-0.2"}, 2, p).holds  # (not learned: not watched)
 
 
 def test_a_unit_without_get_values_is_read_one_by_one():
@@ -125,6 +142,69 @@ def test_probe_says_what_the_unit_is():
         assert "127.0.0.1:1:" in sls.probe("127.0.0.1", 1, "pll", timeout=0.5)
     finally:
         demo.close()
+
+
+def test_survey_says_what_each_unit_is():
+    """Find units (the settings dialog): each unit in a line, by its name on the LAN; names not found said so."""
+    demo = Demo(discovery_port=0, beat=True, beat_servo=1)
+    try:
+        said = sls.survey(demo.pll.sls.host, demo.pll.sls.port)
+        assert said.startswith("3-channel PLL: servo 1 manual lock at 80 MHz; servo 2 off"), said
+        assert sls.survey(demo.pdh.sls.host, demo.pdh.sls.port).startswith("Laser Servo (to the cavity): Locked: 1")
+        assert sls.survey("p1029z-not-here") == "not found on the LAN"
+        found = sls.units("P1029Z-not-here-", letters="AB", timeout=0.5)
+        assert found == [("P1029Z-not-here-A", "not found on the LAN"), ("P1029Z-not-here-B", "not found on the LAN")]
+    finally:
+        demo.close()
+    one = Demo(discovery_port=0, beat=True)
+    try:
+        said = sls.survey(one.pll.sls.host, one.pll.sls.port)
+        assert said.startswith("one-channel PLL at 80 MHz: manual lock (MANUAL)"), said
+    finally:
+        one.close()
+
+
+def test_settings_from_before_and_what_is_learned_afresh():
+    old = SlsParams.from_dict({"kind": "pll", "host": "P1029H", "master": 9, "beat": 80.0})  # (before beat_known)
+    assert old.beat_known and old.beat == 80.0 and old.master_where == "channel 9"
+    new = SlsParams.from_dict({"kind": "pll", "host": "P1029F", "servo": 1, "master": 3, "master_on": "Lab A",
+                               "beat": 0.0, "beat_known": True})
+    assert new.beat_known and new.beat == 0.0 and new.master_where == "channel 3 on Lab A"
+    assert not SlsParams.from_dict({"kind": "pll", "host": "P1029F"}).beat_known  # (learned)
+    assert SlsParams().master_where == ""
+    banded = SlsParams(kind="pll", host="x", fast_mid=0.1, fast_dev=0.01, phase_dev=0.2)
+    d = banded.to_dict()
+    assert not set(SlsParams.FRESH) & set(d) and SlsParams.from_dict(d).fast_dev == 0.0  # (learned each time it holds)
+
+
+def test_a_row_says_whether_its_lock_holds():
+    """A master on another PC: whether its lock holds, as its own PC says on its row (or, a PC running an older
+    version, by its row's words)."""
+    assert row_holds({"holds": True, "state": "off"}) == (True, "")
+    assert row_holds({"holds": False, "holds_why": "Acquiring"}) == (False, "Acquiring")
+    assert row_holds({"holds": None, "state": "on"}) == (None, "")
+    assert row_holds({"state": "on", "info": "locked by SLS Laser Servo   SLS LOCK LOST   SLS P1029D: …"}) == (
+        False, "sls lock lost")
+    assert row_holds({"state": "recovering", "info": ""}) == (False, "being recovered")
+    assert row_holds({"state": "on", "info": "locked by SLS Laser Servo   SLS P1029D: Locked: 3"}) == (True, "")
+    assert row_holds({"state": "off", "info": "…"}) == (None, "")
+    assert clean({"holds": True, "holds_why": "x"}) == {"holds": True, "holds_why": "x"}
+    assert clean({"holds": "yes"}) == {"holds": None}  # (only what it may be)
+
+
+def test_a_master_followed():
+    """Its master's readings, as they come (from its own PC: now and then, fed again): the median of its last
+    three, if the last is fresh; steady since its last jump."""
+    t = Track()
+    assert t.point(0.0, 3.0) is None and t.steady_s(0.0, 3.0) is None
+    for k, f in enumerate((400.0, 400.0 + 1e-6, 400.0 + 9e-6)):
+        t.feed(f, 1.0 + 0.1 * k)
+    assert t.point(1.5, 3.0) == pytest.approx(400.0 + 1e-6, abs=1e-9)  # (one odd reading: not it)
+    t.feed(500.0, 1.2)  # (the same reading's time again: left out)
+    assert list(t.f)[-1] == pytest.approx(400.0 + 9e-6) and t.point(5.0, 3.0) is None  # (too old: none)
+    assert t.steady_s(1.5, 3.0) == pytest.approx(0.3)  # (8 MHz: a jump, steady since)
+    t.feed(None, 2.0)  # (no reading)
+    assert t.point(2.0, 3.0) is None and t.steady_s(2.0, 3.0) is None
 
 
 # ------------------------------------------------------------------------------------------------- the guard
@@ -384,8 +464,8 @@ def test_settings_kept_and_the_unit_not_answering(lab, tmp_path):
     s = e.channels[lab.SLAVE]
     try:
         cfg = e.to_config()["channels"][str(lab.SLAVE)]["sls"]
-        assert cfg["kind"] == "pll" and cfg["master"] == lab.MASTER and cfg["beat"] == 80.0
-        assert SlsParams.from_dict(cfg) == s.sls
+        assert cfg["kind"] == "pll" and cfg["master"] == lab.MASTER and cfg["beat"] == 80.0 and cfg["beat_known"]
+        assert SlsParams.from_dict(cfg).to_dict() == s.sls.to_dict()
         e.engage(lab.SLAVE)
         lab.pll.sls.down = "close"
         assert wait_for(lambda: s.sls_error, 3)
@@ -397,3 +477,129 @@ def test_settings_kept_and_the_unit_not_answering(lab, tmp_path):
         assert s.state == "off" and lab.SLAVE not in e.sls_watches and "sls" not in s.to_config()
     finally:
         e.stop()
+
+
+# ------------------------------------------------------------------------------------------- its master elsewhere
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture
+def sirius(tmp_path):
+    """Sirius, as in the lab: a slave a 3-channel PLL's servo 1 (P1029F) beat-locks with its manual lock, at its
+    master's frequency (an AOM making up the PLL's 80 MHz), on another PC (Lab B) than its master (the other SHG, an
+    SLS Laser Servo locking it to the cavity, on Lab A); each PC with its engine and its instance on the network,
+    the slave's master as the network names it, its beat learned."""
+    demo = Demo(discovery_port=0, beat=True, beat_servo=1, beat_offset=0.0, wavemeter=SimWavemeter(noise=0.05),
+                exposure=0.004)
+    m, s = demo.MASTER, demo.SLAVE
+    master = {"name": "739 SHG", "sls": {"kind": "pdh", "host": "127.0.0.1", "port": demo.pdh.sls.port}}
+    a = Engine({"channels": {str(m): master}}, demo.make_source, discovery_targets=["127.0.0.1"],
+               drop_path=tmp_path / "a.jsonl")
+    b = Engine({"channels": {str(s): {"name": "Sirius", "link": {"device": demo.sister.key, "laser": 1},
+                                      "hop": {"enabled": True, "i_nom": 150.0},
+                                      "sls": {"kind": "pll", "host": "127.0.0.1", "port": demo.pll.sls.port,
+                                              "servo": 1, "master": m, "master_on": "Lab A"}}}},
+               demo.make_source, discovery_targets=["127.0.0.1"], drop_path=tmp_path / "b.jsonl")
+    b.BEAT_LEARN_S = 2.0
+    port = free_port()
+    share_a = Share(a, {"label": "Lab A", "port": port, "lan": False})
+    share_b = Share(b, {"label": "Lab B", "port": free_port(), "lan": False, "peers": [f"127.0.0.1:{port}"]})
+    b.elsewhere = Elsewhere(lambda: [Meter(b, share_b)], share_b)
+    for x in (a, share_a, b, share_b):
+        x.start()
+    try:
+        yield demo, a, b, share_a
+    finally:
+        for x in (share_b, share_a):
+            x.stop()
+            x.join(2.0)
+        b.stop()
+        a.stop()
+        demo.close()
+
+
+def test_sirius_and_its_master_on_another_pc(sirius):
+    """Its master picked as the network shows it, followed from the other PC: its readings, and its lock as its own
+    PC watches it. Its beat learned, near 0. The master's lock lost over there: its PLL released at once, and not
+    engaged again while the master is lost; relocked once it holds, its TA on all along. Its master's PC gone, it
+    is left holding."""
+    demo, a, b, share_a = sirius
+    s = b.channels[demo.SLAVE]
+    assert wait_for(lambda: ("Lab A", demo.MASTER, "739 SHG") in b.elsewhere.lasers(), 10)
+    assert wait_for(lambda: s.sls_view is not None and (s.master_row or {}).get("holds") is True, 10), s.master_row
+    assert s.master_row["label"] == "Lab A" and s.master_row["name"] == "739 SHG"
+    assert not s.sls.beat_known and s.sls_view.amp is None and s.sls_view.mode == "manual"
+    b.engage(demo.SLAVE)
+    assert wait_for(lambda: s.sls_guard is not None and s.sls_guard.stage == "hold", 3)
+    assert wait_for(lambda: s.sls.beat_known, 15), (len(s.beat_seen), s.sls_since)
+    assert abs(s.sls.beat) < 0.5, s.sls.beat  # (on its master's frequency, the same wavemeter reading both)
+    info = view.row(b, demo.SLAVE, time.monotonic())["info"]
+    assert re.search(r"master 739 SHG \(channel 9 on Lab A\), beat [+-]0\.\d\d MHz", info), info
+    assert wait_for(lambda: s.sls.fast_dev > 0, 10)  # (where its outputs sit, holding it: learned)
+    demo.pdh.drop(4.0)
+    t0 = time.monotonic()
+    assert wait_for(lambda: not demo.pll.manual, 1.0), "not released"
+    assert wait_for(lambda: (s.master_row or {}).get("holds") is False, 1.5), s.master_row  # (as Lab A says)
+    assert "739 SHG (channel 9 on Lab A), its lock lost" in view.master_said(s)
+    while time.monotonic() - t0 < 3.8:  # (its master lost: not engaged meanwhile)
+        assert not demo.pll.manual, s.sls_guard.stage
+        time.sleep(0.05)
+    assert wait_for(lambda: s.sls_guard.stage == "hold" and demo.pll.locked, 30), (s.sls_guard.stage, s.sls_guard.why)
+    assert ta_on(demo) and demo.laser(demo.SLAVE).ecdl.lasing
+    assert wait_for(lambda: s.drops_total == 1, 2) and "relocked: its PLL holds it again" in s.sls_note
+    share_a.stop()  # (its master's PC closes)
+    assert wait_for(lambda: s.master_row is None, 5)
+    assert "not seen (its PC not heard from)" in view.row(b, demo.SLAVE, time.monotonic())["info"]
+    time.sleep(1.0)
+    assert demo.pll.manual and demo.pll.locked and s.sls_guard.stage == "hold"  # (left holding)
+
+
+def test_its_masters_servo_polled_from_the_slaves_pc(lab, tmp_path):
+    """Its master's SLS Laser Servo polled by the slave's own PC (its master's lock not watched on its row): lost,
+    the slave's PLL released at once; relocked once it holds again."""
+    e = make_engine(lab, tmp_path, master_host="127.0.0.1", master_port=lab.pdh.sls.port)
+    s = e.channels[lab.SLAVE]
+    try:
+        e.set_sls(lab.MASTER, SlsParams())  # (its own row: not watched)
+        assert wait_for(lambda: s.mview is not None and s.mview.holds and s.m_since is not None, 3)
+        assert "its SLS servo polled from here too, 127.0.0.1:" in view.notes(e, lab.SLAVE)
+        e.engage(lab.SLAVE)
+        assert wait_for(lambda: s.sls_guard is not None and s.sls_guard.stage == "hold", 3)
+        lab.pdh.drop(2.0)
+        assert wait_for(lambda: s.mview.holds is False, 0.5)
+        assert wait_for(lambda: not lab.pll.manual, 1.0), "not released"
+        assert view.master_said(s) == "739 master (channel 9), its lock lost (“Acquiring”)", view.master_said(s)
+        assert wait_for(lambda: s.sls_guard.stage == "hold" and lab.pll.locked, 30), s.sls_guard.stage
+        assert ta_on(lab)
+        e.set_sls(lab.SLAVE, SlsParams.from_dict({**s.sls.to_dict(), "master_host": ""}))
+        assert lab.SLAVE not in e.master_watches and s.mview is None  # (no longer polled)
+    finally:
+        e.stop()
+
+
+def test_where_its_outputs_sit_learned_afresh_when_engaged_again(tmp_path):
+    """A 3-channel PLL holding it: where its fast output sits learned; far from there, it has lost the beat
+    (released); engaged again, where it sits now learned afresh, not held against it."""
+    demo = Demo(discovery_port=0, beat=True, beat_servo=1, wavemeter=SimWavemeter(noise=0.05), exposure=0.004)
+    try:
+        e = make_engine(demo, tmp_path, servo=1)
+        e.BEAT_LEARN_S = 1.0
+        s = e.channels[demo.SLAVE]
+        try:
+            e.engage(demo.SLAVE)
+            assert wait_for(lambda: s.sls_guard.stage == "hold" and s.sls.fast_dev > 0, 8), s.sls_guard.stage
+            assert abs(s.sls.fast_mid) < 0.01 and s.sls.fast_dev < 0.02
+            demo.pll.sls.params["Servo1FastServoOutput"] = lambda: 0.4  # (it sits elsewhere: as lost)
+            assert wait_for(lambda: not demo.pll.manual, 1.0), "not released"
+            assert "its fast output +0.400 V, far from where it holds it" in s.sls_guard.why, s.sls_guard.why
+            assert wait_for(lambda: s.sls_guard.stage == "hold" and demo.pll.locked, 30), s.sls_guard.stage
+            assert wait_for(lambda: s.sls.fast_dev > 0, 8) and s.sls.fast_mid == pytest.approx(0.4)
+            time.sleep(1.0)
+            assert s.sls_guard.stage == "hold" and demo.pll.manual  # (held, not released again)
+        finally:
+            e.stop()
+    finally:
+        demo.close()
