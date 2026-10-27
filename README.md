@@ -1362,7 +1362,10 @@ that is how Sirius's PC knows its lock.
 
 ### What it watches
 
-Each unit is polled ten times a second, on a connection of its own (*a poll takes … ms*, in its tooltip). The master's
+Each unit is polled ten times a second, on a connection of its own (*a poll takes … ms*, in its tooltip). A unit slow
+to send its whole list (P1029F takes seconds; one value comes in a fraction of one) is read a value at a time from the
+first poll that shows it: at each poll only what its guard needs (a PLL's manual lock, outputs and phase error), all of
+them every tenth; a poll under way is cut short when its master's lock is lost, so that its PLL is released at once. The master's
 lock holds while its servo says *Locked* (and its transmission is above its threshold); the slave's while its PLL is on
 (its manual lock, or its autolock) and its beat amplitude is above its threshold (a one-channel PLL), its slow output is
 neither at its rail nor running away (faster than 1 V/s), and the wavemeter reads it within 10 MHz of its beat point
@@ -1915,12 +1918,19 @@ itself, as you would:
 * **SLS UNIT NOT ANSWERING**: its name (`P1029F`, tried as `P1029F.local` too) is not known on this PC: give its IP
   address instead (its touchscreen's *Settings › System Control* shows it); or a firewall between them (TCP 8080).
   *SLS lock…* › *Test* says what it finds, *Find units* what answers.
+* **The program closed by itself**: what it last said is in your user folder (on Windows `C:\Users\you\`), next
+  to its settings: `.simplewavemeterlock-errors.log` (warnings, and every error nothing caught, with where it happened:
+  the program now goes on after those) and `.simplewavemeterlock-crash.log` (where each thread was if Python itself
+  died). The window it was started from shows the same.
 * ***Test*: port 8080 times out, though VNC to the unit works**: VNC (port 5900) reaching it means the network does;
   then its HTTP server does not answer. *Test* tells which: *does not answer at all* while VNC answers (something
   drops port 8080: a firewall on the unit or between, or its HTTP server not running), or *takes connections but does
   not answer them* (its HTTP server stuck: *Settings › System Control › Reboot*, when the laser it locks can spare
   it). A browser on the same PC shows the same: `http://192.168.1.113:8080/?parameter=AppVersion` (its address) should
   say `AppVersion=AppVer:…` at once. If it never does, Stable Laser Systems can say how its HTTP server is started.
+  If it does, but slowly or only after a while, the unit is slow to send its whole list (P1029F is): *Test* reads it a
+  value at a time and says how long each takes (*its whole list did not come in 2 s: read a value at a time*), and it
+  is polled so from then on.
 * **A slave's master *not seen (its PC not heard from)***: the master's PC is not running this program, or not on the
   same network (its frame is missing here; see *Several PCs*). The slave's PLL is left as it is; if it drops, it is
   relocked by its own signals, with nothing to steer it by.

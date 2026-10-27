@@ -288,6 +288,7 @@ class Channel:
         self.beat_ok = False   # ...its beat learned since the program started (one from before, or typed, steers it
         #                        back, but the wavemeter reading it off its beat point does not count until then)
         self.master_row = None  # ...its master as last looked at (Elsewhere.row's), None: not found
+        self.master_lost = False  # ...its lock lost, as its row says (its guard told at once, not at its next poll)
         self.mview = None      # ...its master's SLS servo, polled from here (sls.View), its error, holding since
         self.m_error = ""
         self.m_since = None
@@ -1867,6 +1868,12 @@ class Engine:
         ch.master_row = row
         if row is not None:
             ch.mtrack.feed(row["f"], row["t"])
+        lost = row is not None and row["holds"] is False
+        if lost and not ch.master_lost and ch.sls_guard is not None:
+            w = self.sls_watches.get(ch.n)
+            if w is not None:
+                w.wake()  # (a poll of a slow unit cut short: its PLL released now)
+        ch.master_lost = lost
         return row
 
     def _beat_point(self, ch: Channel, look: bool = True):

@@ -228,3 +228,40 @@ def test_logs_and_demo_serials():
                                                  home / "lab-wlm5678-dropouts.jsonl")
     a, b = sim_serials("demo-a.json"), sim_serials("demo-b.json")
     assert a == sim_serials("demo-a.json") and a[1] == a[0] + 1 and not set(a) & set(b)
+
+
+def test_errors_kept_next_to_the_settings(tmp_path):
+    """Every error nothing caught (in the window's code, in a thread) logged with its traceback to ...-errors.log next
+    to the settings file, the program going on; a crash of the interpreter itself to ...-crash.log."""
+    import faulthandler
+    import logging
+    import sys
+    import threading
+
+    from wmlock import __main__ as entry
+
+    hooks = sys.excepthook, threading.excepthook
+    root = logging.getLogger()
+    before = list(root.handlers)
+    try:
+        errors, crash = entry.keep_errors(tmp_path / ".settings.json")
+        assert errors == tmp_path / ".settings-errors.log" and crash == tmp_path / ".settings-crash.log"
+        assert crash.exists() and faulthandler.is_enabled()
+        try:
+            raise ValueError("in the window's code")
+        except ValueError:
+            sys.excepthook(*sys.exc_info())  # (as Qt hands an error in a slot over)
+        t = threading.Thread(target=lambda: 1 / 0, name="a worker")
+        t.start()
+        t.join()
+        for h in root.handlers:
+            h.flush()
+        text = errors.read_text()
+        assert "CRITICAL wmlock MainThread: uncaught ValueError (the program goes on)" in text
+        assert "ValueError: in the window's code" in text and "uncaught ZeroDivisionError in thread a worker" in text
+    finally:
+        for h in [h for h in root.handlers if h not in before]:
+            root.removeHandler(h)
+            h.close()
+        sys.excepthook, threading.excepthook = hooks
+        faulthandler.enable(file=sys.__stderr__)

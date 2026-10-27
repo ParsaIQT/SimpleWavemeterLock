@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import logging
+import logging.handlers
+import sys
+import threading
 import zlib
 from pathlib import Path
 
@@ -24,6 +28,47 @@ def log_paths(path, serial=None):
     if path.name.startswith("."):
         rec = rec.with_name("." + rec.name)
     return rec, rec.with_name(rec.name.replace("-recoveries", "-dropouts"))
+
+
+_crash_file = None  # (kept open: where faulthandler writes)
+
+
+def keep_errors(path):
+    """Errors kept, next to the settings file: warnings and every error nothing caught (in the window, in a thread),
+    with its traceback, in ...-errors.log (1 MB, and the two before), the program going on where it can; the
+    interpreter itself dying (a crash in Qt, say), where each thread was, in ...-crash.log. Their paths, or None."""
+    global _crash_file
+    path = Path(path)
+    dot = "." if path.name.startswith(".") else ""
+    errors = path.with_name(dot + path.stem.lstrip(".") + "-errors.log")
+    crash = errors.with_name(errors.name.replace("-errors.log", "-crash.log"))
+    try:
+        handler = logging.handlers.RotatingFileHandler(errors, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+        _crash_file = open(crash, "a", encoding="utf-8")
+    except OSError:
+        return None
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(threadName)s: %(message)s",
+                                           "%Y-%m-%d %H:%M:%S"))
+    logging.getLogger().addHandler(handler)
+    faulthandler.enable(file=_crash_file, all_threads=True)
+    log = logging.getLogger("wmlock")
+
+    def uncaught(kind, value, tb):
+        if issubclass(kind, KeyboardInterrupt):
+            sys.__excepthook__(kind, value, tb)
+            return
+        log.critical("uncaught %s (the program goes on)", kind.__name__, exc_info=(kind, value, tb))
+
+    def uncaught_in_thread(a):
+        if a.exc_type is SystemExit:
+            return
+        log.critical("uncaught %s in thread %s", a.exc_type.__name__, a.thread.name if a.thread else "?",
+                     exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+
+    sys.excepthook = uncaught  # (PyQt5 would end the program at an error in the window's code: logged instead)
+    threading.excepthook = uncaught_in_thread
+    return errors, crash
 
 
 def sim_serials(path) -> list:
@@ -70,6 +115,10 @@ def main(argv=None) -> int:
                                             f"its own (--config FILE).")
     except OSError:  # (no lock file can be made there: as ever)
         pass
+    kept = keep_errors(path)
+    if kept:
+        logging.getLogger("wmlock.errors").setLevel(logging.INFO)
+        logging.getLogger("wmlock.errors").info("warnings and errors are kept in %s (a crash in %s)", *kept)
     config = cfgfile.load(path)
     meter = config.get("wavemeter") if isinstance(config.get("wavemeter"), dict) else {}
     demo, targets, extra, backend = None, None, (), None

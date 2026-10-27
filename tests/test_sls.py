@@ -205,7 +205,8 @@ def test_a_slow_whole_list_is_read_a_value_at_a_time():
     try:
         said = sls.probe(u.host, u.port, "pdh", timeout=0.5)
         assert said.startswith(f"{u.host}: Laser Servo, firmware X") and "Locked: 1" in said, said
-        assert said.endswith("(its whole list did not come in 0.5 s: read a value at a time, as it is polled)")
+        assert re.search(r"\(its whole list did not come in 0\.5 s: read a value at a time, as it is polled: \d+ ms "
+                         r"each; the first \d+ ms, behind the whole list\)$", said), said
         got = []
         w = sls.SlsWatch(SlsParams(kind="pdh", host=u.host, port=u.port), step=lambda w, v, fresh: got.append(v) or [])
         w.start()
@@ -701,6 +702,59 @@ def test_a_beat_typed_wrong_is_learned_again_not_held_against_it(tmp_path):
             assert abs(s.sls.beat) < 0.5 and s.sls_guard.stage == "hold" and demo.pll.manual and demo.pll.locked
             assert wait_for(lambda: s.beat_e is not None and abs(s.beat_e) < 1.0, 2)
             assert e.to_config()["channels"][str(demo.SLAVE)]["sls"]["beat"] == s.sls.beat  # (kept)
+        finally:
+            e.stop()
+    finally:
+        demo.close()
+
+
+def slow_unit(unit, whole_s: float, one_s: float):
+    """A unit as slow as P1029F: one request at a time, its whole list taking whole_s, a value one_s."""
+    import threading
+
+    real, gate = unit.answer, threading.Lock()
+
+    def answer(q):
+        with gate:
+            time.sleep(whole_s if q.startswith("getValues") else one_s)
+            return real(q)
+
+    unit.answer = answer
+
+
+def test_a_slow_unit_is_polled_a_value_at_a_time_and_its_slave_still_guarded(tmp_path):
+    """Its PLL on a unit whose whole list takes 2 s and a value 0.1 s, one request at a time: read a value at a time
+    (only what its guard needs, but every tenth poll); its master's lock lost, the poll under way is cut short and its
+    PLL released at once; relocked once its master holds again."""
+    demo = Demo(discovery_port=0, beat=True, beat_servo=1, wavemeter=SimWavemeter(noise=0.05), exposure=0.004)
+    slow_unit(demo.pll.sls, 2.0, 0.1)
+    try:
+        m, s = demo.MASTER, demo.SLAVE
+        cfg = {"channels": {
+            str(m): {"name": "739 master", "sls": {"kind": "pdh", "host": "127.0.0.1", "port": demo.pdh.sls.port}},
+            str(s): {"name": "739 slave", "link": {"device": demo.sister.key, "laser": 1},
+                     "hop": {"enabled": True, "i_nom": 150.0},
+                     "sls": {"kind": "pll", "host": "127.0.0.1", "port": demo.pll.sls.port, "servo": 1, "master": m,
+                             "beat": 80.0}}}}
+        e = Engine(cfg, demo.make_source, discovery_targets=["127.0.0.1"], drop_path=tmp_path / "drops.jsonl")
+        e.start()
+        ch = e.channels[s]
+        try:
+            assert wait_for(lambda: ch.sls_view is not None, 12), ch.sls_error
+            w = e.sls_watches[s]
+            assert not w.whole and w.client.timeout == sls.SlsWatch.ONE_S and not ch.sls_error
+            assert ch.sls_view.mode == "manual" and ch.sls_view.holds
+            polls = w.polls
+            time.sleep(2.0)
+            assert 2 <= w.polls - polls <= 6  # (brief: 4 values, 0.1 s each)
+            e.engage(s)
+            assert wait_for(lambda: ch.sls_guard is not None and ch.sls_guard.stage == "hold", 5)
+            demo.pdh.drop(3.0)
+            t0 = time.monotonic()
+            assert wait_for(lambda: not demo.pll.manual, 2.0), "not released"
+            assert time.monotonic() - t0 < 0.8  # (the poll under way cut short; the write at once)
+            assert wait_for(lambda: ch.sls_guard.stage == "hold" and demo.pll.locked, 40), ch.sls_guard.stage
+            assert ta_on(demo)
         finally:
             e.stop()
     finally:

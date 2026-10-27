@@ -68,11 +68,15 @@ class FakeSls:
                 if fake.delay:
                     time.sleep(fake.delay)
                 body = fake.answer(urlsplit(self.path).query).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):  # (an answer no longer waited for: a slow unit's)
+                    self.close_connection = True
+                    return
                 fake.asked += 1
 
             def log_message(self, *args):

@@ -399,15 +399,26 @@ def pll_view(t: float, values: dict, servo: int, p: SlsParams, prev: View | None
     return v
 
 
-def read(client: Sls, kind: str, servo: int = 0, whole: bool = True) -> dict:
+BRIEF = {"pll": ("manual", "fast", "slow", "phase", "amp"), "pdh": ("auto", "state", "trans")}  # what a guard needs at
+#   every poll of a unit read a value at a time (the rest at every SlsWatch.FULL_N-th)
+
+
+class Interrupted(Exception):
+    """A poll left half done: something more urgent came up (its master's lock lost)."""
+
+
+def read(client: Sls, kind: str, servo: int = 0, whole: bool = True, brief: bool = False, abort=None) -> dict:
     """What a poll needs of a unit: all its values in one request (whole), else the parameters one by one (a unit that
-    has not every one, or none for getValues, says so: SlsError)."""
+    has not every one, or none for getValues, says so: SlsError); brief: only those BRIEF names; abort: () -> True to
+    stop half way (Interrupted)."""
     if whole:
         return client.values()
     out = {}
     for role, name in names(kind, servo).items():
-        if role in ("detect", "freq", "status", "auto2"):
+        if role in ("detect", "freq", "status", "auto2") or (brief and role not in BRIEF[kind]):
             continue  # (not needed at every poll)
+        if abort is not None and abort():
+            raise Interrupted()
         try:
             out[name] = client.get(name)
         except SlsError:
@@ -460,17 +471,23 @@ def diagnose(host: str, port: int = PORT, timeout: float = 1.5) -> tuple:
     return "error", f"{ip}: {http}"
 
 
-def _one_by_one(host: str, port: int, kind: str, servo: int) -> dict:
-    """What a poll needs, a value at a time, each given SLOW_S (a unit whose whole list is too slow); its firmware's
-    version too. OSError, SlsError as read()."""
+def _one_by_one(host: str, port: int, kind: str, servo: int) -> tuple:
+    """What a poll needs, a value at a time, each given SLOW_S (a unit whose whole list is too slow), its firmware's
+    version too: (values, s its first value took (behind a whole list it was still sending), s each other took).
+    OSError, SlsError as read()."""
     c = Sls(host, port, SLOW_S)
     try:
-        values = read(c, kind, servo, whole=False)
+        t0 = time.monotonic()
         try:
-            values["AppVersion"] = c.get("AppVersion")
+            app = c.get("AppVersion")
         except SlsError:
-            pass
-        return values
+            app = None
+        t1 = time.monotonic()
+        values = read(c, kind, servo, whole=False)
+        each = (time.monotonic() - t1) / max(len(values), 1)
+        if app is not None:
+            values["AppVersion"] = app
+        return values, t1 - t0, each
     finally:
         c.close()
 
@@ -489,8 +506,9 @@ def probe(host: str, port: int = PORT, kind: str = "pll", servo: int = 0, timeou
             if what != "open":  # (its port does not even take connections)
                 return f"{host}:{port}: timed out\n{why}"
             t0 = time.monotonic()
-            values = _one_by_one(host, port, kind or "pll", servo)
-            note = f"\n(its whole list did not come in {timeout:g} s: read a value at a time, as it is polled)"
+            values, first, each = _one_by_one(host, port, kind or "pll", servo)
+            note = (f"\n(its whole list did not come in {timeout:g} s: read a value at a time, as it is polled: "
+                    f"{each * 1e3:.0f} ms each; the first {first * 1e3:.0f} ms, behind the whole list)")
         took = time.monotonic() - t0
     except (OSError, SlsError) as e:
         text = f"{host}:{port}: {e or type(e).__name__}"
@@ -950,6 +968,10 @@ class SlsWatch(threading.Thread):
     POLL_S = 0.1
     SLOW_S = 0.3   # a poll taking longer than this: said once (a dropout shorter than a poll may be missed)
     RETRY_S = 2.0  # s between tries while it does not answer
+    WHOLE_S = 0.5  # s its whole list (getValues) may take (not coming in its timeout, or slower: read a value at a time
+    #                from then on; a slow server sends it whole long after it is no longer wanted)
+    ONE_S = 3.0    # s each value is given, read a value at a time (the first may wait for a whole list it still sends)
+    FULL_N = 10    # read a value at a time: every value at every FULL_N-th poll, the others only what BRIEF names
 
     def __init__(self, p: SlsParams, step, wrote=None, name: str = "", clock=time.time):
         super().__init__(daemon=True, name=f"sls {name or p.unit}")
@@ -959,7 +981,8 @@ class SlsWatch(threading.Thread):
         self.label = name or p.unit
         self._stop_ev = threading.Event()
         self._wake = threading.Event()
-        self.whole = True      # all values in one request (getValues), else one by one
+        self.whole = True      # all values in one request (getValues), else one by one...
+        self.carry = {}        # ...its values at the last poll of them all (carried to the brief ones between)
         self.error = ""        # why it does not answer ('' it does)
         self.last = None       # its last View
         self.polls = 0
@@ -981,8 +1004,7 @@ class SlsWatch(threading.Thread):
             if woken and self.last is not None and not self.error:
                 view, fresh = self.last, False  # (act at once on what is known: its master's lock lost, say)
             else:
-                view = self._poll(self.last)
-                fresh = view is not None
+                view, fresh = self._poll(self.last)
             try:
                 actions = self.step(self, view, fresh)
             except Exception:
@@ -996,29 +1018,31 @@ class SlsWatch(threading.Thread):
             self._wake.wait(max(wait - (self.clock() - t0), 0.0))
         self.client.close()
 
-    def _poll(self, prev):
+    def _poll(self, prev) -> tuple:
+        """(view, fresh): a new poll's, or the last (a poll cut short: woken), or (None, False): no answer."""
         t0 = self.clock()
         try:
             try:
-                values = read(self.client, self.p.kind, self.p.servo, self.whole)
+                values = self._read()
             except SlsError as e:
                 if not self.whole:
                     raise
-                self.whole = False  # (no getValues there, or not all of it: one by one)
-                log.info("%s: %s: its parameters read one by one", self.label, e)
-                values = read(self.client, self.p.kind, self.p.servo, self.whole)
+                self._one_by_one(str(e))  # (no getValues there, or not all of it)
+                values = self._read()
             except socket.timeout:  # (TimeoutError from Python 3.10 on)
                 if not self.whole:
                     raise
-                self.client.close()  # (its whole list too slow for a poll: one by one, if that answers)
-                values = read(self.client, self.p.kind, self.p.servo, False)
-                self.whole = False
-                log.info("%s: its whole list takes longer than %.1f s: its parameters read one by one", self.label,
-                         self.client.timeout)
+                self._one_by_one(f"its whole list does not come in {self.client.timeout:g} s")
+                values = self._read()
+        except Interrupted:
+            self._wake.clear()  # (acted on now)
+            return (self.last, False) if self.last is not None else (None, False)
         except (OSError, SlsError) as e:
             self._fail(str(e) or type(e).__name__)
-            return None
+            return None, False
         t1 = self.clock()
+        if self.whole and t1 - t0 > self.WHOLE_S:
+            self._one_by_one(f"its whole list takes {(t1 - t0) * 1e3:.0f} ms")
         if self.error:
             log.info("%s: %s answers again", self.label, self.p.host)
         self.error = ""
@@ -1033,7 +1057,25 @@ class SlsWatch(threading.Thread):
         else:
             view = pll_view(t, values, self.p.servo, self.p, prev, t1 - t0)
         self.last = view
-        return view
+        return view, True
+
+    def _read(self) -> dict:
+        """Its values: in one request, else one at a time (the brief ones, all of them every FULL_N-th poll), a poll
+        cut short when woken (Interrupted)."""
+        if self.whole:
+            return read(self.client, self.p.kind, self.p.servo, True)
+        brief = bool(self.carry) and self.polls % self.FULL_N != 0
+        got = read(self.client, self.p.kind, self.p.servo, False, brief=brief, abort=self._wake.is_set)
+        if brief:
+            return {**self.carry, **got}
+        self.carry = dict(got)
+        return got
+
+    def _one_by_one(self, why: str):
+        self.whole = False
+        self.client.close()
+        self.client.timeout = max(self.client.timeout, self.ONE_S)
+        log.info("%s: %s: its values read one at a time from now on", self.label, why)
 
     def _fail(self, why: str):
         if why != self.error:
