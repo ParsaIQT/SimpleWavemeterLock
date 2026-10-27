@@ -285,6 +285,8 @@ class Channel:
         self.steady_t = 0.0    # monotonic: its readings steady (no jump of STEADY_MHZ) since then...
         self.steady_f = NAN    # ...the last of them (THz)
         self.mtrack = Track()  # a PLL's slave: its master's readings, followed (this PC's or another's)
+        self.beat_ok = False   # ...its beat learned since the program started (one from before, or typed, steers it
+        #                        back, but the wavemeter reading it off its beat point does not count until then)
         self.master_row = None  # ...its master as last looked at (Elsewhere.row's), None: not found
         self.mview = None      # ...its master's SLS servo, polled from here (sls.View), its error, holding since
         self.m_error = ""
@@ -1742,8 +1744,11 @@ class Engine:
             old = ch.sls
             if ch.state != "off" and (params.kind != old.kind or not params.same_unit(old) or not params.on):
                 self._disengage(ch, "")
-            if params.kind != "pll" or (params.master, params.master_on) != (old.master, old.master_on):
+            if (params.kind != "pll" or (params.master, params.master_on) != (old.master, old.master_on)
+                    or not params.same_unit(old)):
                 ch.beat_seen.clear()
+                ch.beat_ok = False
+            if params.kind != "pll" or (params.master, params.master_on) != (old.master, old.master_on):
                 ch.mtrack = Track()
             if params.kind != "pll" or not params.same_unit(old):
                 ch.fast_seen.clear()
@@ -1889,9 +1894,12 @@ class Engine:
             ch.beat_seen.append((ch.freq - row["f"]) * 1e6)  # (kept learned: two wavemeters' disagreement drifts)
             if len(ch.beat_seen) >= self.BEAT_MIN:
                 beat = round(statistics.median(ch.beat_seen), 2)
-                if not p.beat_known or abs(beat - p.beat) > 0.3:
-                    if not p.beat_known:
-                        log.info("channel %d: its beat with its master learned: %+.2f MHz", ch.n, beat)
+                moved = not p.beat_known or abs(beat - p.beat) > 0.3
+                if not ch.beat_ok:
+                    was = f" (it was {p.beat:+.2f} MHz)" if p.beat_known and moved else ""
+                    log.info("channel %d: its beat with its master learned: %+.2f MHz%s", ch.n, beat, was)
+                    ch.beat_ok = True
+                if moved:
                     p.beat, p.beat_known = beat, True
                     self.dirty = True
         point = self._beat_point(ch, look=False)
@@ -1900,7 +1908,7 @@ class Engine:
         else:
             e = (ch.freq - point) * 1e6
             ch.beat_e = e
-            ch.beat_off_n = ch.beat_off_n + 1 if abs(e) > p.off_mhz else 0
+            ch.beat_off_n = ch.beat_off_n + 1 if abs(e) > p.off_mhz and ch.beat_ok else 0
             near = ch.steering is not None and abs(e - ch.steering) <= p.capture
             ch.near_n = ch.near_n + 1 if near else 0
             if p.master:  # (its setpoint: its beat point, or where it is steered)

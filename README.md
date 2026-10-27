@@ -1315,9 +1315,14 @@ debug messages say *Feature Acquire Failed* / *Aborting:STATE_FAIL*: the autoloc
 
 **The unit**, in *SLS lock…*, is the box's serial number as on its label (`P1029F`): that is its name on the LAN
 (tried as `P1029F.local` too). If *Test* says it is not found, type its IP address instead: its touchscreen shows it
-under *Settings › System Control*. The port is 8080 on every unit. **Find units** asks P1029A … P1029H at once and
-lists those that answer with what each is doing (a Laser Servo *Locked: 3 (0d 01:00:00)*; a 3-channel PLL's servos,
-each in its manual lock or off, at its lock frequency): pick the one that locks the laser.
+under *Settings › System Control*. The port is 8080 on every unit. **Find units** asks P1029A … P1029H at once, and
+every address of this PC's private networks (192.168.x.x, 10.x.x.x, 172.16–31.x.x; no other network is scanned) on
+that port, and lists those that answer with what each is doing (a Laser Servo *Locked: 3 (0d 01:00:00)*; a 3-channel
+PLL's servos, each in its manual lock or off, at its lock frequency): pick the one that locks the laser. Those that
+answer VNC but not port 8080 are named too. **Test**, a unit not answering, says why as far as can be told from here:
+its name not known to this PC; nothing listening on its port; its port taking connections but answering nothing (its
+HTTP server stuck); its port dropped while its VNC or SSH answers (a firewall, or its HTTP server not running); or
+nothing there at all. A unit whose whole list of values (*getValues*) is too slow is read a value at a time.
 
 * **The master** (on the PC whose wavemeter reads it): right-click its row › *SLS lock…* › *an SLS Laser Servo locks
   it to the cavity*, its unit, *Test*. No DLC pro needs linking. Its lock's state then shows on its row, on every PC: a
@@ -1330,11 +1335,12 @@ each in its manual lock or off, at its lock frequency): pick the one that locks 
   laser*: the wavemeter steers it back by its piezo), and set up *Mode-hop recovery…* for it (its nominal current, and
   its TA's seed watched: *auto*), so that it can be recovered if it stops lasing. Click *Relock* (*Watching*): it is
   **guarded** (*Guard it*, on by default).
-* **Its beat**: leave *Beat* empty. It is learned while its PLL holds it (10 s after it locked, the median of its
-  readings less its master's), and kept learned: two wavemeters' disagreement drifts, and the beat follows it. It is
-  the slave's frequency less its master's *as the wavemeters read them*, not the PLL's lock frequency: a PLL at 80 MHz
-  whose beat path has an AOM shifting the master's light by 80 MHz holds the slave on its master's frequency, a beat
-  near 0 (plus whatever the two wavemeters disagree by). Its setpoint is then its beat point, its master's reading plus
+* **Its beat** is learned, never typed: 10 s after its PLL locked, the median of its readings less its master's, and
+  kept learned (two wavemeters' disagreement drifts, and the beat follows it). It is the slave's frequency less its
+  master's *as the wavemeters read them*, not the PLL's lock frequency: a PLL at 80 MHz whose beat path has an AOM
+  shifting the master's light by 80 MHz holds the slave on its master's frequency, a beat near 0 (plus whatever the two
+  wavemeters disagree by). It is learned again each time the program starts: the one from before steers the slave back
+  meanwhile, but the wavemeter reading it off that one is not held against it. Its setpoint is then its beat point, its master's reading plus
   the beat, and its row's deviation the beat as the wavemeters see it. On the row: its PLL's state, slow and fast
   outputs (and beat amplitude, a one-channel PLL's), its master (and its lock, if lost), and what its guard did last.
 
@@ -1348,7 +1354,7 @@ wavemeter): on Sirius's PC, its row › *SLS lock…*:
 | Which PLL | *a 3-channel PLL: servo 1* |
 | Its master | the other SHG, as the list names it: *its wavemeter's name · channel N its name* |
 | Its master's servo | the Laser Servo that locks the other SHG (*Find units*: the one saying *Locked*), or empty |
-| Beat | empty: learned (near 0) |
+| Beat | nothing to enter: learned (near 0) |
 
 *Test* says *3-channel PLL, firmware …* and servo 1 *manual lock*; OK; then *Relock*. The other SHG's PC runs this
 program on the same network (its frame shows on Sirius's PC), its row set to its own Laser Servo (*SLS lock…* there):
@@ -1909,6 +1915,12 @@ itself, as you would:
 * **SLS UNIT NOT ANSWERING**: its name (`P1029F`, tried as `P1029F.local` too) is not known on this PC: give its IP
   address instead (its touchscreen's *Settings › System Control* shows it); or a firewall between them (TCP 8080).
   *SLS lock…* › *Test* says what it finds, *Find units* what answers.
+* ***Test*: port 8080 times out, though VNC to the unit works**: VNC (port 5900) reaching it means the network does;
+  then its HTTP server does not answer. *Test* tells which: *does not answer at all* while VNC answers (something
+  drops port 8080: a firewall on the unit or between, or its HTTP server not running), or *takes connections but does
+  not answer them* (its HTTP server stuck: *Settings › System Control › Reboot*, when the laser it locks can spare
+  it). A browser on the same PC shows the same: `http://192.168.1.113:8080/?parameter=AppVersion` (its address) should
+  say `AppVersion=AppVer:…` at once. If it never does, Stable Laser Systems can say how its HTTP server is started.
 * **A slave's master *not seen (its PC not heard from)***: the master's PC is not running this program, or not on the
   same network (its frame is missing here; see *Several PCs*). The slave's PLL is left as it is; if it drops, it is
   relocked by its own signals, with nothing to steer it by.

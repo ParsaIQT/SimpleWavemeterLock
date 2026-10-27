@@ -968,7 +968,7 @@ def test_sls_dialog_round_trip_and_its_test(app):
         d.port.setValue(demo.pll.sls.port)
         assert not d.master_host.isEnabled()  # (no master yet)
         d.master.setCurrentIndex(next(k for k, (_, n, on) in enumerate(d.masters) if (n, on) == (9, "")))
-        assert d.master_host.isEnabled() and d.beat.text() == "" and d.beat.placeholderText() == "learned"
+        assert d.master_host.isEnabled() and d.beat.text() == "not learned yet"  # (learned, never typed)
         d.capture.setValue(0.8)
         p = d.params()
         assert p == SlsParams(kind="pll", host="127.0.0.1", port=demo.pll.sls.port, master=9, capture=0.8)
@@ -976,11 +976,9 @@ def test_sls_dialog_round_trip_and_its_test(app):
         assert wait_for(lambda: (app.processEvents(), "manual lock (MANUAL)" in d.found.text())[1], 5), d.found.text()
         ch.sls = SlsParams(kind="pll", host="P1029F", servo=2, master=9, beat=80.1, beat_known=True, amp_usual=0.9)
         d = gui.SlsDialog(None, e, ch)
-        assert d.servo.currentIndex() == 2 and d.beat.text() == "+80.10" and d.params() == ch.sls
+        assert d.servo.currentIndex() == 2 and d.beat.text() == "+80.10 MHz, as last learned" and d.params() == ch.sls
         d.servo.setCurrentIndex(3)
-        assert d.params().amp_usual == 0.0  # (another PLL: learned afresh)
-        d.beat.setText("")
-        assert not d.params().beat_known  # (emptied: learned afresh)
+        assert d.params().amp_usual == 0.0 and not d.params().beat_known  # (another PLL: learned afresh)
     finally:
         demo.close()
 

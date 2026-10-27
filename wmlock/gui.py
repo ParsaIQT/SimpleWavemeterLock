@@ -1249,8 +1249,9 @@ class SlsDialog(QtWidgets.QDialog):
         self.host.setPlaceholderText("P1029F: the serial number on its label (its name on the LAN), or its IP address")
         self.port = port(p.port)
         find = QtWidgets.QPushButton("Find units")
-        find.setToolTip("Ask the units named P1029A … P1029H on the LAN what they are and what they do now\n(another "
-                        "prefix: type one of its names first, e.g. P1100A)")
+        find.setToolTip("Ask the units named P1029A … P1029H what they are and what they do now, and every address on "
+                        "this PC's\nprivate networks (192.168.x.x, 10.x.x.x) on this port (another prefix: type one "
+                        "of its names first, e.g. P1100A)")
         find.clicked.connect(self._find)
         box = QtWidgets.QHBoxLayout()
         box.addWidget(self.host, 1)
@@ -1286,19 +1287,13 @@ class SlsDialog(QtWidgets.QDialog):
         box.addWidget(Text("port", "dim"))
         box.addWidget(self.master_port)
         form.addRow("Its master's servo", box)
-        self.beat = QtWidgets.QLineEdit(f"{p.beat:+.2f}" if p.beat_known else "")
-        self.beat_text = self.beat.text()
-        valid = QtGui.QDoubleValidator(-1e5, 1e5, 2, self.beat)
-        valid.setLocale(QtCore.QLocale.c())
-        self.beat.setValidator(valid)
-        self.beat.setPlaceholderText("learned")
-        self.beat.setMaximumWidth(110)
+        self.beat = Text(f"{p.beat:+.2f} MHz, as last learned" if p.beat_known else "not learned yet", "fg")
         box = QtWidgets.QHBoxLayout()
         box.addWidget(self.beat)
-        box.addWidget(Text("MHz: its frequency less its master's, as the wavemeters read them; learned while its PLL "
-                           "holds it,\nand kept learned (empty: learned afresh). Near 0 if it sits on its master's "
-                           "frequency (an AOM\nmaking up the PLL's offset), plus how much the two wavemeters disagree.",
-                           "dim"))
+        box.addWidget(Text("  learned, not typed: its frequency less its master's as the wavemeters read them, while "
+                           "its PLL holds it\n  (not the PLL's lock frequency: near 0 if an AOM makes up the PLL's 80 "
+                           "MHz, plus what the two\n  wavemeters disagree by); learned again each time the program "
+                           "starts, and kept learned", "dim"))
         box.addStretch(1)
         form.addRow("Beat", box)
         self.guard = QtWidgets.QCheckBox(
@@ -1371,8 +1366,7 @@ class SlsDialog(QtWidgets.QDialog):
         kind = self.KIND[self.kind.currentIndex()][0]
         for w in (self.host, self.port):
             w.setEnabled(bool(kind))
-        for w in (self.servo, self.master, self.beat, self.guard, self.capture, self.tries, self.off_mhz,
-                  self.slow_max):
+        for w in (self.servo, self.master, self.guard, self.capture, self.tries, self.off_mhz, self.slow_max):
             w.setEnabled(kind == "pll")
         master = kind == "pll" and self.masters[self.master.currentIndex()][1] > 0
         for w in (self.master_host, self.master_port):
@@ -1396,7 +1390,7 @@ class SlsDialog(QtWidgets.QDialog):
     def _find(self):
         m = re.fullmatch(r"(?i)\s*([a-z]+\d+)[a-z]\s*", self.host.text())
         prefix = m.group(1).upper() if m else "P1029"
-        self.found.paint(f"asking {prefix}A … {prefix}H…", "dim")
+        self.found.paint(f"asking {prefix}A … {prefix}H, and this PC's private networks…", "dim")
         self._units = None
 
         def run():
@@ -1432,34 +1426,30 @@ class SlsDialog(QtWidgets.QDialog):
                 self.units.setPlaceholderText(f"found {len(self.found_units)}: pick the one that locks this laser")
                 self.units.setCurrentIndex(-1)
             self.units.setVisible(bool(self.found_units))
+            vnc = [n for n, s in got if s.startswith("VNC answers")]
             if self.found_units:
                 self.found.paint(f"found {len(self.found_units)}: pick one from the list above", "dim")
+            elif vnc:
+                self.found.paint(f"no unit answers on port {self.port.value()}, but VNC answers at {', '.join(vnc)}: "
+                                 "their HTTP servers do not (Test one of them: it says why)", "warn")
             else:
                 others = "; ".join(f"{n}: {s}" for n, s in got if s != "not found on the LAN")
-                self.found.paint(f"none of {got[0][0]} … {got[-1][0]} answers by name: type its IP address (on its "
-                                 f"touchscreen: Settings › System Control)" + (f" ({others})" if others else ""),
-                                 "warn")
+                self.found.paint("no unit found, by name (P1029A … P1029H) or on this PC's private networks: type its "
+                                 "IP address (on its touchscreen: Settings › System Control)"
+                                 + (f" ({others})" if others else ""), "warn")
 
     def params(self) -> SlsParams:
         kind = self.KIND[self.kind.currentIndex()][0]
         _, master, master_on = self.masters[self.master.currentIndex()]
         d = self.p.to_dict()
-        text = self.beat.text().strip()
-        try:
-            beat = round(float(text), 2) if text else None
-        except ValueError:
-            beat = None
         old = (self.p.master, self.p.master_on.strip()) if self.p.master else (0, "")
-        if (master, master_on) != old and text == self.beat_text:
-            beat = None  # (another master: learned afresh)
         d.update(kind=kind if kind in KINDS else "", host=self.host.text().strip(), port=self.port.value(),
                  servo=self.servo.currentIndex(), master=master, master_on=master_on,
                  master_host=self.master_host.text().strip(), master_port=self.master_port.value(),
-                 beat=beat if beat is not None else 0.0, beat_known=beat is not None, guard=self.guard.isChecked(),
-                 capture=self.capture.value(), tries=self.tries.value(), off_mhz=self.off_mhz.value(),
-                 slow_max=self.slow_max.value())
+                 guard=self.guard.isChecked(), capture=self.capture.value(), tries=self.tries.value(),
+                 off_mhz=self.off_mhz.value(), slow_max=self.slow_max.value())
         if d["servo"] != self.p.servo or d["host"] != self.p.host or (master, master_on) != old:
-            d.update(amp_usual=0.0, fast_mid=0.0, fast_dev=0.0, phase_mid=0.0, phase_dev=0.0)  # (learned afresh)
+            d.update(amp_usual=0.0, beat=0.0, beat_known=False)  # (another unit or master: learned afresh)
         return SlsParams.from_dict(d)
 
 

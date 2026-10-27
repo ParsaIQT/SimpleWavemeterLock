@@ -193,8 +193,12 @@ def sls_text(e, ch, now: float) -> str:
     else:
         text += ch.sls_view.said()
     if p.kind == "pll" and p.master:
-        text += f" · master {master_said(ch)}" + (f", beat {p.beat:+.2f} MHz" if p.beat_known else
-                                                  ", beat not learned yet")
+        text += f" · master {master_said(ch)}"
+        if not p.beat_known:
+            text += ", beat not learned yet"
+        else:
+            text += f", beat {p.beat:+.2f} MHz" + ("" if ch.beat_ok else
+                                                   " (as last learned: checked once its PLL has held it 10 s)")
     g = ch.sls_guard
     if g is not None and g.stage == "failed":
         text += f" · {g.said(time.time())}"
@@ -356,8 +360,9 @@ def notes(e, n: int) -> str:
                 text += (f"; its SLS servo polled from here too, {p.master_host.strip()}:{p.master_port}"
                          + (f" (not answering: {ch.m_error})" if ch.m_error else ""))
             text += (f"; its beat {p.beat:+.2f} MHz, its frequency less its master's as the wavemeters read them "
-                     f"(learned, its PLL holding it, and kept learned)" if p.beat_known else
-                     "; its beat not learned yet (its PLL holding it, it is)")
+                     f"(learned, its PLL holding it, and kept learned"
+                     + (")" if ch.beat_ok else "; as last learned, checked again once its PLL has held it 10 s)")
+                     if p.beat_known else "; its beat not learned yet (its PLL holding it, it is)")
             text += ("\nguarded (Relock): its PLL released at once when its master's lock or its beat is lost, and "
                      "relocked once the master holds again" if p.guard else "\nwatched only: not guarded")
         v = ch.sls_view

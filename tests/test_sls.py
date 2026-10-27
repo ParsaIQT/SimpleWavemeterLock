@@ -164,6 +164,80 @@ def test_survey_says_what_each_unit_is():
         one.close()
 
 
+def test_test_says_why_a_unit_does_not_answer(monkeypatch):
+    """Test, a unit not answering: its name not known here; nothing listening on its port; its port taking connections
+    but answering nothing; its port dropped while VNC (or SSH) answers; nothing answering at all."""
+    assert sls.diagnose("p1029z-not-here")[0] == "name"
+    closed = socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+    closed.close()  # (nothing listens there now)
+    what, why = sls.diagnose("127.0.0.1", port, timeout=0.5)
+    assert what == "refused" and f"nothing listens on its port {port}" in why
+    mute = socket.socket()  # (takes connections, never answers)
+    mute.bind(("127.0.0.1", 0))
+    mute.listen(8)
+    try:
+        port = mute.getsockname()[1]
+        assert sls.diagnose("127.0.0.1", port, timeout=0.5)[0] == "open"
+        monkeypatch.setattr(sls, "SLOW_S", 0.3)
+        said = sls.probe("127.0.0.1", port, "pll", 1, timeout=0.3)
+        assert said.startswith(f"127.0.0.1:{port}: timed out") and "takes connections on its port" in said, said
+    finally:
+        mute.close()
+    states = {sls.PORT: "silent", sls.VNC_PORT: "open", sls.SSH_PORT: "refused"}
+    monkeypatch.setattr(sls, "lookup", lambda host: "192.168.1.113")
+    monkeypatch.setattr(sls, "knock", lambda ip, p, timeout=1.5: states[p])
+    what, why = sls.diagnose("192.168.1.113")
+    assert what == "dropped" and why.startswith("192.168.1.113 is there (VNC answers), but its port 8080 does not "
+                                                "answer at all: a firewall drops it"), why
+    states[sls.VNC_PORT] = "silent"
+    assert sls.diagnose("192.168.1.113")[0] == "absent"
+
+
+def test_a_slow_whole_list_is_read_a_value_at_a_time():
+    """A unit whose whole list (getValues) takes longer than a poll may: Test and its watch read its values one at a
+    time instead."""
+    u = FakeSls("P1029S", {"AutoLockEnable": True, "AutoLockState": "Locked: 1 (0d 00:00:10)", "Transmission": 3.0,
+                           "TransmissionThreshold": 0.2, "LockCount": 1, "LockTime": 10.0, "AppVersion": "AppVer:X"})
+    real = u.answer
+    u.answer = lambda q: (time.sleep(1.6), real(q))[1] if q.startswith("getValues") else real(q)
+    try:
+        said = sls.probe(u.host, u.port, "pdh", timeout=0.5)
+        assert said.startswith(f"{u.host}: Laser Servo, firmware X") and "Locked: 1" in said, said
+        assert said.endswith("(its whole list did not come in 0.5 s: read a value at a time, as it is polled)")
+        got = []
+        w = sls.SlsWatch(SlsParams(kind="pdh", host=u.host, port=u.port), step=lambda w, v, fresh: got.append(v) or [])
+        w.start()
+        try:
+            assert wait_for(lambda: any(v is not None for v in got), 6)
+            assert not w.whole and next(v for v in got if v is not None).holds
+        finally:
+            w.stop()
+            w.join(3)
+    finally:
+        u.close()
+
+
+def test_find_units_looks_on_this_pcs_private_networks():
+    """Find units, names not known here: this PC's private networks (only those) asked on the units' port; a unit
+    found so said by its address; one answering VNC only said so."""
+    import ipaddress
+
+    nets = sls.private_nets(["192.168.1.50", "139.184.52.46", "10.0.0.7", "127.0.0.1", "169.254.3.4", "x"])
+    assert nets == [ipaddress.IPv4Network("192.168.1.0/24"), ipaddress.IPv4Network("10.0.0.0/24")]
+    demo = Demo(discovery_port=0, beat=True, beat_servo=1)
+    try:
+        port = demo.pll.sls.port
+        loop = [ipaddress.IPv4Network("127.0.0.0/30")]
+        assert sls.scan(loop, (port,), timeout=0.3) == {"127.0.0.1": [port]}
+        found = sls.units("P1029Z-not-here-", letters="A", port=port, nets=loop)
+        assert found[0] == ("P1029Z-not-here-A", "not found on the LAN")
+        assert found[1][0] == "127.0.0.1" and found[1][1].startswith("3-channel PLL: servo 1 manual lock"), found
+    finally:
+        demo.close()
+
+
 def test_settings_from_before_and_what_is_learned_afresh():
     old = SlsParams.from_dict({"kind": "pll", "host": "P1029H", "master": 9, "beat": 80.0})  # (before beat_known)
     assert old.beat_known and old.beat == 80.0 and old.master_where == "channel 9"
@@ -599,6 +673,34 @@ def test_where_its_outputs_sit_learned_afresh_when_engaged_again(tmp_path):
             assert wait_for(lambda: s.sls.fast_dev > 0, 8) and s.sls.fast_mid == pytest.approx(0.4)
             time.sleep(1.0)
             assert s.sls_guard.stage == "hold" and demo.pll.manual  # (held, not released again)
+        finally:
+            e.stop()
+    finally:
+        demo.close()
+
+
+def test_a_beat_typed_wrong_is_learned_again_not_held_against_it(tmp_path):
+    """Its beat set to 80 MHz (the PLL's lock frequency, typed in by mistake: with an AOM making that up, it sits on
+    its master's frequency, a beat of 0): Relock does not release it for reading 80 MHz off its beat point; once its
+    PLL has held it, its beat is learned again (0) and gone by from then on."""
+    demo = Demo(discovery_port=0, beat=True, beat_servo=1, beat_offset=0.0, wavemeter=SimWavemeter(noise=0.05),
+                exposure=0.004)
+    try:
+        e = make_engine(demo, tmp_path, servo=1, beat=80.0)
+        e.BEAT_LEARN_S = 2.0
+        s = e.channels[demo.SLAVE]
+        try:
+            assert s.sls.beat_known and s.sls.beat == 80.0 and not s.beat_ok  # (as saved: not gone by yet)
+            assert "(as last learned: checked once its PLL has held it 10 s)" in view.row(e, demo.SLAVE,
+                                                                                          time.monotonic())["info"]
+            e.engage(demo.SLAVE)
+            assert wait_for(lambda: s.sls_guard is not None and s.sls_guard.stage == "hold", 3)
+            assert wait_for(lambda: s.beat_e is not None and abs(s.beat_e + 80.0) < 2.0, 3), s.beat_e
+            assert s.beat_off_n == 0 and demo.pll.manual  # (80 MHz off what it was told: not held against it)
+            assert wait_for(lambda: s.beat_ok, 10), (len(s.beat_seen), s.sls_since)
+            assert abs(s.sls.beat) < 0.5 and s.sls_guard.stage == "hold" and demo.pll.manual and demo.pll.locked
+            assert wait_for(lambda: s.beat_e is not None and abs(s.beat_e) < 1.0, 2)
+            assert e.to_config()["channels"][str(demo.SLAVE)]["sls"]["beat"] == s.sls.beat  # (kept)
         finally:
             e.stop()
     finally:

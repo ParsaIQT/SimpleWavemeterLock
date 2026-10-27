@@ -39,12 +39,14 @@ from __future__ import annotations
 
 import html
 import http.client
+import ipaddress
 import logging
 import math
 import re
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from urllib.parse import quote
 
@@ -414,15 +416,87 @@ def read(client: Sls, kind: str, servo: int = 0, whole: bool = True) -> dict:
     return out
 
 
+VNC_PORT, SSH_PORT = 5900, 22  # what else a unit answers on (its GUI, by VNC; its Raspberry Pi, by SSH)
+SLOW_S = 6.0  # s a unit is given for one value, its whole list (getValues) not answering in time
+
+
+def knock(ip: str, port: int, timeout: float = 1.5) -> str:
+    """A TCP port at an address: 'open', 'refused' (nothing listens there), 'silent' (no answer: dropped on the way,
+    or nothing there), or why not (no route...)."""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return "open"
+    except ConnectionRefusedError:
+        return "refused"
+    except socket.timeout:
+        return "silent"
+    except OSError as e:
+        return str(e) or type(e).__name__
+
+
+def diagnose(host: str, port: int = PORT, timeout: float = 1.5) -> tuple:
+    """Why a unit does not answer its HTTP requests, as far as can be told from here: (what, why), what one of 'name'
+    (not known to this PC), 'refused', 'open' (its port takes connections: its server is stuck, or slow), 'dropped'
+    (it is there, VNC or SSH answering, but its port does not), 'absent' (nothing answers), or 'error'."""
+    try:
+        ip = lookup(host)
+    except OSError:
+        return "name", (f"the name {host.strip()} is not known to this PC: type its IP address instead (on its "
+                        "touchscreen: Settings › System Control)")
+    http = knock(ip, port, timeout)
+    if http == "refused":
+        return "refused", (f"{ip} is there, but nothing listens on its port {port}: its HTTP server is not running "
+                           "(Settings › System Control › Reboot; else ask Stable Laser Systems)")
+    if http == "open":
+        return "open", (f"{ip} takes connections on its port {port} but does not answer them: its HTTP server is "
+                        "stuck or slow (Settings › System Control › Reboot)")
+    others = [name for name, p in (("VNC", VNC_PORT), ("SSH", SSH_PORT)) if knock(ip, p, timeout) == "open"]
+    if others:
+        return "dropped", (f"{ip} is there ({' and '.join(others)} answer{'' if len(others) > 1 else 's'}), but its "
+                           f"port {port} does not answer at all: a firewall drops it (on the unit, or between), or "
+                           "its HTTP server is not running")
+    if http == "silent":
+        return "absent", f"{ip} does not answer at all: not on a network this PC reaches, or off"
+    return "error", f"{ip}: {http}"
+
+
+def _one_by_one(host: str, port: int, kind: str, servo: int) -> dict:
+    """What a poll needs, a value at a time, each given SLOW_S (a unit whose whole list is too slow); its firmware's
+    version too. OSError, SlsError as read()."""
+    c = Sls(host, port, SLOW_S)
+    try:
+        values = read(c, kind, servo, whole=False)
+        try:
+            values["AppVersion"] = c.get("AppVersion")
+        except SlsError:
+            pass
+        return values
+    finally:
+        c.close()
+
+
 def probe(host: str, port: int = PORT, kind: str = "pll", servo: int = 0, timeout: float = 2.0) -> str:
     """One look at a unit (the settings dialog's Test): what it is and what it says now, or why not."""
     c = Sls(host, port, timeout)
+    note = ""
     try:
         t0 = time.monotonic()
-        values = c.values()
+        try:
+            values = c.values()
+        except socket.timeout:  # (TimeoutError from Python 3.10 on)
+            c.close()
+            what, why = diagnose(host, port)
+            if what != "open":  # (its port does not even take connections)
+                return f"{host}:{port}: timed out\n{why}"
+            t0 = time.monotonic()
+            values = _one_by_one(host, port, kind or "pll", servo)
+            note = f"\n(its whole list did not come in {timeout:g} s: read a value at a time, as it is polled)"
         took = time.monotonic() - t0
     except (OSError, SlsError) as e:
-        return f"{host}:{port}: {e or type(e).__name__}"
+        text = f"{host}:{port}: {e or type(e).__name__}"
+        if isinstance(e, SlsError):
+            return text
+        return text + "\n" + diagnose(host, port)[1]
     finally:
         c.close()
     app = values.get("AppVersion", "").replace("AppVer:", "").strip()
@@ -439,17 +513,50 @@ def probe(host: str, port: int = PORT, kind: str = "pll", servo: int = 0, timeou
         if is_pll:
             return head + ": a PLL, not a Laser Servo"
         view = pdh_view(time.time(), values)
-    return f"{head}\n{view.said()}" + (f"\nnot holding: {view.why}" if view.holds is False else "")
+    return f"{head}\n{view.said()}" + (f"\nnot holding: {view.why}" if view.holds is False else "") + note
+
+
+def _identify(host: str, port: int) -> dict:
+    """What a unit is and what it does, a value at a time (its whole list too slow), each given SLOW_S."""
+    c = Sls(host, port, SLOW_S)
+    out = {}
+    try:
+        for name in ("AppVersion", "Servo1LockState", "PLLLockState", "AutoLockState"):
+            try:
+                out[name] = c.get(name)
+            except SlsError:
+                pass
+        if "Servo1LockState" in out:
+            for k in (1, 2, 3):
+                out.update(read(c, "pll", k, whole=False))
+                out[f"Servo{k}LockFrequency"] = c.get(f"Servo{k}LockFrequency")
+        elif "PLLLockState" in out:
+            out.update(read(c, "pll", 0, whole=False))
+            out["LockFrequency"] = c.get("LockFrequency")
+        elif "AutoLockState" in out:
+            out.update(read(c, "pdh", 0, whole=False))
+        return out
+    finally:
+        c.close()
 
 
 def survey(host: str, port: int = PORT, timeout: float = 1.5) -> str:
     """What a unit is and what it says now, in a line (the settings dialog's Find units), or why not."""
     c = Sls(host, port, timeout)
     try:
-        values = c.values()
+        try:
+            values = c.values()
+        except socket.timeout:  # (TimeoutError from Python 3.10 on)
+            c.close()
+            what, why = diagnose(host, port, timeout)
+            if what != "open":
+                return why
+            values = _identify(host, port)  # (its port takes connections: its whole list is slow)
     except (OSError, SlsError) as e:
         text = str(e) or type(e).__name__
-        return "not found on the LAN" if "Name or service" in text or "getaddrinfo" in text or "11001" in text else text
+        if "Name or service" in text or "getaddrinfo" in text or "11001" in text or "nodename" in text:
+            return "not found on the LAN"
+        return text if isinstance(e, SlsError) else diagnose(host, port, timeout)[1]
     finally:
         c.close()
     now = time.time()
@@ -469,20 +576,77 @@ def survey(host: str, port: int = PORT, timeout: float = 1.5) -> str:
     return f"answers, but is none of the units known here ({len(values)} values)"
 
 
-def units(prefix: str = "P1029", letters: str = "ABCDEFGH", port: int = PORT, timeout: float = 1.5) -> list:
-    """[(name, survey)] of the units named prefix + a letter (P1029A ... P1029H), asked at once."""
+def private_nets(addresses) -> list:
+    """The /24 networks of this PC's private addresses (10/8, 172.16/12, 192.168/16: where lab instruments sit; no
+    other network is scanned)."""
+    nets = []
+    for a in addresses:
+        try:
+            ip = ipaddress.IPv4Address(a)
+        except ValueError:
+            continue
+        if ip.is_private and not (ip.is_loopback or ip.is_link_local or ip.is_unspecified):
+            net = ipaddress.IPv4Network(f"{a}/24", strict=False)
+            if net not in nets:
+                nets.append(net)
+    return nets
+
+
+def scan(nets, ports=(PORT, VNC_PORT), timeout: float = 0.4, workers: int = 64) -> dict:
+    """{address: [those of its ports that are open]} of the hosts of those networks that answer on any of them (a
+    connection each, many at once)."""
+    jobs = [(str(h), p) for net in nets for h in net.hosts() for p in ports]
+    found = {}
+    if not jobs:
+        return found
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+        for (ip, p), state in zip(jobs, pool.map(lambda j: knock(j[0], j[1], timeout), jobs)):
+            if state == "open":
+                found.setdefault(ip, []).append(p)
+    return found
+
+
+def units(prefix: str = "P1029", letters: str = "ABCDEFGH", port: int = PORT, timeout: float = 1.5,
+          nets=None) -> list:
+    """[(name or address, what it is and says)]: the units named prefix + a letter (P1029A ... P1029H), asked at once;
+    then the hosts of this PC's private networks (nets: those; None, as its addresses say) that answer on port, and
+    those that answer VNC only (said so: a unit whose HTTP server does not answer)."""
     names = [prefix + c for c in letters]
     found = {}
 
-    def ask(name):
-        found[name] = survey(name, port, timeout)
+    def ask(where):
+        found[where] = survey(where, port, timeout)
 
-    threads = [threading.Thread(target=ask, args=(n,), daemon=True) for n in names]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout + 2.0)
-    return [(n, found.get(n, "no answer")) for n in names]
+    def ask_all(wheres):
+        threads = [threading.Thread(target=ask, args=(w,), daemon=True) for w in wheres]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout + 4 * SLOW_S)
+
+    ask_all(names)
+    out = [(n, found.get(n, "no answer")) for n in names]
+    if nets is None:
+        from .dlcpro import lan_addresses
+
+        nets = private_nets(lan_addresses())
+    if not nets:
+        return out
+    known = set()
+    for n, said in out:
+        if said != "not found on the LAN":
+            try:
+                known.add(lookup(n))
+            except OSError:
+                pass
+    hosts = scan(nets, (port, VNC_PORT))
+    order = sorted(hosts, key=ipaddress.IPv4Address)
+    serving = [ip for ip in order if port in hosts[ip] and ip not in known]
+    ask_all(serving)
+    out += [(ip, found.get(ip, "no answer")) for ip in serving]
+    out += [(ip, f"VNC answers, its port {port} does not: a unit whose HTTP server does not answer?")
+            for ip in order if port not in hosts[ip]]
+    return out
 
 
 # ------------------------------------------------------------------------------------------------- the guard
@@ -843,6 +1007,14 @@ class SlsWatch(threading.Thread):
                 self.whole = False  # (no getValues there, or not all of it: one by one)
                 log.info("%s: %s: its parameters read one by one", self.label, e)
                 values = read(self.client, self.p.kind, self.p.servo, self.whole)
+            except socket.timeout:  # (TimeoutError from Python 3.10 on)
+                if not self.whole:
+                    raise
+                self.client.close()  # (its whole list too slow for a poll: one by one, if that answers)
+                values = read(self.client, self.p.kind, self.p.servo, False)
+                self.whole = False
+                log.info("%s: its whole list takes longer than %.1f s: its parameters read one by one", self.label,
+                         self.client.timeout)
         except (OSError, SlsError) as e:
             self._fail(str(e) or type(e).__name__)
             return None
