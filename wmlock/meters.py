@@ -291,7 +291,7 @@ class Elsewhere:
                 holds, why = m.engine.holds_of(ch)
                 f = ch.freq if ch.freq > 0 else None
                 return {"f": f, "t": ch.t if ch.t > 0 else None, "holds": holds, "why": why, "name": ch.name,
-                        "label": label}
+                        "label": label, "dev": ch.error_mhz if f and ch.setpoint_nm else None}
         share = self.share
         if share is None or not share.on:
             return None
@@ -307,6 +307,7 @@ class Elsewhere:
             t = got - age if age is not None and got is not None else None
             f = v.get("f")
             holds, why = row_holds(v)
+            dev = v.get("dev")
             return {"f": f if f else None, "t": t, "holds": holds, "why": why, "name": v.get("name", ""),
-                    "label": label}
+                    "label": label, "dev": dev if isinstance(dev, (int, float)) and f else None}
         return None

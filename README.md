@@ -123,7 +123,8 @@ it switches that channel back on when the laser needs relocking, then off again
 | A wavemeter of this PC's, with others (see *Several wavemeters on one PC*) | Click its name to fold it away or back; right-click its name: Swap settings with…, Hide this wavemeter…, Network…; right-click empty space: Show wavemeter |
 
 Greyed digits mean the channel has had no new reading for 3 s; a grey *off* in their place, that
-someone unticked the channel in the WLM software (see *Its wavemeter channel switched off*).
+someone unticked the channel in the WLM software (see *Its wavemeter channel switched off*). What a
+row says under its deviation goes onto more lines when it is long: the window keeps its width.
 
 ## The lock
 
@@ -1398,21 +1399,26 @@ again only well above its current), its TA, without seed, switches itself off, a
 night. Guarded:
 
 1. **Released at once**: its master's servo saying it lost the lock (its watch tells the slave's at once; on another
-   PC, as its row says), or two polls of the slave not holding: its manual lock off (its outputs back to zero, the
-   slave back where its DLC pro has it). In the simulation, the PLL is released 0.1–0.2 s after the master's lock
-   drops, before the slave stops lasing.
+   PC, as its row says), the slave hopping (the wavemeter reading it 1 GHz or more from its beat point, two readings
+   in a row; 0.4 of its mode spacing once that is known), or two polls of the slave not holding: its manual lock off
+   (its outputs back to zero, the slave back where its DLC pro has it). In the simulation, the PLL is released 0.1–0.2
+   s after the master's lock drops.
 2. **Lasing first**: a slave that stopped lasing anyway (its seed power, or no reading) is recovered at once by its
    mode-hop recovery: its current jumped up until it lases, brought back down slowly (before its TA's delay is up),
    onto its beat point. Without *Mode-hop recovery…* set up it is waited for, 90 s at most.
-3. **The master first**: nothing more until the master has held 3 s (watched; else its readings steady that long; its
-   PC not heard from at all, 3 s after the release).
-4. **Steered**: the wavemeter lock brings the slave to its beat point (its PLL still off); a one-channel PLL is engaged
+3. **The master first, on target**: nothing more until the master has held 3 s (watched; else its readings steady
+   that long; its PC not heard from at all, 3 s after the release), and reads within 100 MHz of its own setpoint, if it
+   has one (`master_off` in its settings: locked on the wrong peak, it is not followed: *waiting for its master to be
+   on target (it reads +1520 MHz from its own setpoint)*).
+4. **Recentered after a hop**: a slave a hop from its beat point is recovered (its mode-hop recovery puts it back on its
+   mode, in the middle of it, onto its beat point), not steered there by the piezo.
+5. **Steered**: the wavemeter lock brings the slave to its beat point (its PLL still off); a one-channel PLL is engaged
    the moment its beat amplitude shows the beat in its band (0.7 of its usual), else a half capture either side in turn
    (±0.3, ±0.6, ±0.9, ±1.2 MHz with a capture of 0.6 MHz); a 3-channel PLL once three readings are within *Capture* of
    it.
-5. **Engaged**: its manual lock on, and released again at the first poll it does not hold (0.15 s on); holding 1.5 s,
-   it is locked: *relocked: its PLL holds it again*.
-6. **Again**: an engagement that does not hold (and stops the slave lasing: recovered again) is tried again, a little
+6. **Engaged**: its manual lock on (its master still on target), and released again at the first poll it does not
+   hold (0.15 s on); holding 1.5 s, it is locked: *relocked: its PLL holds it again*.
+7. **Again**: an engagement that does not hold (and stops the slave lasing: recovered again) is tried again, a little
    either side; after *Tries* (6) in a row, it gives up for 5 minutes, the slave left lasing, free, where it is
    (**BEAT LOCK LOST** · *gave up: … tries again in …*), then tries again; given up three times in a row, it tries no
    more until you click *Relock* (something else is wrong: look at it).

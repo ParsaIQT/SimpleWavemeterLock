@@ -1032,6 +1032,32 @@ def test_sls_dialog_masters_elsewhere_and_find_units(app):
         d.found.text()
 
 
+def test_a_long_message_under_a_laser_wraps_and_the_window_keeps_its_width(app, demo):
+    """What a row says under a laser, however long (a recovery's, say), goes onto more lines: the window does not get
+    wider for it (it used to, message after message)."""
+    e = Engine({"channels": {"1": {"name": "397"}, "2": {"name": "866"}}}, demo.make_source)
+    win = gui.MainWindow(e, lambda: None)
+    e.start()
+    win.show()
+    try:
+        assert wait_for(lambda: (app.processEvents(), 1 in win.rows)[1], 5)
+        spin(app, 0.3)
+        row, width = win.rows[1], win.minimumSizeHint().width()
+        lines = row.info.fontMetrics().height()
+        with e.lock:
+            e.channels[1].message = ("recovery failed, it stops lasing below 75.10 mA, too near the top of the window "
+                                     "(74.35 mA): left lasing at 75.88 mA: look at the laser (left at 75.88 mA, "
+                                     "115.50 V); tries again in 300 s, after its master has held 3 s and the slave "
+                                     "reads near its beat point once more")
+        assert wait_for(lambda: (app.processEvents(), "tries again in 300 s" in row.info.text())[1], 3)
+        spin(app, 0.3)
+        assert win.minimumSizeHint().width() <= width + 2, (width, win.minimumSizeHint().width())
+        assert row.info.height() >= 2 * lines, (row.info.height(), lines)  # (on more than one line)
+    finally:
+        win.close()
+        e.stop()
+
+
 def test_rows_of_lasers_sls_units_lock(app, tmp_path):
     """The master's row and the slave's: Relock and Watching, the unit's state on the line under the digits, and
     Relocking while the guard has the slave."""

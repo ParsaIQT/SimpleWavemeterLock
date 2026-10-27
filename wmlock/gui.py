@@ -296,6 +296,9 @@ class Row(QtWidgets.QFrame):
         self.anchor_text = Text("", "dim", win.mono_font)  # replaces the setpoint on the reference row
         self.anchor_text.hide()
         self.info = Text("", "dim")
+        self.info.setWordWrap(True)  # (a long one goes onto more lines: the window keeps its width)
+        self.info.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+        self.info.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.btn = QtWidgets.QPushButton("Lock")
         self.btn.setObjectName("lock")
         self.btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)

@@ -227,6 +227,8 @@ class SlsParams:
     capture: float = 0.6      # pll: MHz: brought this close to its beat point by the wavemeter, its PLL is engaged
     tries: int = 6            # pll: tries in a row that fail before it waits Guard.RETRY_S, and tries again
     off_mhz: float = 10.0     # pll: its reading further than this from its beat point (two in a row), it has lost it
+    master_off: float = 100.0  # pll: MHz: its master read further than this from its own setpoint is not on target:
+    #                            its PLL is not engaged until it is (its lock on the wrong peak, say)
     slow_max: float = 5.0     # pll: V: its slow output's range, either way; at 95 % of it, it is at its rail (0: never)
     fast_max: float = 0.0     # pll: V: likewise its fast output (0: not watched: what units it shows is not known)
     ramp: float = 1.0         # pll: V/s: its slow output running faster than this, it has lost it (0: not watched)
@@ -684,7 +686,9 @@ class Look:
     beat_off: str = ""            # the wavemeter reads it off its beat point (two readings in a row): how far
     near_n: int = 0               # readings in a row within capture of where it is being steered
     lasing: bool | None = None    # by its seed power (None: no telling)
-    far: str = ""                 # the wavemeter reads it too far from its beat point to steer it (a hop), or not
+    far: str = ""                 # no reading of it (it may not lase), or steering it failed: why
+    hopped: str = ""              # the wavemeter reads it a hop from its beat point (two readings in a row): how far
+    master_off: str = ""          # its master holds, but not on target (read far from its own setpoint): how far
     can_steer: bool = False       # the wavemeter lock can steer it there (a controller linked, readings, a beat point)
     can_recover: bool = False     # its mode-hop recovery is set up
     recovering: bool = False      # its mode-hop recovery runs
@@ -694,7 +698,9 @@ class Look:
 class Guard:
     """The guard of a slave its PLL's manual lock beat-locks (see the module): told what is known at each step (Look),
     it says what to do: ('release', why), ('engage',), ('steer', MHz from the beat point), ('unsteer',), ('recover',
-    why, urgent), ('disarm', why), ('held',), ('gave_up', why). Its stage and why are shown.
+    why, urgent[, quick]), ('disarm', why), ('held',), ('gave_up', why). Its stage and why are shown. A hop: its PLL
+    released at once, the slave recentered (its mode-hop recovery) once its master holds on target, and only then its
+    PLL engaged again.
 
     Stages: idle (not armed), auto (its autolock has it: watched), hold (its manual lock holds it), released (by this
     guard: waiting for its master and the slave), recover (its mode-hop recovery has it), steer (the wavemeter
@@ -730,6 +736,7 @@ class Guard:
         self.search_j = 0    # ...the search's point (a beat amplitude to go by: looked for there, not engaged)
         self.tried_recovery = False
         self.asked = ""      # a recentering asked for (by hand): why, its PLL being released for it
+        self.wait_why = ""   # released: its master not on target (why it is not engaged)
 
     @property
     def relocking(self) -> bool:
@@ -783,6 +790,9 @@ class Guard:
             if k.master is False:
                 self._release(out, now, "its master's lock was lost")
                 return out
+            if k.hopped:  # (a hop: released at once, before its PLL runs it away)
+                self._release(out, now, f"it hopped: the wavemeter reads it {k.hopped}")
+                return out
             bad = p.why if p.holds is False else (f"the wavemeter reads it {k.beat_off}" if k.beat_off else "")
             if bad and k.fresh:
                 self.bad_n += 1
@@ -813,6 +823,11 @@ class Guard:
                 return out
             if not self._master_ready(k):
                 return out
+            if k.hopped and k.can_recover and not self.tried_recovery:  # (a hop: recentered first, onto its beat
+                self.tried_recovery = True                               # point, its master on target)
+                out.append(("recover", f"it hopped: the wavemeter reads it {k.hopped}", False))
+                self._go("recover", now)
+                return out
             if k.can_steer:
                 self.search_j = 0
                 self._steer(out, now, self._point(p))
@@ -828,7 +843,8 @@ class Guard:
         if self.stage == "steer":
             amp = p is not None and p.amp is not None
             want = max(p.amp_min or 0.0, self.ENGAGE_AMP * self.p.amp_usual) if amp else 0.0
-            if k.master is False or k.lasing is False or k.far:
+            hop = k.hopped and not self.tried_recovery  # (it hopped meanwhile: recentered first)
+            if k.master is False or k.master_off or k.lasing is False or k.far or hop:
                 out.append(("unsteer",))
                 self._go("released", now)
             elif amp and want and p.amp >= want:  # (the beat in its band: engaged)
@@ -867,7 +883,7 @@ class Guard:
                         self.wrote, self.writes = now, self.writes + 1
                 return out
             bad = (p.why if p.holds is False else "its master's lock was lost" if k.master is False else
-                   f"the wavemeter reads it {k.beat_off}" if k.beat_off else "")
+                   k.master_off if k.master_off else f"the wavemeter reads it {k.beat_off}" if k.beat_off else "")
             if bad and k.fresh:
                 out.append(("release", f"it did not hold: {bad}"))
                 self.wrote = now
@@ -944,8 +960,10 @@ class Guard:
         return True
 
     def _master_ready(self, k: Look) -> bool:
-        """Its master has held MASTER_S (watched), or read steady that long; not told, MASTER_S since the release."""
-        if k.master is False:
+        """Its master has held MASTER_S (watched), or read steady that long; not told, MASTER_S since the release; and
+        it is on target (read near its own setpoint, if it has one)."""
+        self.wait_why = k.master_off
+        if k.master is False or k.master_off:
             return False
         if k.master_s is not None:
             return k.master_s >= self.MASTER_S
@@ -969,7 +987,9 @@ class Guard:
     def said(self, now: float) -> str:
         """Its stage, for the row."""
         if self.stage == "released":
-            return "its PLL released: waiting for its master to hold, the slave to lase"
+            if self.wait_why:
+                return f"its PLL released: waiting for its master to be on target ({self.wait_why})"
+            return "its PLL released: waiting for its master to hold on target, the slave to lase"
         if self.stage == "recover":
             return "its PLL released: the slave being recovered"
         if self.stage == "steer":

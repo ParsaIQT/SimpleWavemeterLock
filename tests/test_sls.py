@@ -21,6 +21,7 @@ from wmlock.share import Share, clean
 from wmlock.sim import Demo, SimWavemeter
 from wmlock.simsls import FakeSls
 from wmlock.sls import Guard, Look, SlsParams, View
+from wmlock.wavemeter import C_NM_THZ
 
 
 # ------------------------------------------------------------------------------------------------- the client
@@ -316,6 +317,31 @@ def test_guard_releases_when_the_master_is_lost_and_relocks_once_it_holds():
     assert not g.relocking and g.tries == 0
 
 
+def test_guard_a_hop_released_at_once_recentered_and_engaged_only_with_its_master_on_target():
+    """A hop (Sirius, 27 October: 4 GHz): its PLL released at once (no second poll waited for), the slave recentered
+    (its mode-hop recovery, not steered there by the piezo) once its master holds on target, and only then steered and
+    engaged; its master holding but read far from its own setpoint (on the wrong peak, say), it is not engaged."""
+    g = Guard(SlsParams(kind="pll", host="x"))
+    assert g.step(look(0.0, pv())) == [] and g.stage == "hold"
+    hop = "+4.034 GHz from its beat point"
+    assert g.step(look(0.1, pv(), hopped=hop)) == [("release", f"it hopped: the wavemeter reads it {hop}")]
+    off = pv(mode="", holds=None)
+    wrong = "it reads +1520 MHz from its own setpoint"
+    assert g.step(look(1.0, off, hopped=hop, master_off=wrong, can_recover=True, can_steer=True)) == []
+    assert g.stage == "released" and wrong in g.said(1.0)  # (its master holds, but not on target: waited for)
+    assert g.step(look(2.0, off, hopped=hop, can_recover=True, can_steer=True)) == [
+        ("recover", f"it hopped: the wavemeter reads it {hop}", False)]
+    assert g.stage == "recover"
+    assert g.step(look(10.0, off, can_recover=True, can_steer=True, recovering=True)) == []
+    assert g.step(look(20.0, off, can_recover=True, can_steer=True, recovered="")) == [] and g.stage == "released"
+    assert g.step(look(20.1, off, master_off=wrong, can_recover=True, can_steer=True)) == []  # (off target again)
+    assert g.step(look(21.0, off, can_recover=True, can_steer=True)) == [("steer", 0.0)]
+    assert g.step(look(22.0, off, near_n=3, master_off=wrong, can_steer=True)) == [("unsteer",)]  # (not engaged)
+    assert g.stage == "released"
+    assert g.step(look(23.0, off, can_steer=True)) == [("steer", 0.0)]
+    assert g.step(look(24.0, off, near_n=3, can_steer=True)) == [("unsteer",), ("engage",)]
+
+
 def test_guard_releases_after_two_polls_not_holding_and_a_search_by_amplitude():
     g = Guard(SlsParams(kind="pll", host="x", capture=0.6, amp_usual=0.88))
     assert g.step(look(0.0, pv(amp=0.88, amp_min=0.3))) == [] and g.stage == "hold"
@@ -593,6 +619,36 @@ def test_a_lock_switched_off_by_hand_ends_its_dropout_and_the_next_begins_afresh
         s.sls_guard._go("hold", 119.0)
         e._sls_track(s, pv(t=120.0))
     assert [(t0, round(dt, 3)) for t0, dt in s.drops] == [(100.0, 10.0), (112.0, 8.0)]
+
+
+def test_a_hop_releases_its_pll_at_once_recenters_it_and_engages_it_with_its_master_on_target(lab, tmp_path):
+    """The slave hops (a mode, 6 GHz) while its PLL holds it: its PLL released at once, by the wavemeter; the slave
+    recentered (its mode-hop recovery) and its PLL engaged again only once its master is on target: held at its lock,
+    but read 1.5 GHz from its own setpoint (on the wrong peak, as it were), it is left released until it is."""
+    e = make_engine(lab, tmp_path)
+    s, m = e.channels[lab.SLAVE], e.channels[lab.MASTER]
+    slave = lab.laser(lab.SLAVE)
+    slave.ecdl.i_stop = None  # (it lases on whatever its PLL does: the hop alone tells)
+    try:
+        e.engage(lab.MASTER)
+        e.engage(lab.SLAVE)
+        assert wait_for(lambda: s.sls_guard is not None and s.sls_guard.stage == "hold", 3)
+        on_target = C_NM_THZ / m.freq
+        e.set_setpoint(lab.MASTER, round(C_NM_THZ / (m.freq + 1.5e-3), 9))  # (its master 1.5 GHz off its setpoint)
+        slave.hop_mode(+1)
+        assert wait_for(lambda: not lab.pll.manual, 2), "not released"
+        assert s.sls_note.startswith("its PLL released: it hopped: the wavemeter reads it"), s.sls_note
+        time.sleep(3.0)
+        assert s.runner is None and not lab.pll.manual and s.sls_guard.stage == "released"
+        assert "waiting for its master to be on target (it reads -1500 MHz from its own setpoint)" in \
+            s.sls_guard.said(time.time())
+        e.set_setpoint(lab.MASTER, round(on_target, 9))  # (its master on target)
+        assert wait_for(lambda: s.runner is not None, 5), s.sls_guard.said(time.time())
+        assert s.hop_why.startswith("it hopped: the wavemeter reads it")
+        assert wait_for(lambda: s.sls_guard.stage == "hold" and s.state == "on", 90), (s.sls_guard.stage, s.message)
+        assert lab.pll.locked and abs(s.beat_e) < 5.0 and s.last["ok"], s.last["outcome"]
+    finally:
+        e.stop()
 
 
 def test_three_channel_pll_relocked_by_the_wavemeter_alone(tmp_path):

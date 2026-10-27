@@ -103,7 +103,7 @@ from .dropouts import Monitor as DropoutMonitor
 from .dropouts import log as drop_log
 from .lasermap import FOLDER, LOOK, MODEL_MIN, MapFile, MapPlan, Mapper, MapRunner, file_name, fmt_time
 from .lock import Lock, LockParams
-from .modehop import SEED_FLOOR, Guard, HopParams, Recenter, Runner, perform
+from .modehop import HOP_MIN, SEED_FLOOR, Guard, HopParams, Recenter, Runner, perform
 from .observe import Observation
 from .relock import TRANS, says_locked, setup_report, transmission_input, transmission_signal, usable_zero, volts
 from .reference import Reference, RefParams
@@ -320,6 +320,7 @@ class Channel:
         self.beat_step = False  # ...being told: its readings off its beat point do not count meanwhile
         self.steps = deque(maxlen=8)  # monotonic: its beat learned again so (a step of it)
         self.recenter_ask = ""  # Recenter clicked: its guard to release its PLL for the recovery (_sls_step)
+        self.hop_n = 0         # readings in a row a hop from its beat point (Engine._hop_mhz)
         self.watching = bool(cfg.get("watching"))  # an SLS unit locks it, and it is watched (Relock): again on start
         # its piezo trimmed to keep its PLL's fast output near 0 (SlsParams.trim: its slow servo unused)
         self.trim_seen = []    # (time.time(), V): its fast output since its last step settled...
@@ -1960,6 +1961,13 @@ class Engine:
             if w is not None:
                 w.wake()
 
+    HOP_MHZ = 1000.0  # MHz: a slave read this far from its beat point (two readings in a row) has hopped (or 0.4 of
+    #                   its mode spacing, once known, and HOP_MIN at least)
+
+    def _hop_mhz(self, ch: Channel) -> float:
+        spacing = ch.hop.spacing
+        return max(HOP_MIN, 0.4 * spacing) if spacing else self.HOP_MHZ
+
     def _follows(self, ch: Channel) -> bool:
         """Its setpoint is its beat point (its master's reading plus the beat), not its own."""
         return ch.beat_slave and bool(ch.sls.master) and ch.sls.beat_known
@@ -1990,7 +1998,7 @@ class Engine:
             else:
                 holds, why = self.holds_of(m)
                 row = {"f": m.freq if m.freq > 0 else None, "t": m.t if m.t > 0 else None, "holds": holds, "why": why,
-                       "name": m.name, "label": ""}
+                       "name": m.name, "label": "", "dev": m.error_mhz if m.freq > 0 and m.setpoint_nm else None}
         else:
             row = self.elsewhere.row(p.master_on, p.master) if self.elsewhere is not None else None
         ch.master_row = row
@@ -2039,12 +2047,17 @@ class Engine:
                     self.dirty = True
         point = self._beat_point(ch, look=False)
         if point is None or not ch.freq > 0:
-            ch.beat_e, ch.beat_off_n, ch.near_n = None, 0, 0
+            ch.beat_e, ch.beat_off_n, ch.near_n, ch.hop_n = None, 0, 0, 0
             self._beat_step(ch, None)
         else:
             e = (ch.freq - point) * 1e6
             ch.beat_e = e
             ch.beat_off_n = ch.beat_off_n + 1 if abs(e) > p.off_mhz and ch.beat_ok else 0
+            ch.hop_n = ch.hop_n + 1 if abs(e) > self._hop_mhz(ch) else 0  # (a hop is no wavemeter's recalibration:
+            if ch.hop_n == 2 and ch.sls_guard is not None:                 # it counts with its beat as last learned)
+                w = self.sls_watches.get(ch.n)
+                if w is not None:
+                    w.wake()  # (its PLL released at once, a poll of a slow unit cut short)
             self._beat_step(ch, e)
             if not ch.beat_off_n:
                 point = self._beat_point(ch, look=False)  # (its beat learned again, just now)
@@ -2181,19 +2194,20 @@ class Engine:
         else:
             master_s = ch.mtrack.steady_s(mono, self.BEAT_FRESH_S)  # (not watched: its readings steady that long)
         far = ""
-        cap = ch.lock.p.capture if ch.lock.p.capture > 0 else 3000.0
-        if ch.beat_e is not None and abs(ch.beat_e) > cap:
-            far = f"{ch.beat_e / 1e3:+.3f} GHz from its beat point"
-        elif not ch.off and ch.t > 0 and not ch.freq > 0 and mono - ch.t <= self.BEAT_FRESH_S and (
+        if not ch.off and ch.t > 0 and not ch.freq > 0 and mono - ch.t <= self.BEAT_FRESH_S and (
                 row is None or row["f"]):
             far = f"no reading ({ch.status or 'none'}): it may not lase"
+        hopped = f"{ch.beat_e / 1e3:+.3f} GHz from its beat point" if ch.hop_n >= 2 and ch.beat_e is not None else ""
+        dev = row.get("dev") if row is not None else None
+        master_off = (f"it reads {dev:+.0f} MHz from its own setpoint" if dev is not None and math.isfinite(dev)
+                      and abs(dev) > ch.sls.master_off else "")
         hop = ch.hop
         k = Look(now=now, armed=ch.sls_guard is not None and ch.state in ("on", "recovering"),
                  pll=view if view is not None and now - view.t <= self.SLS_STALE_S and not ch.sls_error else None,
                  fresh=fresh, master=master, master_s=master_s,
                  beat_off=(f"{ch.beat_e:+.1f} MHz from its beat point" if self._beat_lost(ch) and ch.beat_e is not None
                            else ""),
-                 near_n=ch.near_n, lasing=ch.lasing, far=far,
+                 near_n=ch.near_n, lasing=ch.lasing, far=far, hopped=hopped, master_off=master_off,
                  can_steer=bool(ch.device) and self._beat_point(ch, look=False) is not None and not ch.off,
                  can_recover=hop.enabled and bool(ch.device) and not ch.dac, recovering=ch.runner is not None,
                  recovered=ch.recovered)
