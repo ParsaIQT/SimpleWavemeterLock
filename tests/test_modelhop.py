@@ -17,7 +17,7 @@ from test_modehop import Bench  # noqa: E402
 from wmlock import lasermodel as lm  # noqa: E402
 from wmlock.engine import Channel, Engine  # noqa: E402
 from wmlock.modehop import HopParams, Recenter  # noqa: E402
-from wmlock.modelhop import AVOID_V, WINDOW_IN, Planner, _grid  # noqa: E402
+from wmlock.modelhop import AVOID_V, WINDOW_IN, Planner, _apply, _grid  # noqa: E402
 from wmlock.sim import ModelLaser  # noqa: E402
 
 
@@ -193,7 +193,8 @@ def test_the_493nm_laser_hopped_comes_back_on_target_by_its_model(seed):
     assert abs(hop) > 3.0  # GHz (it hopped)
     assert r.state == "done" and abs(e) < 20.0  # MHz
     m = rec.record["model"]
-    assert m["agree"] > 0.6 and m["plans"] and m["done"] >= 1 and rec.maps == 1  # (one map: the model's fit)
+    assert m["agree"] > 0.6 and (m.get("done") or m.get("band")) and rec.maps == 1  # (one map: the model's fit; by a
+    #                                                                                  plan, or its right mode's band)
 
 
 @pytest.mark.parametrize("seed", [300, 304, 309])
@@ -201,7 +202,8 @@ def test_the_650nm_laser_hopped_comes_back_on_target_by_its_model(seed):
     r, rec, hop, e = recover(red(), seed)
     assert abs(hop) > 1.0
     assert r.state == "done" and abs(e) < 20.0
-    assert rec.record["model"]["done"] >= 1 and rec.maps == 1
+    m = rec.record["model"]
+    assert (m.get("done") or m.get("band")) and rec.maps == 1
 
 
 @pytest.mark.parametrize("seed", [300, 304])
@@ -372,3 +374,188 @@ def test_a_channel_takes_its_lasers_model_from_a_map_made_before(tmp_path):
     while ch.model_note.startswith("being fitted") and time.monotonic() < end:
         time.sleep(0.05)
     assert ch.model_note.startswith("none from old.sqlite: ") and ch.laser_model() == model
+
+
+# ------------------------------------------- the lab's 493 nm laser on 27 October
+BLUE_NM = 493.545433
+BLUE_REF = (67.8905, 65.5175)  # (V, mA) where it ran on target for days, come to sweeping up
+
+
+def blue_v1() -> lm.LaserModel:
+    """The lab's 493 nm DL pro as its map of 25 October has it, fitted by a version before the chip's modes were given
+    no drift (version 1): its chip's modes drifting -5.41 GHz per 10 min along the map and moved +0.977 GHz/V by its
+    piezo (the same thing: its slow axis's doing), its piezo moving its external modes +0.918 GHz/V (its map could not
+    tell that from its cavity's drift; +1.19, as its recoveries have it since)."""
+    return lm.LaserModel.from_dict({
+        "f_ref": 607.5268773, "i0": 64.9658, "v0": 73.31425, "t0": 24531.563,
+        "ext": {"spacing": 8.260032, "p0": 61.24649, "p_i": -1.714243, "p_ii": -0.0060591, "p_v": 0.917847,
+                "p_vv": 0.0024266, "p_t": 3.195623, "p_leg": -0.375774, "drift_known": True},
+        "chip": {"spacing": 87.175876, "p0": -19.671275, "p_i": -4.234911, "p_ii": -0.0087092, "p_v": 0.976839,
+                 "p_vv": -0.00034083, "p_t": -5.409938, "drift_known": True},
+        "lo": -214.11636, "hi": 75.564297, "h_up": 0.00050378, "h_down": 0.0048471, "offset": 0.543025,
+        "pull": 0.393302, "lag": 0.268832, "soft": 5.0, "i_th": 29.118, "slope": 0.50637, "power_dp": -0.55185,
+        "right": 0.726, "pace": 108.705, "step_s": 0.269, "step_x": 0.2024, "kind": "current"})
+
+
+def as_found(phi: float = 8.0, p_v: float = 1.19) -> tuple:
+    """(the laser as its recoveries' maps have it, the target THz): its model's chip drift its piezo's, its piezo moving
+    its external modes p_v GHz/V, its chip's modes phi GHz from where its model has them; on target where it ran
+    (BLUE_REF), its frequencies GHz from the target."""
+    target = lm.C_LIGHT / BLUE_NM * 1e-3
+    m = blue_v1()
+    m.chip.p_v += m.chip.p_t * m.pace / lm.UNIT_T
+    m.chip.p_t = 0.0
+    m.ext.p_v, m.ext.p_t, m.ext.others = p_v, 0.0, []
+    pl = Planner(m, target, ref=(BLUE_REF[1], BLUE_REF[0]))
+    _apply(pl.m, pl._rule(0, phi, 0.0))
+    return pl.m, target
+
+
+def blue_bench(true, target):
+    """It on a DL pro whose feedforward (-0.6 mA/V, on) adds nothing as the scan's offset moves the piezo (its scan
+    off), on target where it ran, its current come up to it."""
+    b = None
+    laser = ModelLaser(true, clock=lambda: b.t if b is not None else 0.0)
+    v, i = BLUE_REF
+    b = Bench(laser, 0.0, current=i - 2.0, offset=v, dt=0.27)
+    b.dlc.params["laser1:dl:cc:feedforward-enabled"] = True
+    b.dlc.params["laser1:dl:cc:feedforward-factor"] = -0.6
+    b.dlc.ff_from[1] = None
+    for k in range(21):
+        b.client.set("laser1:dl:cc:current-set", i - 2.0 + 2.0 * (k + 1) / 21)
+        b.t += 0.15
+    b.target = target
+    return b, laser
+
+
+def blue_recover(b, target, p=None):
+    p = p or HopParams(enabled=True, method="model", i_nom=65.404, i_below=1.0, i_window=2.0, v_window=25.0,
+                       kv=1925.5, spacing=89973.8)  # (as its settings had them)
+    n0 = len(b.dlc.log)
+    rec = Recenter(p, b.I, b.V, p.i_nom - p.i_below, p.i_nom + p.i_window, b.V - p.v_window, b.V + p.v_window,
+                   i_top=p.i_nom + p.jump_max, ref=BLUE_REF, model=blue_v1(), target=target)
+    r = b.run(rec)
+    sets = [x for name, x in b.dlc.log[n0:] if name == "laser1:dl:cc:current-set"]
+    return r, rec, sets
+
+
+@pytest.mark.parametrize("case", ["drifted", "knocked", "moved"])
+def test_the_493nm_laser_as_on_27_october_comes_back_by_its_model(case):
+    """Its recoveries of 27 October failed: its DL pro's feedforward adds nothing as the piezo moves, but they reckoned
+    the current as if it did (it went 3.2 mA above its window, and the plans' currents were off by 0.6 mA a volt), its
+    model (an older version's) had its piezo's doing wrong, and the margins' check took it off its narrow mode. Now:
+    drifted 330 MHz off on its right mode, the piezo alone; knocked off it, back where it was on target, come to
+    sweeping up; its right mode moved (it hopped as its chip's modes went on), where the map has it, the piezo onto the
+    target with the current moved along as its feedforward would. Each time on target, its current inside its window,
+    and what its feedforward does kept for the next."""
+    true, target = as_found()
+    b, laser = blue_bench(true, target)
+    assert abs(laser.freq(b.V, b.act) - target) * 1e3 < 1.0  # GHz (on target where it ran)
+    if case == "drifted":
+        true.ext.p0 += 0.33
+    elif case == "knocked":
+        for x in (66.6, 67.4, 66.4, BLUE_REF[1]):
+            b.client.set("laser1:dl:cc:current-set", x)
+            b.t += 0.3
+    else:
+        for _ in range(60):  # (its chip's modes moved, its cavity drifted: where it ran it is on its mode's edge now)
+            true.offset += 0.009
+            true.ext.p0 -= 0.006
+            b.t += 0.3
+            b._settle(None)
+        for x in (66.6, 67.4, 66.4, BLUE_REF[1]):  # (and knocked off it)
+            b.client.set("laser1:dl:cc:current-set", x)
+            b.t += 0.3
+    began = (laser.freq(b.V, b.act) - target) * 1e3
+    r, rec, sets = blue_recover(b, target)
+    assert r.state == "done", r.error
+    assert abs(laser.freq(b.V, b.act) - target) * 1e6 < 20.0  # MHz
+    assert 65.404 - 1.0 - 1e-6 <= min(sets) and max(sets) <= 65.404 + 2.0 + 1e-6  # (as measured: the same)
+    if abs(b.V - BLUE_REF[0]) > 0.01:  # (the piezo moved: what its feedforward does seen, and kept)
+        assert rec.ff == 0.0 and rec.learned["ff_set"] == -0.6 and rec.learned["ff_act"] == 0.0
+    assert rec.mA(rec.I) == pytest.approx(b.act, abs=Recenter.FF_TELLS)  # (the current as it is, not as the factor
+    #                                                                     would have it; a piezo move too small to tell
+    #                                                                     what the feedforward does: less than that)
+    m = rec.record.get("model") or {}
+    if case == "drifted":
+        assert abs(began) < 1.0 and rec.maps == 0 and not m
+    elif case == "knocked":
+        assert abs(began) > 50.0 and rec.back_at == "up" and rec.maps == 0
+    else:
+        assert abs(began) > 50.0 and rec.maps == 1 and m.get("band")
+        assert m["agree"] > 0.9 and rec.learned["model_adapt"]["phi"] == pytest.approx(8.6, abs=1.0)
+
+
+def test_an_older_models_chip_drift_is_taken_as_its_slow_axis_doing():
+    model = blue_v1()
+    assert model.version == 1
+    pl = Planner(model, lm.C_LIGHT / BLUE_NM * 1e-3, ref=(BLUE_REF[1], BLUE_REF[0]))
+    assert pl.m.chip.p_t == 0.0 and pl.m.chip.p_v == pytest.approx(0.976839 - 5.409938 * 108.705 / 600, abs=1e-6)
+    assert abs(pl.m.chip.p_v) < 0.01  # (the chip's modes not moved by the piezo, as a fit now has it)
+    v2 = blue_v1()
+    v2.version = lm.MODEL_VERSION  # (a fit that gave them no drift: as it is)
+    assert Planner(v2, lm.C_LIGHT / BLUE_NM * 1e-3).m.chip.p_v == pytest.approx(0.976839)
+
+
+def test_how_its_piezo_tunes_it_is_learned_from_what_it_did_at_two_voltages():
+    true, target = as_found(p_v=1.19)
+    v, i = BLUE_REF
+    pl = Planner(blue_v1(), target, ref=(i, v))
+    for vv in (v, v + 2.0):  # (two maps, 2 V apart)
+        state, t = None, 0.0
+        for leg, path in ((1, _grid(64.4, 67.4, 0.1)), (2, _grid(67.4, 64.4, 0.1))):
+            seg = pl.segment()
+            for x in path:
+                t += 0.27
+                g, _, state = true.step(float(x), vv, true.t0, state, clock=t)
+                pl.observe(seg, t, float(x), vv, leg == 1, g)
+    pl.fit()
+    assert pl.pv0 == pytest.approx(0.917847) and pl.pv0 + pl.pv == pytest.approx(1.19, abs=0.05)
+    one = Planner(blue_v1(), target, ref=(i, v))  # (at one voltage: nothing to tell it by)
+    for x in _grid(64.4, 67.4, 0.1):
+        one.observe(1, 0.0, float(x), v, True, float(true.step(float(x), v, true.t0)[0]))
+    one.fit()
+    assert one.pv == 0.0
+
+
+def test_a_channel_keeps_what_its_recoveries_found_of_its_model():
+    ch = Channel(3, {"link": {"device": "192.168.1.30", "laser": 1}})
+    ch.adopt_model(blue(), "map 1.sqlite")
+    ch.adapt_model({"phi": 8.0, "p_v": 1.19})
+    got = ch.laser_model()
+    assert got.offset == pytest.approx(blue().offset + 8.0) and got.ext.p_v == 1.19 and got.ext.others == []
+    assert got.alt["offset"] == pytest.approx(blue().alt["offset"] + 8.0)
+    back = Channel(3, ch.to_config())  # (kept in its settings)
+    assert back.laser_model().offset == pytest.approx(got.offset) and back.model_dict["adapt"]["n"] == 1
+    back.adapt_model({"phi": 80.0})  # (as well a whole chip mode on: 88.0 GHz, 0.62 GHz)
+    assert back.model_dict["adapt"]["phi"] == pytest.approx(88.0 - 87.379, abs=1e-3)
+    assert back.laser_model().ext.p_v == 1.19 and back.model_dict["adapt"]["n"] == 2
+    back.adopt_model(blue(), "map 2.sqlite")  # (a new map: nothing of the old one's)
+    assert "adapt" not in back.model_dict and back.laser_model().offset == blue().offset
+
+
+def test_check_setup_says_what_its_feedforward_does_and_what_its_model_found():
+    from test_modehop import Loopback
+
+    from wmlock.lock import LockParams
+    from wmlock.relock import setup_report
+    from wmlock.sim import FakeDLCPro
+
+    dlc = FakeDLCPro("SN-B", "bench", {1: {"current": 65.5, "offset": 67.9, "feedforward": -0.6}}, serve=False)
+    ch = Channel(5, {"link": {"device": "192.168.1.103", "laser": 2}})
+    ch.adopt_model(blue_v1(), "map_2026-10-25_012516_ch5.sqlite")
+    ch.model_dict["model"].pop("version")  # (kept by the version before it said)
+    ch.adapt_model({"phi": 8.5, "p_v": 1.19})
+
+    def text(**hop):
+        p = HopParams(enabled=True, method="model", i_nom=65.404, **hop)
+        return "\n".join(t for _, t in setup_report(Loopback(dlc), 1, p, LockParams(), ch.model_dict))
+
+    before = text()
+    assert "Whether it does, a recovery's first piezo move shows" in before
+    seen = text(ff_set=-0.6, ff_act=0.0)
+    assert "its recoveries saw that the feedforward adds nothing as the piezo moves" in seen
+    assert "move it along themselves as they tune the piezo, -0.6000 mA/V" in seen
+    assert "its chip's modes +8.5 GHz from where it had them, its piezo tuning its external modes +1.19 GHz/V" in seen
+    assert "fitted by an older version" in seen and "back where it was on target" in seen
+    assert "Whether it does" not in text(ff_set=-0.6, ff_act=-0.6)  # (it does)

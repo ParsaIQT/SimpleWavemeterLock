@@ -943,13 +943,21 @@ def setup_report(client, laser: int, hop, lp, model=None) -> list:
     ff, factor = g["dl:cc:feedforward-enabled"], g["dl:cc:feedforward-factor"]
     add("info", f"current offset {fmt(g['dl:cc:current-offset'], ' mA')}; feedforward from the piezo "
                 + (f"on, {factor:+.4f} mA/V" if ff and _num(factor) else fmt(ff)))
-    if ff and _num(factor) and factor:
+    seen = bool(hop.ff_set) and _num(factor) and abs(hop.ff_set - factor) < 1e-9  # (what its recoveries saw it do)
+    if ff and _num(factor) and factor and seen and not hop.ff_act:
+        add("info", f"its recoveries saw that the feedforward adds nothing as the piezo moves (the scan's offset moves "
+                    f"it, its scan off: the feedforward follows the scan alone): they reckon the current as it is, "
+                    f"and move it along themselves as they tune the piezo, {factor:+.4f} mA/V, as the feedforward is "
+                    f"meant to")
+    elif ff and _num(factor) and factor:
         add("info", f"with the feedforward, the piezo moves the current too: up to ±{abs(factor) * hop.v_window:.2f} "
                     f"mA over the ±{hop.v_window:g} V a recovery may move it. A recovery keeps the measured current "
                     "within its window, and above where it stopped lasing, wherever the piezo goes (the current set "
                     "follows), moves the piezo in steps that change it by 0.2 mA at most, and before walking the piezo "
                     "the way that takes the current down, parks the current high (up while the SHG sweep stays as "
-                    "good, then back two steps), again whenever it has come down 0.3 mA")
+                    "good, then back two steps), again whenever it has come down 0.3 mA"
+                    + ("" if seen else ". Whether it does, a recovery's first piezo move shows (on a DL pro whose "
+                                       "piezo the scan's offset moves, its scan off, it adds nothing)"))
     if g["dl:cc:output-filter:slew-rate-enabled"]:
         add("warn", f"the current's slew rate is limited ({fmt(g['dl:cc:output-filter:slew-rate'])}): a recovery "
                     "steps it 0.2 mA at a time and expects each step to take effect at once")
@@ -1298,14 +1306,26 @@ def setup_report(client, laser: int, hop, lp, model=None) -> list:
                         f"the ±{hop.v_window:g} V a recovery may move it")
     elif how == "model":
         temps = (model.get("model") or {}).get("temps") if (model.get("model") or {}).get("T0") is not None else None
+        adapt = model.get("adapt") or {}
         add("info", f"by its model, from its last map ({model.get('from', '?')}, {model.get('t', '?')}: "
                     f"{model.get('right', 0):.0%} of that map's points on the right mode"
                     + (f"; made at {min(temps):g} … {max(temps):g} °C, the model is taken at the diode's temperature "
-                       f"as set" if temps else "") + "): a map here first and the "
-                    f"model fitted to it (how far its modes have moved), then the way onto a mode on target that holds "
-                    f"best, its own or another at another piezo voltage, and which way the current comes to it; the "
-                    f"margins checked as the map's; up to {mh.Recenter.MODEL_TRIES} plans, the model fitted again to "
-                    f"all it read after each, then the map")
+                       f"as set" if temps else "") + "): near its target the piezo alone; else back where it was on "
+                    "target, its current come to it both ways; else a map here and the model fitted to it (how far "
+                    "its modes have moved), its right mode where the map has it, then the way onto a mode on target "
+                    "that holds best, its own or another at another piezo voltage, and which way the current comes to "
+                    f"it; the margins checked as the map's; up to {mh.Recenter.MODEL_TRIES} plans, the model fitted "
+                    f"again to all it read after each, then the map")
+        if adapt:
+            add("info", f"since its map, its recoveries found its chip's modes {adapt.get('phi', 0.0):+.1f} GHz from "
+                        f"where it had them" + (f", its piezo tuning its external modes {adapt['p_v']:+.2f} GHz/V"
+                                                if adapt.get("p_v") is not None else "")
+                        + f" ({adapt.get('n', 1)} recover{'ies' if adapt.get('n', 1) != 1 else 'y'}, last "
+                          f"{adapt.get('t', '?')}): its recoveries begin from there")
+        if not (model.get("model") or {}).get("version"):
+            add("info", "its model was fitted by an older version (before 25 October): its chip's modes' drift "
+                        "along its map is taken as its piezo's doing, as fits now have it; fitting it again to its "
+                        "map (right-click › Its laser's model from a map…) does the rest")
     else:
         add("info", f"map: the current swept over its window both ways in {hop.step:g} mA steps, the best mode "
                     f"parked on the way it lases, the piezo onto the target")

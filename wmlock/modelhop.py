@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .lasermodel import RULE, WINDOW, LaserModel, _losses, _select
+from .lasermodel import RULE, UNIT_T, WINDOW, LaserModel, _losses, _select
 
 RAMP_STEP = 0.2   # mA: a quick move's steps (the recovery's STEP_MAX)
 RAMP_DT = 0.05    # s each (no reading)
@@ -47,6 +47,11 @@ WINDOW_DRIFT = 0.1  # ...as far as this much of its width from where the model h
 MEMBER_GAP = 0.08  # the rule held the other way kept as members if it puts this much less of the readings right at most
 SPREAD = 3        # members either side where the readings allow its window further than WINDOW_SLIP from the model's
 AVOID_V = 1.5     # V: a plan this near one that did not hold (the same mode, the same way) is not made again
+PV_SPAN = 1.0     # V: readings this far apart in piezo voltage at least tell how the piezo tunes its external modes,
+PV_N = 6          # by where its comb is at each voltage it was read at this often at least (its readings on it, a
+PV_RANGE = 1.0    # half at least): GHz/V as far as this from what its model says (its map could not tell that from its
+PV_MIN = 0.03     # cavity drifting meanwhile, a whole mode more or less over the map); this much at least, and three
+#                   times as much as it is uncertain
 
 
 @dataclass
@@ -98,12 +103,20 @@ class Planner:
         m.f_ref = target_thz
         m.ext.p0 += shift
         m.ext.p_t, m.ext.others = 0.0, []
-        if m.chip is not None:
+        alt = {"soft": model.soft, **model.alt} if model.alt is not None else None  # (kept before its window's edges
+        if m.chip is not None:                                                     # were soft: as its own)
             m.chip.p0 += shift
+            if model.version < 2 and m.chip.p_t and model.pace:  # (an older fit gave its chip's modes a drift: along
+                d = m.chip.p_t * model.pace / UNIT_T             # its map, its slow axis's doing, as fits now have it)
+                if model.kind == "current":
+                    m.chip.p_v += d
+                else:
+                    m.chip.p_i += d
+                    if alt is not None:
+                        alt["ci"] += d
             m.chip.p_t = 0.0
         rules = [m.rule()]
-        if model.alt is not None:
-            alt = {"soft": model.soft, **model.alt}  # (kept before its window's edges were soft: as its own)
+        if alt is not None:
             rules.append(np.array([alt[k] for k in RULE + ("dc", "ci") + WINDOW], dtype=float))
         for P in rules:  # (their windows' frequencies too)
             if math.isfinite(P[0]) and math.isfinite(P[1]):
@@ -118,6 +131,9 @@ class Planner:
         self.slide = 0.0         # ...and its window
         self.ensemble = []       # [(rule, phi, slide)]: its members' (members())
         self.drift = 0.0         # GHz: its external comb, moved to where the readings have it
+        self.pv0 = m.ext.p_v     # GHz/V: how the piezo tunes it, as its model has it...
+        self.pv = 0.0            # ...and how much more, as the readings have it (_recomb)
+        self.ref_v = None        # V set: where it was on target (anchor)
         self.slid = 0.0          # GHz its window was moved by to have the target in it where it was on target
         self.right = None        # the right mode's order
         self.seen = []           # [Seen]
@@ -177,7 +193,7 @@ class Planner:
         b = float(self.base(i, v))
         n = round((ghz - b) / e.spacing)
         e.p0 += ghz - (b + n * e.spacing)
-        self.right = int(n)
+        self.right, self.ref_v = int(n), float(v)
         for r, P in enumerate(self.rules):
             if math.isfinite(P[0]) and math.isfinite(P[1]):
                 shift = P[9] * (float(self._dv(v)) - m.v0) + P[10] * (i - m.i0)
@@ -329,14 +345,58 @@ class Planner:
 
     def _recomb(self, segs):
         """Its external comb moved to where the readings have it (the mean of each reading's offset from the mode
-        nearest it, around the comb's spacing; it may have drifted since it was anchored)."""
+        nearest it, around the comb's spacing; it may have drifted since it was anchored). With readings PV_SPAN apart
+        in piezo voltage, how the piezo tunes it as well, where that puts more of them on it (its map could not tell
+        that from a drift of its cavity: PV_RANGE either way of its model's), its comb kept where it was on target."""
         e = self.m.ext
-        x = np.array([(s.ghz - float(self.base(s.i, s.v, s.up))) / e.spacing for ss in segs for s in ss])
+        ss = [s for sg in segs for s in sg]
+        x = np.array([(s.ghz - float(self.base(s.i, s.v, s.up))) / e.spacing for s in ss])
+        v = np.array([s.v for s in ss])
+        dp = self._pv(x, v) if float(np.ptp(v)) >= PV_SPAN else 0.0
+        if dp:
+            pivot = self._dv(self.ref_v if self.ref_v is not None else float(np.mean(v))) - self.m.v0
+            e.p_v += dp
+            e.p0 -= dp * pivot  # (where it was on target, its comb where it was)
+            self.pv += dp
+            x -= dp * (self._dv(v) - self.m.v0 - pivot) / e.spacing
         z = complex(np.exp(2j * np.pi * x).mean())
         if abs(z) > 0.5:  # (the readings on one comb)
             d = math.atan2(z.imag, z.real) / (2 * math.pi) * e.spacing
             e.p0 += d
             self.drift += d
+
+    def _pv(self, x: np.ndarray, v: np.ndarray) -> float:
+        """GHz/V more than the piezo tunes its external comb as it is now, as where the readings have it at each piezo
+        voltage tells (x: each reading's place on its comb, of its spacing; v: V set): at the voltage read most often,
+        and at each other read PV_N times at least, its readings on it (concentrated, a half at least); from one to the
+        other, the whole number of its spacing more or less that leaves it nearest its model's (PV_RANGE at most),
+        weighted by how far apart and how many; 0 if that is less than PV_MIN, or than three times its uncertainty."""
+        sp = self.m.ext.spacing
+        at = []
+        for vg in np.unique(np.round(v, 2)):
+            xs = x[np.abs(v - vg) < 0.005]
+            z = complex(np.exp(2j * np.pi * xs).mean()) if len(xs) >= PV_N else 0j
+            if abs(z) > 0.5:  # (where its comb is there, GHz; how well that is known, GHz)
+                at.append((float(vg), math.atan2(z.imag, z.real) / (2 * math.pi) * sp,
+                           sp * math.sqrt(-2 * math.log(abs(z))) / (2 * math.pi) / math.sqrt(len(xs)), len(xs)))
+        if len(at) < 2 or max(a[0] for a in at) - min(a[0] for a in at) < PV_SPAN:
+            return 0.0
+        v0, o0, s0, _ = max(at, key=lambda a: a[3])
+        num = den = 0.0
+        for vg, o, sg, _ in at:
+            d = vg - v0
+            if abs(d) < 1e-9:
+                continue
+            k = round(((self.pv * d) - (o - o0)) / sp)  # (the whole number of its spacing nearest its model's)
+            dp = (o - o0 + k * sp) / d
+            if abs(self.pv + dp) > PV_RANGE:
+                continue
+            w = d * d / (sg * sg + s0 * s0)
+            num, den = num + w * dp, den + w
+        if not den:
+            return 0.0
+        dp, err = num / den, 1.0 / math.sqrt(den)
+        return dp if abs(dp) >= max(PV_MIN, 3 * err) else 0.0
 
     def _slides(self, segs, r: int = 0) -> np.ndarray:
         """GHz: where its window may be by rule r, from where the model has it: each reading inside it (2 GHz out at
@@ -403,9 +463,9 @@ class Planner:
         return np.concatenate([pre, app]), t, np.concatenate([np.full(len(pre), not up), np.full(len(app), up)]), \
             len(pre)
 
-    def _weigh(self, cands, i_lo, i_hi, step, i_nom, v_now, step_s, want, avoid=()) -> Plan | None:
-        """The candidates (order, V set, mA) each come to both ways, and on past (ahead) or back (behind) in FINE
-        steps, by each of the members' rules: the best Plan (plan())."""
+    def _weigh(self, cands, i_lo, i_hi, step, i_nom, v_now, step_s, want, avoid=(), ways=(True, False)) -> Plan | None:
+        """The candidates (order, V set, mA) each come to both ways (or as ways has it: up, down), and on past
+        (ahead) or back (behind) in FINE steps, by each of the members' rules: the best Plan (plan())."""
         def avoided(v, i, up=None):
             return any(abs(v - av) < AVOID_V and abs(i - ai) < 0.5 and up in (None, au) for av, ai, au in avoid)
 
@@ -415,7 +475,7 @@ class Planner:
         m = self.m
         rows, keys = [], []
         for c, (_, v, i) in enumerate(cands):
-            for up in (True, False):
+            for up in ways:
                 ii, t, uu, npre = self._way(i, up, i_lo, i_hi, step, step_s)
                 for ahead in (True, False):
                     tail = _grid(i, i + (REACH if up == ahead else -REACH), FINE)[1:]
@@ -446,7 +506,7 @@ class Planner:
             idx = int(n - orders[0])
             if not 0 <= idx < len(orders):
                 continue
-            for up in (True, False):
+            for up in ways:
                 if avoided(v, i, up):
                     continue
                 ga, npre, end = got[(c, up, True)]
@@ -470,6 +530,17 @@ class Planner:
                 out.append(Plan(int(n), v, i, up, i_lo if up else i_hi, ahead, behind, score, path, share,
                                 float(held.min())))
         return max(out, key=lambda p: p.score) if out else None
+
+    def arrives(self, i: float, v: float, up: bool, i_lo: float, i_hi: float, step: float, i_nom: float,
+                step_s: float = 0.2, want: float = 0.5) -> float:
+        """The share of its members that have its right mode arrive at (i mA measured, v V set) come to sweeping up
+        (or down) from that end of the window by way of the other, as plan() has it, and hold with margins `want` (0:
+        none has it arrive; or there is no right mode, not anchored)."""
+        if self.right is None:
+            return 0.0
+        p = self._weigh([(self.right, float(v), float(i))], i_lo, i_hi, step, i_nom, float(v), step_s, want,
+                        ways=(bool(up),))
+        return 0.0 if p is None else max(p.share, 1e-3)
 
     def _firsts(self, rows, orders, P) -> np.ndarray:
         """(rules, paths): the mode each path begins on by each rule (P, as _select has them), as if long at its

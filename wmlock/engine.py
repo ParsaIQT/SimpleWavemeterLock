@@ -421,12 +421,37 @@ class Channel:
             try:
                 from .lasermodel import LaserModel
 
-                self._model = LaserModel.from_dict(d["model"])
+                model = LaserModel.from_dict(d["model"])
+                a = d.get("adapt") or {}
+                if a.get("phi"):  # (as its recoveries found it since its map: adapt_model)
+                    model.offset += float(a["phi"])
+                    if model.alt is not None:
+                        model.alt = dict(model.alt, offset=model.alt["offset"] + float(a["phi"]))
+                if a.get("p_v") is not None:
+                    model.ext.p_v, model.ext.others = float(a["p_v"]), []
+                self._model = model
             except (ImportError, TypeError, ValueError, KeyError) as exc:
                 log.warning("channel %d: its laser's model cannot be used: %s", self.n, exc)
                 self.model_dict = None
                 return None
         return self._model
+
+    def adapt_model(self, adapt: dict):
+        """What a recovery by its model found its laser to be since its map (Recenter.learned's model_adapt: its chip's
+        modes phi GHz from where its model had them, how its piezo tunes its external modes, p_v GHz/V): its model has
+        it from then on (laser_model), the next recovery beginning from there."""
+        d = self.model_dict
+        if d is None or self.laser_model() is None:
+            return
+        a, dc = dict(d.get("adapt") or {}), self._model.dc
+        if adapt.get("phi") is not None:
+            phi = float(a.get("phi", 0.0)) + float(adapt["phi"])
+            a["phi"] = round((phi + dc / 2) % dc - dc / 2, 3)  # (its chip's modes: as well a whole spacing on)
+        if adapt.get("p_v") is not None:
+            a["p_v"] = round(float(adapt["p_v"]), 4)
+        a["t"], a["n"] = time.strftime("%Y-%m-%d %H:%M"), int(a.get("n", 0)) + 1
+        d["adapt"] = a
+        self._model = None
 
     def adopt_model(self, model, source: str):
         """Its laser's model from now on (lasermodel.LaserModel fitted to a map of its laser now: source, that map)."""
@@ -3285,6 +3310,8 @@ class Engine:
             for name, value in res.learned.items():
                 if name in HopParams.LEARNED:
                     setattr(ch.hop, name, value)
+            if res.learned.get("model_adapt"):  # (its model, as this recovery found its laser: the next from there)
+                ch.adapt_model(res.learned["model_adapt"])
             self.dirty = True
             ch.current_set, ch.offset = res.current, res.offset
             ch.message = ""
@@ -3315,10 +3342,14 @@ class Engine:
             where = f"left at {rec.mA(r.i_written):.2f} mA, {r.v_written:.2f} {ch.unit}"
         if "dl:lock:lock-enabled" in r.journal:
             where += ", cavity lock left off"
-        for name in ("lp_code", "lp_kind", "peak_y", "falc_sign", "falc_gain", "trans_zero"):  # worth keeping, even so
+        for name in ("lp_code", "lp_kind", "peak_y", "falc_sign", "falc_gain", "trans_zero", "ff_set",
+                     "ff_act"):  # worth keeping, even so
             if name in rec.learned:
                 setattr(ch.hop, name, rec.learned[name])
                 self.dirty = True
+        if rec.kv_tuned:  # (its piezo's tuning, as the tuning steps it made found it: as they are made from now on)
+            ch.hop.kv = round(rec.kv, 1)
+            self.dirty = True
         head = "recovery stopped" if r.error == "stopped" else f"{why}recovery failed, {r.error}"
         ch.message = f"{head} ({where})"
         log.warning("channel %d: %s", ch.n, ch.message)

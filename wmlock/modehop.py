@@ -223,6 +223,11 @@ class HopParams:
     shg_lock: float = 0.0     # V: the SHG cavity's intra-cavity signal, locked, the master single-mode
     shg_ratio: float = 0.0    # its SHG peak scanned (peak_top) over its intra-cavity signal locked, both above the
     #                           sweep's floor (0: not known, taken as 1)
+    ff_set: float = 0.0       # mA/V: the feedforward factor at which its recoveries saw what the feedforward does
+    #                           (0: never)...
+    ff_act: float = 0.0       # ...and what it does: mA/V the measured current moves as the scan offset moves the
+    #                           piezo (0 on a DL pro whose piezo the scan's offset moves, its scan off: there the
+    #                           feedforward follows the scan alone)
     # the optimum, as set by hand: taken when Relock is first clicked on it (or by Take the optimum now)
     opt_i: float = 0.0        # mA measured (0: not taken)
     opt_v: float = 0.0        # V: its piezo voltage
@@ -230,7 +235,7 @@ class HopParams:
     opt_t: str = ""           # when it was taken
 
     LEARNED = ("kv", "spacing", "peak_y", "lp_kind", "lp_code", "shg_area", "shg_side", "shg_n", "falc_sign",
-               "falc_gain", "seed_ok", "trans_locked", "trans_zero", "shg_lock", "shg_ratio")
+               "falc_gain", "seed_ok", "trans_locked", "trans_zero", "shg_lock", "shg_ratio", "ff_set", "ff_act")
     OPTIMUM = ("opt_i", "opt_v", "opt_shg", "opt_t")
 
     @classmethod
@@ -671,6 +676,7 @@ class Recenter(CavitySteps):
     SHIFT = 0.15           # mA/V: how far a mode's current range may move per volt of piezo (rather more)
     KV_GUESS = 300.0       # MHz/V, before anything is known
     KV_PLAUSIBLE = (20.0, 3000.0)
+    KV_MOVED = 100.0       # MHz: a tuning step that moved it this much tells its tuning, however far off what it went by
     VERIFY_S = 10.0        # s for the cavity lock to show the right peak
     VERIFY_N = 5           # readings in a row on target that prove it
     ARRIVE_S = 5.0         # s at most for the current to get where a quick ramp sent it
@@ -737,6 +743,8 @@ class Recenter(CavitySteps):
         self._top = max(i_hi if i_top is None else i_top, i_hi)  # where it stopped lasing)
         self.i_clip = i_clip
         self.ff = 0.0                       # mA/V: the feedforward moves the measured current this much per volt
+        self.ff_said = 0.0                  # mA/V: its factor, as the DLC pro has it...
+        self.ff_known = True                # ...and whether what it does has been seen (at the first piezo move)
         self.act_offset = act_offset
         self._nominal = p.i_nom - act_offset if p.i_nom else current  # as a set current, the piezo at V0
         self.parked = None                  # mA measured where the walk last parked the current high
@@ -750,6 +758,9 @@ class Recenter(CavitySteps):
         self.kv_known = bool(guess)
         self.kv_measured = False
         self._kv_try = None                 # a first measurement, waiting for confirmation
+        self.kv_tuned = False               # the piezo's tuning learned from what tuning it did in this recovery...
+        self.kv_model = False               # ...or its model's (at a current as measured: as set, the feedforward's
+        #                                     part added)
         self.cavity = cavity
         self.spacing = p.spacing
         self.threshold = max(HOP_MIN, 0.4 * self.spacing) if self.spacing else 1000.0
@@ -807,6 +818,7 @@ class Recenter(CavitySteps):
         self.upkept = None                  # ...(mA measured: where it began, the top of its mode, where it is left;
         #                                     back up below the top)
         self.step_max = self.UP_STEP if upkeep else STEP_MAX  # mA: the most the Runner moves the current a write
+        self.back_at = ""                   # by its model: back where it was on target, come to sweeping this way
         self.resets_done = 0                # resets (the catch, after a hop: piezo and current to nominal, ...)
         self.reset_rounds = 0               # ...catch rounds that began with them
         self.reset_hit = None               # (V, mA measured) where a reset brought it back onto its right mode
@@ -885,7 +897,75 @@ class Recenter(CavitySteps):
         way round where the piezo takes the measured current away from where the current takes it: never
         out of the window meanwhile). check: with the seed power watched, ask it whether the laser still
         lases after each step down; and if the wavemeter has no valid reading of it, ask the SHG sweep
-        (alive). Raises NotLasing if it does not lase."""
+        (alive). Raises NotLasing if it does not lase. The first time the piezo moves, whether the feedforward
+        does what its factor says is seen first (check_ff)."""
+        if offset is not None and not self.ff_known:
+            yield from self.check_ff(min(max(offset, self.v_lo), self.v_hi))
+        return (yield from self._move(current, offset, read, check, top))
+
+    FF_PROBE = 0.1    # mA: the feedforward is seen by a piezo step that would move the measured current this much...
+    FF_TELLS = 0.04   # mA: ...a step that would move it less than this tells nothing (not seen then)
+
+    def check_ff(self, toward: float):
+        """Whether the feedforward moves the measured current as its factor says when the piezo moves (on a DL pro
+        whose piezo the scan's offset moves, its scan off, it adds nothing: it follows the scan alone): a piezo step
+        toward `toward` (as far as would move the current FF_PROBE if it did, no further), the current as set kept
+        (in its window either way), the measured current read before and after; what it moved by, the set
+        current's move taken off, is the feedforward's. From then on the current is reckoned by that, and it is kept
+        for the next recovery (HopParams.ff_set, ff_act)."""
+        said, v0, i0 = self.ff_said, self.V, self.I
+        step = math.copysign(min(abs(toward - v0), self.FF_PROBE / abs(said)), toward - v0)
+        if abs(said * step) < self.FF_TELLS:
+            return  # (too small a move to tell: the next)
+        self.ff_known = True  # (seen now, or not at all: once)
+        a = yield from self.current_now()
+        yield from self._move(offset=v0 + step, read=False)
+        b = yield from self.current_now()
+        if not (_num(a) and _num(b)):
+            return
+        seen = (b - a - (self.I - i0)) / step
+        if abs(seen) < 0.3 * abs(said):
+            ff, how = 0.0, ("adds nothing as the piezo moves (the scan's offset moves it, its scan off: the "
+                            "feedforward follows the scan alone): the current is reckoned so, and moved along as the "
+                            "piezo tunes it")
+        elif abs(seen - said) < 0.3 * abs(said):
+            ff, how = said, "moves the current as its factor says"
+        elif abs(seen) <= 2 * abs(said):
+            ff, how = seen, f"moves the current {seen:+.3f} mA/V, not as its factor says: reckoned so from now on"
+        else:
+            self.note(f"feedforward {said:+.4f} mA/V: the current moved {b - a:+.3f} mA as the piezo moved "
+                      f"{step:+.2f} V (nothing seen of the feedforward, as its factor says it is)")
+            return
+        self.ff = ff  # (the window, the floor, where it began: set currents at V0, the measured ones reckoned anew)
+        self.learned["ff_set"], self.learned["ff_act"] = said, round(ff, 4)
+        self.note(f"feedforward {said:+.4f} mA/V: it {how} (the piezo {step:+.2f} V, the current {b - a:+.3f} mA)")
+        if self.ff_soft:  # (this step's too, as its feedforward would have moved it)
+            if not self.kv_model and not self.kv_tuned:  # (the tuning it went by, the current kept: the current's
+                self.kv += self.ff_soft * self.slope    # part added now that it moves along)
+            yield from self._move(current=self.I + self.ff_soft * step, read=False)
+
+    @property
+    def ff_soft(self) -> float:
+        """mA/V: what of its feedforward the DLC pro does not do itself as the piezo moves (seen: check_ff), which the
+        piezo's tuning steps (tune, measure_kv) do instead, the current moved along: on the lab's DL pros, all of it,
+        so that a mode that holds over a narrow range of current (its band moving with the piezo, as the feedforward
+        set is meant to follow) is not left behind."""
+        return self.ff_said - self.ff if self.ff_known else 0.0
+
+    def current_now(self):
+        """The measured current (mA), once it has stopped changing (ARRIVE_S at most); None if it cannot be read."""
+        last = None
+        for _ in range(int(self.ARRIVE_S / 0.1)):
+            (act,) = yield Get(("dl:cc:current-act",))
+            if not _num(act):
+                return None
+            if last is not None and abs(act - last) <= 0.005:
+                return float(act)
+            last = act
+            yield Wait(0.1)
+        return float(last)
+
+    def _move(self, current=None, offset=None, read=True, check=True, top=False):
         i0, v0 = self.I, self.V
         v = v0 if offset is None else min(max(offset, self.v_lo), self.v_hi)
         lo, hi, tp = self.window(v)
@@ -928,8 +1008,10 @@ class Recenter(CavitySteps):
         where the piezo, through the feedforward, takes the measured current the other way (it comes back in, the
         window's edge never passed meanwhile). Returns what the last Move gets back."""
         if current is not None and offset is not None and self.ff * (offset - v_was) * (current - i_was) < 0:
-            yield Move(current, None, False)
-            return (yield Move(None, offset, read))
+            lo, top = self.allowed(v_was)
+            if lo - 1e-9 <= current <= top + 1e-9:  # (unless the current would leave its window meanwhile: at its
+                yield Move(current, None, False)     # edge, the piezo first, which brings it in)
+                return (yield Move(None, offset, read))
         return (yield Move(current, offset, read))
 
     def come_to(self, up: bool):
@@ -1163,6 +1245,12 @@ class Recenter(CavitySteps):
         """Closer than this to the target, try the piezo alone first."""
         return max(0.3 * self.spacing if self.spacing else 1500.0, 2 * self.p.tolerance)
 
+    def quick_margin(self) -> float:
+        """mA: the margins checked when the piezo alone brought it back (near its target it has not hopped: it is on
+        the mode it ran on, at the current it ran at): the least worth having, not the margin wanted, which on a
+        narrow mode (the lab's 493 nm laser's is some 0.6 mA wide) would itself take it off its mode."""
+        return min(self.p.margin, self.MIN_MARGIN)
+
     # ------------------------------------------------------------------ steps
     def run(self):
         yield from self.current_setup()
@@ -1203,13 +1291,24 @@ class Recenter(CavitySteps):
     def current_setup(self):
         """With the DLC pro's feedforward on, the piezo moves the current too (feedforward-factor mA/V of the
         measured current): the window, and the floor kept above where it stopped lasing, follow the measured
-        current, and no piezo move changes it by more than STEP_MAX at once."""
+        current, and no piezo move changes it by more than STEP_MAX at once. Unless it does not: on a DL pro whose
+        piezo the scan's offset moves (its scan off), the feedforward follows the scan alone and adds nothing; so
+        what it does is seen at the first piezo move (check_ff), and kept (HopParams.ff_set, ff_act) for the next."""
         on, factor = yield Get(("dl:cc:feedforward-enabled", "dl:cc:feedforward-factor"))
         if on is True and _num(factor) and factor:
-            self.ff = float(factor)
+            p = self.p
+            self.ff_said = float(factor)
+            self.ff_known = bool(p.ff_set) and abs(p.ff_set - factor) < 1e-9  # (seen before, at this factor)
+            self.ff = p.ff_act if self.ff_known else float(factor)
             lo, hi, _ = self.window()
-            self.note(f"feedforward {self.ff:+.4f} mA/V: the piezo moves the current too; it is kept within "
-                      f"{self.mA(lo):.2f} … {self.mA(hi):.2f} mA as measured, wherever the piezo goes")
+            where = f"{self.mA(lo):.2f} … {self.mA(hi):.2f} mA as measured"
+            if not self.ff:
+                self.note(f"feedforward {self.ff_said:+.4f} mA/V, but as its recoveries saw, it adds nothing when the "
+                          f"piezo moves (the scan's offset moves it, its scan off): the current is kept within {where}")
+                return
+            self.note(f"feedforward {self.ff:+.4f} mA/V: the piezo moves the current too; it is kept within {where}, "
+                      f"wherever the piezo goes" + ("" if self.ff_known else " (whether it does, its first piezo move "
+                                                                             "shows)"))
 
     def come_inside(self):
         """Begun with the current outside its window (left high where it lased again after it stopped, say, or
@@ -1278,7 +1377,7 @@ class Recenter(CavitySteps):
             yield from self.shg_scan(True)  # its sweep shows how single-mode the laser is, all along
         if mapped is None and self.quick and math.isfinite(self.e) and abs(self.e) <= self.near():
             yield from self.ask(f"The laser is {self.e:+.0f} MHz from its target: tune the piezo onto it")
-            if ((yield from self.tune()) == "ok" and (yield from self.check(self.p.margin))
+            if ((yield from self.tune()) == "ok" and (yield from self.check(self.quick_margin()))
                     and (yield from self.mode_ok())):
                 return
         lo, hi = self.mA(self.i_lo), self.mA(self.i_hi)
@@ -1319,6 +1418,8 @@ class Recenter(CavitySteps):
     MODEL_BETTER = 0.1   # this many more than a model that never hops, or fewer than MODEL_COMB of them on its
     MODEL_COMB = 0.7     # external comb: not this laser's now (it was realigned, its temperature changed a lot)
     MODEL_V = 5.0        # V beyond the piezo voltages its map covered that the model is trusted
+    PLAN_V = 3.0         # V: its plans this near where it has been seen in this recovery first (its model is only as
+    #                      good as how its piezo tunes it, further away: its map could not tell that from a drift)
 
     def by_model(self):
         """Method 'model': the laser's own model (lasermodel.LaserModel, fitted to its map) puts it on a mode on target
@@ -1352,9 +1453,11 @@ class Recenter(CavitySteps):
         if self.quick and math.isfinite(self.e) and abs(self.e) <= self.near():
             yield from self.ask(f"The laser is {self.e:+.0f} MHz from its target: tune the piezo onto it (its model's "
                                 f"tuning, {self.kv:+.0f} MHz/V)")
-            if ((yield from self.tune()) == "ok" and (yield from self.check(self.p.margin))
+            if ((yield from self.tune()) == "ok" and (yield from self.check(self.quick_margin()))
                     and (yield from self.mode_ok())):
                 return
+        if self.ref_given and (yield from self.back_to_ref(pl)):
+            return
         bands = yield from self.map()
         v, points = self.mapped
         for leg in (1, 2):
@@ -1363,9 +1466,9 @@ class Recenter(CavitySteps):
                 if pt.leg == leg and not (pt.bad or pt.rough):
                     pl.observe(seg, pt.t, self.mA(pt.i, v), v, pt.up, pt.e / 1e3)
         agree = yield Think(pl.fit)
-        rec = {"phi": round(pl.phi, 3), "slide": round(pl.slide, 2), "drift": round(pl.drift, 3),
-               "agree": None if agree is None else round(agree, 3), "right": pl.right, "plans": []}
-        self.record["model"] = rec
+        rec = self.record.setdefault("model", {})  # (and where it was on target, tried: back_to_ref)
+        rec.update({"phi": round(pl.phi, 3), "slide": round(pl.slide, 2), "drift": round(pl.drift, 3),
+                    "agree": None if agree is None else round(agree, 3), "right": pl.right, "plans": []})
         if (agree is None or pl.on_comb < self.MODEL_COMB
                 or (agree < self.MODEL_AGREE and agree < pl.null + self.MODEL_BETTER)):
             self.note("its model fits this map's readings badly" +
@@ -1378,6 +1481,7 @@ class Recenter(CavitySteps):
                   + (f", where it lases {pl.slide:+.1f} GHz" if abs(pl.slide) >= 0.05 else "")
                   + (f", its external modes {pl.drift:+.2f} GHz from where they were on target" if ref is not None
                      and abs(pl.drift) >= 0.05 else ""))
+        self.model_pv(pl)
         lo_m, hi_m = self.mA(self.i_lo), self.mA(self.i_hi)
         v_lo, v_hi = self.v_lo, self.v_hi
         if self.model.v_span:  # (as far as its map went, and a little)
@@ -1385,11 +1489,21 @@ class Recenter(CavitySteps):
             v_lo, v_hi = max(v_lo, a - self.MODEL_V), min(v_hi, b + self.MODEL_V)
         ts = [pt.t for pt in points if math.isfinite(pt.t)]
         step_s = _median([b - a for a, b in zip(ts, ts[1:]) if b > a]) if len(ts) > 2 else 0.2
+        if (yield from self.right_band(pl, bands)):
+            rec["band"] = True
+            self.learned["model_adapt"] = self.adapted(pl)
+            return
         avoid = []
         for k in range(self.MODEL_TRIES):
-            args = (lo_m, hi_m, v_lo, v_hi, self.p.step, self.mA(self.nominal), self.V, step_s or 0.2, self.p.margin)
-            plan = (yield Think(lambda args=args, avoid=list(avoid): pl.plan(*args, avoid=avoid))) if v_lo <= v_hi \
-                else None
+            seen = [x.v for x in pl.seen] + ([self.v_ref] if self.ref_given else [])
+            near = (max(v_lo, min(seen) - self.PLAN_V), min(v_hi, max(seen) + self.PLAN_V)) if seen else (v_lo, v_hi)
+            plan = None
+            for a, b in ((near, (v_lo, v_hi)) if near != (v_lo, v_hi) else ((v_lo, v_hi),)):  # (as near as it can)
+                args = (lo_m, hi_m, a, b, self.p.step, self.mA(self.nominal), self.V, step_s or 0.2, self.p.margin)
+                plan = (yield Think(lambda args=args, avoid=list(avoid): pl.plan(*args, avoid=avoid))) if a <= b \
+                    else None
+                if plan is not None:
+                    break
             if plan is None:
                 self.note("its model: no way onto a mode on target within the window"
                           + (" but those that did not hold" if avoid else self.model_why(pl)))
@@ -1434,6 +1548,7 @@ class Recenter(CavitySteps):
                                                seen))
                             and (yield from self.mode_ok())):
                         rec["done"] = k + 1
+                        self.learned["model_adapt"] = self.adapted(pl)
                         return
                 self.note("its model: it does not hold there")
             else:
@@ -1442,8 +1557,95 @@ class Recenter(CavitySteps):
             agree = yield Think(pl.fit)
             rec["refits"] = rec.get("refits", []) + [[round(pl.phi, 3), round(pl.slide, 2),
                                                       None if agree is None else round(agree, 3)]]
+            self.model_pv(pl)
         self.note("its model did not bring it onto a mode on target: the map's way")
         return (yield from self.find())
+
+    def right_band(self, pl, bands):
+        """Where the map just made has its right mode lasing (the band whose mode its model, fitted to it, says is the
+        right one: where it is, the map's; which it is, the model's), the best two first: parked there, the piezo onto
+        the target and the margins checked, as the map's way does. True: done."""
+        if pl.right is None:
+            return False
+        right = [b for b in bands if pl.order_of(self.mA(b.op, b.v), b.v, b.e / 1e3) == pl.right][:2]
+        for band in right:
+            if not (yield from self.park(band)):
+                return False  # (not where the map had it: its model's plans)
+            outcome = yield from self.tune(band)
+            if outcome == "ok" and ((yield from self.check(max(self.MIN_MARGIN, min(self.p.margin, 0.8 * band.margin))))
+                                    and (yield from self.mode_ok())):
+                self.note(f"on its right mode where the map has it ({self.mA(band.lo):.2f}–{self.mA(band.hi):.2f} mA "
+                          f"sweeping {band.way}), the piezo onto the target")
+                return True
+            self.note(f"its right mode where the map has it ({self.mA(band.lo):.2f}–{self.mA(band.hi):.2f} mA sweeping "
+                      f"{band.way}): " + ("it does not hold, the piezo onto the target" if outcome == "ok" else
+                                          f"the piezo did not bring it onto the target ({outcome})"))
+            if outcome != "ok":
+                return False
+        return False
+
+    @staticmethod
+    def adapted(pl) -> dict:
+        """What its model, fitted here, found its laser to be (a recovery by it that brought it back keeps it with its
+        model: Channel.adapt_model): its chip's modes phi GHz from where it had them, and how its piezo tunes its
+        external modes, if what it did here told that."""
+        return {"phi": round(pl.phi, 3), **({"p_v": round(pl.pv0 + pl.pv, 4)} if pl.pv else {})}
+
+    def model_pv(self, pl):
+        """Say how its piezo tunes its external modes, if what it did in this recovery tells that better than its
+        map did (Planner._recomb), once and when it changes."""
+        said = self.record.setdefault("model", {}).get("p_v")
+        now = round(pl.pv0 + pl.pv, 3)
+        if abs(pl.pv) < 0.02 or (said is not None and abs(now - said) < 0.02):
+            return
+        self.record["model"]["p_v"] = now
+        vs = sorted({round(x.v, 2) for x in pl.seen})
+        self.note(f"its piezo tunes its external modes {now:+.2f} GHz/V (its map had {pl.pv0:+.2f}, not telling it "
+                  f"from its cavity's drift), as what it did at {vs[0]:.2f} … {vs[-1]:.2f} V has it")
+
+    def back_to_ref(self, pl):
+        """As by hand, the first thing to try after a hop, before any map: back where it was on target (ref: its
+        right mode on target there, a few minutes ago at most), the piezo there and the current come to it sweeping up
+        from the window's bottom, then down from its top (the way its model says lands it on its right mode there
+        first: hysteresis), a reading a step. On its right mode there, the piezo onto the target and the least margins
+        worth having checked (it held there): True, done. Its readings go to its model, for its map's fit after."""
+        v, i_set = self.v_ref, self.i_ref
+        lo, hi, _ = self.window(v)
+        if not (lo + 1e-9 < i_set < hi - 1e-9 and self.v_lo <= v <= self.v_hi) or pl.right is None:
+            return False
+        i, lo_m, hi_m = self.mA(i_set, v), self.mA(lo, v), self.mA(hi, v)
+        step_s = self.model.step_s or 0.25
+        nominal, shares = self.mA(self.nominal), {}
+        for up in (True, False):
+            shares[up] = yield Think(lambda up=up: pl.arrives(i, v, up, lo_m, hi_m, self.p.step, nominal, step_s,
+                                                              self.MIN_MARGIN))
+        tried = self.record.setdefault("model", {}).setdefault("ref", [])
+        for up in sorted(shares, key=lambda u: -shares[u]):
+            way = "up" if up else "down"
+            likely = f" (its model: on its right mode so in {shares[up]:.0%} of the ways it can be now)"
+            yield from self.ask(f"Back where it was on target: the piezo to {v:.2f} V, then the current sweeping {way} "
+                                f"to {i:.2f} mA" + (likely if shares[up] else ""))
+            self.stage = f"back where it was on target: {v:.2f} V, sweeping {way} to {i:.2f} mA"
+            if abs(self.V - v) > 1e-6:
+                yield from self.move(offset=v, read=False)
+            yield from self.come_to(up)
+            seg = pl.segment()
+            for x in _steps(self.i_lo if up else self.i_hi, i_set, self.p.step):
+                e = yield from self.move(current=x)
+                pl.observe(seg, self.t, self.mA(x), self.V, up, e / 1e3)
+            e = yield from self.steady()
+            tried.append([way, round(e, 1) if math.isfinite(e) else None])
+            where = f"back where it was on target ({self.mA(self.I):.2f} mA, {self.V:.2f} V), come to sweeping {way}"
+            if not (math.isfinite(e) and abs(e) < 0.3 * pl.m.ext.spacing * 1e3):
+                self.note(f"{where}: {e:+.0f} MHz from the target, not on its right mode")
+                continue
+            self.note(f"{where}: on its right mode, {e:+.0f} MHz from the target")
+            if ((yield from self.tune()) == "ok" and (yield from self.check(self.quick_margin()))
+                    and (yield from self.mode_ok())):
+                self.back_at = way
+                return True
+            self.note("it does not hold there")
+        return False
 
     def model_why(self, pl) -> str:
         """Why its model has no way onto the target, if it is where it lases (its window, as the model has it now)."""
@@ -1455,11 +1657,16 @@ class Recenter(CavitySteps):
                 f"with the diode's temperature)")
 
     def model_tuning(self, pl):
-        """The model's tuning where the laser is (no measuring): the piezo's, the current's on a mode, the modes'
-        spacing."""
+        """The model's tuning where the laser is (no measuring): the current's on a mode, the modes' spacing; and
+        the piezo's, unless its recoveries measured that (HopParams.kv: as the piezo moves at a current as set) or this
+        one has (tune). The model's is at a current as measured: as tune moves the piezo, the current moves as its
+        feedforward is set to (by the DLC pro, or by tune itself where the DLC pro does not: ff_soft), which adds its
+        part."""
         i, v = self.mA(self.I), self.V
-        self.kv, self.kv_known, self.kv_measured = pl.kv(i, v), True, True
         self.slope = pl.slope(i, v)
+        if not (self.kv_tuned or (self.kv_known and not self.kv_model)):
+            self.kv, self.kv_model = pl.kv(i, v) + self.ff_said * self.slope, True
+        self.kv_known = self.kv_measured = True
         self.spacing = pl.m.ext.spacing * 1e3
         self.threshold = max(HOP_MIN, 0.4 * self.spacing)
 
@@ -1533,8 +1740,10 @@ class Recenter(CavitySteps):
         self.modes = modes
         if self.maps == 1 and abs(v - self.V0) < 1e-6 and math.isfinite(self.e0):
             self.home = self.homeward(modes)
-        if res.spacing:
-            self.spacing = res.spacing
+        if res.spacing and self.method != "model":  # (its model's external modes, not its hops: whole chip modes on
+            self.spacing = res.spacing                # a laser whose chip's modes decide, as the 493 nm's do)
+        elif self.method == "model" and self.spacing:  # (a hop: to another of its external modes at least)
+            self.threshold = max(self.threshold, 0.4 * self.spacing)
         if res.noise:
             self.noise = res.noise
         bands = self.weigh([Band(mode, a, b, v, up) for mode in modes
@@ -1628,12 +1837,15 @@ class Recenter(CavitySteps):
         per volt, to choose between modes with. Each the middle of three readings: near where it
         goes multimode, the wavemeter now and then reads nonsense."""
         self.stage = "measuring the piezo tuning"
+        if not self.ff_known:  # (what its feedforward does, seen first: the current moved along by what it does not)
+            yield from self.check_ff(self.V + (0.5 if self.V + 0.5 <= self.v_hi else -0.5))
         v = self.V
         dv = 0.5 if v + 0.5 <= self.v_hi else -0.5
         e0 = yield from self.steady()
-        yield from self.move(offset=v + dv)
+        i = self.I
+        yield from self.move(offset=v + dv, current=i + self.ff_soft * dv if self.ff_soft else None)
         e1 = yield from self.steady()
-        yield from self.move(offset=v)
+        yield from self.move(offset=v, current=i if self.ff_soft else None)
         e2 = yield from self.steady()
         a, b = (e1 - e0) / dv, (e1 - e2) / dv
         lo, hi = self.KV_PLAUSIBLE
@@ -1702,7 +1914,10 @@ class Recenter(CavitySteps):
                 if not math.isfinite(e2) or abs(e2 - e - self.slope * (i - self.I)) > self.threshold:
                     return "hop"
                 continue
-            e2 = yield from self.move(offset=v)
+            if not self.ff_known:  # (what its feedforward does, seen first: the current moved along by what it
+                yield from self.check_ff(v)  # does not)
+            soft = self.ff_soft * (v - self.V)
+            e2 = yield from self.move(offset=v, current=self.I + soft if soft else None)
             if not math.isfinite(e2):
                 return "lost"
             kv = (e2 - e) / dv
@@ -1717,8 +1932,13 @@ class Recenter(CavitySteps):
             if self.kv_measured:
                 if 0.5 < kv / self.kv < 2:
                     self.kv = 0.7 * self.kv + 0.3 * kv
+                elif kv / self.kv > 0 and lo <= abs(kv) <= hi and abs(e2 - e) >= max(self.KV_MOVED, 20 * self.noise):
+                    self.kv = kv  # (what it went by is far off, a step that moved it more than any scatter tells: it
+                    #               overshoots, or creeps, a step at a time; what it did instead)
+                self.kv_tuned = True
             elif self._kv_try is not None and 0.7 < kv / self._kv_try < 1.4:
                 self.kv, self.kv_known, self.kv_measured = 0.5 * (kv + self._kv_try), True, True
+                self.kv_tuned = True
             elif lo <= abs(kv) <= hi:
                 self.kv = self._kv_try = kv  # use it, but believe it once a second step agrees
         return "ok" if abs(self.e) <= self.tol() else "slow"
@@ -3110,6 +3330,9 @@ class Recenter(CavitySteps):
                           f", then to the top end of where it is at its best, {self.topped[1]:.2f} mA")
                        + f", the piezo {v:.2f} → {self.V:.2f} V, current {began:.2f} → {now:.2f} mA measured "
                        f"({self.readings} readings)")
+        elif self.back_at:
+            summary = (f"back where it was on target, its current come to sweeping {self.back_at}: {began:.2f} → "
+                       f"{now:.2f} mA measured, {self.V0:.2f} → {self.V:.2f} V ({self.readings} readings)")
         elif self.method in ("walk", "catch") and not self.trims and abs(self.V - self.V0) < 0.5 and not self.panics:
             summary = f"the laser itself was fine; piezo {self.V0:.2f} → {self.V:.2f} V"
         elif self.method == "catch" and self.caught is not None:
@@ -3350,8 +3573,10 @@ class Runner:
             v, i = v0 + (offset - v0) * k / n, i0 + (current - i0) * k / n
             dv, di = v - self._ops_offset(), i - self._ops_current()
             ops = [("offset", v)] if abs(dv) > 1e-12 else []
-            if abs(di) > 1e-12:  # (first, where the piezo takes the measured current the other way: Recenter._step)
-                ops.insert(0 if r.ff * dv * di < 0 else len(ops), ("current", i))
+            if abs(di) > 1e-12:  # (first, where the piezo takes the measured current the other way: Recenter._step;
+                lo, top = r.allowed(self._ops_offset())  # unless that takes it out of its window meanwhile: its edge)
+                first = r.ff * dv * di < 0 and lo - 1e-9 <= i <= top + 1e-9
+                ops.insert(0 if first else len(ops), ("current", i))
             self._ops.extend(ops)
             if pace and di + r.ff * dv < 0:
                 self._ops.append(("pause", pace))

@@ -137,10 +137,11 @@ def measured_currents(b):
     """The current the laser ran at (measured: with the feedforward, the piezo moves it too) when the recovery
     began and after each write of current or offset."""
     d = b.dlc.params
-    ff = d["laser1:dl:cc:feedforward-factor"] if d["laser1:dl:cc:feedforward-enabled"] else 0.0
+    ref = b.dlc.ff_from.get(1, 0.0)  # (None: the feedforward adds nothing as the scan's offset moves the piezo)
+    ff = d["laser1:dl:cc:feedforward-factor"] if d["laser1:dl:cc:feedforward-enabled"] and ref is not None else 0.0
     base = d["laser1:dl:cc:current-offset"] + b.dlc.bias.get(1, 0.0)
     i, v = b.start
-    out = [i + base + ff * v]
+    out = [i + base + ff * (v - (ref or 0.0))]
     for name, value in b.dlc.log:
         if name == "laser1:dl:cc:current-set":
             i = value
@@ -148,7 +149,7 @@ def measured_currents(b):
             v = value
         else:
             continue
-        out.append(i + base + ff * v)
+        out.append(i + base + ff * (v - (ref or 0.0)))
     return out
 
 
@@ -156,8 +157,9 @@ def check_safety(b, i_lo, i_hi, p):
     """i_lo, i_hi: the window as set currents with the piezo where it began; it is on the measured current."""
     acts = measured_currents(b)
     off = acts[0] - b.start[0]
-    assert all(i_lo + off - 1e-9 <= a <= i_hi + off + 1e-9 for a in acts), "current outside its window"
-    assert all(abs(x - y) <= STEP_MAX + 1e-9 for x, y in zip(acts, acts[1:])), "measured current jumped"
+    eps = 1e-6  # (what goes over the wire: values written to six decimals)
+    assert all(i_lo + off - eps <= a <= i_hi + off + eps for a in acts), "current outside its window"
+    assert all(abs(x - y) <= STEP_MAX + eps for x, y in zip(acts, acts[1:])), "measured current jumped"
     currents = [b.start[0]] + b.writes("dl:cc:current-set")
     assert all(abs(x - y) <= STEP_MAX + 1e-9 for x, y in zip(currents, currents[1:])), "current jumped"
     falc0 = {}
@@ -2008,7 +2010,7 @@ def test_the_catch_with_the_feedforward():
     assert r.state == "done", r.error
     assert rec.panics == 0 and b.laser.lasing and b.laser.m == 0 and lock.locked() and abs(b.off_mhz()) < 1
     acts = measured_currents(b)
-    assert min(acts) >= I0 - 1.0 - 1e-9 and max(acts) <= I0 + 0.95 + 1e-9
+    assert min(acts) >= I0 - 1.0 - 1e-6 and max(acts) <= I0 + 0.95 + 1e-6  # (values written to six decimals)
 
 
 def test_monte_carlo_catches_over_random_lasers_with_near_modes():
@@ -2456,3 +2458,90 @@ def test_monte_carlo_catches_by_the_wavemeter_alone():
             right += laser.m == 0
     assert feasible >= 25 and right >= 0.95 * feasible, (right, feasible)
     assert inside >= 36 and sorted(readings)[20] < 80, (inside, sorted(readings))
+
+
+# ------------------------------------------------- what the feedforward does, seen
+def test_a_feedforward_that_does_nothing_is_seen_at_the_first_piezo_move():
+    """On a DL pro whose piezo the scan's offset moves (its scan off) the feedforward follows the scan alone: its factor
+    says -0.3 mA/V, but the current stays where it is set as the piezo moves (the lab's 493 and 650 nm lasers). A
+    recovery sees that at its first piezo move, reckons the current so from then on (its window on the current as it
+    is), moves the current along itself as it tunes the piezo (as the feedforward set is meant to), and keeps what it
+    saw for the next."""
+    laser = ECDL(400.0, seed=3)
+    target = laser.freq(V0, I0) + 0.6e-3  # THz: 600 MHz above it, on its mode
+    b = Bench(laser, target)
+    d = b.dlc.params
+    d["laser1:dl:cc:feedforward-enabled"], d["laser1:dl:cc:feedforward-factor"] = True, -0.3
+    b.dlc.ff_from[1] = None
+    b, rec, r = recover(laser, target, HopParams(enabled=True, i_nom=I0), bench=b)  # (its window kept: check_safety)
+    assert r.state == "done" and abs(b.off_mhz()) < 5 and rec.maps == 0
+    assert rec.ff == 0.0 and rec.learned["ff_set"] == -0.3 and rec.learned["ff_act"] == 0.0
+    assert any("it adds nothing as the piezo moves" in n for n in rec.notes)
+    assert rec.mA(rec.I) == pytest.approx(b.act, abs=1e-6)  # (as it is)
+    assert b.V > V0 + 0.5 and b.I - I0 == pytest.approx(-0.3 * (b.V - V0), abs=0.06)  # (moved along, as it tuned)
+
+
+def test_what_its_feedforward_does_is_kept_for_the_next_recovery():
+    seen = HopParams(enabled=True, i_nom=I0, ff_set=-0.3, ff_act=0.0)
+    since = HopParams(enabled=True, i_nom=I0, ff_set=-0.5, ff_act=0.0)  # (seen at another factor: looked at again)
+    for p, probe in ((seen, False), (since, True)):
+        laser = ECDL(400.0, seed=3)
+        b = Bench(laser, laser.freq(V0, I0) + 0.6e-3)
+        d = b.dlc.params
+        d["laser1:dl:cc:feedforward-enabled"], d["laser1:dl:cc:feedforward-factor"] = True, -0.3
+        b.dlc.ff_from[1] = None
+        b, rec, r = recover(laser, b.target, p, bench=b)
+        assert r.state == "done" and rec.ff == 0.0
+        assert any("as its recoveries saw, it adds nothing" in n for n in rec.notes) is not probe
+        assert ("ff_act" in rec.learned) is probe
+
+
+def test_the_feedforward_that_does_what_its_factor_says_is_seen_so():
+    laser = ECDL(400.0, seed=3)
+    b = Bench(laser, laser.freq(V0, I0) + 0.6e-3)
+    d = b.dlc.params
+    d["laser1:dl:cc:feedforward-enabled"], d["laser1:dl:cc:feedforward-factor"] = True, -0.3
+    b.dlc.ff_from[1] = V0  # (it moves the current as its factor says, from where it began)
+    b, rec, r = recover(laser, b.target, HopParams(enabled=True, i_nom=I0), bench=b)
+    assert r.state == "done" and rec.ff == -0.3 and rec.learned["ff_act"] == -0.3
+    assert rec.mA(rec.I) == pytest.approx(b.act, abs=1e-6) and rec.ff_soft == 0.0
+    assert b.I == pytest.approx(I0)  # (the DLC pro moved it as the piezo went: not moved besides)
+
+
+def test_put_back_from_the_bottom_of_its_window_the_current_never_leaves_it():
+    """10:26 on 27 October: a recovery that failed with the piezo 5.3 V up and the current at the bottom of its
+    window could not put them back: the current's first step down came before the piezo's (which, through the
+    feedforward, brings the current back up), so that it would have left its window meanwhile, and that write was
+    refused: the laser was left there. The piezo first, then."""
+    class Gone(Recenter):
+        def run(self):
+            yield from self.current_setup()
+            yield from self.move(offset=self.V0 + 5.3, read=False)
+            yield from self.move(current=self.i_lo, read=False)
+            raise Failed("no mode")
+
+    b = Bench(ECDL(400.0, seed=3), 0.0)
+    d = b.dlc.params
+    d["laser1:dl:cc:feedforward-enabled"], d["laser1:dl:cc:feedforward-factor"] = True, -0.6
+    b.dlc.ff_from[1] = V0
+    p = HopParams(enabled=True, i_nom=I0, ff_set=-0.6, ff_act=-0.6)
+    r = b.run(Gone(p, I0, V0, I0 - 1.0, I0 + 2.0, V0 - 25.0, V0 + 25.0))
+    assert r.state == "failed" and r.error == "no mode" and r.restored
+    assert (b.I, b.V) == (I0, V0)
+    acts = measured_currents(b)
+    assert min(acts) >= I0 - 1.0 - 1e-6 and max(acts) <= I0 + 2.0 + 1e-6
+
+
+def test_a_tuning_far_off_what_it_went_by_is_taken_from_what_it_did():
+    """10:26 on 27 October: the piezo's tuning its model gave (0.9 GHz/V) was less than half what it does: each step
+    overshot the target further than the last, and a tuning off by more than twice was never taken from what it did.
+    Now a step that moved it more than any scatter tells sets it: on target in a few steps."""
+    laser = ECDL(400.0, kv=0.4, seed=3)
+    target = laser.freq(V0, I0) + 0.328e-3
+    b = Bench(laser, target)
+    p = HopParams(enabled=True, i_nom=I0)
+    rec = Recenter(p, I0, V0, I0 - 1.0, I0 + 2.0, V0 - 25.0, V0 + 25.0, kv=186.0)
+    rec.kv_measured = True  # (as its model's tuning is taken)
+    r = b.run(rec)
+    assert r.state == "done" and rec.maps == 0 and abs(b.off_mhz()) < 5
+    assert len(b.writes("scan:offset")) <= 4 and rec.kv == pytest.approx(400.0, rel=0.2)

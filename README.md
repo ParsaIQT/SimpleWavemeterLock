@@ -481,7 +481,17 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   it shows is measured. With the DLC pro's **feedforward** on, the piezo moves the current too
   (`feedforward-factor` mA/V): the window, and the floor kept above where the laser stopped
   lasing, are on the measured current wherever the piezo goes (the set current follows), and
-  no piezo move changes the measured current by more than 0.2 mA at once. A current found
+  no piezo move changes the measured current by more than 0.2 mA at once. **Unless it does
+  not**: on a DL pro whose piezo the scan's offset moves (its scan off), the feedforward follows
+  the scan alone and adds nothing, whatever its factor (the lab's 493 and 650 nm lasers). So a
+  recovery sees which at its first piezo move (a step of 0.1 mA's worth, the measured current
+  read before and after), reckons the current by what it saw from then on, and keeps that for
+  the next (*Check setup* says it). Where it adds nothing, the recovery moves the current along
+  itself as it tunes the piezo, by the factor set: as the feedforward is meant to, keeping a mode
+  that holds over a narrow range of current on it as the piezo moves it. Before this, recoveries
+  took the factor at its word: on the 493 nm laser on 27 October each volt of piezo moved its
+  current 0.6 mA from where they reckoned it (3.2 mA above its window once), and one that failed
+  could not put the piezo and current back. A current found
   **outside** its window when a recovery starts (left high where a laser that had stopped
   lasing lased again, say) is brought into it first: from above slowly, asking every 0.2 mA
   whether it still lases, and on down, as by hand, until the SHG sweep is single-mode.
@@ -900,8 +910,9 @@ mode lases sweeping either way is enough; and the laser is brought to its operat
 way the map found its mode there.
 
 1. **Quick check.** If the laser is close to its target (the cavity lock had caught a wrong
-   peak, say), the piezo tunes it back, and steps of the current check that it is clear of
-   the next hop. If so, it is handed back.
+   peak, say), the piezo tunes it back, and steps of the current (±0.15 mA, the least worth
+   having: it has not hopped, and on a narrow mode the margin wanted would itself take it off)
+   check that it is clear of the next hop. If so, it is handed back.
 2. **Map.** At fixed piezo, the current is ramped to the top of its window and down to the
    bottom (so the laser starts on the mode a sweep down leaves it on), then swept **up**
    across the window and back **down**, one reading per 0.1 mA step. The readings fall into
@@ -942,8 +953,15 @@ chip lagging the current.
 
 1. **Anchored.** Where the laser was last on target (in the last 15 minutes) its right mode was on
    target: that places the model's external modes as they are now (they drift), and the target inside
-   where it lases.
-2. **A map here**, as the map method's: the current over its window, up and down, at the piezo voltage
+   where it lases. Near its target (it drifted, it has not hopped), the piezo alone brings it back, the
+   least margins checked (as the map's quick check). A model fitted by a version before 25 October
+   gave its chip's modes a drift along its map, which was its slow axis's doing (the piezo's): they
+   are taken so.
+2. **Back where it was on target**, as you would by hand: the piezo there, and the current come to
+   where it was sweeping up from the window's bottom, then down from its top (the way its model says
+   lands it on its right mode there first), a reading a step. On its right mode there, the piezo onto
+   the target and the least margins checked: done, before any map (a few seconds each way).
+3. **A map here**, as the map method's: the current over its window, up and down, at the piezo voltage
    it is at. The model is fitted to it: its external modes where the readings have them, then how far its
    chip's modes have moved since its map (their temperature, their age) and where it lases (its window),
    each sweep simulated from its first reading, the modes it lases on those it was read on. Every
@@ -951,20 +969,31 @@ chip lagging the current.
    way, which its map could tell apart only so far) if it fits nearly as well: the model's *members*.
    A model that fits worse than one that never hops, or whose modes are not where the readings are, is
    not this laser's as it is now (realigned, or its temperature changed a lot): the map's way, from
-   this map.
-3. **A plan.** For piezo voltages across the piezo's range (as far as its map went, and 5 V more), the
-   current that puts a mode on target there: the one it was on, or one a few modes away at another
-   piezo voltage (the target, either way); each come to sweeping up from the window's bottom or down
-   from its top, by way of the other end first, as the recovery does. Each is simulated by every
+   this map. Read at piezo voltages 1 V apart or more (a map, and where it went back to), how its piezo
+   tunes its external modes is taken from where they are at each (its map could not tell that from its
+   cavity's drift: on the 493 nm laser +1.19 GHz/V, where its map had +0.92).
+4. **Its right mode where the map has it.** The model says which of the map's modes is its right one
+   (where it is, the map's own readings say): parked there and the piezo onto the target, the current
+   moved along, the margins checked as the map method's.
+5. **A plan.** For piezo voltages within 3 V of where it has been read in this recovery first (its
+   model is only as good as how its piezo tunes it, further away), then across the piezo's range (as far
+   as its map went, and 5 V more), the current that puts a mode on target there: the one it was on, or
+   one a few modes away at another piezo voltage (the target, either way); each come to sweeping up
+   from the window's bottom or down from its top, by way of the other end first, as the recovery does. Each is simulated by every
    member, then on past it and back in 0.02 mA steps: the plan is the one the most members bring onto
    its mode with the margins asked for (*Keep a hop at least …*), then by their margins, then little
    piezo and the current near nominal. The note says which mode, where, which way, and the margins.
-4. **There.** The piezo to the plan's voltage, the current round by the far end of the window and
+6. **There.** The piezo to the plan's voltage, the current round by the far end of the window and
    swept to the operating point, a reading a step (each one against what the model expected). On its
-   mode: the piezo onto the target with the model's own tuning (nothing to measure), then the margins
-   checked as the map method's. Not on it, or not holding: everything it read on the way, the margins'
-   check too, goes into the model, fitted again, and the next plan avoids where that one did not hold;
-   six plans at most, then the map's way.
+   mode: the piezo onto the target with the tuning its recoveries measured (else its model's), then the
+   margins checked as the map method's. Not on it, or not holding: everything it read on the way, the
+   margins' check too, goes into the model, fitted again, and the next plan avoids where that one did not
+   hold; six plans at most, then the map's way.
+
+What a recovery that brought it back found its laser to be, its model fitted to it (where its chip's
+modes are, and how its piezo tunes its external modes, if that was read), is kept with its model: the
+next recovery begins from there (*Mode-hop recovery…* still says which map it came from). A new map
+starts afresh.
 
 If no mode can be put on target within the window, it says why as the model sees it: where it lases,
 from the target, and how that moves with the piezo and the current. The model's sums (a second or two each,
@@ -984,6 +1013,17 @@ for each of two such truths (made from its model, and from the map's other fit):
 
 Of the three it did not recover, two it would have had on a seventh and a ninth plan, and one not with any
 margin: the target was where that laser lased only at the very bottom of its current window.
+
+**27 October, the 493 nm laser.** Its recoveries that morning failed, and it was brought back by hand,
+with difficulty: its right mode lases over some 0.6 mA of current only, and only come to sweeping up, and
+moves 0.5 mA a volt with the piezo. Its recoveries' maps since its map of 25 October all put its chip's
+modes 8.5 GHz from where its model had them (on 24 October as on 27 October: it had not changed; its
+model, fitted by the version before, had), and its external modes moving +1.19 GHz/V with its piezo. As
+those maps have it (`sim.ModelLaser`), on a DL pro whose feedforward adds nothing, after 24 drifts and hops
+(its chip's modes moved 0.5 to 3 GHz, its cavity up to 0.6 GHz, its current knocked about): before, 15
+back on target (median 55 s), its current from 63.2 to 73.0 mA (its window 64.4 … 67.4 mA); now all 24
+(median 20 s: a drift, the piezo alone, 7 s; a hop, back where it was on target, 15 to 26 s; else one map,
+its right mode where the map has it or its model's plan, 70 to 100 s), its current always inside its window.
 
 ### Upkeep: kept just below the top of its mode
 
