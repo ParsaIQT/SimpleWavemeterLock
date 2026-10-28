@@ -437,6 +437,18 @@ def _num(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
+def ff_does(said: float, seen: float):
+    """mA/V: what a feedforward whose factor is `said` does, by what it was seen to do as the piezo moved (`seen` mA/V
+    of the measured current, its set current's moves taken off): nothing (0: on a DL pro whose piezo the scan's offset
+    moves, its scan off, the feedforward follows the scan alone), what its factor says, or what was seen; None: more
+    than twice its factor, nothing to go by."""
+    if abs(seen) < 0.3 * abs(said):
+        return 0.0
+    if abs(seen - said) < 0.3 * abs(said):
+        return said
+    return seen if abs(seen) <= 2 * abs(said) else None
+
+
 @dataclass
 class Result:
     current: float   # mA, the new operating point
@@ -924,18 +936,15 @@ class Recenter(CavitySteps):
         if not (_num(a) and _num(b)):
             return
         seen = (b - a - (self.I - i0)) / step
-        if abs(seen) < 0.3 * abs(said):
-            ff, how = 0.0, ("adds nothing as the piezo moves (the scan's offset moves it, its scan off: the "
-                            "feedforward follows the scan alone): the current is reckoned so, and moved along as the "
-                            "piezo tunes it")
-        elif abs(seen - said) < 0.3 * abs(said):
-            ff, how = said, "moves the current as its factor says"
-        elif abs(seen) <= 2 * abs(said):
-            ff, how = seen, f"moves the current {seen:+.3f} mA/V, not as its factor says: reckoned so from now on"
-        else:
+        ff = ff_does(said, seen)
+        if ff is None:
             self.note(f"feedforward {said:+.4f} mA/V: the current moved {b - a:+.3f} mA as the piezo moved "
                       f"{step:+.2f} V (nothing seen of the feedforward, as its factor says it is)")
             return
+        how = ("adds nothing as the piezo moves (the scan's offset moves it, its scan off: the feedforward follows the "
+               "scan alone): the current is reckoned so, and moved along as the piezo tunes it" if not ff else
+               "moves the current as its factor says" if ff == said else
+               f"moves the current {seen:+.3f} mA/V, not as its factor says: reckoned so from now on")
         self.ff = ff  # (the window, the floor, where it began: set currents at V0, the measured ones reckoned anew)
         self.learned["ff_set"], self.learned["ff_act"] = said, round(ff, 4)
         self.note(f"feedforward {said:+.4f} mA/V: it {how} (the piezo {step:+.2f} V, the current {b - a:+.3f} mA)")

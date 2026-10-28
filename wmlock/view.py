@@ -267,7 +267,7 @@ def hop_text(ch, now: float) -> str:
     """The current, the DLC pro lock and the last recovery, for a laser with mode-hop recovery on."""
     if not ch.hop.enabled:
         return ""
-    text = f"   {ch.current:.2f} mA" if ch.current is not None else ""
+    text = f"   {ch.current:.2f} mA" + follow_text(ch) if ch.current is not None else ""
     if ch.seed is not None:
         text += f"   seed {ch.seed:.1f} mW"
     if ch.hop.cavity:
@@ -295,6 +295,15 @@ def hop_text(ch, now: float) -> str:
         if k:
             text += f"   {k} lock dropout{'s' if k != 1 else ''} in the last hour"
     return text
+
+
+def follow_text(ch) -> str:
+    """Its current moved along with its piezo by its wavemeter lock, tuning it to a new setpoint (engine.Follow), said
+    short."""
+    f = ch.follow
+    if f is None or f.k is None or not f.tuning:
+        return ""
+    return ", held at its window's edge" if f.edge else ", following its piezo"
 
 
 def shg_gone(ch) -> bool:
@@ -350,6 +359,11 @@ def notes(e, n: int) -> str:
                  + (", step by step" if hop.confirm else ""))
     if getattr(ch, "model_note", ""):
         text += f"\nits laser's model: {ch.model_note}"
+    f = ch.follow  # (the engine's thread may let it go meanwhile)
+    if f is not None:
+        text += f"\n{f.said()}"
+    elif ch.follow_note:
+        text += f"\n{ch.follow_note}"
     if ch.sls.on:
         p = ch.sls
         text += f"\nlocked by {TITLES[p.kind]}: {p.unit}, http://{p.host.strip()}:{p.port}"

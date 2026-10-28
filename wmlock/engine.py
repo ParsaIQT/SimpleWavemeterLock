@@ -103,7 +103,7 @@ from .dropouts import Monitor as DropoutMonitor
 from .dropouts import log as drop_log
 from .lasermap import FOLDER, LOOK, MODEL_MIN, MapFile, MapPlan, Mapper, MapRunner, file_name, fmt_time
 from .lock import Lock, LockParams
-from .modehop import HOP_MIN, SEED_FLOOR, Guard, HopParams, Recenter, Runner, perform
+from .modehop import HOP_MIN, SEED_FLOOR, Guard, HopParams, Recenter, Runner, ff_does, perform
 from .observe import Observation
 from .relock import TRANS, says_locked, setup_report, transmission_input, transmission_signal, usable_zero, volts
 from .reference import Reference, RefParams
@@ -121,6 +121,8 @@ CAVITY_LOCK = "dl:lock:lock-enabled"
 SHG_STATE = "nlo:shg:lock:state-txt"
 SHG_INTRA = "nlo:pd:shg-int:photodiode"
 WATCHED = (CURRENT_ACT, CAVITY_LOCK, "dl:lock:state-txt", SHG_STATE, SHG_INTRA, SCAN_OUT)  # (and its piezo, current)
+FOLLOW_READ = ("dl:cc:feedforward-enabled", "dl:cc:feedforward-factor", CURRENT_ACT, "dl:cc:current-clip")  # (and its
+#              set current: engage reads them, its current to be moved along with its piezo, Follow)
 FINE_N = 600   # polls: a level locked as usual is the median of the last this many running as it should...
 FINE_MIN = 10  # ...once there are this many (until then, the one learned before)
 OBSERVING = ("observe", "observe_end", "observed")  # remote(): a channel's lock observed, nothing changed
@@ -194,6 +196,139 @@ class Track:
         if self.steady is None or self.t is None or now - self.t > fresh:
             return None
         return now - self.steady
+
+
+class Follow:
+    """The wavemeter lock moving its laser's current along with its piezo while it tunes it to a new frequency (its
+    setpoint moved, or engaged far from it), as its DLC pro's feedforward is set to and does not (on a DL pro whose
+    piezo the scan's offset moves, its scan off, it follows the scan alone): the band of current its mode lases over
+    moves with its piezo (the lab's 493 nm laser's 0.47 mA a volt), and a laser tuned without its current would hop a
+    few GHz along. Not while the lock holds it on its setpoint: what its piezo makes up for there is its cavity's length
+    drifting, which leaves where its mode lases as it was; its current moved along, it would hop sooner (that laser's
+    model: after 1.4 GHz of drift, against none in 30 GHz). Tuning, its set current goes i0 + k (u - u0) at piezo u, its
+    measured current (its set current + off + ff (u - ue)) kept within lo … hi (its recovery's window, widened to where
+    it was) and its set current below its current-clip; tuned (SETTLE_N readings in a row within SETTLE_MHZ of its
+    setpoint, or TUNE_S after it began), it is left where it is. What its feedforward does is seen first unless known
+    (HopParams.ff_set, ff_act, as its recoveries saw it): once the lock has moved its piezo `probe` V from where it was
+    engaged (a move that would move its current Recenter.FF_PROBE if the feedforward did), its measured current is read
+    again; a tuning then catches up on what it should have moved, CATCH mA a step."""
+
+    TUNE_MHZ = 100.0   # MHz: engaged further than this from its setpoint, the lock tunes it there
+    SETTLE_MHZ = 10.0  # MHz: tuned, SETTLE_N readings in a row within this of its setpoint...
+    SETTLE_N = 5
+    TUNE_S = 60.0      # s: ...or this long after it began
+    CATCH = 0.01       # mA: a step's catch-up at most
+    LEAST = 0.001      # mA: a write at least this far from the last
+    KEEP = 10.0        # s: its writes remembered so long: a poll of its set current that reads one of them...
+    SAME = 0.0005      # mA: ...(this near) is not a change by hand
+
+    def __init__(self, factor: float, u0: float, i0: float, a0: float, lo: float, hi: float, clip: float,
+                 ff=None, now: float = 0.0):
+        """factor: its feedforward's (mA/V); u0, i0, a0: its piezo, set and measured current where it is engaged;
+        lo, hi: its window (mA, measured); clip: its current-clip; ff: what its feedforward does (mA/V; None: not
+        known, seen first)."""
+        self.factor = factor
+        self.ue, self.se, self.ae = u0, i0, a0  # where it was engaged
+        self.off = a0 - i0
+        self.lo, self.hi = min(lo, a0), max(hi, a0)  # (never pulled into its window: only kept from leaving it)
+        self.clip = clip
+        self.probe = Recenter.FF_PROBE / abs(factor)
+        self.ff = self.k = None
+        if ff is not None:
+            self.ff, self.k = ff, factor - ff
+        self.tuning = False    # the lock tunes it to a new frequency: its current follows its piezo
+        self.began = 0.0       # (monotonic: since then)
+        self.settled = 0       # readings in a row within SETTLE_MHZ of its setpoint, tuning
+        self.u0, self.i0 = u0, i0  # V, mA: followed from there (its piezo, its set current)
+        self.at = i0           # mA: its set current as last written (or set by hand)
+        self.total = 0.0       # mA: its writes have moved it so, since it was engaged
+        self.lag = 0.0         # mA: its catch-up still to come
+        self.edge = False      # held at the edge of its window (or its current-clip)
+        self.busy = False      # its feedforward being seen (a read on its way)
+        self.sent = deque([(now, i0)])  # (monotonic, mA): its writes of late
+
+    def window(self, lo: float, hi: float):
+        """Its recovery's window set anew (mA, measured): kept within it, widened to where it was engaged (and, at its
+        next tuning, to where it is then)."""
+        self.lo, self.hi = min(lo, self.ae), max(hi, self.ae)
+
+    def tune(self, u: float, now: float, act=None):
+        """The lock tunes it to a new frequency from here (its piezo at u; act: its measured current, if known): its
+        current follows its piezo until it is there (its window widened to where it is)."""
+        self.tuning, self.began, self.settled = True, now, 0
+        self.u0, self.i0, self.lag = u, self.at, 0.0
+        if self.ff is not None:
+            act = self.at + self.off + self.ff * (u - self.ue)
+        if act is not None:
+            self.lo, self.hi = min(self.lo, act), max(self.hi, act)
+
+    def tuned(self, e_mhz: float, now: float) -> bool:
+        """A reading e MHz from its setpoint, tuning: True once it is there (its current left where it is from then
+        on)."""
+        self.settled = self.settled + 1 if abs(e_mhz) <= self.SETTLE_MHZ and not self.lag else 0
+        if self.settled >= self.SETTLE_N or now - self.began >= self.TUNE_S:
+            self.tuning, self.lag = False, 0.0
+            return True
+        return False
+
+    def seen(self, ff: float, u: float, s: float):
+        """What its feedforward does (ff mA/V), seen with its piezo at u and its set current at s: tuning, its set
+        current follows by what the DLC pro does not, catching up on what it should have moved since it began."""
+        self.ff, self.k = ff, self.factor - ff
+        self.at = s
+        if self.tuning:
+            self.i0, self.lag = s, self.k * (u - self.u0)
+
+    def step(self, u: float, now: float):
+        """Its set current, its piezo set to u: mA to write (None: none: not tuning, or not LEAST from the last)."""
+        if self.k is None or not self.tuning:
+            return None
+        if self.lag:
+            self.lag -= math.copysign(min(abs(self.lag), self.CATCH), self.lag)
+        s = self.i0 + self.k * (u - self.u0) - self.lag
+        d = self.off + self.ff * (u - self.ue)
+        lo, hi = self.lo - d, min(self.hi - d, self.clip)
+        self.edge = not lo <= s <= hi
+        s = round(min(max(s, lo), hi), 4)
+        if abs(s - self.at) < self.LEAST:
+            return None
+        self.total += s - self.at
+        self.at = s
+        self.sent.append((now, s))
+        while len(self.sent) > 1 and now - self.sent[1][0] > self.KEEP:  # (the one before those KEEP s old kept: it
+            self.sent.popleft()                                           # may be what a poll reads, the next unsent)
+        return s
+
+    def mine(self, v: float) -> bool:
+        """A poll of its set current read v: one of its writes (or where it was), not a change by hand."""
+        return any(abs(v - s) <= self.SAME for _, s in self.sent)
+
+    def by_hand(self, v: float, u: float, now: float):
+        """Its set current set to v by hand, its piezo at u: followed from there if it is tuning (its window widened
+        to it), nothing caught up."""
+        self.sent.clear()
+        self.sent.append((now, v))
+        self.at = v
+        if self.tuning and self.k is not None:
+            self.u0, self.i0, self.lag = u, v, 0.0
+            m = v + self.off + self.ff * (u - self.ue)
+            self.lo, self.hi = min(self.lo, m), max(self.hi, m)
+
+    def said(self) -> str:
+        """What it does, said."""
+        hold = ("held on its setpoint, its current is left as it is (what its piezo makes up for there is its "
+                "cavity drifting, which leaves where its mode lases as it was)")
+        if self.k is None:
+            return (f"its DLC pro's feedforward is set to {self.factor:+.3f} mA/V: whether it moves its current as its "
+                    f"piezo moves is seen once the wavemeter lock has moved that {self.probe:.2f} V (on a DL pro whose "
+                    f"piezo the scan's offset moves, its scan off, it adds nothing); then as the lock tunes it to a "
+                    f"new setpoint, its current follows its piezo by what the feedforward does not; {hold}")
+        does = "adds nothing as the scan's offset moves its piezo" if not self.ff else f"does {self.ff:+.3f} mA/V"
+        return (f"as the wavemeter lock tunes it to a new setpoint, its current follows its piezo, {self.k:+.3f} mA/V "
+                f"(its DLC pro's feedforward, {self.factor:+.3f} mA/V, {does}); {hold}"
+                + (f"; moved {self.total:+.3f} mA since it was locked" if self.total else "")
+                + ("; tuning now" if self.tuning else "")
+                + (", held at the edge of its window" if self.tuning and self.edge else ""))
 
 
 class Channel:
@@ -348,6 +483,9 @@ class Channel:
         self.lock_note = ""
         self.lock_t = 0.0      # monotonic...
         self.lock_wall = 0.0   # ...and time.time(): when
+        self.follow = None     # Follow: it moves its current along with its piezo, as its feedforward does not (None:
+        #                        it does not; its mode-hop recovery on, a DLC pro's feedforward on)
+        self.follow_note = ""  # why it does not, when it was to
         # a laser map (lasermap.py)
         self.mapper = None     # the map going on (a MapRunner)...
         self.map_last = None   # ...or the last one, over
@@ -1105,6 +1243,7 @@ class Engine:
             if note:
                 ch.lock_note, ch.lock_t, ch.lock_wall = note, time.monotonic(), time.time()
                 log.warning("channel %d: %s", ch.n, note)
+        follow = ch.follow  # (its current along with the offset it puts back unlocking, too)
         if not ch.lock.active:  # (first: unlocking drops the lock's writes on their way, not the one it puts back)
             self._disengage(ch, ch.lock.message)
         if u is not None:
@@ -1116,6 +1255,101 @@ class Engine:
                 p = ch.lock.p
                 ff = min(max(ch.ff0 + (u - ch.lock.u0) / ch.ff_ratio, p.v_min), p.v_max)
                 c.set(f"laser{ch.ff_ao}:{ACTUATOR}", ff, lambda e: self._comm_failed(ch, tok, e))
+            if follow is not None:
+                self._follow(ch, follow, u, c, tok)
+
+    FF_SETTLE = 0.2  # s: its measured current read this long after its piezo was set, what its feedforward does seen
+
+    def _follow(self, ch: Channel, f: Follow, u: float, c: Controller, tok: int):
+        """Its wavemeter lock has just set its piezo to u: tuning it to a new frequency, its current moved along
+        (Follow); what its feedforward does seen first, once the lock has moved its piezo far enough for that."""
+        if f.k is None and ch.follow is f and not f.busy and abs(u - f.ue) >= f.probe:
+            f.busy = True
+            self._see_ff(ch, f, c)
+        if not f.tuning:
+            return
+        now = time.monotonic()
+        edge = f.edge
+        s = f.step(u, now)
+        if f.edge != edge:
+            log.info("channel %d: %s", ch.n, "its current at the edge of its window: no longer moved along with its "
+                     "piezo, until that comes back" if f.edge else "its current moved along with its piezo again")
+        if s is not None:
+            ch.current_set = s
+            c.set(f"laser{ch.laser}:{ch.cc}", s, lambda e: self._comm_failed(ch, tok, e))
+        if ch.follow is f and f.tuned(ch.error_mhz, now):
+            log.info("channel %d: tuned to its setpoint, its current followed its piezo: %+.3f mA since it was "
+                     "locked; held there, it is left as it is", ch.n, f.total)
+
+    def _tune(self, ch: Channel):
+        """Its wavemeter lock tunes it to a new frequency (its setpoint moved): its current follows its piezo till it
+        is there (Follow), as its feedforward would."""
+        f = ch.follow
+        if f is not None and ch.state == "on" and ch.lock.active and ch.offset is not None:
+            f.tune(ch.offset, time.monotonic(), act=ch.current)
+
+    def _see_ff(self, ch: Channel, f: Follow, c: Controller):
+        """What its feedforward does, seen as its wavemeter lock moved its piezo (its measured current read again, its
+        set current's moves taken off): kept (HopParams.ff_set, ff_act, as its recoveries keep it); its current then
+        moved along by what the DLC pro does not."""
+        laser, names = ch.laser, (ch.piezo, CURRENT_ACT, ch.cc)
+
+        def job(client):
+            time.sleep(self.FF_SETTLE)
+            v, a, s = perform(client, laser, ("get", names))
+            with self.lock:
+                if ch.follow is not f:
+                    return
+                f.busy = False
+                if not (_num(v) and _num(a) and _num(s)) or abs(v - f.ue) < 0.5 * f.probe:
+                    return  # (moved back meanwhile: another time)
+                seen = (a - f.ae - (s - f.se)) / (v - f.ue)
+                ff = ff_does(f.factor, seen)
+                if ff is None:
+                    ch.follow = None
+                    ch.follow_note = (f"its current not moved along with its piezo: its DLC pro's feedforward is set "
+                                      f"to {f.factor:+.3f} mA/V, and as the wavemeter lock moved its piezo "
+                                      f"{v - f.ue:+.3f} V, its measured current moved {a - f.ae:+.3f} mA (its set "
+                                      f"current {s - f.se:+.3f} mA): nothing to go by")
+                    log.warning("channel %d: %s", ch.n, ch.follow_note)
+                    return
+                ch.hop.ff_set, ch.hop.ff_act = f.factor, round(ff, 4)  # (what its recoveries go by too)
+                self.dirty = True
+                f.seen(ch.hop.ff_act, v, s)
+                if not f.k:
+                    ch.follow, ch.follow_note = None, self._ff_does_it(f.factor)
+                log.info("channel %d: its feedforward, %+.3f mA/V, seen as the wavemeter lock moved its piezo %+.3f "
+                         "V: %s", ch.n, f.factor, v - f.ue, ch.follow_note if ch.follow is None else f.said())
+
+        def failed(exc):
+            with self.lock:
+                if ch.follow is f:
+                    f.busy = False
+
+        c.submit(job, failed)
+
+    def _follow_from(self, ch: Channel, v: float, got) -> Follow | None:
+        """At engage, its piezo at v: its Follow (None: none), by its feedforward and its currents as read (got: its
+        feedforward on, its factor, its measured current, its current-clip, its set current; None: not read)."""
+        if not got:
+            return None
+        on, factor, a0, clip, s0 = got
+        if on is not True or not _num(factor) or not factor or not all(_num(x) for x in (a0, clip, s0)):
+            return None
+        hop = ch.hop
+        mid = hop.i_nom or a0
+        known = bool(hop.ff_set) and abs(hop.ff_set - factor) < 1e-9  # (seen before, at this factor)
+        f = Follow(float(factor), v, s0, a0, mid - hop.i_below, mid + hop.i_window, clip,
+                   ff=hop.ff_act if known else None, now=time.monotonic())
+        if f.k is not None and abs(f.k) < 1e-6:  # (its DLC pro's feedforward does it all)
+            ch.follow_note = self._ff_does_it(f.factor)
+            return None
+        return f
+
+    @staticmethod
+    def _ff_does_it(factor: float) -> str:
+        return (f"its DLC pro's feedforward moves its current as its factor says ({factor:+.3f} mA/V) as its piezo "
+                f"moves: nothing to add")
 
     def _comm_failed(self, ch: Channel, tok: int, exc: Exception):
         with self.lock:
@@ -1157,17 +1391,21 @@ class Engine:
             ch.state, ch.message = "engaging", ""
             ch.token += 1
             ch.guard.reset()
+            ch.follow, ch.follow_note = None, ""
             tok, key, laser, params, on_dac = ch.token, ch.device, ch.laser, ch.lock.p, ch.dac
             ff_ao = ch.ff_ao if ch.dac and ch.ff_ratio else None
+            follow = not on_dac and ch.hop.enabled  # (its current moved along with its piezo, as its feedforward does
+            #                                         not: within its mode-hop recovery's window)
 
             def job(client):
-                piezo = ACTUATOR if on_dac else self._drives(ch, client, key, laser)[0]  # (what its scan drives now)
+                piezo, cc = (ACTUATOR, CURRENT) if on_dac else self._drives(ch, client, key, laser)  # (as driven now)
                 v = client.get_float(f"laser{laser}:{piezo}")  # (an analog output never set: not known, an error)
                 try:
                     unit = (client.get_str(f"laser{laser}:scan:unit") or "V") if piezo == ACTUATOR else "V"
                 except DecopError:
                     unit = "V"
                 ff0 = client.get_float(f"laser{ff_ao}:{ACTUATOR}") if ff_ao is not None else None
+                got = perform(client, laser, ("get", FOLLOW_READ + (cc,))) if follow else None
                 with self.lock:
                     if ch.token != tok:
                         return
@@ -1188,6 +1426,10 @@ class Engine:
                         return
                     ch.lock.engage(v)
                     ch.state = "on"
+                    if ch.cc == cc and ch.hop.enabled:
+                        ch.follow = self._follow_from(ch, v, got)
+                        if ch.follow is not None and abs(ch.error_mhz) > Follow.TUNE_MHZ:  # (far from its setpoint:
+                            ch.follow.tune(v, time.monotonic(), act=got[2])                # tuned there)
 
             def failed(exc):
                 with self.lock:
@@ -1232,6 +1474,7 @@ class Engine:
                 self._disengage(ch, message)
 
     def _disengage(self, ch: Channel, message: str):
+        self._unfollow(ch)
         if ch.watching and not self.stopping:  # (watched no more, not even after a restart)
             ch.watching = False
             self.dirty = True
@@ -1264,6 +1507,15 @@ class Engine:
         if c is not None:
             c.cancel(ch.param)
 
+    def _unfollow(self, ch: Channel):
+        """Its current moved along with its piezo no more (its last write on its way dropped, as its piezo's is)."""
+        if ch.follow is None:
+            return
+        ch.follow = None
+        c = self.controllers.get(ch.device)
+        if c is not None:
+            c.cancel(f"laser{ch.laser}:{ch.cc}")
+
     def set_setpoint(self, n: int, nm):
         with self.lock:
             ch = self.channels[n]
@@ -1274,6 +1526,7 @@ class Engine:
             ch.set_setpoint(nm)
             ch.guard.reset()  # not a hop: the guard waits for the laser to settle there
             ch.guard.track = 0.0
+            self._tune(ch)  # (the lock tunes it there: its current follows its piezo, as its feedforward would)
             if ch.state == "recovering":
                 self._disengage(ch, "setpoint changed")
             elif ch.setpoint_nm is None and ch.state != "off":
@@ -1472,8 +1725,13 @@ class Engine:
         def on_current_set(v):
             with self.lock:
                 if mine() and ch.state != "recovering":
+                    f = ch.follow
+                    if f is not None and f.mine(v):
+                        return  # (its wavemeter lock's own write, its current moved along with its piezo)
                     if ch.current_set is not None and abs(v - ch.current_set) > 0.005:
                         ch.guard.reset()  # changed by hand: stand by until the laser is on target again
+                        if f is not None:  # (and moved along with its piezo from there)
+                            f.by_hand(v, ch.offset, time.monotonic())
                     ch.current_set = v
 
         def on_current(v):
@@ -3014,6 +3272,11 @@ class Engine:
             ch.hop = params
             ch.guard.reset()
             ch.guard.track = 0.0
+            if not params.enabled:
+                self._unfollow(ch)  # (its current no longer polled: a hand's change would go unseen)
+            elif ch.follow is not None:
+                mid = params.i_nom or ch.follow.ae
+                ch.follow.window(mid - params.i_below, mid + params.i_window)
             ch.trans_fine.clear()  # (learned afresh if forgotten)
             ch.shg_fine.clear()
             if ch.device:
@@ -3168,6 +3431,7 @@ class Engine:
             return
         ch.resume = ch.state == "on" or relock
         ch.lock.disengage("")
+        self._unfollow(ch)
         c = self._controller(ch.device)
         c.cancel(ch.param)
         ch.state, ch.message = "recovering", ""

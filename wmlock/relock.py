@@ -958,6 +958,17 @@ def setup_report(client, laser: int, hop, lp, model=None) -> list:
                     "good, then back two steps), again whenever it has come down 0.3 mA"
                     + ("" if seen else ". Whether it does, a recovery's first piezo move shows (on a DL pro whose "
                                        "piezo the scan's offset moves, its scan off, it adds nothing)"))
+    if ff and _num(factor) and factor and not hop.cavity:  # (locked to the wavemeter: engine.Follow)
+        if seen and hop.ff_act == factor:
+            add("info", "the wavemeter lock leaves the current to the feedforward: it moves it as its factor says as "
+                        "the piezo moves, as the lock tunes it to a new setpoint and as it holds it there alike")
+        else:
+            by = (f"{factor - hop.ff_act:+.4f} mA/V" if seen else
+                  "what it does seen once the lock has moved the piezo 0.1 mA's worth")
+            add("info", f"as the wavemeter lock tunes it to a new setpoint, it moves the current along with the piezo "
+                        f"by what the feedforward does not ({by}), within its recovery's window; held on its setpoint, "
+                        f"it leaves the current alone: what the piezo makes up for there is the cavity's length "
+                        f"drifting, which leaves where its mode lases as it was")
     if g["dl:cc:output-filter:slew-rate-enabled"]:
         add("warn", f"the current's slew rate is limited ({fmt(g['dl:cc:output-filter:slew-rate'])}): a recovery "
                     "steps it 0.2 mA at a time and expects each step to take effect at once")

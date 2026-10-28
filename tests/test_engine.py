@@ -626,6 +626,141 @@ def test_a_recovery_brings_a_current_outside_its_window_into_it_first(quiet_demo
         e.stop()
 
 
+def test_tuning_its_current_follows_its_piezo_within_its_window_and_only_then():
+    """Engine.Follow, a DL pro's feedforward of -0.6 mA/V that adds nothing: held on its setpoint, its current is left
+    alone; tuned, its set current follows its piezo, kept within its window, from where a hand set it; once there, it
+    is left where it is. What its feedforward does seen late in a tuning, it catches up, 0.01 mA a step."""
+    from wmlock.engine import Follow
+
+    f = Follow(-0.6, 70.0, 65.0, 65.0, 64.4, 67.4, 200.0, ff=0.0, now=0.0)
+    assert f.k == -0.6 and f.step(71.0, 1.0) is None  # held: its piezo makes up for its cavity's drift
+    f.tune(71.0, 2.0)
+    assert f.step(71.5, 3.0) == pytest.approx(64.7)  # tuned: -0.6 mA/V from where it began
+    assert f.step(71.5005, 3.1) is None  # (less than LEAST from the last)
+    assert f.step(73.0, 4.0) == pytest.approx(64.4) and f.edge  # held at the bottom of its window
+    assert f.step(71.0, 5.0) == pytest.approx(65.0) and not f.edge
+    assert f.mine(64.7) and f.mine(64.4) and f.mine(65.0) and not f.mine(65.3)  # its own writes, polled
+    f.by_hand(65.3, 71.0, 6.0)  # set by hand: followed from there
+    assert f.step(72.0, 7.0) == pytest.approx(64.7)
+    assert not any(f.tuned(3.0, 8.0 + k) for k in range(Follow.SETTLE_N - 1))
+    assert f.tuned(3.0, 12.0) and not f.tuning and f.step(70.0, 13.0) is None  # there: left where it is
+    assert f.total == pytest.approx(-0.6)  # (what its writes moved it: a hand's not counted)
+
+    g = Follow(-0.6, 70.0, 65.0, 65.0, 64.4, 67.4, 200.0, now=0.0)  # what its feedforward does: not known yet
+    g.tune(70.0, 0.0, act=65.0)
+    assert g.step(70.5, 1.0) is None  # (nothing to go by: not moved)
+    g.seen(0.0, 70.5, 65.0)  # it adds nothing: the 0.3 mA it should have moved since the tuning began, caught up
+    out = [x for x in (g.step(70.5, 2.0 + k) for k in range(40)) if x is not None]
+    assert len(out) == 30 and out[0] == pytest.approx(64.99) and out[-1] == pytest.approx(64.7)
+    assert all(a - b == pytest.approx(0.01) for a, b in zip(out, out[1:]))
+    assert not g.tuned(3.0, 50.0) and g.tuned(500.0, 61.0)  # (TUNE_S at most: then held, wherever it is)
+
+
+def ff_adds_nothing(dlc, laser, factor=-0.6):
+    """Its DLC pro's feedforward on, at `factor`, adding nothing as the scan's offset moves its piezo (as the lab's
+    DL pros' do, their scan off)."""
+    dlc.params[f"laser{laser}:dl:cc:feedforward-enabled"] = True
+    dlc.params[f"laser{laser}:dl:cc:feedforward-factor"] = factor
+    dlc.ff_from[laser] = None
+
+
+def test_the_lock_moves_the_current_along_with_the_piezo_as_it_tunes_it_not_as_it_holds_it(quiet_demo):
+    """Its feedforward (-0.6 mA/V) adds nothing as the scan's offset moves its piezo: held on its setpoint against its
+    cavity's drift, its current is left alone (what its feedforward does is seen meanwhile, and kept); tuned to a new
+    setpoint, its current follows its piezo by the factor and is left where it is once it is there, its own writes
+    never taken for a hand's; tuned again after a hand set it, from where the hand left it."""
+    from wmlock import view
+
+    demo, dlc = quiet_demo, quiet_demo.dlcs[0]
+    ff_adds_nothing(dlc, 1)
+    e, ch = hop_engine(demo, 1, dlc.key, 1, dict(enabled=True, step=0.2))
+    laser = demo.laser(1)
+    written = lambda: dlc.written("laser1:dl:cc:current-set")  # noqa: E731
+    try:
+        e.engage(1)
+        assert wait_for(lambda: ch.state == "on" and ch.guard.armed and ch.follow is not None, 5)
+        assert ch.follow.k is None and "is seen once the wavemeter lock has moved that 0.17 V" in view.notes(e, 1)
+        for _ in range(60):  # its cavity drifts 300 MHz: held
+            laser.walk += 5.0
+            time.sleep(0.1)
+        assert wait_for(lambda: abs(ch.error_mhz) < 3, 5) and dlc.offset(1) < 69.5
+        assert written() == [] and ch.hop.ff_set == -0.6 and ch.hop.ff_act == 0.0  # left alone; its feedforward seen
+        resets = []
+        reset = ch.guard.reset
+        ch.guard.reset = lambda: (resets.append(1), reset())[1]
+        v0, i0 = dlc.offset(1), dlc.current(1)
+        e.set_setpoint(1, detune(ch, 400))
+        assert ch.follow.tuning and view.follow_text(ch) == ", following its piezo"
+        assert wait_for(lambda: not ch.follow.tuning, 20) and abs(ch.error_mhz) < 10
+        dv, di = dlc.offset(1) - v0, dlc.current(1) - i0
+        assert dv > 0.6 and di == pytest.approx(-0.6 * dv, abs=0.02), (dv, di)
+        assert view.follow_text(ch) == "" and "moved -0." in view.notes(e, 1)
+        n = len(written())
+        for _ in range(40):  # drifts back 200 MHz: held, its current left where it is
+            laser.walk -= 5.0
+            time.sleep(0.1)
+        assert wait_for(lambda: abs(ch.error_mhz) < 3, 5)
+        assert len(written()) == n and ch.guard.armed and ch.state == "on" and len(resets) == 1  # (the setpoint's)
+        dlc.params["laser1:dl:cc:current-set"] = 149.8  # by hand
+        assert wait_for(lambda: ch.current_set == 149.8 and ch.follow.at == 149.8, 3)
+        v0 = dlc.offset(1)
+        e.set_setpoint(1, detune(ch, -250))
+        assert wait_for(lambda: not ch.follow.tuning, 20)
+        dv, di = dlc.offset(1) - v0, dlc.current(1) - 149.8
+        assert dv < -0.5 and di == pytest.approx(-0.6 * dv, abs=0.02), (dv, di)
+        cfg = e.to_config()["channels"]["1"]["hop"]
+        assert cfg["ff_set"] == -0.6 and cfg["ff_act"] == 0.0  # (kept: its recoveries go by it too)
+        e.check_setup(1)
+        assert wait_for(lambda: ch.setup is not None, 5)
+        text = "\n".join(t for _, t in ch.setup)
+        assert ("as the wavemeter lock tunes it to a new setpoint, it moves the current along with the piezo by what "
+                "the feedforward does not (-0.6000 mA/V), within its recovery's window; held on its setpoint, it "
+                "leaves the current alone") in text
+    finally:
+        e.stop()
+
+
+def test_a_feedforward_that_moves_the_current_itself_is_left_to_it(quiet_demo):
+    """Its DLC pro's feedforward moves its current as its factor says: seen so, the lock adds nothing (tuned, its DLC
+    pro moves its current itself)."""
+    demo, dlc = quiet_demo, quiet_demo.dlcs[0]
+    dlc.params["laser1:dl:cc:feedforward-enabled"] = True
+    dlc.params["laser1:dl:cc:feedforward-factor"] = -0.6
+    dlc.ff_from[1] = dlc.offset(1)  # (it adds -0.6 mA a volt from here)
+    e, ch = hop_engine(demo, 1, dlc.key, 1, dict(enabled=True, step=0.2))
+    try:
+        e.engage(1)
+        assert wait_for(lambda: ch.state == "on" and ch.guard.armed and ch.follow is not None, 5)
+        e.set_setpoint(1, detune(ch, 400))
+        assert wait_for(lambda: ch.follow is None and abs(ch.error_mhz) < 10, 20)
+        assert "moves its current as its factor says (-0.600 mA/V) as its piezo moves: nothing to add" in ch.follow_note
+        assert dlc.written("laser1:dl:cc:current-set") == [] and ch.hop.ff_act == -0.6
+    finally:
+        e.stop()
+
+
+def test_the_lock_tunes_it_with_what_its_recoveries_saw_its_feedforward_do(quiet_demo):
+    """What its feedforward does, as its recoveries saw it (HopParams.ff_set, ff_act), at the factor it is set to:
+    tuned from the first, its current follows its piezo at once, and no further than its window (144.5 mA, measured,
+    at the bottom), held at its edge."""
+    from wmlock import view
+
+    demo, dlc = quiet_demo, quiet_demo.dlcs[0]
+    ff_adds_nothing(dlc, 1)
+    e, ch = hop_engine(demo, 1, dlc.key, 1, dict(enabled=True, step=0.2, i_nom=150.0, i_below=0.5, ff_set=-0.6,
+                                                 ff_act=0.0))
+    try:
+        e.engage(1)
+        assert wait_for(lambda: ch.state == "on" and ch.guard.armed and ch.follow is not None, 5)
+        assert ch.follow.k == -0.6
+        e.set_setpoint(1, detune(ch, 600))
+        assert wait_for(lambda: ch.follow.edge, 10) and view.follow_text(ch) == ", held at its window's edge"
+        assert wait_for(lambda: not ch.follow.tuning, 30) and abs(ch.error_mhz) < 10
+        assert min(dlc.written("laser1:dl:cc:current-set")) == pytest.approx(149.5)  # (no further down)
+    finally:
+        e.stop()
+
+
 def test_relock_brings_a_laser_left_high_and_off_target_back(quiet_demo):
     """The morning after: the SHG laser left 3 mA above nominal (where it lased again, say), its cavity lock off, off
     target. Relock: down into its window slowly, watching that it lases, on down until single-mode, walked onto the

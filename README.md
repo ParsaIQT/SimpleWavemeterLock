@@ -160,6 +160,28 @@ offset = offset_at_engage − (P·e + I·Σe)
   DLC pro while the laser is locked, the laser is unlocked within a second (what the lock writes would
   set something else from then on): switch it with the lock off. *Check setup…* says which it uses.
   In `--sim`, the 423 nm laser's scan drives its current.
+* **Its current, as the lock tunes it**: with mode-hop recovery on and the DLC pro's feedforward on
+  (`feedforward-factor` mA/V), the lock moves the current along with the piezo **while it tunes the
+  laser to a new setpoint** (the setpoint moved, or the laser engaged more than 100 MHz from it),
+  by what the feedforward does not do: on a DL pro whose piezo the scan's offset moves, its scan
+  off, the feedforward follows the scan alone and adds nothing (the lab's 493 and 650 nm lasers),
+  so the lock moves the current by the whole factor, as a working feedforward would. The band of
+  current a mode lases over moves with the piezo (the 493's by some 0.47 mA a volt), so tuned
+  without its current a laser hops a few GHz along: by its model, the 493 hops 2 GHz up or 3 GHz
+  down with its current kept, and gets 8 GHz either way with it following at −0.47 or −0.6 mA/V.
+  Once the laser is within 10 MHz of its new setpoint for 5 readings (or a minute on), the current
+  is left where it is. **Not while it holds the laser on its setpoint**: what the piezo makes up
+  for there is the cavity's length drifting (temperature, air pressure), which leaves where the
+  mode lases as it was, at the same current: by the 493's model, its cavity drifting with the
+  current kept, it does not hop in 30 GHz; with the current following the piezo, it hops after
+  1.4 to 3 GHz. Whether the feedforward adds anything is seen at the lock's first 0.1 mA's worth
+  of piezo move (its measured current read again) unless its recoveries saw it already, and kept
+  for them. The current stays within the recovery's window (widened to where it was, never
+  pulled into it) and below `current-clip`; the row says *following its piezo* while it does,
+  and its tooltip what it did. A current set by hand meanwhile is followed from where it was
+  set, and the lock's own writes are never taken for a hand's (which would stand the hop guard
+  down). With a feedforward that does act on the scan's offset, the lock leaves the current to
+  it.
 * The lock is bumpless: it reads the present offset when you engage. Each reading
   moves the offset by at most *Max step* (0.25 V). The lock unlocks itself and
   says why if any of these happens:
@@ -1015,8 +1037,12 @@ Of the three it did not recover, two it would have had on a seventh and a ninth 
 margin: the target was where that laser lased only at the very bottom of its current window.
 
 **27 October, the 493 nm laser.** Its recoveries that morning failed, and it was brought back by hand,
-with difficulty: its right mode lases over some 0.6 mA of current only, and only come to sweeping up, and
-moves 0.5 mA a volt with the piezo. Its recoveries' maps since its map of 25 October all put its chip's
+with difficulty: its right mode is come onto over some 0.6 mA of current only, and only sweeping up, and
+moves 0.5 mA a volt with the piezo (once on it, it holds from 64.2 to 66.1 mA, by its model: it ran at
+65.5). What began it was not its lock's doing: it jumped +328 MHz with its piezo within 5 mV of where it
+had last been on target (the hop guard keeps a reading more than 100 MHz off from the lock), so a lock
+moving its current along with its piezo would not have kept it (see *The lock*: it does so as it tunes
+it, not as it holds it). Its recoveries' maps since its map of 25 October all put its chip's
 modes 8.5 GHz from where its model had them (on 24 October as on 27 October: it had not changed; its
 model, fitted by the version before, had), and its external modes moving +1.19 GHz/V with its piezo. As
 those maps have it (`sim.ModelLaser`), on a DL pro whose feedforward adds nothing, after 24 drifts and hops
