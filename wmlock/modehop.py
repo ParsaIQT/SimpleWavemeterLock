@@ -34,11 +34,13 @@ Three ways to a mode on target (HopParams.method):
         (the tallest resonance in the SHG cavity's sweep, its true height: cavity.peak_top) as a
         fraction of the optimum's (its intra-cavity signal locked at the optimum, as set by hand:
         HopParams.opt_*); within 1 - catch_min, caught; on into the mode's best and back up to the top
-        end of it. Not caught in catch_tries goes: the same from the optimum's piezo voltage +- pc_try.
-        Before the goes, with an SHG stage, a reset (resets), as by hand: the piezo and the current to
-        the optimum's, the current reset_up mA up, down a mA at a time to reset_slow above, then a step
-        at a time to the optimum's: coming from that far above, it lands on its right mode, as a rule,
-        where hysteresis keeps it off whatever the current does within the window; then on as ever.
+        end of it. Not caught in catch_tries goes: the same from v_opt +- pc_try (where it was last on
+        target as it should be, if that was of late: its cavity drifts, the piezo making up for it; else
+        the optimum's piezo voltage). Before the goes, with an SHG stage, a reset (resets), as by hand:
+        the piezo to v_opt and the current to the optimum's, the current reset_up mA up, down a mA at a
+        time to reset_slow above, then a step at a time to the optimum's: coming from that far above, it
+        lands on its right mode, as a rule, where hysteresis keeps it off whatever the current does
+        within the window; then on as ever.
         Already on the right mode, its peak as good as that (a relock): the current parked at the top
         end of where the mode is at its best all the same (up while the peak stays at its best, then
         back), since the feedforward takes it down as the piezo drifts up, relock after relock.
@@ -187,10 +189,12 @@ class HopParams:
     reach: float = 8.0        # GHz: a single-mode mode this near the target is walked onto it with the piezo (walk)
     catch_min: float = 0.9    # catch: the right mode's SHG peak at least this fraction of the optimum's...
     catch_tries: int = 3      # ...caught going up and sweeping down this many times at a piezo voltage, then...
-    pc_try: float = 30.0      # ...from the optimum's piezo voltage + and - this (V; 0: not)
+    pc_try: float = 30.0      # ...from where it was last on target (else the optimum's piezo voltage) + and - this
+    #                           (V; 0: not)
     walk_step: float = 0.5    # V: the piezo's steps while walking, the mode looked at after each
-    reset_up: float = 3.0     # catch: after a hop, first a reset, as by hand: piezo and current to nominal (the
-    #                           optimum's), the current this many mA up (0: no reset), down a mA at a time to...
+    reset_up: float = 3.0     # catch: after a hop, first a reset, as by hand: the piezo to where it was last on
+    #                           target (else the optimum's), the current to nominal (the optimum's), then this many
+    #                           mA up (0: no reset), down a mA at a time to...
     reset_slow: float = 1.0   # ...this many mA above nominal, then on down step mA at a time to nominal;
     reset_tries: int = 2      # ...this many times, before the goes up and down
     ease_step: float = 0.001  # mA: a step easing the current off the top of its mode (its SHG signal locked dipping)
@@ -811,7 +815,15 @@ class Recenter(CavitySteps):
         # the catch
         self.v_ref, self.i_ref = ref if ref is not None else (offset, current)  # the right mode on target there
         self.ref_given = ref is not None
-        self.v_opt = p.opt_v if p.optimum else self.v_ref  # the optimum's piezo voltage
+        # the piezo voltage the reset and the catch go back to: where it was last on target as it should be, if that was
+        # of late, else the optimum's. Its cavity drifts, the piezo making up for it (a relock walks it, its DLC pro's
+        # lock adds to it), while what picks its mode does not move with the piezo: its right mode is at its best where
+        # the piezo has been taken since, not where it was when the optimum was taken. The 739 nm master's on 28
+        # October: 102.51 V, taken four days before, when it was on target at 104.9 V (its relocks had walked it
+        # there) and 106 V (its lock's own share): the right mode near its edge there, missed by 6 resets in 7
+        self.v_opt = self.v_ref if self.ref_given or not p.optimum else p.opt_v
+        self.v_from = ("where it was last on target" if self.ref_given else "the optimum's" if p.optimum else
+                       "where it began")
         self.ratio = p.shg_ratio or 1.0     # its SHG peak scanned over its intra-cavity signal locked
         self.caught = None                  # (V, mA measured) where the right mode was caught, if it was
         self.tries = 0                      # goes up and down
@@ -1167,7 +1179,7 @@ class Recenter(CavitySteps):
         leave it lasing)."""
         p = self.p
         self.panics += 1
-        away = abs(self.V - self.V0) > self.FAR_V  # (the catch's try from the optimum's piezo voltage +- pc_try, say)
+        away = abs(self.V - self.V0) > self.FAR_V  # (the catch's try from v_opt +- pc_try, say)
         self.note(f"not lasing ({why})" + (f": seed power {self.seed:.2f} mW" if self.seed_name else "")
                   + ", current up at once" + (f", and the piezo back from {self.V:.2f} to {self.V0:.2f} V, where it "
                                               f"lased (not tried there again)" if away else ""))
@@ -2429,8 +2441,8 @@ class Recenter(CavitySteps):
     def catch_mode(self):
         """As by hand, for a laser with a neighbouring mode close by (method 'catch'): back onto the right mode, the one
         it was on target on before it hopped, by the current (catch: up, then down a step at a time until it is on it,
-        its SHG peak within 1 - catch_min of the optimum's; a few goes, then from the optimum's piezo voltage
-        +- pc_try); then the piezo walked onto the target, the current parked high in the mode now and then on the way
+        its SHG peak within 1 - catch_min of the optimum's; a few goes, then from v_opt +- pc_try); then the piezo
+        walked onto the target, the current parked high in the mode now and then on the way
         (walk_on). A laser on the right mode and as good as that has its current parked at the top end of where the
         mode is at its best all the same (park_top: the feedforward takes it down as the piezo drifts up, relock after
         relock, until the mode is no good there), then the piezo walked; with nothing but the wavemeter, it is left as
@@ -2526,12 +2538,15 @@ class Recenter(CavitySteps):
 
     def spacing_now(self) -> float:
         """MHz between neighbouring modes: the smallest hop seen in this recovery, else as learned, else the jump it
-        began with (a hop, most likely), else a guess."""
+        began with (a hop, most likely), else a guess. Not that jump where its cavity lock was taken over: it is then
+        wherever the lock's own share, taken off, or a recovery before this one, left it (the 739 nm master's Relock on
+        28 October began 10 GHz from its target, where a failed recovery had left it: its right mode taken to be
+        anywhere within 4 GHz of where it should be, a neighbour 2 GHz off was caught for it)."""
         if self.hops:
             return min(self.hops)
         if self.spacing:
             return self.spacing
-        if math.isfinite(self.e0) and abs(self.e0) >= 1000.0:
+        if math.isfinite(self.e0) and abs(self.e0) >= 1000.0 and not self.cavity:
             return abs(self.e0)
         return self.SPACING_GUESS
 
@@ -2608,11 +2623,12 @@ class Recenter(CavitySteps):
         return False
 
     def reset(self):
-        """As by hand: the piezo to its nominal voltage and the current to nominal (the optimum's, as set by hand; else
-        where it was last on target as it should be, and the nominal current), then the current reset_up mA up, down a
-        mA at a time to reset_slow mA above nominal, and on down to nominal step mA at a time, a reading each: coming
-        from that far above, it lands on its right mode there, as a rule. True if it is on it (the wavemeter says so;
-        its SHG sweep single-mode, or its peak within 1 - catch_min of the optimum's), caught there."""
+        """As by hand: the piezo to where it was last on target as it should be, if that was of late, else to the
+        optimum's (v_opt), and the current to nominal (the optimum's, as set by hand; else the nominal current), then
+        the current reset_up mA up, down a mA at a time to reset_slow mA above nominal, and on down to nominal step mA
+        at a time, a reading each: coming from that far above, it lands on its right mode there, as a rule. True if it
+        is on it (the wavemeter says so; its SHG sweep single-mode, or its peak within 1 - catch_min of the optimum's),
+        caught there."""
         p = self.p
         v_nom = min(max(self.v_opt, self.v_lo), self.v_hi)
         a_nom = p.opt_i if p.optimum else (p.i_nom or self.mA(self.I0, self.V0))
@@ -2666,10 +2682,17 @@ class Recenter(CavitySteps):
                                     + (f"{self.e / 1e3:+.3f} GHz)" if math.isfinite(self.e) else "no reading)")))
         return False
 
+    def from_home(self, v: float, full: bool = False) -> str:
+        """v, said from v_opt (where the reset and the catch go back to)."""
+        if self.v_from == "the optimum's":
+            return f"the optimum's{' piezo voltage' if full else ''} {self.v_opt:.2f} V {v - self.v_opt:+g} V"
+        return f"{self.v_from}, {self.v_opt:.2f} V, {v - self.v_opt:+g} V"
+
     def catch(self):
-        """Onto the right mode by the current, as by hand (sweep_down): catch_tries goes here, then as many from the
-        optimum's piezo voltage + pc_try, and - pc_try (where the right mode is elsewhere, as the piezo tuning says;
-        not where it stopped lasing before: dark_at). True once caught; else it is left where the last go left it."""
+        """Onto the right mode by the current, as by hand (sweep_down): catch_tries goes here, then as many from v_opt
+        (where it was last on target, if that was of late, else the optimum's piezo voltage) + pc_try, and - pc_try
+        (where the right mode is elsewhere, as the piezo tuning says; not where it stopped lasing before: dark_at). True
+        once caught; else it is left where the last go left it."""
         p = self.p
         starts = [self.V]
         for v in ((self.v_opt + p.pc_try, self.v_opt - p.pc_try) if p.pc_try > 0 else ()):
@@ -2677,12 +2700,11 @@ class Recenter(CavitySteps):
                 starts.append(v)
         for n, v in enumerate(starts):
             if n and not self.v_lo - 1e-6 <= v <= self.v_hi + 1e-6:
-                self.note(f"{v:.2f} V (the optimum's piezo voltage {self.v_opt:.2f} V {v - self.v_opt:+g} V) is beyond "
-                          f"the {self.v_lo:.1f} … {self.v_hi:.1f} V the piezo may use: not tried from there")
+                self.note(f"{v:.2f} V ({self.from_home(v, True)}) is beyond the {self.v_lo:.1f} … {self.v_hi:.1f} V "
+                          f"the piezo may use: not tried from there")
                 continue
             if n and any(abs(v - d) < self.FAR_V for d in self.dark_at):
-                self.note(f"{v:.2f} V (the optimum's piezo voltage {self.v_opt:.2f} V {v - self.v_opt:+g} V): it "
-                          f"stopped lasing there: not tried again")
+                self.note(f"{v:.2f} V ({self.from_home(v, True)}): it stopped lasing there: not tried again")
                 continue
             if n:
                 if not self.kv_known:  # (where the right mode is there: the piezo tuning says)
@@ -2693,10 +2715,10 @@ class Recenter(CavitySteps):
                         self.note("cannot measure the piezo tuning: where the right mode is at another piezo voltage "
                                   "is not known, so it is not tried from there")
                         return False
-                yield from self.ask(f"Not caught at {self.V:.2f} V: piezo to {v:.2f} V (the optimum's "
-                                    f"{self.v_opt:.2f} V {v - self.v_opt:+g} V), and catch it there")
-                self.note(f"not caught in {p.catch_tries} goes at {self.V:.2f} V: piezo to {v:.2f} V (the optimum's "
-                          f"{self.v_opt:.2f} V {v - self.v_opt:+g} V)")
+                yield from self.ask(f"Not caught at {self.V:.2f} V: piezo to {v:.2f} V ({self.from_home(v)}), and "
+                                    f"catch it there")
+                self.note(f"not caught in {p.catch_tries} goes at {self.V:.2f} V: piezo to {v:.2f} V "
+                          f"({self.from_home(v)})")
                 self.stage = f"piezo to {v:.2f} V"
                 for vk in _steps(self.V, v, 5.0):
                     yield from self.move(offset=vk, read=False)

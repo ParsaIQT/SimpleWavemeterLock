@@ -1263,8 +1263,9 @@ def setup_report(client, laser: int, hop, lp, model=None) -> list:
                     f"the current: up to the top of its window, then down {hop.step:g} mA at a time until the laser is "
                     f"on it and its SHG peak (the tallest resonance in the SHG sweep, between samples) is within "
                     f"{100 * (1 - hop.catch_min):.0f} % of the optimum's; on into the mode's best and back up to the "
-                    f"top end of it. Not caught in {hop.catch_tries} goes, the same from the optimum's piezo voltage "
-                    f"+ and - {hop.pc_try:g} V; then the piezo onto the target in {hop.walk_step:g} V steps, the "
+                    f"top end of it. Not caught in {hop.catch_tries} goes, the same from where it was last on target "
+                    f"as it should be (within the last 15 min; else from the optimum's piezo voltage) + and - "
+                    f"{hop.pc_try:g} V; then the piezo onto the target in {hop.walk_step:g} V steps, the "
                     f"current parked high in the mode every 4. A laser on the right mode and as good as that has its "
                     f"current parked at the top end of where the mode is at its best all the same (up {hop.step:g} mA "
                     f"at a time while its SHG peak stays at its best, then two back, no lower than it was: the "
@@ -1273,8 +1274,10 @@ def setup_report(client, laser: int, hop, lp, model=None) -> list:
                     f"(walk)")
         if hop.shg and hop.reset_up > 0:
             slow = min(max(hop.reset_slow, 0.0), hop.reset_up)
-            add("info", f"after a hop, first a reset, as by hand: the piezo to the optimum's voltage and the current "
-                        f"to the optimum's, then the current up {hop.reset_up:g} mA, down 1 mA at a time to "
+            add("info", f"after a hop, first a reset, as by hand: the piezo to where it was last on target as it "
+                        f"should be (within the last 15 min; else to the optimum's voltage: its cavity drifts, the "
+                        f"piezo making up for it, so that the optimum's own goes stale) and the current to the "
+                        f"optimum's, then the current up {hop.reset_up:g} mA, down 1 mA at a time to "
                         f"{slow:g} mA above it, and on down {hop.step:g} mA at a time to it, a reading each: coming "
                         f"from that far above it lands on its right mode there, as a rule. On it (its SHG peak within "
                         f"{100 * (1 - hop.catch_min):.0f} % of the optimum's), the piezo onto the target and relocked; "

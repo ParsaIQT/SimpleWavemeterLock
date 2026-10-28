@@ -2129,6 +2129,43 @@ def test_the_reset_goes_to_the_optimum_s_piezo_voltage_with_the_feedforward():
                                        "its best, 150.70 mA, the piezo 67.60 → 70.3"), r.result.summary
 
 
+@pytest.mark.parametrize("fresh", [True, False], ids=["last_on_target", "optimum"])
+def test_the_reset_goes_back_where_it_was_last_on_target_not_to_an_optimum_its_cavity_has_drifted_from(fresh):
+    """The 739 nm master on 28 October: its optimum taken four days before at 102.51 V, its cavity drifted since, the
+    piezo making up for it (its relocks walked it to 104.9 V, its lock's own share to 106 V), while what picks its mode
+    did not move with the piezo (ksv 0): its right mode near its edge at the optimum's piezo voltage. After a hop that
+    its window cannot undo, the reset from where it was last on target lands on it at once; from the optimum's, it
+    missed, and so did nine goes (here 5 V stale: there, 3.5 V, and 6 resets in 7 missed)."""
+    b, lock = stuck_bench(ksv=0.0)
+    p = optimum(b, kv=400.0, i_window=0.7, opt_v=V0 - 5.0)
+    p = HopParams.from_dict({**p.to_dict(), "shg_lock": b.shg_usual})
+    i_lo, i_hi, i_top = p.i_nom - p.i_below, p.i_nom + p.i_window, p.i_nom + p.jump_max
+    rec = Recenter(p, b.I, b.V, i_lo, i_hi, V0 - 5.0 - p.pc_try, V0 + p.pc_try, cavity=True, i_top=i_top,
+                   ref=(V0, I0) if fresh else None)
+    r = b.run(rec)
+    check_safety(b, i_lo, i_top, p)
+    assert r.state == "done" and b.laser.m == 0 and lock.locked() and abs(b.off_mhz()) < 1, r.error
+    reset = r.result.record["reset"]
+    if fresh:
+        assert rec.resets_done == 1 and rec.tries == 0 and reset[0]["on"] and reset[0]["v"] == pytest.approx(V0)
+        assert r.result.summary.startswith("relocked, back on its right mode by a reset (the piezo to 70.00 V"), \
+            r.result.summary
+    else:  # (as it was: the optimum's piezo voltage, where the right mode is not to be had)
+        assert not any(x["on"] for x in reset) and reset[0]["v"] == pytest.approx(V0 - 5.0) and rec.tries == 9
+        assert "not caught in 3 goes at 65.00 V: piezo to 95.00 V (the optimum's 65.00 V +30 V)" in rec.notes
+
+
+def test_a_cavity_lock_taken_over_far_off_does_not_take_how_far_for_its_modes_spacing():
+    """Relock clicked where a failed recovery had left it, 10 GHz from its target: that is no hop, and its right mode
+    is taken to be within 0.4 of a guessed spacing of where it should be, not of 10 GHz (on 28 October a neighbour
+    2 GHz off was caught for it so). A laser locked to the wavemeter that has just hopped that far takes it for one."""
+    for cavity, spacing in ((True, Recenter.SPACING_GUESS), (False, 10000.0)):
+        rec = Recenter(HopParams(enabled=True, i_nom=I0, cavity=cavity, shg=True), I0, V0, I0 - 1, I0 + 0.7, V0 - 25,
+                       V0 + 25, cavity=cavity)
+        rec.e0 = 10000.0
+        assert rec.spacing_now() == spacing
+
+
 def test_monte_carlo_resets_over_masters_whose_modes_hold_on_longer_one_way():
     """Random masters, their modes 1.8 to 3 GHz apart, holding on far longer going up than going down (hysteresis
     0.6 to 0.95 of the spacing, skewed 0.5 to 0.9), hopped onto the next mode by a dip of the current (0.6 to 1.5

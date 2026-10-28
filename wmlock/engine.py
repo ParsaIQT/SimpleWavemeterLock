@@ -3503,13 +3503,13 @@ class Engine:
         off = a0 - i0
         i_lo, i_hi = max(hop.i_nom - hop.i_below - off, 0.0), hop.i_nom + hop.i_window - off
         i_top = hop.i_nom + max(hop.jump_max, hop.i_window) - off
-        v_lo, v_hi = v0 - hop.v_window, v0 + hop.v_window
-        if hop.how() == "catch" and hop.pc_try > 0:  # (its tries from the optimum's piezo voltage +- pc_try)
-            vo = hop.opt_v if hop.optimum else v0
-            v_lo, v_hi = min(v_lo, vo - hop.pc_try), max(v_hi, vo + hop.pc_try)
-        v_lo, v_hi = max(lp.v_min, v_lo), min(lp.v_max, v_hi)
         fine = ch.fine_at
         ref = (fine[1], fine[2]) if fine and time.monotonic() - fine[0] <= self.FINE_S else None
+        v_lo, v_hi = v0 - hop.v_window, v0 + hop.v_window
+        if hop.how() == "catch" and hop.pc_try > 0:  # (its tries from where it was last on target, if that was of
+            vo = ref[0] if ref else hop.opt_v if hop.optimum else v0  # late, else the optimum's: +- pc_try)
+            v_lo, v_hi = min(v_lo, vo - hop.pc_try), max(v_hi, vo + hop.pc_try)
+        v_lo, v_hi = max(lp.v_min, v_lo), min(lp.v_max, v_hi)
         ch.current, ch.current_set, ch.offset = a0, i0, v0
         if not i_lo <= min(i_hi, clip):
             self._recovery_failed(ch, f"current-clip, {clip + off:.2f} mA measured, is below its window ("

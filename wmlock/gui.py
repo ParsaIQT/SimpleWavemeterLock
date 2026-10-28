@@ -1569,14 +1569,15 @@ class HopDialog(QtWidgets.QDialog):
         self.catch_tries.setValue(p.catch_tries)
         self.pc_try = number(p.pc_try, 0, 100, 1, 5)
         form.addRow("Catch", row("its SHG peak within", self.catch_pct, "% of the optimum's;", self.catch_tries,
-                                 "goes, then from the optimum's piezo voltage ±", self.pc_try, "V"))
+                                 "goes, then from where it was last on target ±", self.pc_try, "V"))
         self.pc_try.setToolTip("The right mode: the one it was on target on before it hopped. Each go takes the "
                                "current to the top of\nits window, then down a step at a time, until the laser is on "
                                "the right mode and its SHG\npeak (the tallest resonance in the SHG cavity's sweep) is "
-                               "within that of the optimum's.\nNot caught in that many goes, it tries from the "
-                               "optimum's piezo voltage + and - this\n(the piezo may go that far for it), then walks "
-                               "the piezo back onto the target, the\ncurrent parked high in the mode every few steps. "
-                               "0: no tries elsewhere.")
+                               "within that of the optimum's.\nNot caught in that many goes, it tries from where it "
+                               "was last on target as it should be (within\nthe last 15 min; else from the optimum's "
+                               "piezo voltage) + and - this (the piezo may go that far for it),\nthen walks the piezo "
+                               "back onto the target, the current parked high in the mode every few steps.\n0: no "
+                               "tries elsewhere.")
         self.reset_up = number(p.reset_up, 0, 10, 1, 0.5)
         self.reset_slow = number(p.reset_slow, 0, 10, 1, 0.5)
         self.reset_tries = QtWidgets.QSpinBox()
@@ -1585,12 +1586,14 @@ class HopDialog(QtWidgets.QDialog):
         form.addRow("Reset", row("after a hop, first: piezo and current to nominal, up", self.reset_up,
                                  "mA, down 1 mA at a time to +", self.reset_slow, "mA, then a step at a time;",
                                  self.reset_tries, "times"))
-        self.reset_up.setToolTip("With an SHG stage, as by hand: the piezo to the optimum's voltage and the current to "
-                                 "the optimum's, then the current\nthis far up, down 1 mA at a time, and on down to "
-                                 "the optimum's a step at a time, a reading each: coming\nfrom that far above, it "
-                                 "lands on its right mode there, as a rule. Then on as ever: the current to the top "
-                                 "end\nof where the mode is at its best, the piezo onto the target. Only if that does "
-                                 "not bring it back,\nthe goes up and down. 0: no reset.")
+        self.reset_up.setToolTip("With an SHG stage, as by hand: the piezo to where it was last on target as it should "
+                                 "be (within the last 15 min;\nelse to the optimum's voltage: its cavity drifts, the "
+                                 "piezo making up for it) and the current to the optimum's,\nthen the current this far "
+                                 "up, down 1 mA at a time, and on down to the optimum's a step at a time, a "
+                                 "reading\neach: coming from that far above, it lands on its right mode there, as a "
+                                 "rule. Then on as ever: the\ncurrent to the top end of where the mode is at its best, "
+                                 "the piezo onto the target. Only if that does not\nbring it back, the goes up and "
+                                 "down. 0: no reset.")
         self.ease_step = number(p.ease_step, 0, 0.1, 3, 0.001)
         self.upkeep_back = number(p.upkeep_back, 0, 0.5, 3, 0.005)
         self.upkeep = number(p.upkeep, 0, 1440, 0, 5)
