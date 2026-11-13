@@ -101,6 +101,7 @@ from . import dac
 from .dlcpro import SCAN_OUT, DLCPro, DecopError, Device, discover, drives, output_name, probe, scan_output
 from .dropouts import Monitor as DropoutMonitor
 from .dropouts import log as drop_log
+from .keep import ModeWatch
 from .lasermap import FOLDER, LOOK, MODEL_MIN, MapFile, MapPlan, Mapper, MapRunner, file_name, fmt_time
 from .lock import Lock, LockParams
 from .modehop import HOP_MIN, SEED_FLOOR, Guard, HopParams, Recenter, Runner, ff_does, perform
@@ -477,6 +478,21 @@ class Channel:
         self.remote_wall = 0.0  # ...and time.time(): when
         # the upkeep (HopParams.upkeep): the top of its mode found now and then, and backed off from
         self.upkeeping = False  # the recovery in progress is that
+        # kept off the edge of its mode (HopParams.keep; keep.py): locked, its SHG signal or its fringes on the
+        # wavemeter watched, its current trimmed when a second mode begins
+        self.watch = ModeWatch()  # its signals, as watched, and when to act
+        self.keeping = None    # the keeping in progress: what its watch said (its alarm)
+        self.keep_locked = False  # ...during it, this program's wavemeter lock goes on holding it
+        self.keep_checked = 0.0   # monotonic: its watch last asked
+        self.keep_said = ""    # what the last keeping did (or why it could not), and when (monotonic)
+        self.keep_t = 0.0
+        self.keep_edge = ""    # its current is at this edge of its window, a second mode beginning: said until it is not
+        self.fringes = None    # what is left of its fringes on the wavemeter, at its last reading (None: not watched)
+        self.detailed = False  # its readings are asked for in detail (their patterns), for that
+        self.follow_kept = None  # its Follow, set aside while its mode is kept (a keeping moves its current itself)
+        self.unlock_why = None   # asked to unlock while a recovery ran (why; 'stopped': by hand): done once it is over
+        self.hop_ask = 0.0       # monotonic: a jump just seen, its set current is being read (a hand's doing, or a
+        #                          hop?), until then at the latest
         self.opt_why = ""      # its optimum taken last: why its SHG level was not (as its DLC pro said)
         self.upkeep_t = 0.0    # monotonic: when it was armed, recovered or upkept last
         # what its wavemeter lock last did by itself (it ran away: its gains reversed)
@@ -825,6 +841,7 @@ class Engine:
     OBSERVED_S = 600.0      # s an ended one is kept, to be fetched
     END_S = 6.0             # s an ended one waits for its dropouts up to its end to be read, at most...
     PAST_S = 0.25           # ...read until this long past its end (its recorder starts a moment after it is told)
+    TICK_S = 0.005          # s: a recovery's pauses and ramps (modehop.Sweep) are woken this often while one runs
 
     def __init__(self, config: dict, make_source, discovery_targets=None, extra_devices=(), log_path=None,
                  drop_path=None):
@@ -861,6 +878,8 @@ class Engine:
         self.reference = Reference.from_config(ref) if ref else None
         self.dirty = False       # settings changed since the last save
         self.stopping = False    # stop() under way
+        self._ticking = threading.Event()  # set: its ticker is to end (stop())
+        self._ticker = threading.Thread(target=self._tick_runners, daemon=True, name="recoveries' ticker")
         self.source = make_source(self)
         if self.source is not None:  # (the WLM software stuck or gone: restarted, where the source can)
             self.source.restart = config.get("wlm_restart", True) is not False
@@ -877,7 +896,24 @@ class Engine:
                         log.info("channel %d: watched again, as it was when the program stopped", ch.n)
                         self._arm_sls(ch)
         self.source.start()
+        self._ticker.start()
         self.start_discovery()
+
+    def _tick_runners(self):
+        """A thread of its own: a recovery's ramps go a small step at a time, each no sooner than its pace has it
+        (modehop.Runner.wake), which the readings alone (and the window's timer) would wake too seldom."""
+        busy = False
+        while not self._ticking.wait(self.TICK_S if busy else 0.1):
+            try:
+                with self.lock:
+                    now = time.monotonic()
+                    runners = [ch.runner for ch in self.channels.values() if ch.runner is not None]
+                    busy = bool(runners)
+                    for r in runners:
+                        if r.wake() <= now:
+                            r.tick(now)
+            except Exception:  # (a bug in what a recovery calls as it ends: the others' ramps go on)
+                log.exception("recoveries' ticker")
 
     def stop(self):
         with self.lock:
@@ -910,6 +946,7 @@ class Engine:
         while getattr(self.source, "switching", False) and self.source.is_alive() and time.monotonic() < end:
             time.sleep(0.02)
         self.source.stop()
+        self._ticking.set()
         for m in monitors + watches:
             m.join(max(0.0, end + 5.0 - time.monotonic()))
         with self.lock:
@@ -1152,6 +1189,119 @@ class Engine:
             if self._upkeep_due(ch, now):
                 ch.upkeeping = True
                 self._start_recovery(ch, "upkeep", budget=False, relock=True)
+            elif now - ch.keep_checked >= self.KEEP_ASK_S:
+                ch.keep_checked = now
+                alarm = self._keep_due(ch, now)
+                if alarm is not None:
+                    self._start_keep(ch, alarm)
+
+    KEEP_ASK_S = 1.0  # s between two looks at a laser's watch (is a second mode beginning?)
+
+    def _keeps(self, ch: Channel) -> bool:
+        """Its mode is watched, to be kept off its edge (HopParams.keep): mode-hop recovery on, a DLC pro's laser."""
+        return bool(ch.hop.enabled and ch.hop.keep and ch.device and not ch.dac)
+
+    def _fringes_wanted(self, ch: Channel) -> bool:
+        """Its fringes on the wavemeter are what its mode is watched by: locked (or watched), no SHG stage to tell,
+        and a source that says its readings in detail."""
+        return (self._keeps(ch) and not ch.hop.shg and ch.state in ("on", "recovering")
+                and bool(getattr(self.source, "details", False)))
+
+    def _detail(self, ch: Channel):
+        """Its readings in detail (their interference patterns) while its mode is watched by its fringes; else no
+        more (a map of it says what it wants itself, meanwhile). Looked at with every reading: asked of the source
+        only when it changes."""
+        if not getattr(self.source, "details", False) or ch.mapper is not None or ch.state == "mapping":
+            return
+        want = self._fringes_wanted(ch)
+        if want != ch.detailed:
+            ch.detailed = want
+            self.source.detail(ch.n, True if want else None)
+        if not want:
+            ch.fringes = None
+
+    def _fringes(self, ch: Channel, r):
+        """A reading in detail: what is left of its fringes (keep.Fringes: 1, as they were when first seen); running
+        as it should, its watch takes it."""
+        if not self._fringes_wanted(ch) or not ch.freq > 0:
+            return
+        pattern = (r.extra.get("patterns") or {}).get(0)
+        q = ch.watch.fringes.seen(pattern[1]) if pattern else None
+        if q is None and (not pattern or not ch.watch.fringes.able):  # (no patterns to be had, or no numpy to
+            #                                                           look at them: their amplitudes' contrast)
+            amps = r.extra.get("amps")
+            if amps and len(amps) >= 2 and _num(amps[0]) and _num(amps[1]) and amps[0] + amps[1] > 0:
+                q = (amps[1] - amps[0]) / (amps[1] + amps[0])
+        ch.fringes = q
+        if q is not None and ch.runner is None and self._running_fine(ch):
+            ch.watch.feed("fringes", r.t, q)
+
+    def _keep_due(self, ch: Channel, now: float):
+        """Locked and running as it should, nothing else going on: has its watch seen a second mode beginning (its
+        SHG signal, or its fringes on the wavemeter, dipped by HopParams.keep_dip: keep.ModeWatch.alarm)? Then what
+        it said, else None."""
+        hop = ch.hop
+        if not self._keeps(ch) or self._is_reference(ch):
+            return None
+        if ch.state != "on" or ch.runner is not None or ch.pending is not None or ch.look_why or ch.off:
+            return None
+        if ch.beat_slave:  # (an SLS PLL holds it: as its upkeep, its piezo moved along with its current)
+            g, v = ch.sls_guard, ch.sls_view
+            if not (ch.sls.trim and g is not None and g.stage == "hold" and v is not None and v.holds
+                    and ch.steering is None and not self._beat_lost(ch) and says_locked(ch.shg_txt)
+                    and self._beat_point(ch, look=False) is not None and (ch.beat_ok or not ch.sls.master)):
+                return None
+            if not self._piezo_per_ma(ch):
+                if ch.sls.trim_gain and not ch.sls.trim_cur:
+                    ch.trim_cur_want = True  # (how its fast output follows its current: its trim's next step)
+                return None
+        elif not self._running_fine(ch) or (hop.cavity and self._slipping(ch)):
+            return None
+        elif not hop.cavity and ch.lock.watching:  # (its wavemeter lock just engaged, still watched for running
+            return None                            # away: its error growing as its current is ramped would be that)
+        return ch.watch.alarm(now, hop.keep_dip)
+
+    def _start_keep(self, ch: Channel, alarm: dict):
+        """A second mode is beginning (alarm: what its watch said): its current trimmed, its locks on, to where its
+        signal is back up (modehop.Recenter.keep). It does not count towards the recoveries an hour."""
+        what = "SHG signal" if alarm["signal"] == "shg" else "fringes on the wavemeter"
+        ch.upkeeping = True
+        self._start_recovery(ch, f"its {what} dipping {100 * alarm['dip']:.1f} % (a second mode beginning)",
+                             budget=False, relock=True, keep=dict(alarm))
+
+    def _kept(self, ch: Channel, r: Runner, keeping: dict):
+        """A keeping is over: its watch told how it went (mended: not again for a moment; not: not for a while,
+        longer each time; the current made no difference: the signal is taken for what it is now)."""
+        k = r.rec.kept or {}
+        done = r.state == "done"
+        mended = done and bool(k.get("mended"))
+        edge = k.get("edge", "") if done else ""
+        ch.watch.kept(time.monotonic(), mended, k.get("way", 0), rebase=done and not mended and not edge,
+                      level=k.get("level"))
+        ch.keep_edge = edge
+        ch.keep_said, ch.keep_t = (r.result.summary if done else f"its mode not kept: {r.error}"), time.monotonic()
+
+    def _refollow(self, ch: Channel, current):
+        """A keeping is over, its wavemeter lock on as before: its Follow, set aside meanwhile, is back, from where
+        its set current is now (current; None: as it was): the keeping's doing, as a hand's would be. Its setpoint
+        moved meanwhile: tuned there, its current following."""
+        f, ch.follow_kept = ch.follow_kept, None
+        if f is None or ch.follow is not None or ch.state != "on" or not ch.lock.active:
+            return
+        ch.follow = f
+        now = time.monotonic()
+        if current is not None and ch.offset is not None:
+            f.by_hand(current, ch.offset, now)
+        if abs(ch.error_mhz) > Follow.TUNE_MHZ and ch.offset is not None:
+            f.tune(ch.offset, now, act=ch.current)
+
+    def _rearm(self, ch: Channel, check: bool = True):
+        """A keeping of a laser its DLC pro locks is over (its locks were left on): watched again, and looked at
+        (check): its lock off, or the laser off its target, it is relocked now (an unarmed guard would never see
+        it). Its upkeep is due when it was."""
+        t = ch.upkeep_t
+        self._arm(ch, check=check, take=False)
+        ch.upkeep_t = t
 
     def _upkeep_due(self, ch: Channel, now: float) -> bool:
         """A laser its DLC pro locks, with an SHG stage, watched, locked and steady (on target a while, its locks
@@ -1217,11 +1367,16 @@ class Engine:
                     ch.steady_f = ch.freq
                 else:
                     ch.steady_t, ch.steady_f = r.t, NAN
+                self._detail(ch)
+                ch.fringes = None  # (this reading's, if it comes with them: never the last one's again)
+                if r.extra is not None:  # (in detail: what is left of its fringes, its mode watched by them)
+                    self._fringes(ch, r)
                 withheld = self._hop_reading(ch, r.t) if ch.hop.enabled or ch.runner else False
                 if ch.beat_slave:
                     self._beat_reading(ch)
-                elif ch.state == "on" and ch.freq > 0 and not withheld and not ch.relock and not ch.sls.on:
-                    self._step(ch)
+                elif ((ch.state == "on" or ch.keep_locked) and ch.freq > 0 and not withheld and not ch.relock
+                      and not ch.sls.on):
+                    self._step(ch)  # (its mode being kept, its wavemeter lock goes on holding it)
                 if ch.pending is not None and ch.freq > 0:  # the readings it waited for
                     args, ch.pending = ch.pending, None
                     self._begin_recovery(ch, *args)
@@ -1426,6 +1581,7 @@ class Engine:
                         return
                     ch.lock.engage(v)
                     ch.state = "on"
+                    ch.watch.reset(0.0)
                     if ch.cc == cc and ch.hop.enabled:
                         ch.follow = self._follow_from(ch, v, got)
                         if ch.follow is not None and abs(ch.error_mhz) > Follow.TUNE_MHZ:  # (far from its setpoint:
@@ -1487,6 +1643,7 @@ class Engine:
             self._unsteer(ch)
         if ch.runner is not None:  # a recovery: it puts current and offset back, then reports
             ch.resume = False
+            ch.unlock_why = message or "stopped"  # (a keeping, its lock left on: unlocked once that is over)
             ch.runner.cancel(message or "stopped")
             return
         if ch.mapper is not None:  # a map: likewise
@@ -1526,8 +1683,12 @@ class Engine:
             ch.set_setpoint(nm)
             ch.guard.reset()  # not a hop: the guard waits for the laser to settle there
             ch.guard.track = 0.0
+            ch.watch.reset(0.0)  # (elsewhere, its fringes on the wavemeter are others: seen afresh there)
             self._tune(ch)  # (the lock tunes it there: its current follows its piezo, as its feedforward would)
-            if ch.state == "recovering":
+            if ch.state == "recovering" and ch.keeping is not None and ch.runner is not None \
+                    and ch.setpoint_nm is not None:
+                ch.runner.cancel("setpoint changed")  # (its mode being kept: no more of that; locked as it is)
+            elif ch.state == "recovering":
                 self._disengage(ch, "setpoint changed")
             elif ch.setpoint_nm is None and ch.state != "off":
                 self._disengage(ch, "unlocked: setpoint cleared")
@@ -1700,6 +1861,8 @@ class Engine:
             self._unsteer(ch, why)
         if ch.runner is not None:
             ch.resume = False
+            if ch.keep_locked:  # (its mode being kept, its wavemeter lock on: unlocked once that has stopped)
+                ch.unlock_why = f"unlocked: {why}"
             ch.runner.cancel(why, keep=True)
         elif ch.state == "on" and not ch.relock and not ch.sls.on:
             self._disengage(ch, f"unlocked: {why}")
@@ -1779,6 +1942,7 @@ class Engine:
                 self._find_trans(ch)
         else:
             self._unwatch_trans(ch)
+        self._detail(ch)
         names = hop.seed_names if hop.enabled else ()
         if ch.seed_name and ch.seed_name not in names:
             c.unwatch(p + ch.seed_name)
@@ -1881,6 +2045,11 @@ class Engine:
             return
         if self._running_fine(ch):
             self._usual(ch, ch.shg_fine, "shg_lock", v)
+            if self._keeps(ch):  # (its mode watched by it: a second mode beginning, it dips; to begin with against
+                level = ch.watch.signals["shg"]  # its level as learned since it was last relocked, not before)
+                if not level.prior and len(ch.shg_fine) >= FINE_MIN:
+                    level.prior = hop.shg_lock
+                ch.watch.feed("shg", time.monotonic(), v)
         if not self._armed(ch):
             ch.shg_hist.clear()
             return
@@ -3137,6 +3306,8 @@ class Engine:
         self._release(ch)
         if getattr(self.source, "details", False):
             self.source.detail(ch.n, None)
+            ch.detailed = False
+            ch.watch.fringes.reset()  # (its fringes, as its map's exposures left them: seen afresh)
         out = m.out if m is not None else None
         if out is not None:
             out.meta("end", {"outcome": text, "ok": ok, "error": r.error if r else text,
@@ -3279,6 +3450,8 @@ class Engine:
                 ch.follow.window(mid - params.i_below, mid + params.i_window)
             ch.trans_fine.clear()  # (learned afresh if forgotten)
             ch.shg_fine.clear()
+            ch.watch = ModeWatch()
+            ch.keep_edge = ""
             if ch.device:
                 self._watch_hop(ch)
                 if params.enabled and not params.i_nom:
@@ -3387,8 +3560,9 @@ class Engine:
         """The mode-hop guard's look at a new reading. True: keep it from the wavemeter lock."""
         e = self._hop_error(ch)
         if ch.runner is not None:
-            ch.runner.on_reading(t, e - ch.guard.track)
-            return True
+            ch.runner.on_reading(t, e - ch.guard.track, ch.fringes)
+            # (its mode being kept: its wavemeter lock goes on, on the readings that are on target)
+            return not (ch.keep_locked and math.isfinite(e) and abs(e - ch.guard.track) <= ch.hop.off_target())
         if ch.sls.on:  # (an SLS unit locks it: its guard calls its recoveries)
             return False
         hop = ch.hop
@@ -3405,22 +3579,76 @@ class Engine:
                 ch.guard.reset()
                 return False
             track = False
-        if ch.guard.update(t, e, hop.off_target(), hop.grace, track):
+        if time.monotonic() < ch.hop_ask:  # (a jump just seen, its set current being read: kept from the lock
+            return True                     # meanwhile)
+        if ch.guard.update(t, e, hop.off_target(), hop.grace, track, self._hop_jump(ch)):
             off = e - ch.guard.track
-            self._start_recovery(ch, f"jumped {off / 1e3:+.3f} GHz" if abs(off) >= 1e3 else (
-                f"locked {off:+.0f} MHz off: the wrong peak" if hop.cavity else f"off by {off:+.0f} MHz"))
+            why = f"jumped {off / 1e3:+.3f} GHz" if abs(off) >= 1e3 else (
+                f"locked {off:+.0f} MHz off: the wrong peak" if hop.cavity else f"off by {off:+.0f} MHz")
+            if ch.guard.quick and ch.current_set is not None:
+                self._hop_or_hand(ch, why)
+            else:
+                self._start_recovery(ch, why)
             return True
         return ch.guard.armed and math.isfinite(e) and abs(e - ch.guard.track) > hop.off_target()
 
+    def _hop_or_hand(self, ch: Channel, why: str):
+        """A jump seen at once (Guard's QUICK readings, not its grace): sooner than its set current is polled, so a
+        hand at its current (which jumps it as far) is not yet known of. Its set current is read first: changed, it
+        was a hand (its guard stands by until it is on target again, as when the poll sees it); as it was, a hop:
+        recovered."""
+        ch.hop_ask = time.monotonic() + self.HOP_ASK_S
+        tok, key, name = ch.token, ch.device, f"laser{ch.laser}:{ch.cc}"
+
+        def over(v):
+            with self.lock:
+                if ch.token != tok or not ch.hop_ask:
+                    return
+                ch.hop_ask = 0.0
+                if ch.state != "on" or ch.runner is not None:
+                    return
+                f = ch.follow
+                if _num(v) and ch.current_set is not None and abs(v - ch.current_set) > 0.005 \
+                        and not (f is not None and f.mine(v)):
+                    log.info("channel %d: %s as its current was set by hand (%.3f → %.3f mA): not a hop", ch.n, why,
+                             ch.current_set, v)
+                    ch.guard.reset()
+                    if f is not None:
+                        f.by_hand(v, ch.offset, time.monotonic())
+                    ch.current_set = v
+                    return
+                self._start_recovery(ch, why)
+
+        def job(client):
+            over(client.get_float(name))
+
+        self._controller(key).submit(job, lambda exc: over(None))
+
+    HOP_JUMP = 300.0  # MHz: a laser this far off at least, its readings in one place, has hopped (no waiting)
+    HOP_ASK_S = 2.0   # s: ...once its set current is read as it was (not a hand's doing): asked, and waited for so long
+
+    def _hop_jump(self, ch: Channel) -> float:
+        """MHz: off its target by this much, a few readings in a row all in one place, a laser this program locks to
+        the wavemeter has hopped, without the grace's wait (modehop.Guard): two fifths of what its modes are apart
+        (its model's, else as its recoveries learned), HOP_JUMP at least. 0 (the grace, as ever) for a laser its DLC
+        pro locks to a cavity: its lock may be catching it again."""
+        if ch.hop.cavity:
+            return 0.0
+        model = ch.laser_model() if ch.model_dict is not None else None
+        spacing = model.ext.spacing * 1e3 if model is not None else ch.hop.spacing
+        return max(0.4 * spacing, self.HOP_JUMP)
+
     def _start_recovery(self, ch: Channel, why: str, quick: bool = True, budget: bool = True, relock: bool = False,
-                        urgent: bool = False):
+                        urgent: bool = False, keep: dict | None = None):
         """quick: try the piezo alone first if the laser is near its target. budget: counts towards
         max_per_hour (those the guard starts). relock: asked to relock a laser its DLC pro locks to a
         cavity: take its lock over even if it is off now, and watch it afterwards. Its wavemeter channel
         switched off, it is switched on, and the recovery begins with readings (WAIT_S at most), unless
-        urgent (it does not lase: its current jump does not wait)."""
+        urgent (it does not lase: its current jump does not wait). keep: not a recovery: its mode kept (what its
+        watch said: _start_keep), its locks left on."""
         hop = ch.hop
         now = time.monotonic()
+        ch.keeping, ch.unlock_why, ch.hop_ask = keep, None, 0.0  # (a keeping only if this is one)
         if budget and not ch.guard.allow(now, hop.max_per_hour):
             ch.guard.reset()
             msg = f"{why}: {hop.max_per_hour} recoveries within the hour already, not another"
@@ -3430,10 +3658,16 @@ class Engine:
                 ch.message = msg
             return
         ch.resume = ch.state == "on" or relock
-        ch.lock.disengage("")
+        # (its mode kept: this program's wavemeter lock, if that is what holds it, goes on holding it)
+        ch.keep_locked = (ch.keeping is not None and ch.state == "on" and ch.lock.active and not ch.relock
+                          and not ch.sls.on)
+        follow = ch.follow if ch.keep_locked else None  # (set aside: the keeping moves its current; back after it)
         self._unfollow(ch)
+        ch.follow_kept = follow
         c = self._controller(ch.device)
-        c.cancel(ch.param)
+        if not ch.keep_locked:
+            ch.lock.disengage("")
+            c.cancel(ch.param)
         ch.state, ch.message = "recovering", ""
         m = self.monitors.get(ch.n)
         if m is not None:
@@ -3522,9 +3756,11 @@ class Engine:
             return
         model = ch.laser_model() if hop.method in ("auto", "model") and not ch.upkeeping else None
         rec = Recenter(hop, i0, v0, i_lo, i_hi, v_lo, v_hi, cavity=locked, quick=quick, shg=hop.shg, act_offset=off,
-                       i_top=i_top, i_clip=clip, ref=ref, upkeep=ch.upkeeping, model=model, target=ch.f_set)
+                       i_top=i_top, i_clip=clip, ref=ref, upkeep=ch.upkeeping, model=model, target=ch.f_set,
+                       keep=ch.keeping)
         io = _HopIO(self, ch, controller)
-        runner = Runner(rec, io, time.monotonic(), timeout=rec.timeout, finished=lambda r: self._recovery_done(ch, r))
+        runner = Runner(rec, io, time.monotonic(), timeout=rec.timeout, finished=lambda r: self._recovery_done(ch, r),
+                        clock=time.monotonic)
         if runner.busy:
             ch.runner = runner
             if ch.off:  # (begun at once, not lasing: its channel is being switched on)
@@ -3534,12 +3770,22 @@ class Engine:
         """Before anything was touched."""
         if self._sls_recovered(ch, why):
             return
-        if ch.upkeeping:  # (an upkeep that did not begin: watched again)
+        if ch.upkeeping:  # (an upkeep, or a keeping, that did not begin: watched again)
+            kept, ch.keeping = ch.keeping is not None, None
+            locked, ch.keep_locked = ch.keep_locked, False
             ch.upkeeping, ch.state = False, "off"
-            ch.note, ch.note_t = f"upkeep: none, {why}", time.monotonic()
+            ch.note, ch.note_t = f"{'its mode not kept' if kept else 'upkeep: none'}, {why}", time.monotonic()
             ch.token += 1
             ch.pending = None
-            self._arm(ch, check=False)
+            if kept:
+                ch.watch.kept(time.monotonic(), False)
+            if locked:  # (its wavemeter lock never stopped)
+                ch.state = "on"
+                self._refollow(ch, None)
+            elif kept:
+                self._rearm(ch)
+            else:
+                self._arm(ch, check=False)
             return
         ch.state, ch.resume = "off", False
         ch.message = f"{ch.hop_why + ': ' if ch.hop_why else ''}no recovery, {why}"
@@ -3551,17 +3797,28 @@ class Engine:
         if getattr(r, "abandoned", False):  # (an upkeep its PLL's guard stopped to act itself: said there, _end_upkeep)
             return
         ch.runner = None
-        ch.guard.reset()
+        if ch.keep_locked:  # (its mode kept, its wavemeter lock on all the while: its guard armed as it was, so that
+            ch.guard.pause()  # a laser off its target now has hopped, and is not followed there by its lock)
+        else:
+            ch.guard.reset()
         ch.state = "off"
         ch.token += 1
         upkeep, ch.upkeeping = ch.upkeeping, False
-        ch.upkeep_t = time.monotonic()
+        keeping, ch.keeping = ch.keeping, None
+        locked, ch.keep_locked = ch.keep_locked, False  # (its wavemeter lock went on all the while)
+        asked, ch.unlock_why = ch.unlock_why, None      # (asked to unlock meanwhile: below)
+        if keeping is not None:
+            self._kept(ch, r, keeping)
+        else:
+            ch.upkeep_t = time.monotonic()
+            ch.follow_kept = None
+            ch.watch.reset(0.0)  # (recovered, relocked: its signals as they are from now on, learned afresh)
         self._release(ch)  # its wavemeter channel, if it was switched on for the recovery
         took = f"{r.now - ch.hop_t:.0f} s"
         why = f"{ch.hop_why}: " if ch.hop_why else ""
         rec = r.rec
         if upkeep and ch.beat_slave and ch.sls_guard is not None:
-            self._beat_upkept(ch, r, took)
+            self._beat_upkept(ch, r, took, "" if keeping is not None else "upkeep: ")
             return
         if self._sls_recovered(ch, "" if r.state == "done" else r.error or "failed"):
             pass  # (its guard goes on with it; what it did is noted below all the same)
@@ -3582,9 +3839,14 @@ class Engine:
             ch.note, ch.note_t = f"{why}{res.summary}{self._recenter_target(ch, res.lock_e)}, {took}", time.monotonic()
             log.info("channel %d: %s", ch.n, ch.note)
             self._keep_record(ch, r, ch.note)
-            if ch.resume:
+            if locked:  # (its mode kept, its wavemeter lock never stopped: locked as it was)
+                ch.resume, ch.state, ch.offset = False, "on", ch.lock.u
+                self._refollow(ch, res.current)
+            elif ch.resume:
                 ch.resume = False
-                if ch.relock and not self._is_reference(ch):
+                if keeping is not None and ch.relock and not self._is_reference(ch):
+                    self._rearm(ch)  # (its locks were left on: watched again, relocked now if it is not as it was)
+                elif ch.relock and not self._is_reference(ch):
                     if rec.cavity:
                         ch.cavity_on = True  # it relocked it (the poll may not have seen it yet)
                     self._arm(ch, check=False)  # watch it again
@@ -3594,12 +3856,31 @@ class Engine:
         ch.resume = False
         ch.current_set = r.i_written
         if upkeep and r.error != "stopped":  # (an upkeep that went wrong: watched again, relocked if it must be)
-            ch.note = f"upkeep: {r.error}" + ("" if r.restored else f" (left at {rec.mA(r.i_written):.3f} mA)")
+            ch.note = (f"{'its mode not kept' if keeping is not None else 'upkeep'}: {r.error}"
+                       + ("" if r.restored or "left where it is" in r.error
+                          else f" (left at {rec.mA(r.i_written):.3f} mA)"))
             ch.note_t = time.monotonic()
             log.warning("channel %d: %s", ch.n, ch.note)
             self._keep_record(ch, r, ch.note)
-            self._arm(ch, take=False)
+            if asked not in (None, "stopped"):  # (asked to unlock meanwhile, its channel no longer measured, say: so
+                if locked:                       # it is, as it would have been with nothing going on)
+                    ch.state = "on"
+                ch.follow_kept = None
+                self._disengage(ch, asked)
+            elif locked:  # (its wavemeter lock never stopped: its guard sees to the rest, a hop if it hopped)
+                ch.state = "on"
+                self._refollow(ch, r.i_written)
+            elif keeping is not None:
+                self._rearm(ch)
+            else:
+                self._arm(ch, take=False)
             return
+        ch.follow_kept = None
+        if locked:  # (stopped: its wavemeter lock too)
+            ch.lock.disengage("")
+            c = self.controllers.get(ch.device)
+            if c is not None:
+                c.cancel(ch.param)
         if r.restored:
             where = "current and offset put back"
         else:
@@ -3619,18 +3900,19 @@ class Engine:
         log.warning("channel %d: %s", ch.n, ch.message)
         self._keep_record(ch, r, ch.message)
 
-    def _beat_upkept(self, ch: Channel, r: Runner, took: str):
-        """An upkeep of a laser an SLS PLL holds is over (its PLL held it on its beat point all along, its piezo moving
-        with its current): its guard goes on with it, its piezo trimmed as before."""
+    def _beat_upkept(self, ch: Channel, r: Runner, took: str, what: str = "upkeep: "):
+        """An upkeep (or a keeping: what '') of a laser an SLS PLL holds is over (its PLL held it on its beat point
+        all along, its piezo moving with its current): its guard goes on with it, its piezo trimmed as before."""
         ch.state = "on"  # (its guard's to tell from here: _sls_step)
         rec = r.rec
         if r.state == "done":
             ch.current_set = r.result.current
             ch.message = ""
-            ch.note = f"upkeep: {r.result.summary}, its piezo with it ({ch.offset:.3f} V), {took}"
+            ch.note = f"{what}{r.result.summary}, its piezo with it ({ch.offset:.3f} V), {took}"
         else:
             ch.current_set = r.i_written
-            ch.note = f"upkeep: {r.error}" + ("" if r.restored else f" (left at {rec.mA(r.i_written):.3f} mA)")
+            ch.note = (f"{what or 'its mode not kept: '}{r.error}"
+                       + ("" if r.restored else f" (left at {rec.mA(r.i_written):.3f} mA)"))
         ch.note_t = time.monotonic()
         log.log(logging.INFO if r.state == "done" else logging.WARNING, "channel %d: %s", ch.n, ch.note)
         self._keep_record(ch, r, ch.note)
@@ -3642,11 +3924,16 @@ class Engine:
         if r is None or not ch.upkeeping:
             return
         r.abandoned = True
+        kept, ch.keeping = ch.keeping is not None, None  # (a keeping: no more of one; its watch waits a while)
+        ch.keep_locked, ch.follow_kept, ch.unlock_why = False, None, None
         ch.runner, ch.upkeeping, ch.state = None, False, "on"
-        ch.upkeep_t = time.monotonic()
+        if kept:
+            ch.watch.kept(time.monotonic(), False)
+        else:
+            ch.upkeep_t = time.monotonic()
         ch.token += 1
         r.cancel(f"its PLL's guard: {why}", keep=True)
-        ch.note, ch.note_t = f"upkeep stopped: {why}", time.monotonic()
+        ch.note, ch.note_t = f"{'its mode not kept' if kept else 'upkeep stopped'}: {why}", time.monotonic()
         log.warning("channel %d: %s", ch.n, ch.note)
         self._keep_record(ch, r, ch.note)
 
@@ -3671,7 +3958,7 @@ class Engine:
             "i_top": round(rec.mA(rec.i_top), 4), "v_window": [rec.v_lo, rec.v_hi], "seed": ch.seed,
             "ref": [round(rec.v_ref, 4), round(rec.mA(rec.i_ref, rec.v_ref), 4)],
             "optimum": [ch.hop.opt_i, ch.hop.opt_v, ch.hop.opt_shg, ch.hop.opt_t] if ch.hop.optimum else None,
-            "kv": rec.kv, "ff": rec.ff, "unit": ch.unit, **rec.record,
+            "kv": rec.kv, "ff": rec.ff, "unit": ch.unit, "write_s": round(r._lat, 4), **rec.record,
             "notes": [[None if t is None else round(t - r.started, 1), text] for t, text in rec.record["notes"]],
         }
         if self.log_path:

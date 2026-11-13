@@ -285,6 +285,7 @@ def hop_text(ch, now: float) -> str:
         if lv is not None:
             level, usual, _ = lv
             text += f" · {volts(level, usual)} V" + (f" (locked {volts(usual, usual)})" if usual else "")
+    text += keep_text(ch)
     if ch.note and now - ch.note_t < NOTE_S:
         text += f"   ⟲ {fmt_duration(now - ch.note_t)} ago"
     if ch.looked and now - ch.looked_t < NOTE_S and ch.looked_t > ch.note_t:
@@ -295,6 +296,20 @@ def hop_text(ch, now: float) -> str:
         if k:
             text += f"   {k} lock dropout{'s' if k != 1 else ''} in the last hour"
     return text
+
+
+def keep_text(ch) -> str:
+    """Its mode as its watch has it (keep.ModeWatch), said short: a signal dipping (a second mode beginning), and
+    where its current has nowhere to go."""
+    if not ch.hop.keep or ch.state != "on":
+        return ""
+    if ch.keep_edge:
+        return f"   SECOND MODE BEGINNING, ITS CURRENT AT THE {ch.keep_edge.upper()} OF ITS WINDOW"
+    names = {"shg": "SHG signal", "fringes": "fringes"}
+    for name, (dip, sd, _) in ch.watch.state().items():
+        if dip >= 0.5 * ch.hop.keep_dip and sd >= 3.0:
+            return f"   a second mode beginning? its {names[name]} {100 * dip:.1f} % down"
+    return ""
 
 
 def follow_text(ch) -> str:
@@ -357,6 +372,17 @@ def notes(e, n: int) -> str:
                  + (", takes over the DLC pro's cavity lock" if hop.cavity else "")
                  + (", checks the mode in the SHG cavity" if hop.shg else "")
                  + (", step by step" if hop.confirm else ""))
+        if hop.keep:
+            by = ("its SHG signal" if hop.shg else "its fringes on the wavemeter" if ch.fringes is not None else
+                  "its fringes on the wavemeter (not read in detail yet)")
+            text += (f"\nkept off the edge of its mode: {by} watched while it runs locked; dipped {100 * hop.keep_dip:g} "
+                     f"% (a second mode beginning), its current is trimmed, its locks on"
+                     + (f"; done {ch.watch.kept_n} time{'s' if ch.watch.kept_n != 1 else ''} since the program started"
+                        if ch.watch.kept_n else "")
+                     + (f"; what is left of its fringes: {ch.fringes:.3f}" if ch.fringes is not None and not hop.shg
+                        else ""))
+            if ch.keep_said:
+                text += f"\nits mode, last: {ch.keep_said}"
     if getattr(ch, "model_note", ""):
         text += f"\nits laser's model: {ch.model_note}"
     f = ch.follow  # (the engine's thread may let it go meanwhile)

@@ -1550,6 +1550,26 @@ class HopDialog(QtWidgets.QDialog):
         self.per_hour.setValue(p.max_per_hour)
         form.addRow("At most", row(self.per_hour, "recoveries an hour (not counting a laser that stopped lasing)"))
 
+        heading("Before it hops")
+        self.keep = QtWidgets.QCheckBox("Keep it off the edge of its mode: locked, its signal dipping by")
+        self.keep.setChecked(p.keep)
+        self.keep_dip = number(100 * p.keep_dip, 0.5, 30, 1, 0.5)
+        self.keep_back = number(p.keep_back, 0, 0.5, 3, 0.01)
+        form.addRow(row(self.keep, self.keep_dip, "%: the current trimmed, slowly, its locks on, until it is back up, "
+                                                  "and", self.keep_back, "mA further"))
+        self.keep.setToolTip("Shortly before it hops, the mode that will take over begins to lase as well. With an SHG "
+                             "stage its SHG signal\n(locked) falls by that mode's part of the power; without one, its "
+                             "fringes on the wavemeter fade (its interference\npatterns are read for it). Either is "
+                             "watched while the laser runs locked on target, against what it is as it\nshould be "
+                             "(the last hour's). Dipped by this much: the current a little one way, slowly, its locks "
+                             "left on (its\ncavity lock, or this program's wavemeter lock, goes on holding it); on "
+                             "that way while the signal rises, the\nother way if it falls, until it is back up, and "
+                             "that much further. If the current makes no difference, it is\nnot the mode's doing: "
+                             "the signal is taken for what it is from then on, and looked into again only after a\n"
+                             "while. Unticked as it comes: it moves the current of a laser that is locked and on "
+                             "target, by itself\n(0.005 mA a write, within its window), and has not been tried on the "
+                             "real laser yet. Step by step (below),\nit asks first.")
+
         heading("Finding a mode on target")
         self.method = QtWidgets.QComboBox()
         self.method.addItems([label for _, label in self.METHOD])
@@ -1636,6 +1656,18 @@ class HopDialog(QtWidgets.QDialog):
         form.addRow("Keep a hop at least", row(self.margin, "mA away, both ways (the map checks it)"))
         self.step = number(p.step, 0.01, 1, 2, 0.01)
         form.addRow("Trim and map in steps of", row(self.step, "mA"))
+        self.smooth = QtWidgets.QCheckBox("Sweeps ramped steadily, read on the way; no write moves the current more than")
+        self.smooth.setChecked(p.smooth)
+        self.fine = number(p.fine, 0.001, 0.2, 3, 0.005)
+        self.fine_v = number(p.fine_v, 0, 10, 2, 0.05)
+        form.addRow(row(self.smooth, self.fine, "mA, the piezo", self.fine_v, "V"))
+        self.smooth.setToolTip("Ticked: a sweep of the current (a map's, parking, the margins' check, its model's "
+                               "ways) is one steady ramp, a step\n(above) a reading at the rate the wavemeter reads "
+                               "the laser, every reading kept with the current it was read at,\nand stopped the "
+                               "moment the readings are not as expected. Unticked: a step at a time, a reading after "
+                               "each\nhas settled, as before. Either way every move of the current and of the piezo "
+                               "is written in steps no larger\nthan these, one after another (0 V: the piezo in one "
+                               "write).")
 
         heading("Lasing")
         self.seed = QtWidgets.QLineEdit(p.seed)
@@ -1808,7 +1840,9 @@ class HopDialog(QtWidgets.QDialog):
             catch_tries=self.catch_tries.value(), pc_try=self.pc_try.value(), reset_up=self.reset_up.value(),
             reset_slow=self.reset_slow.value(), reset_tries=self.reset_tries.value(),
             ease_step=round(self.ease_step.value(), 4), upkeep=self.upkeep.value(),
-            upkeep_back=round(self.upkeep_back.value(), 4))
+            upkeep_back=round(self.upkeep_back.value(), 4), keep=self.keep.isChecked(),
+            keep_dip=round(self.keep_dip.value() / 100, 4), keep_back=round(self.keep_back.value(), 4),
+            smooth=self.smooth.isChecked(), fine=round(self.fine.value(), 4), fine_v=round(self.fine_v.value(), 3))
         if not self.forget:
             for name in HopParams.LEARNED:
                 setattr(out, name, getattr(p, name))

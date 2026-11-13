@@ -436,11 +436,15 @@ class ECDL:
     light (an AR-coated chip without its feedback), which its seed photodiode cannot tell from
     lasing. Warmer, it needs more current to lase: kth mA per K, its thresholds and its power's.
     Its own photodiode (a DL pro's, photodiode()) sees its power, and a little spontaneous light.
+    With power_dp (mW per GHz), its power goes with where its mode sits on its selection filter (its
+    misalignment: more feedback at the filter's middle, less threshold): along a mode it rises or falls
+    besides the current's slope, and jumps back at each hop (the sawtooth of an ECDL's power against
+    its current), so that the power at a given current says where in its mode it is.
     """
 
     def __init__(self, f0, fsr=6.0, kv=0.4, ki=-0.25, ksv=None, ksi=-2.0, kt=-4.0, kst=-1.0,
                  hysteresis=0.6, multimode=0.3, v0=70.0, i0=150.0, seed=None, mm_noise=0.03, skew=0.0,
-                 i_stop=None, i_start=None, dark_v=None, kth=0.0):
+                 i_stop=None, i_start=None, dark_v=None, kth=0.0, power_dp=0.0):
         self.f0, self.fsr = f0, fsr
         self.mm_noise = mm_noise  # GHz rms the wavemeter reads where it runs on two modes
         self.kv, self.ki = kv, ki
@@ -459,6 +463,8 @@ class ECDL:
         self.slope_mw, self.i_th = 0.25, i0 - 80.0   # its power: mW per mA above threshold
         self.ase = 0.0     # not lasing, this fraction of that power still goes on (broadband)
         self.kth = kth     # mA/K: its thresholds move up this much as it warms
+        self.power_dp = power_dp  # mW per GHz its mode is misaligned (above its selection filter's middle)
+        self._a = 0.0      # GHz: its mode's misalignment, as last settled (lase)
 
     def misalignment(self, m: int, v: float, i: float) -> float:
         return (m * self.fsr + (self.kv - self.ksv) * (v - self.v0) + (self.ki - self.ksi) * (i - self.i0)
@@ -500,6 +506,7 @@ class ECDL:
         if not lo < a < hi:
             self.m -= round(a / self.fsr)
             a = self.misalignment(self.m, v, i)
+        self._a = a
         return a
 
     def mode_ghz(self, v: float, i: float) -> float:
@@ -510,7 +517,9 @@ class ECDL:
         """mW it sends on (to a TA's seed photodiode, say): lasing, above threshold; else a trace, or
         broadband light (ase)."""
         p = max(self.slope_mw * (i - self.i_th - self.kth * self.T), 0.0)
-        return p if self.lasing else max(self.ase * p, 0.3)
+        if not self.lasing:
+            return max(self.ase * p, 0.3)
+        return max(p + self.power_dp * self._a, 0.0) if self.power_dp else p
 
     def photodiode(self, i: float) -> float:
         """µA from its own photodiode (a DL pro's, dl:pd:photodiode): its power lasing, else (and besides) the
@@ -563,16 +572,24 @@ class ModelLaser:
     bench use (lase, freq, components, power, photodiode, T, f0, lasing). clock: s, for the model's drift (from the
     model's t0 when made) and its chip's lag (None: no drift, the lag by the monotonic clock). T: K its diode is from
     t_ref °C (its controller's temperature when it was made, as a bench has it; None: the model's own, T0 or temp),
-    which a model of several temperatures goes by. Needs numpy."""
+    which a model of several temperatures goes by. With the model's mm, shortly before it hops the mode that would
+    take over lases as well (LaserModel.look: components() has the two, and the wavemeter reads noise there, now and
+    then nonsense: mm_noise GHz rms, as ECDL's). sided: its hysteresis by which edge of its mode it is at (above its
+    chip resonance's best place: the edge a current rising takes it to, h_up; below it: h_down), not by which way
+    its current last moved: the same along a sweep (which is what its map tells), but a laser held at one frequency,
+    its chip's modes drifting, or its current turned round near an edge, holds by where it is, not by where it came
+    from. Needs numpy."""
 
-    def __init__(self, model, clock=None, seed=None, t_ref=None):
-        self.model, self.clock = model, clock
+    def __init__(self, model, clock=None, seed=None, t_ref=None, mm_noise=0.03, sided=False):
+        self.model, self.clock, self.sided = model, clock, sided
         self.f0 = model.f_ref
         self.T = 0.0
         self.t_ref = t_ref if t_ref is not None else (model.T0 if model.T0 is not None else model.temp)
         self.lasing = True
         self.ase = 0.0
         self.rng = random.Random(seed)
+        self.mm_noise = mm_noise  # GHz rms the wavemeter reads where it runs on two modes
+        self._second = None       # (part of the power, GHz from f0): a second mode lasing as well, now
         self.i_th = model.i_th if model.i_th is not None else -math.inf
         self.slope_uw = model.slope if model.slope else 1.0  # µW at the wavemeter per mA (SimCCD: 10 µW a mW)
         self._began = clock() if clock is not None else 0.0
@@ -586,23 +603,67 @@ class ModelLaser:
         if m.i_th is not None and m.i_th_T is not None and m.T0 is not None and self.t_ref is not None:
             self.i_th = m.i_th + m.i_th_T * (self.t_ref + self.T - m.T0)  # (its threshold where its diode is now)
         if i < self.i_th:
-            self.lasing, self._state = False, None
+            self.lasing, self._state, self._second = False, None, None
             return None
         self.lasing = True
         now = self.clock() if self.clock is not None else time.monotonic()
         t = self.model.t0 + (now - self._began if self.clock is not None else 0.0)
         T = self.t_ref + self.T if self.t_ref is not None else None
-        self._ghz, self._delta, self._state = self.model.step(i, v, t, self._state, clock=now, T=T)
+        self._ghz, self._delta, self._state = self._step(i, v, t, self._state, self._delta, now, T)
+        self._second = None
+        if m.mm > 0:  # (shortly before it hops: the mode that would take over lases as well)
+            look = m.look(i, v, t, self._state, T)
+            if look is not None and look["p2"] > 0:
+                self._second = (look["p2"], look["rival"])
         return self._ghz
+
+    def _step(self, i, v, t, state, delta, clock, T):
+        """Its model's step; sided: the hysteresis of the edge its mode is at (delta: GHz it sits above its chip
+        resonance's best place), whichever way its current moves."""
+        m = self.model
+        if self.sided and state is not None:
+            slide = m._ci() - m.ext.p_i if m.kind == "current" else ((m.chip.p_v if m.chip else 0.0) - m.ext.p_v)
+            state = (state[0], state[1], state[2], i if m.kind == "current" else v, delta * slide < 0)
+        return m.step(i, v, t, state, clock=clock, T=T)
+
+    def holds(self, v: float, i: float, reach: float = 1.5, fine: float = 0.02) -> tuple:
+        """(mA down, mA up) its current can go from (v, i) before the mode it lases on hops, as it is now (slowly: its
+        chip as warm as its current), in steps of `fine` as far as `reach` (inf: not within that); NaN: not lasing."""
+        if self.lase(v, i) is None:
+            return math.nan, math.nan
+        now = self.clock() if self.clock is not None else time.monotonic()
+        t = self.model.t0 + (now - self._began if self.clock is not None else 0.0)
+        T = self.t_ref + self.T if self.t_ref is not None else None
+        order, out = self._state[0], []
+        for way in (-1.0, 1.0):
+            st = (order, i, 0.0, i if self.model.kind == "current" else v, self._state[4])
+            delta, got = self._delta, math.inf
+            for k in range(1, int(round(reach / fine)) + 1):
+                _, delta, st = self._step(i + way * k * fine, v, t, st, delta, 1e6 * k, T)
+                if st[0] != order:
+                    got = (k - 1) * fine
+                    break
+            out.append(got)
+        return out[0], out[1]
 
     def freq(self, v: float, i: float, extra_mhz: float = 0.0) -> float:
         """THz, as a wavemeter would see it (NaN: not lasing)."""
         if self.lase(v, i) is None:
             return math.nan
-        return self.f0 + (self._ghz + extra_mhz * 1e-3) * 1e-3
+        ghz = self._ghz + extra_mhz * 1e-3
+        if self._second is not None and self.mm_noise:  # two modes: noisy, now and then nonsense (as ECDL's)
+            ghz += self.rng.gauss(0.0, self.mm_noise)
+            if self.rng.random() < 0.05:
+                ghz += self.rng.uniform(0.2, 0.8) * (self._second[1] - self._ghz)
+        return self.f0 + ghz * 1e-3
 
     def components(self, v: float, i: float):
-        return [(1.0, self._ghz)] if self.lasing else []
+        if not self.lasing:
+            return []
+        if self._second is not None:
+            p2, ghz = self._second
+            return [(1.0 - p2, self._ghz), (p2, ghz)]
+        return [(1.0, self._ghz)]
 
     def power(self, i: float) -> float:
         """mW it sends on (SimCCD: a hundredth of it reaches the wavemeter): its model's at the wavemeter, with how
@@ -637,10 +698,12 @@ class SimCCD:
     VISIBILITY = 0.92                     # its fringes' contrast for a single mode
     DARK_COUNTS = 30.0                    # its CCD's offset
 
-    def __init__(self, coupling: float = 0.01, counts: float = 13.0, spont: float = 0.004, seed=None):
+    def __init__(self, coupling: float = 0.01, counts: float = 13.0, spont: float = 0.004, seed=None,
+                 amp_noise: float = 0.0):
         """counts: at the fringes' peak, per µW and ms; spont: µW reaching it from a laser that does not lase, per mA
-        of its current."""
-        self.coupling, self.counts, self.spont = coupling, counts, spont
+        of its current; amp_noise: counts rms on each of its fringes' amplitudes as it says them (its CCD's noise:
+        0, none)."""
+        self.coupling, self.counts, self.spont, self.amp_noise = coupling, counts, spont, amp_noise
         self.exp = 2.0  # ms: the exposure it will have next
         self.rng = random.Random(seed)
 
@@ -671,6 +734,8 @@ class SimCCD:
         top, d = min(peak, self.FULL), self.DARK_COUNTS
         amps = [d + (top - d) * (1 - v1) / (1 + v1), top, d + (top - d) / (1 + v1),
                 d + (top - d) * (1 - wide) / (1 + wide), top, d + (top - d) / (1 + wide)]
+        if self.amp_noise:
+            amps = [a + self.rng.gauss(0.0, self.amp_noise) for a in amps]
         extra = {"power": uw * (1 + self.rng.gauss(0.0, 0.01)) if value > 0 or value in (-2.0, -3.0) else None,
                  "exposure": [round(exp, 3), 0.0], "amps": [round(a) for a in amps]}
         if patterns:
@@ -898,6 +963,8 @@ class SimLocked:
         self.shg_fsr, self.shg_vfsr, self.shg_finesse = 1.37, 9.0, 150.0
         self.shg_tem = ((0.31, 0.06), (0.62, 0.035))
         self.shg_h, self.shg_floor = 1.2, 0.03
+        self.shg_slope, self.shg_i0 = 0.0, None  # locked, its signal goes with its master's power too: this part of
+        #                                          it a mA of its current from shg_i0 (None: where it is first read)
         self.collapse = collapse
         self.shg_phase = self.rng.random()
         self.shg_jitter = 0.0   # rms: each sweep shows its resonances this much taller or shorter (a real one, ±7 %)
@@ -1288,6 +1355,11 @@ class SimLocked:
             comps = self._comps()
             if self.shg_state()[0] == 5:
                 main = max((p for p, _ in comps), default=0.0)
+                if self.shg_slope:  # (its master's power with its current: a little more light, whatever its mode)
+                    i = self._vi()[1]
+                    if self.shg_i0 is None:
+                        self.shg_i0 = i
+                    main *= 1.0 + self.shg_slope * (i - self.shg_i0)
                 return self.shg_floor + self.shg_h * main + self.rng.gauss(0.0, 0.003)
             s = self._get("nlo:shg:scan:offset")
             if self._get("nlo:shg:scan:enabled"):

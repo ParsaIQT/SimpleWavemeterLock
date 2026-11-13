@@ -52,6 +52,14 @@ PV_N = 6          # by where its comb is at each voltage it was read at this oft
 PV_RANGE = 1.0    # half at least): GHz/V as far as this from what its model says (its map could not tell that from its
 PV_MIN = 0.03     # cavity drifting meanwhile, a whole mode more or less over the map); this much at least, and three
 #                   times as much as it is uncertain
+HOP_PAST = (-0.015, 0.0, 0.015)  # of the chip's mode spacing: its chip's modes this far past where the hop has them, as
+#                   well (since_hop: its rule is known only so well, and they drifted a little on since)
+HOP_RULES = ((1.0, 0.0), (0.6, 0.0), (1.6, 0.0), (1.0, -0.05), (1.0, 0.05))  # (its hysteresis times this, its pull
+#                   plus this): the rules the hop is read by, its model's and those another fit of its map might as
+#                   well have given (a map tells its hysteresis to some 40 %, its pull to 0.05)
+SHORT_REACH = 1.5  # mA: a short way ends this far from where it was on target at most (along its target's line)...
+SHORT_TURN = 2.5   # ...and turns this far from where the laser is at most
+SHORT_SHARE = 0.6  # of its members have a short way arrive and hold, at least, or it is not taken
 
 
 @dataclass
@@ -59,9 +67,10 @@ class Plan:
     """Where to put the laser: a mode (its order) on target at piezo v (V set) and current i (mA measured), come
     to sweeping up from the window's bottom or down from its top (start, mA measured); margins (mA) the model gives
     it there, the median of its members that have it arrive: ahead (on the way it came) and behind, before it hops;
-    path: [(mA, GHz)] the first of those expects on the way, a reading a step; share: of the model's members
-    (Planner.members()), those that have it arrive and hold with the margins asked for; robust: the least margin of
-    theirs (0: one has it arrive on another mode)."""
+    path: [(mA, GHz)] the first of those expects on the way, a reading a step; ways: [(mA, [GHz, ...])] the modes
+    any of those expects there (a reading on none of them, a few times running: none of them is the laser as it is);
+    share: of the model's members (Planner.members()), those that have it arrive and hold with the margins asked
+    for; robust: the least margin of theirs (0: one has it arrive on another mode)."""
     order: int
     v: float
     i: float
@@ -73,6 +82,9 @@ class Plan:
     path: list = field(default_factory=list)
     share: float = 1.0
     robust: float = 0.0
+    ways: list = field(default_factory=list)
+    turn: float | None = None   # a short way (Planner.short): mA measured it goes to first (None: straight there)...
+    legs: list = field(default_factory=list)  # ...and its legs: [(mA measured it goes to, its ways there)]
 
     @property
     def margin(self) -> float:
@@ -133,7 +145,9 @@ class Planner:
         self.drift = 0.0         # GHz: its external comb, moved to where the readings have it
         self.pv0 = m.ext.p_v     # GHz/V: how the piezo tunes it, as its model has it...
         self.pv = 0.0            # ...and how much more, as the readings have it (_recomb)
-        self.ref_v = None        # V set: where it was on target (anchor)
+        self.ref_v = None        # V set: where it was on target (anchor)...
+        self.ref_i = None        # ...and mA measured
+        self.hop = None          # what the hop itself said (since_hop): {'phi': [...], 'to': the order it hopped to}
         self.slid = 0.0          # GHz its window was moved by to have the target in it where it was on target
         self.right = None        # the right mode's order
         self.seen = []           # [Seen]
@@ -193,7 +207,7 @@ class Planner:
         b = float(self.base(i, v))
         n = round((ghz - b) / e.spacing)
         e.p0 += ghz - (b + n * e.spacing)
-        self.right, self.ref_v = int(n), float(v)
+        self.right, self.ref_v, self.ref_i = int(n), float(v), float(i)
         for r, P in enumerate(self.rules):
             if math.isfinite(P[0]) and math.isfinite(P[1]):
                 shift = P[9] * (float(self._dv(v)) - m.v0) + P[10] * (i - m.i0)
@@ -206,9 +220,10 @@ class Planner:
                     self.slid = slid
         _apply(m, self._rule(self.which, self.phi, self.slide))
 
-    def _rule(self, r: int, phi: float, slide: float) -> np.ndarray:
-        """Rule r (as _select has it) with its chip's modes phi and its window slide GHz from the model's."""
-        P = self.rules[r].copy()
+    def _rule(self, r, phi: float, slide: float) -> np.ndarray:
+        """Rule r (its number, or the rule itself, as _select has it) with its chip's modes phi and its window slide
+        GHz from the model's."""
+        P = (self.rules[r] if isinstance(r, (int, np.integer)) else np.asarray(r, dtype=float)).copy()
         P[4] += phi
         if math.isfinite(P[0]) and math.isfinite(P[1]):
             P[0] += slide
@@ -527,9 +542,186 @@ class Planner:
                 ii = self._way(i, up, i_lo, i_hi, step, step_s)[0]
                 path = [(float(x), float(self.ghz(orders[g], x, v))) for x, g in zip(ii[npre:end + 1],
                                                                                     ga[there[0], npre:end + 1])]
+                each = [(float(x), [float(self.ghz(orders[g], x, v)) for g in sorted(set(ga[there, k].tolist()))])
+                        for k, x in zip(range(npre, end + 1), ii[npre:end + 1])]
                 out.append(Plan(int(n), v, i, up, i_lo if up else i_hi, ahead, behind, score, path, share,
-                                float(held.min())))
+                                float(held.min()), each))
         return max(out, key=lambda p: p.score) if out else None
+
+    def offset_for(self, order: int, i: float, v_guess: float) -> float:
+        """V set: the piezo voltage that puts that mode on target at current i (Newton's, as current_for)."""
+        v = float(v_guess)
+        for _ in range(4):
+            d = self.kv(i, v) / 1e3
+            if abs(d) < 1e-9:
+                return math.nan
+            v -= float(self.ghz(order, i, v)) / d
+        return v
+
+    def since_hop(self, i: float, v: float, ghz: float, grid: int = 160) -> bool:
+        """The hop itself, read as a measurement of its chip's modes: at (i mA measured, v V set), where it lased on
+        its right mode (anchored there), nothing moved, it now lases ghz from the target, on another. Its chip's modes
+        have drifted to where its rule has the mode it was on lose to that one, and no further than they must have
+        (they drift slowly: it hopped the moment they got there): for each rule and each way its hysteresis may be held
+        (it was not being swept: either), the chip's modes (phi) nearest where the model had them at which the right
+        mode, lasing, gives way to the mode it is on now, from the side on which it still held; and HOP_PAST beyond.
+        Those are its members from now on (members()), the nearest its own. False if it is on its right mode (it has
+        not hopped), not anchored, or no drift of its chip's modes has its rule make that hop (its window's doing,
+        say: nothing to go by)."""
+        if self.right is None or not math.isfinite(ghz):
+            return False
+        m = self.m
+        to = self.order_of(i, v, ghz)
+        if to == self.right:
+            return False
+        orders = np.arange(min(to, self.right) - 3, max(to, self.right) + 4)
+        ir, it = int(self.right - orders[0]), int(to - orders[0])
+        rules = []
+        for r in range(len(self.rules)):
+            for n, (kh, dp) in enumerate(HOP_RULES):
+                P = self.rules[r].copy()
+                P[2], P[3], P[5] = P[2] * kh, P[3] * kh, P[5] + dp
+                rules.append((r, n, P))
+        found = []
+        for up in (False, True):
+            pk = self._paths([(np.array([i, i]), v, np.array([0.0, 1.0]), up)], orders)
+            for r, n, P0 in rules:
+                dc = float(P0[7])
+                # its chip's modes drifting up slide past its external ones as its current moving this way does
+                # (GHz/mA, the chip's less the external modes'): the hysteresis that holds is that way's
+                rel = float(P0[8]) - (m.ext.p_i if m.kind == "current" else 0.0)
+                phis = self.phi + np.linspace(-dc / 2, dc / 2, grid, endpoint=False)
+                end = _select(pk, np.array([self._rule(P0, phi, self.slide) for phi in phis]), [ir])[:, 0, 1]
+                hops, holds = end == it, end == ir
+                for k in np.flatnonzero(hops):  # (an edge of where it makes that hop, next to where it still held)
+                    for side in (-1, 1):
+                        if holds[(k + side) % grid] and (m.kind != "current" or (-side * rel > 0) == up):
+                            found.append((abs(float(phis[k]) - self.phi), n, r, float(phis[k]), -side * dc / grid,
+                                          dc, up, P0))
+        if not found:
+            return False
+        found.sort(key=lambda f: f[:3])
+        own = next((f for f in found if f[1] == 0), found[0])  # (by its model's own rule, the nearest)
+        keep, seen = [], set()
+        for d, n, r, phi, step, dc, up, P0 in found:  # (the nearest by each rule, and one about as near the other way:
+            if (r, n, step > 0) in seen or d > own[0] + 0.15 * dc:  # the hop cannot tell which way they drifted)
+                continue
+            seen.add((r, n, step > 0))
+            keep.append((P0, phi, step, dc))
+        self.ensemble = [(P0, phi + math.copysign(past * dc, step), self.slide) for P0, phi, step, dc in keep
+                         for past in HOP_PAST]
+        self.which, self.phi = own[2], own[3]
+        self.hop = {"to": int(to - self.right), "phi": round(own[3], 3), "up": bool(own[6]), "rules": len(keep)}
+        _apply(m, self._rule(self.which, self.phi, self.slide))
+        return True
+
+    def short(self, i_now: float, v_now: float, ghz_now: float, i_lo: float, i_hi: float, v_lo: float, v_hi: float,
+              step: float, i_nom: float, step_s: float = 0.2, want: float = 0.5, avoid=(),
+              least: float = 0.15) -> Plan | None:
+        """A short way back onto its right mode, on target, from where the laser is now (i_now mA measured, v_now V
+        set, lasing ghz_now from the target: the mode it is on is known, so nothing needs sweeping out of it first): the
+        piezo to where a current near the one it ran at has its right mode on target (within SHORT_REACH of where it
+        was on target, along its target's line), then the current there, straight or by way of a turning point
+        (within SHORT_TURN of where it is: past where the mode it hopped to gives way again, hysteresis and all), a
+        reading a step (step_s s) all the way. Each way is run by every member from the mode it is on, then on past
+        its end and back in FINE steps; the best by the share of its members that have it arrive on its right mode and
+        hold (want: the margins asked for), then by how short it is. None: no way that SHORT_SHARE of them have
+        arrive and hold with the least margins worth having (least). avoid: [(mA it ended at, its turning point or
+        None)] not to be made again."""
+        if self.right is None or self.ref_i is None or not math.isfinite(ghz_now):
+            return None
+        m = self.m
+        now = self.order_of(i_now, v_now, ghz_now)
+        ends = []
+        for d in np.arange(-SHORT_REACH, SHORT_REACH + 1e-9, step):
+            i = self.ref_i + float(d)
+            if not i_lo + FINE <= i <= i_hi - FINE:
+                continue
+            v = self.offset_for(self.right, i, self.ref_v)
+            if math.isfinite(v) and v_lo <= v <= v_hi:
+                ends.append((i, v))
+        turns = [None] + [i_now + sign * a for a in np.arange(2 * step, SHORT_TURN + 1e-9, 2 * step)
+                          for sign in (1.0, -1.0) if i_lo <= i_now + sign * a <= i_hi]
+        rows, keys = [], []
+        for i, v in ends:
+            pre = _grid(v_now, v, V_STEP)[1:] if abs(v - v_now) > 1e-6 else np.zeros(0)  # (the piezo first, quickly)
+            for turn in turns:
+                if any(abs(i - ai) < 0.5 * step and (turn is None) == (at is None)
+                       and (turn is None or abs(turn - at) < step) for ai, at in avoid):
+                    continue
+                if turn is not None and abs(turn - i) < step:
+                    continue
+                a = _grid(i_now, turn, step)[1:] if turn is not None else np.zeros(0)
+                b = _grid(i_now if turn is None else turn, i, step)[1:]
+                if not len(b):
+                    continue
+                up_a = turn is not None and turn > i_now
+                up_b = i > (i_now if turn is None else turn)
+                n0, na, nb = len(pre), len(a), len(b)
+                for ahead in (True, False):
+                    tail = _grid(i, i + (REACH if up_b == ahead else -REACH), FINE)[1:]
+                    ii = np.concatenate([[i_now], np.full(n0, i_now), a, b, tail])
+                    vv = np.concatenate([[v_now], pre, np.full(na + nb + len(tail), v)])
+                    tt = np.concatenate([[0.0], RAMP_DT * np.arange(1, n0 + 1),
+                                         n0 * RAMP_DT + step_s * np.arange(1, na + nb + len(tail) + 1)])
+                    uu = np.concatenate([[up_a if na else up_b], np.full(n0 + na, up_a if na else up_b),
+                                         np.full(nb, up_b), np.full(len(tail), up_b == ahead)])
+                    rows.append((ii, vv, tt, uu))
+                    keys.append((len(keys) // 2, i, v, turn, 1 + n0, na, nb))
+        if not rows:
+            return None
+        P = self.members()
+        bs = self.base(np.concatenate([r[0] for r in rows]), np.concatenate([r[1] for r in rows]))
+        if self._bounded():  # (all its members' windows, as _weigh)
+            lo_f = min(float(Q[0]) for Q in P) - 5.0 * abs(m.w_v) - 3.0 * abs(m.w_i)
+            hi_f = max(float(Q[1]) for Q in P) + 5.0 * abs(m.w_v) + 3.0 * abs(m.w_i)
+        else:
+            lo_f, hi_f = float(np.min(bs)) - 3 * m.dc, float(np.max(bs)) + 3 * m.dc
+        orders = self._orders(min(lo_f, ghz_now) - 5.0, max(hi_f, ghz_now) + 5.0, float(np.min(bs)), float(np.max(bs)))
+        inow, idx = int(now - orders[0]), int(self.right - orders[0])
+        if not (0 <= inow < len(orders) and 0 <= idx < len(orders)):
+            return None
+        got = []
+        for a in range(0, len(rows), 200):  # (in parts: paths x points x modes)
+            part = rows[a:a + 200]
+            chosen = _select(self._paths(part, orders), P, np.full(len(part), inow))
+            got += [chosen[:, k] for k in range(len(part))]
+        best = None
+        for c in range(0, len(rows), 2):
+            _, i, v, turn, n0, na, nb = keys[c]
+            ga, gb = got[c], got[c + 1]
+            end = n0 + na + nb - 1  # (the point it ends at)
+            there = np.flatnonzero(ga[:, end] == idx)
+            if not len(there):
+                continue
+            held = np.zeros(len(P))
+            ahead = np.array([(_held(ga[p, end:], idx) - 1) * FINE for p in there])
+            behind = np.array([(_held(gb[p, end:], idx) - 1) * FINE for p in there])
+            held[there] = np.minimum(ahead, behind)
+            share = float(np.mean(held >= want - 1e-9))
+            if float(np.mean(held >= least - 1e-9)) < SHORT_SHARE:
+                continue
+            length = (abs(turn - i_now) + abs(i - turn)) if turn is not None else abs(i - i_now)
+            score = (share + 0.5 * float(np.mean(np.minimum(held, 2 * want))) / (2 * want) - 0.03 * length
+                     - 0.004 * abs(v - v_now) - 0.02 * abs(i - i_nom))
+            if best is None or score > best[0]:
+                best = (score, c, there, share, float(np.median(ahead)), float(np.median(behind)), float(held.min()))
+        if best is None:
+            return None
+        score, c, there, share, ahead, behind, robust = best
+        _, i, v, turn, n0, na, nb = keys[c]
+        ii, ga = rows[c][0], got[c]
+
+        def each(a, b):  # (the modes any member that arrives expects, point by point)
+            return [(float(ii[k]), [float(self.ghz(orders[g], ii[k], v)) for g in sorted(set(ga[there, k].tolist()))])
+                    for k in range(a, b)]
+
+        # (from the first: the mode it is on now, which it may stay on longer than they say)
+        legs = ([(float(turn), each(0, n0 + na))] if turn is not None else []) + [
+            (float(i), each(n0 + na if turn is not None else 0, n0 + na + nb))]
+        up = i > (i_now if turn is None else turn)
+        return Plan(int(self.right), float(v), float(i), bool(up), float(i_now), ahead, behind, score,
+                    [(x, gs[0]) for x, gs in legs[-1][1]], share, robust, legs[-1][1], turn, legs)
 
     def arrives(self, i: float, v: float, up: bool, i_lo: float, i_hi: float, step: float, i_nom: float,
                 step_s: float = 0.2, want: float = 0.5) -> float:

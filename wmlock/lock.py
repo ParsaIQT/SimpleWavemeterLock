@@ -71,6 +71,12 @@ class Lock:
     def disengage(self, message: str = ""):
         self.active, self.message = False, message
 
+    @property
+    def watching(self) -> bool:
+        """Engaged, and still watched for running away (its first WATCH_N readings): an error that grows for another
+        reason meanwhile (its current ramped, its piezo following) would be taken for that."""
+        return self.active and self._n < self.WATCH_N
+
     def limits(self):
         lo, hi = self.p.v_min, self.p.v_max
         if self.p.excursion > 0:

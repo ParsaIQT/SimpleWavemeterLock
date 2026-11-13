@@ -16,7 +16,7 @@ from test_modehop import Bench  # noqa: E402
 
 from wmlock import lasermodel as lm  # noqa: E402
 from wmlock.engine import Channel, Engine  # noqa: E402
-from wmlock.modehop import HopParams, Recenter  # noqa: E402
+from wmlock.modehop import STEP_MAX, HopParams, Recenter  # noqa: E402
 from wmlock.modelhop import AVOID_V, WINDOW_IN, Planner, _apply, _grid  # noqa: E402
 from wmlock.sim import ModelLaser  # noqa: E402
 
@@ -98,8 +98,11 @@ def hopped(model: lm.LaserModel, seed: int, true=None, bench_of=None):
     return bench, laser, p, (i_nom, v_nom, target)
 
 
-def recover(model: lm.LaserModel, seed: int, true=None, given=None):
+def recover(model: lm.LaserModel, seed: int, true=None, given=None, smooth=True):
+    """smooth False: by steps, a reading after each (HopParams.smooth off, its writes whole steps), as it was."""
     bench, laser, p, (i_nom, v_nom, target) = hopped(model, seed, true)
+    if not smooth:
+        p.smooth, p.fine, p.fine_v = False, STEP_MAX, 0.0
     hop = (laser.freq(v_nom, i_nom) - target) * 1e3
     rec = Recenter(p, i_nom, v_nom, i_nom - 1.0, i_nom + 2.0, v_nom - 25.0, v_nom + 25.0, ref=(v_nom, i_nom),
                    model=model if given is None else given, target=target)
@@ -187,23 +190,34 @@ def test_where_a_plan_did_not_hold_it_plans_elsewhere():
     assert abs(other.v - first.v) >= AVOID_V or abs(other.i - first.i) >= 0.5 or other.up != first.up
 
 
+def by_its_model(r, rec, smooth, agree=0.0):
+    """By its model's short way from where it hopped to (ramped: no map), else one map: the model's fit; by a plan, or
+    its right mode's band."""
+    m = rec.record["model"]
+    if rec.short_at is not None:
+        assert smooth and m["short_done"] and rec.maps == 0 and "its model's short way" in r.result.summary
+        return "short"
+    assert m["agree"] > agree and (m.get("done") or m.get("band")) and rec.maps == 1
+    assert smooth or "short" not in m  # (by steps: the short way is not tried)
+    return "map"
+
+
+@pytest.mark.parametrize("smooth", [True, False])
 @pytest.mark.parametrize("seed", [300, 303, 307])
-def test_the_493nm_laser_hopped_comes_back_on_target_by_its_model(seed):
-    r, rec, hop, e = recover(blue(), seed)
+def test_the_493nm_laser_hopped_comes_back_on_target_by_its_model(seed, smooth):
+    r, rec, hop, e = recover(blue(), seed, smooth=smooth)
     assert abs(hop) > 3.0  # GHz (it hopped)
     assert r.state == "done" and abs(e) < 20.0  # MHz
-    m = rec.record["model"]
-    assert m["agree"] > 0.6 and (m.get("done") or m.get("band")) and rec.maps == 1  # (one map: the model's fit; by a
-    #                                                                                  plan, or its right mode's band)
+    assert by_its_model(r, rec, smooth, 0.6) == ("short" if smooth and seed != 307 else "map")
 
 
+@pytest.mark.parametrize("smooth", [True, False])
 @pytest.mark.parametrize("seed", [300, 304, 309])
-def test_the_650nm_laser_hopped_comes_back_on_target_by_its_model(seed):
-    r, rec, hop, e = recover(red(), seed)
+def test_the_650nm_laser_hopped_comes_back_on_target_by_its_model(seed, smooth):
+    r, rec, hop, e = recover(red(), seed, smooth=smooth)
     assert abs(hop) > 1.0
     assert r.state == "done" and abs(e) < 20.0
-    m = rec.record["model"]
-    assert (m.get("done") or m.get("band")) and rec.maps == 1
+    assert by_its_model(r, rec, smooth) == ("short" if smooth else "map")
 
 
 @pytest.mark.parametrize("seed", [300, 304])
@@ -559,3 +573,73 @@ def test_check_setup_says_what_its_feedforward_does_and_what_its_model_found():
     assert "its chip's modes +8.5 GHz from where it had them, its piezo tuning its external modes +1.19 GHz/V" in seen
     assert "fitted by an older version" in seen and "back where it was on target" in seen
     assert "Whether it does" not in text(ff_set=-0.6, ff_act=-0.6)  # (it does)
+
+
+# ------------------------------------------------- the hop itself, and the short way
+def since_it_hopped(model, seed):
+    """The laser hopped where it was on target, nothing moved; its planner anchored there, told so: (planner, bench,
+    laser, where it was on target (mA, V), its target, GHz it hopped, what since_hop said)."""
+    bench, laser, p, (i_nom, v_nom, target) = hopped(model, seed)
+    ghz = (laser.freq(v_nom, i_nom) - target) * 1e3
+    pl = Planner(model, target, ref=(i_nom, v_nom))
+    return pl, bench, laser, (i_nom, v_nom), target, ghz, pl.since_hop(i_nom, v_nom, ghz)
+
+
+@pytest.mark.parametrize("which", ["blue", "red"])
+def test_the_hop_itself_says_where_its_chips_modes_are(which):
+    """On target, then on another mode with nothing moved: its chip's modes have just drifted to where its right mode
+    gives way to that one. Read so, the hop places them to a hundredth of their spacing or so (the laser's rule a
+    little off the model's: so well, no better), and its members from then on are about there."""
+    errs = []
+    for seed in range(300, 308):
+        model = {"blue": blue, "red": red}[which]()
+        pl, bench, laser, (i_nom, v_nom), target, ghz, said = since_it_hopped(model, seed)
+        dc = model.dc
+        assert said and pl.hop["to"] == round(ghz / model.ext.spacing) != 0
+        truth = laser.model.offset - model.offset  # (the laser's chip modes from the model's, as they really are)
+        errs.append(abs((pl.phi - truth + dc / 2) % dc - dc / 2) / dc)
+        assert len(pl.members()) >= 15 and pl.hop["phi"] == pytest.approx(pl.phi, abs=1e-3)
+        spread = [abs((float(P[6]) - float(pl.members()[0][6]) + dc / 2) % dc - dc / 2) / dc for P in pl.members()]
+        assert max(spread) < 0.25  # (its members: about where the hop has them, not all over)
+    assert max(errs) < 0.04 and float(np.median(errs)) < 0.01, errs
+
+
+def test_no_hop_nothing_said():
+    model = blue()
+    pl = Planner(model, model.f_ref + 0.050, ref=(64.0, 68.0))
+    assert not pl.since_hop(64.0, 68.0, 0.02) and pl.hop is None          # (on its right mode: it has not hopped)
+    assert not pl.since_hop(64.0, 68.0, float("nan"))                      # (no reading)
+    assert not Planner(model, model.f_ref + 0.050).since_hop(64.0, 68.0, 8.3)  # (not anchored)
+
+
+@pytest.mark.parametrize("which,seed", [("red", 300), ("red", 304), ("red", 309), ("blue", 300), ("blue", 303)])
+def test_a_short_way_back_from_the_mode_it_hopped_to(which, seed):
+    """From where it hopped to (the mode it is on is known): the piezo to where a current near the one it ran at has
+    its right mode on target, the current there, straight or by way of a turning point; the laser itself, taken
+    that way, arrives on its right mode and holds."""
+    model = {"blue": blue, "red": red}[which]()
+    pl, bench, laser, (i_nom, v_nom), target, ghz, said = since_it_hopped(model, seed)
+    assert said
+    args = (i_nom, v_nom, ghz, i_nom - 1.0, i_nom + 2.0, v_nom - 25.0, v_nom + 25.0, 0.1, i_nom)
+    plan = pl.short(*args)
+    assert plan is not None and plan.share >= 0.6 and plan.order == pl.right
+    assert abs(plan.i - i_nom) <= 1.5 + 1e-9 and i_nom - 1.0 <= plan.i <= i_nom + 2.0
+    assert plan.turn is None or (abs(plan.turn - i_nom) <= 2.5 + 1e-9 and i_nom - 1.0 <= plan.turn <= i_nom + 2.0)
+    assert pl.ghz(pl.right, plan.i, plan.v) == pytest.approx(0.0, abs=1e-3)  # (its right mode on target there)
+    assert [to for to, _ in plan.legs] == ([plan.turn] if plan.turn is not None else []) + [plan.i]
+    assert all(ways for _, ways in plan.legs) and plan.ways == plan.legs[-1][1]
+    # the laser itself: the piezo first, then the current along the plan's legs, a step every 0.2 s
+    bench.client.set("laser1:scan:offset", plan.v)
+    i = bench.act
+    for to in [x for x in (plan.turn, plan.i) if x is not None]:
+        for x in _grid(i, to, 0.1)[1:]:
+            bench.client.set("laser1:dl:cc:current-set", float(x))
+            bench.t += 0.2
+        i = to
+    off = (laser.freq(bench.V, bench.act) - target) * 1e3
+    assert abs(off) < 0.3 * model.ext.spacing, off  # (on its right mode: the piezo's trim away from the target)
+    again = pl.short(*args, avoid=[(plan.i, plan.turn)])  # (not to be made again: another, or none)
+    assert again is None or abs(again.i - plan.i) >= 0.05 or (again.turn is None) != (plan.turn is None) or \
+        abs(again.turn - plan.turn) >= 0.1
+    assert pl.short(i_nom, v_nom, float("nan"), *args[3:]) is None
+    assert pl.offset_for(pl.right, plan.i, v_nom) == pytest.approx(plan.v, abs=1e-6)

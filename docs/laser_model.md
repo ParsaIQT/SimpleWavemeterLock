@@ -100,6 +100,21 @@ Two more things hold a mode once it lases.
   it. With $\rho > 0$ a mode holds itself; with $\rho < 0$ it pushes its resonance away. The light a mode does
   not emit heats the chip, and that is likely what is behind it.
 
+**Two modes at once.** The rule above has the laser on one mode until it hops. A real ECDL is not that
+abrupt: shortly before the mode it lases on gives way, the one that will take over begins to lase as well, with
+a growing part of the power (the maps show it: about half the points next to a hop read as two modes). The
+model has a term for that, `mm`: with $u = \min_{k \ne \mathrm{now}} g_k + h - g_{\mathrm{now}}$ the margin
+the lasing mode holds by (it hops at $u = 0$), the rival has a part
+
+$$
+p_2 \;=\; \tfrac{1}{2}\,\max\!\left(0,\; 1 - u/\mathrm{mm}\right)
+$$
+
+of the power: none until the margin is down to `mm`, half where it hops. `LaserModel.look()` gives the margin,
+the rival and its part at any point of a path; a fit does not set `mm` (a map's frequencies say little of it),
+the simulator's lasers have it so that the last fifth of each mode's range is two-mode. It is what keeping a
+laser off the edge of its mode goes by (4.3).
+
 ### 2.3 Its terms
 
 Each comb is a line of modes moving together. The external modes are
@@ -224,6 +239,43 @@ on target, since they drift. It then plans, over every external mode on target n
 moves of current and piezo that arrive on it and hold it, by both rules where two did nearly as well. It runs
 the best plan and checks the frequency at each step.
 
+**The hop is a measurement.** What a map of the current is otherwise made for, after a hop, is to find where the
+chip's modes have drifted to. But the hop says that itself. The laser sat where it was on target, nothing was
+moved, and it is now on another mode, $n$ external modes away: the chip's modes have just drifted to where the
+rule has the right mode lose to *that* one,
+
+$$
+g_{\mathrm{right}}(\phi) \;=\; g_{\mathrm{right}+n}(\phi) + h ,
+$$
+
+and no further, since they drift slowly and it hopped the moment they got there. `Planner.since_hop()` solves
+that for the chip modes' position $\phi$ (the solution nearest where the model had them, for the model's rule
+and for the rules another fit of its map might have given: the hysteresis 0.6 to 1.6 times, the pull ± 0.05;
+which hysteresis holds is the one of the way the chip's modes were drifting past the external ones). Against
+simulated lasers made a little unlike their models, that places the chip's modes to half a percent of their
+spacing (the median; 3 % at the worst), which is as well as a map of the window does.
+
+**The short way.** With the chip's modes placed and the mode the laser is on known, nothing has to be swept out
+of it first. `Planner.short()` plans from where the laser is: the piezo to where a current near the one it ran
+at has the right mode on target, then the current there, straight or by way of a turning point past where the
+mode it hopped to gives way again. Every way is run by every member (each rule, the chip's modes a little
+either side), then on past its end and back, and the one most of them have arrive and hold is taken, if six in
+ten do. The recovery ramps along it (`Recenter.short_way`), each reading against the modes those ways pass:
+three in a row on none of them, and it stops there, fits the model to what it read, and plans again. In the
+trials (README, *Trials*) nine in ten of the 650 nm laser's hops and two in three of the 493 nm laser's are
+mended this way, in some ten seconds and without a map.
+
+### 4.3 Before a mode hop
+
+With `mm` (2.2) a hop has a warning: the rival's part of the power, which shows as a dip of the SHG cavity's
+intra-cavity signal (it resonates with the main mode alone) or as the wavemeter's fringes fading (the two
+modes' fringes add out of step). `wmlock/keep.py` watches either against its own baseline while the laser is
+locked, and `Recenter.keep` then trims the current, slowly and with the locks left on, to where the signal is
+back up: off the edge of the mode, before it hops (README, *Kept off the edge of its mode*). The model is not
+asked which way: the signal itself says, within 0.05 mA. It is the scheme of Chiow et al. (the piezo holds the
+frequency, the current is trimmed to stay matched to it), with the second mode's own signature as the error
+signal in place of the laser's noise under a dither.
+
 ## 5. What a map cannot tell
 
 * **The cavity's drift.** Without a line swept again later, a drift is taken for the piezo's doing. Sweep the
@@ -234,6 +286,32 @@ the best plan and checks the frequency at each step.
   `--park --robust` ranks every spot by the worst of those.
 * **What holds a mode.** A hysteresis of its own and a pull can explain the same map. Both are kept when they do
   nearly as well.
+* **Which hysteresis holds a laser that stands still.** A map is made of sweeps, and the rule takes $h_\uparrow$
+  or $h_\downarrow$ by the way the swept axis last moved. A laser held on one frequency while its chip's modes
+  drift past is at one edge of its mode or the other, whichever way its current last moved: the simulator's
+  lasers for the keeping's trials take the hysteresis of the edge they are at (`sim.ModelLaser(sided=True)`),
+  and a hop is read (4.2) with the hysteresis of the way the modes drifted. Whether the real lasers do so, a
+  map cannot say; hopping at the same current whatever the ramp's rate would.
+* **How much of a mode is two-mode** (`mm`), beyond that the points next to hops scatter.
+
+## 5a. Where this stands among what is published
+
+The rule (the mode of least loss lases) is the usual static picture of an ECDL's mode selection: Saliba, Junker,
+Turner and Scholten, *Mode stability of external cavity diode lasers*, Appl. Opt. 48, 6692 (2009), for the
+chip, the grating and the external cavity as factors of one product; Führer and Walther, Opt. Lett. 33, 372
+(2008), for the two combs. A threshold before the lasing mode gives way has one measured counterpart:
+Takamizawa (arXiv:2309.07393, 2024) lets the running mode persist while its neighbour's transmittance is
+better by less than about 2 %, a number taken from the hysteresis he measured, as $h$ is here from a map. That
+the stable range reaches further to the red and grows with power is Detoma, Tromborg and Montrosset's (IEEE J.
+Quantum Electron. 41, 2005). Trimming the current under a frequency lock so as to stay on a mode is Chiow,
+Long, Vo, Müller and Chu's, *Extended-cavity diode lasers with tracked resonances*, Appl. Opt. 46, 7997 (2007;
+arXiv:0710.0636): half an hour without a hop became 48 h, a few hours 12 days; Führer's thesis (TU Darmstadt,
+2012) has a wavemeter's loop on the piezo around an inner one on the current, its error signal from an
+intracavity wave plate (Führer, Stang and Walther, Opt. Express 17, 4991, 2009). Not found in print: the SHG
+cavity's signal or the wavemeter's interferogram as the warning of a hop, a hop read as a measurement of where
+the chip's modes are, or the chip's thermal lag as part of a hysteresis model. Those are this program's, tried
+in its simulator and not yet on the lasers. The survey these come from, with what was read and what only
+skimmed, is `docs/mode_hop_literature.md`.
 
 ## 6. How long it takes
 

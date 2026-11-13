@@ -723,6 +723,9 @@ class LaserModel:
     i_th_T: float | None = None  # mA/K: its threshold, as the temperature moves it
     by_temp: list | None = None  # [[°C, the fraction of the points there it puts on the right mode]], each mapped
     version: int = MODEL_VERSION  # its make (this version's; 1: kept by a version before it said)
+    mm: float = 0.0              # two modes at once: the mode that would take over lases as well once the one lasing
+    #                              holds by less than this (a loss, as its hysteresis is: look()), with up to half the
+    #                              power where it hops (0: never two at once, as far as the model says)
 
     # ----------------------------------------------------------- the rule
     @property
@@ -952,6 +955,66 @@ class LaserModel:
         mid = base + self.pull * ((modes[k] - base + dc / 2) % dc - dc / 2)
         delta = float((modes[k] - mid + dc / 2) % dc - dc / 2)
         return float(modes[k]), delta, (int(orders[k]), warm, now_t, x, up)
+
+    def look(self, i: float, v: float, t: float, state, T=None) -> dict | None:
+        """How the mode lasing holds at a point of a path (state: what step() left there; None: no telling): its
+        order and GHz, its loss and the loss of the mode that would take over (the best of the others, as the rule
+        sees them there: the chip's resonance pulled by the one lasing, the chip as warm as the state has it), the
+        margin it holds by (`u`: the other's loss + the hysteresis that way - its own: it hops at 0), that mode's GHz
+        (`rival`), and the part of the power that mode has (`p2`: none until u < mm, then rising to a half where it
+        hops: two modes at once, as an ECDL runs shortly before it hops)."""
+        if state is None:
+            return None
+        order, warm, _, _, up = state
+        e, dc = self.ext, self.dc
+        di, dv, dt = self._d(i, v, t)
+        b = float(e.base(di, dv, dt, dT=self._dT(T))) + self.leg_now(i, warm, up)
+        lo, hi = self.window(i, v, T)
+        lo = lo if math.isfinite(lo) else b - 3 * dc
+        hi = hi if math.isfinite(hi) else b + 3 * dc
+        orders = np.arange(min(math.floor((lo - 30 - b) / e.spacing), order - 1),
+                           max(math.ceil((hi + 30 - b) / e.spacing), order + 1) + 1)
+        modes = b + orders * e.spacing
+        k = int(order - orders[0])
+        base = float(self.chip_base(i, v, t, T)) + self.offset + self._ci() * (warm - i)
+        mid = base + self.pull * ((modes[k] - base + dc / 2) % dc - dc / 2)
+        g = self._loss(modes, mid, i, v, T)
+        own = float(g[k])
+        g[k] = math.inf
+        j = int(np.argmin(g))
+        u = float(g[j]) + (self.h_up if up else self.h_down) - own
+        p2 = 0.5 * min(max(1.0 - u / self.mm, 0.0), 1.0) if self.mm > 0 else 0.0
+        return {"order": int(order), "ghz": float(modes[k]), "loss": own, "rival": float(modes[j]),
+                "rival_order": int(orders[j]), "u": u, "p2": p2,
+                "delta": float((modes[k] - mid + dc / 2) % dc - dc / 2)}
+
+    def margins(self, i: float, v: float, t: float, state, T=None, reach: float = 1.5, fine: float = 0.02,
+                hold: bool = False) -> tuple:
+        """(mA down, mA up): how far the current can go each way from a point of a path (state: what step() left
+        there) before the mode lasing hops, in steps of `fine` as far as `reach` (math.inf: not within that), the
+        chip as warm as its current all the way (slowly). hold: the piezo moved along to keep the mode's frequency
+        (as a lock on the piezo has it: its cavity's part of what the current does made up for)."""
+        if state is None:
+            return math.nan, math.nan
+        e = self.ext
+        order = state[0]
+        out = []
+        for way in (-1.0, 1.0):
+            st, got = (order, i, 0.0, i if self.kind == "current" else v, state[4]), math.inf
+            for k in range(1, int(round(reach / fine)) + 1):
+                ik = i + way * k * fine
+                vk = v
+                if hold:  # (the mode's frequency kept: e_i dI + e_v dV = 0, where it is)
+                    di, dv = ik - self.i0, v - self.v0
+                    pv = e.p_v + 2 * e.p_vv * dv
+                    if abs(pv) > 1e-9:
+                        vk = v - (e.p_i + 2 * e.p_ii * di) * (ik - i) / pv
+                _, _, st = self.step(ik, vk, t, st, clock=1e6 * k, T=T)
+                if st[0] != order:
+                    got = (k - 1) * fine
+                    break
+            out.append(got)
+        return out[0], out[1]
 
     def leg_now(self, i: float, warm: float, up: bool) -> float:
         """GHz its external modes are off where they would be at rest, the current sweeping (p_leg: down less up, at

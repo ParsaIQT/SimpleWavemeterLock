@@ -200,7 +200,19 @@ class HopParams:
     ease_step: float = 0.001  # mA: a step easing the current off the top of its mode (its SHG signal locked dipping)
     upkeep: float = 0.0       # min: locked (a laser its DLC pro locks), now and then the top of its mode found and
     upkeep_back: float = 0.02  # backed off from (this many mA below where its SHG signal is back up) (0: never)
+    keep: bool = False        # locked, its mode watched (its SHG signal, its fringes on the wavemeter: keep.py), and
+    #                           when a second mode begins (a hop would come next) its current trimmed, slowly, its
+    #                           locks on, to where the signal is back up (off as it comes: it moves the current of
+    #                           a laser that is locked and on target, by itself)...
+    keep_dip: float = 0.02    # ...begun once the signal has dipped this much below what it is as it should be...
+    keep_back: float = 0.05   # ...and taken this many mA further than where it is back up
     step: float = 0.1         # mA between readings while mapping, and of a trim
+    smooth: bool = True       # its sweeps ramped steadily, read on the way (Sweep: each reading with the current it
+    #                           was read at, the ramp stopped the moment they are not as expected); False: a step at a
+    #                           time, a reading after each has settled (as before)
+    fine: float = 0.02        # mA: the most the current changes in one write (every move: in steps this small, a
+    #                           write after another; STEP_MAX at the very most)
+    fine_v: float = 0.1       # V: the same of the piezo
     margin: float = 0.5       # mA: wanted distance from a hop, both ways (the map checks it)
     tolerance: float = 100.0  # MHz: further than this from the target is off target (locked to a cavity: peak_tol)...
     grace: float = 2.0        # s: ...for this long (and two readings) means a hop
@@ -261,7 +273,7 @@ class HopParams:
         """The same settings, with nothing learned."""
         d = self.to_dict()
         d.update({k: getattr(HopParams, k) for k in self.LEARNED})
-        return HopParams.from_dict(d)
+        return type(self).from_dict(d)
 
     @property
     def shg_ref(self) -> cavity.ModeRef:
@@ -311,6 +323,57 @@ class Move:
     current: float | None = None
     offset: float | None = None
     read: bool = True
+
+
+@dataclass
+class Sample:
+    """What a sweep saw at a point of its way: when (s), where (the set current mA and the scan offset V as last
+    written then), and either a reading (e: MHz from the target, NaN: no valid one; q: what is left of its fringes
+    on the wavemeter then, if that is watched: keep.Fringes) or what its parameters read (values); rest: read with
+    the sweep over, the laser at rest where it ended."""
+    t: float
+    i: float
+    v: float
+    e: float | None = None
+    values: list | None = None
+    rest: bool = False
+    q: float | None = None
+
+
+@dataclass
+class Sweep:
+    """Ramp the current (mA) and/or the scan offset (V) steadily to there, in writes of HopParams.fine (fine_v) at
+    most, at `rate` mA/s (V/s where only the offset moves; 0: `per` mA (V) a reading, at the rate the wavemeter reads
+    the laser), every reading that comes on the way kept with where the ramp was then (a Sample), no reading waited
+    for, none skipped: the laser never stands still, and a reading's exposure sees it move a few MHz at most.
+    watch(sample), if given, is asked at each: True stops the ramp there, at once (things are not as expected).
+    names: parameters read on the way, every `every` s, each after the step before it has had its time (samples
+    too: a seed power, an SHG signal), and once more where the ramp ends. rest: once there, one more reading, at
+    rest. silence: s; no valid reading for that long, the ramp stops where it is (0: it goes on unseen; a ramp
+    that relies on the wavemeter's word, a laser kept locked meanwhile, must not). What comes back: a Swept."""
+    current: float | None = None
+    offset: float | None = None
+    rate: float = 0.0
+    per: float = 0.1
+    watch: object = None
+    names: tuple = ()
+    every: float = 0.0
+    rest: bool = True
+    silence: float = 0.0
+
+
+@dataclass
+class Swept:
+    """A sweep's samples, in order; where it ended (set mA, V); stopped: its watch stopped it short (or, silent: no
+    valid reading came for as long as its silence allows); gap: s between the wavemeter's readings of the laser,
+    of late (their median)."""
+    samples: list
+    current: float
+    offset: float
+    stopped: bool = False
+    gap: float = 0.0
+    silent: bool = False
+    step: float = 0.0  # mA (V, where only the offset moved) a write of it: between two, the laser stood still
 
 
 @dataclass
@@ -732,7 +795,8 @@ class Recenter(CavitySteps):
     def __init__(self, p: HopParams, current: float, offset: float, i_lo: float, i_hi: float,
                  v_lo: float, v_hi: float, kv: float = 0.0, cavity: bool = False, quick: bool = True,
                  shg: bool | None = None, act_offset: float = 0.0, i_top: float | None = None,
-                 i_clip: float = math.inf, ref=None, upkeep: bool = False, model=None, target: float = math.nan):
+                 i_clip: float = math.inf, ref=None, upkeep: bool = False, model=None, target: float = math.nan,
+                 keep: dict | None = None):
         """Currents are set currents (what is written); act_offset is the measured current minus
         the set current (with the piezo at `offset`), for showing them as measured, and for the
         nominal current, which is.
@@ -748,7 +812,9 @@ class Recenter(CavitySteps):
         ref: (piezo voltage, set current) where the laser was on target, on the right mode, before it hopped
         (the catch: by default where it is now). upkeep: not a recovery: locked, the top of its mode found and backed
         off from (upkeep), the locks left as they are. model: the laser's own (lasermodel.LaserModel, from its map:
-        the method 'model'), target: THz (what the readings are from)."""
+        the method 'model'), target: THz (what the readings are from). keep: not a recovery either: locked, a second
+        mode beginning (its signal dipping: what keep.ModeWatch.alarm said), its current trimmed to where the signal
+        is back up (keep), the locks left as they are."""
         self.p = p
         self.quick = quick
         self.I0, self.V0 = current, offset  # where the laser was when this began (where it lases, after a panic)
@@ -838,11 +904,24 @@ class Recenter(CavitySteps):
         self.narrow = ""                    # ...the right mode alone over too little of the window for that (why)
         self.topped = None                  # (from, to), mA measured: on the right mode, not caught, the current
         #                                     parked at the top end of where it is at its best (park_top) all the same
-        self.upkeeping = upkeep             # not a recovery: the upkeep...
+        self.upkeeping = upkeep or keep is not None  # not a recovery: the upkeep...
         self.upkept = None                  # ...(mA measured: where it began, the top of its mode, where it is left;
         #                                     back up below the top)
-        self.step_max = self.UP_STEP if upkeep else STEP_MAX  # mA: the most the Runner moves the current a write
+        self.keeping = keep                 # ...or keeping it off the edge of its mode (what its watch said)...
+        self.kept = None                    # ...and how that went: {mended, way, from, to, dip, level, base, why}
+        self.keep_off, self.keep_blind, self.keep_noise, self.keep_scatter = None, "", 0.0, 0.0
+        self.back_pace = 0.0                # s a step_max of the way back, put back by the Runner (a keeping: its
+        #                                     locks are on, and follow; 0: at once)
+        self.fringes = None                 # what is left of its fringes on the wavemeter, at its last reading (the
+        #                                     Runner's, if that is watched)
+        fine = min(max(p.fine, 1e-4), STEP_MAX) if p.fine > 0 else STEP_MAX
+        self.step_max = min(self.UP_STEP, fine) if self.upkeeping else fine  # mA: the most the Runner moves the
+        #                                     current a write
+        self.v_fine = max(p.fine_v, 1e-3) if p.fine_v > 0 else math.inf  # V: ...and the piezo
+        self.gap = 0.0                      # s between the wavemeter's readings of it, as its sweeps saw it (0: not yet)
         self.back_at = ""                   # by its model: back where it was on target, come to sweeping this way
+        self.short_at = None                # by its model: (mA measured, its turning point or None) of the short way
+        #                                     that brought it back (short_way)
         self.resets_done = 0                # resets (the catch, after a hop: piezo and current to nominal, ...)
         self.reset_rounds = 0               # ...catch rounds that began with them
         self.reset_hit = None               # (V, mA measured) where a reset brought it back onto its right mode
@@ -927,6 +1006,74 @@ class Recenter(CavitySteps):
             yield from self.check_ff(min(max(offset, self.v_lo), self.v_hi))
         return (yield from self._move(current, offset, read, check, top))
 
+    def hurry(self, moves):
+        """Moves that cannot wait (it does not lase, and its TA switches itself off without seed): each write as
+        large as a write may be (STEP_MAX; the piezo's whole), not HopParams.fine: a tenth of the round trips to
+        its controller."""
+        was = self.step_max, self.v_fine
+        self.step_max, self.v_fine = STEP_MAX, math.inf
+        try:
+            return (yield from moves)
+        finally:
+            self.step_max, self.v_fine = was
+
+    def sweep(self, current=None, offset=None, per: float = 0.0, rate: float = 0.0, watch=None, check=True,
+              top=False, rest=True, names=(), every: float = 0.0, silence: float = 0.0):
+        """The current (and the piezo, if given: the two together, on a straight line) steadily to there, within
+        their windows (top: the current up to i_top), read on the way: a Sweep, `per` mA a reading (HopParams.step
+        by default) at the rate the wavemeter reads the laser, or `rate` mA/s; watch(sample): True stops it there.
+        Returns the Swept (its samples: every reading on the way with the current it was read at, then one at rest
+        unless it was stopped). check: with the seed power watched, that is read on the way too, every SEED_S (or
+        every STEP_MAX of the way, if that is sooner), and the ramp stops where it says the laser stopped lasing
+        (NotLasing, from where that was); and if the wavemeter
+        lost it on the way, the SHG sweep (or the seed) is asked (alive). names: parameters read on the way besides,
+        every `every` s (samples with their values, which watch is asked about too). silence: s without a valid
+        reading that stop it where it is (Swept.silent). The readings count as any (self.e, self.t: the last)."""
+        v = self.V if offset is None else min(max(offset, self.v_lo), self.v_hi)
+        if offset is not None and not self.ff_known:
+            yield from self.check_ff(v)
+        lo, hi, tp = self.window(v)
+        i = min(max(self.I if current is None else current, lo), tp if top else hi)
+        self.edge = None
+        seed = check and bool(self.seed_name)
+        dark = []
+
+        def seen(s: Sample):
+            if s.values is not None:
+                if seed and _num(s.values[-1]):
+                    self.seed = float(s.values[-1])
+                    self.lasing = self.lases(self.seed)
+                    if self.lasing is False:
+                        dark.append(s)
+                        return True
+                if not names:
+                    return False
+            return watch is not None and watch(s)
+
+        per = per or self.p.step
+        pace = rate if rate > 0 else min(max(per / (self.gap or Runner.GAP), Runner.RATE[0]), Runner.RATE[1])
+        asked = min(self.SEED_S, STEP_MAX / pace)  # (its seed: every STEP_MAX of the way at least, as by steps)
+        got = yield Sweep(i if current is not None or abs(i - self.I) > 1e-12 else None,
+                          v if offset is not None else None, rate, per, seen,
+                          tuple(names) + ((self.seed_name,) if seed else ()),
+                          min(every, asked) if names and seed else every if names else asked, rest, silence)
+        self.I, self.V = got.current, got.offset
+        if got.gap > 0:
+            self.gap = got.gap
+        reads = [x for x in got.samples if x.e is not None]
+        self.readings += len(reads)
+        if reads:
+            last = reads[-1]
+            self.t, self.e = last.t, last.e
+            self.e_at = (self.I, self.V) if last.rest else None
+            self.seen_lasing |= any(math.isfinite(x.e) for x in reads)
+        if dark:
+            raise NotLasing(dark[0].i)  # (where it stopped lasing)
+        if check and reads and not any(math.isfinite(x.e) for x in reads[-3:]) and (yield from self.alive()) is False:
+            raise self.stopped()  # the wavemeter lost it on the way: it stopped lasing, by the SHG sweep (or seed)
+        return got
+
+    SEED_S = 0.2      # s: sweeping, its seed power is read this often (does it still lase?)
     FF_PROBE = 0.1    # mA: the feedforward is seen by a piezo step that would move the measured current this much...
     FF_TELLS = 0.04   # mA: ...a step that would move it less than this tells nothing (not seen then)
 
@@ -1198,9 +1345,9 @@ class Recenter(CavitySteps):
         ups.append(p.jump_max)
         for rounds in range(1, self.PANICS + 2):
             self.stage = "not lasing: current up"
-            for up in ups:
-                yield from self.move(current=max(min(self.nominal + up, top), self.I), read=False, check=False,
-                                     top=True)
+            for up in ups:  # (at once: in writes of STEP_MAX, whatever HopParams.fine)
+                yield from self.hurry(self.move(current=max(min(self.nominal + up, top), self.I), read=False,
+                                                check=False, top=True))
                 yield Wait(self.PANIC_WAIT)
                 if (yield from self.alive()) is not False:  # (the SHG sweep shows resonances again, or the seed)
                     break
@@ -1213,7 +1360,7 @@ class Recenter(CavitySteps):
             if away:  # home, the current still high (where it lased with the piezo there), then down as ever
                 away = False
                 for vk in _steps(self.V, self.V0, 5.0):
-                    yield from self.move(offset=vk, read=False, check=False, top=True)
+                    yield from self.hurry(self.move(offset=vk, read=False, check=False, top=True))
             if floor is not None:
                 self.raise_floor(floor)
             if rounds > self.PANICS:
@@ -1223,8 +1370,11 @@ class Recenter(CavitySteps):
             back = min(max(self.nominal, self.i_lo), self.i_hi)
             stopped = None
             for i in _steps(self.I, back, STEP_MAX) if self.I > back + 1e-9 else []:
-                yield from self.move(current=i, read=False, check=False, top=True)
-                yield Wait(STEP_MAX / max(p.ramp, 0.01))
+                if self.step_max < STEP_MAX:  # (steadily, in fine writes, at that rate; asked every STEP_MAX)
+                    yield from self.sweep(current=i, rate=max(p.ramp, 0.01), check=False, top=True, rest=False)
+                else:
+                    yield from self.move(current=i, read=False, check=False, top=True)
+                    yield Wait(STEP_MAX / max(p.ramp, 0.01))
                 if (yield from self.alive()) is False:
                     stopped = i
                     break
@@ -1279,7 +1429,7 @@ class Recenter(CavitySteps):
         if self.upkeeping:
             if self.lasing is False:
                 raise Failed("not lasing: no upkeep")
-            yield from self.upkeep()
+            yield from (self.keep() if self.keeping is not None else self.upkeep())
             return (yield from self.finish())
         if self.lasing is False:  # first of all: without seed, its TA may switch itself off
             yield from self.panic("when the recovery began")
@@ -1439,6 +1589,8 @@ class Recenter(CavitySteps):
     MODEL_BETTER = 0.1   # this many more than a model that never hops, or fewer than MODEL_COMB of them on its
     MODEL_COMB = 0.7     # external comb: not this laser's now (it was realigned, its temperature changed a lot)
     MODEL_V = 5.0        # V beyond the piezo voltages its map covered that the model is trusted
+    MODEL_ASTRAY = 3     # ramped to a plan's point: this many readings in a row on a mode none of the ways its model
+    #                      has it arrive passes on the way, and no further: none of them is the laser as it is (astray)
     PLAN_V = 3.0         # V: its plans this near where it has been seen in this recovery first (its model is only as
     #                      good as how its piezo tunes it, further away: its map could not tell that from a drift)
 
@@ -1477,6 +1629,8 @@ class Recenter(CavitySteps):
             if ((yield from self.tune()) == "ok" and (yield from self.check(self.quick_margin()))
                     and (yield from self.mode_ok())):
                 return
+        if self.ref_given and self.p.smooth and (yield from self.short_way(pl)):
+            return
         if self.ref_given and (yield from self.back_to_ref(pl)):
             return
         bands = yield from self.map()
@@ -1544,15 +1698,28 @@ class Recenter(CavitySteps):
                 yield from self.move(offset=plan.v, read=False)
             yield from self.come_to(plan.up)
             seg = pl.segment()
-            start, misses = (self.i_lo if plan.up else self.i_hi), 0
+            start, misses, astray = (self.i_lo if plan.up else self.i_hi), 0, False
             want = {round(i, 6): g for i, g in plan.path}
-            for i in _steps(start, i_set, self.p.step):
-                e = yield from self.move(current=i)
-                pl.observe(seg, self.t, self.mA(i), self.V, plan.up, e / 1e3)
-                g = want.get(round(self.mA(i), 6))
-                misses += g is not None and math.isfinite(e) and abs(e / 1e3 - g) > 0.35 * pl.m.ext.spacing
-            e = yield from self.steady()
-            if math.isfinite(e) and abs(e) < 0.3 * pl.m.ext.spacing * 1e3:
+            if self.p.smooth:  # ramped steadily, each reading against what its model expects there
+                run = [0, 0]  # (readings in a row not as it said, in all)
+                unexpected = self.astray(plan.ways, self.slope / 1e3, 0.35 * pl.m.ext.spacing, run)
+                got = yield from self.sweep(current=i_set, watch=unexpected)
+                for x in got.samples:
+                    if x.e is not None:
+                        pl.observe(seg, x.t, self.mA(x.i), self.V, plan.up, x.e / 1e3)
+                misses, astray = run[1], got.stopped
+            else:
+                for i in _steps(start, i_set, self.p.step):
+                    e = yield from self.move(current=i)
+                    pl.observe(seg, self.t, self.mA(i), self.V, plan.up, e / 1e3)
+                    g = want.get(round(self.mA(i), 6))
+                    misses += g is not None and math.isfinite(e) and abs(e / 1e3 - g) > 0.35 * pl.m.ext.spacing
+            e = self.e if astray else (yield from self.steady())
+            if astray:
+                self.note(f"its model: at {self.mA(self.I):.2f} mA, on the way to {plan.i:.2f} mA, it is {e:+.0f} MHz "
+                          f"from the target, {self.MODEL_ASTRAY} readings in a row on a mode none of the ways it has it "
+                          f"arrive passes: no further")
+            elif math.isfinite(e) and abs(e) < 0.3 * pl.m.ext.spacing * 1e3:
                 self.model_tuning(pl)
                 self.note(f"its model: on {which} at {self.mA(self.I):.2f} mA, {self.V:.2f} V, come to sweeping "
                           f"{plan.way}: {e:+.0f} MHz from the target" + (f" ({misses} readings on the way not as it "
@@ -1572,7 +1739,7 @@ class Recenter(CavitySteps):
                         self.learned["model_adapt"] = self.adapted(pl)
                         return
                 self.note("its model: it does not hold there")
-            else:
+            elif not astray:
                 self.note(f"its model: at {self.mA(self.I):.2f} mA it is {e:+.0f} MHz from the target, not on {which}")
             avoid.append((plan.v, plan.i, plan.up))
             agree = yield Think(pl.fit)
@@ -1581,6 +1748,127 @@ class Recenter(CavitySteps):
             self.model_pv(pl)
         self.note("its model did not bring it onto a mode on target: the map's way")
         return (yield from self.find())
+
+    SHORT_TRIES = 2      # short ways tried (the second with its model fitted to what the first one read)
+    SHORT_AT = (0.05, 0.5)  # mA, V: the hop is read as its chip's modes' doing if the laser is still this near where
+    #                         it was on target (nothing else moved)
+
+    def short_way(self, pl):
+        """Before anything is swept out: the hop itself says where its chip's modes are (Planner.since_hop: the laser
+        still where it was on target, they have just drifted to where its right mode gives way to the one it is on
+        now), and the mode it is on is known, so its model plans from there (Planner.short): the piezo to where a
+        current nearby has its right mode on target, then the current there, straight or by way of a turning point
+        past where the mode it hopped to gives way again, ramped steadily, each reading against what the ways its
+        model has it arrive expect there (MODEL_ASTRAY in a row on none of them: no further; its model is fitted to
+        what was read, and a second way planned from where it is then). On its right mode: the piezo onto the target,
+        the margins checked. True: done; False: the ways of old (back_to_ref, a map)."""
+        e = yield from self.steady()
+        if not math.isfinite(e) or pl.right is None:
+            return False
+        rec = self.record.setdefault("model", {})
+        i_ref = self.mA(self.i_ref, self.v_ref)
+        here = abs(self.mA(self.I) - i_ref) <= self.SHORT_AT[0] and abs(self.V - self.v_ref) <= self.SHORT_AT[1]
+        if here and abs(e) >= 0.5 * pl.m.ext.spacing * 1e3:
+            said = yield Think(lambda: pl.since_hop(i_ref, self.v_ref, e / 1e3))
+            if said:
+                rec["hop"] = dict(pl.hop)
+                seg = pl.segment()  # (the hop, as a reading of its: on its right mode there, then on that one)
+                pl.observe(seg, self.t - 1.0, i_ref, self.v_ref, pl.hop["up"], 0.0)
+                pl.observe(seg, self.t, i_ref, self.v_ref, pl.hop["up"], e / 1e3)
+                self.note(f"it hopped {e / 1e3:+.2f} GHz where it was on target ({i_ref:.2f} mA, {self.v_ref:.2f} V), "
+                          f"nothing moved: by its model its chip's modes have drifted {pl.phi:+.2f} GHz from where it "
+                          f"had them, to where its right mode gives way to that one")
+        self.model_tuning(pl)
+        avoid = []
+        for k in range(self.SHORT_TRIES):
+            lo, hi, _ = self.window(self.V)
+            args = (self.mA(self.I), self.V, e / 1e3, self.mA(lo), self.mA(hi), self.v_lo, self.v_hi, self.p.step,
+                    self.mA(self.nominal), self.gap or Runner.GAP, self.p.margin)
+            plan = yield Think(lambda args=args, avoid=list(avoid): pl.short(*args, avoid=avoid))
+            if plan is None:
+                if not k:
+                    self.note("its model has no short way back onto its right mode from where it is that enough of "
+                              "the ways it can be now agree on")
+                return False
+            turn = "" if plan.turn is None else f" by way of {plan.turn:.2f} mA"
+            rec.setdefault("short", []).append([round(plan.v, 3), round(plan.i, 3),
+                                                None if plan.turn is None else round(plan.turn, 3),
+                                                round(plan.ahead, 3), round(plan.behind, 3), round(plan.share, 2)])
+            yield from self.ask(f"Its model's short way back: the piezo to {plan.v:.2f} V, then the current{turn} to "
+                                f"{plan.i:.2f} mA, ramped steadily: its right mode on target there, {plan.ahead:.2f} mA "
+                                f"from a hop on the way it comes, {plan.behind:.2f} mA back"
+                                + (f" (so in {plan.share:.0%} of the ways it can be now)" if plan.share < 1 else ""))
+            self.stage = f"by its model, the short way: {plan.v:.2f} V,{turn} to {plan.i:.2f} mA"
+            if abs(self.V - plan.v) > 1e-6:  # (its measured current kept, whatever its feedforward does)
+                yield from self.move(offset=plan.v, current=self.I - self.ff * (plan.v - self.V), read=False)
+            astray = False
+            passed = [w for _, ways in plan.legs for w in ways]  # (every mode they pass, on either leg)
+            for to, _ in plan.legs:
+                seg, up = pl.segment(), to > self.mA(self.I)
+                unexpected = self.astray(passed, self.slope / 1e3, 0.35 * pl.m.ext.spacing)
+                got = yield from self.sweep(current=to - self.act_offset - self.ff * (self.V - self.V0),
+                                            watch=unexpected)
+                for x in got.samples:
+                    if x.e is not None:
+                        pl.observe(seg, x.t, self.mA(x.i), self.V, up, x.e / 1e3)
+                if got.stopped:
+                    astray = True
+                    break
+            e = self.e if astray else (yield from self.steady())
+            where = f"{self.mA(self.I):.2f} mA, {self.V:.2f} V"
+            if not astray and math.isfinite(e) and abs(e) < 0.3 * pl.m.ext.spacing * 1e3:
+                self.model_tuning(pl)
+                self.note(f"its model's short way: on its right mode at {where}{turn}, {e:+.0f} MHz from the target")
+                held = False
+                if (yield from self.tune()) == "ok":
+                    seg = pl.segment()
+                    pl.observe(seg, self.t, self.mA(self.I), self.V, up, self.e / 1e3)
+
+                    def seen(i, x, up, seg=seg):
+                        pl.observe(seg, self.t, self.mA(i), self.V, up, x / 1e3)
+
+                    held = yield from self.check(max(self.MIN_MARGIN, min(self.p.margin, 0.8 * plan.margin)),
+                                                 abs(self.model.ext.p_leg) * 1e3, seen)
+                if held and (yield from self.mode_ok()):
+                    rec["short_done"] = k + 1
+                    self.short_at = (round(plan.i, 3), plan.turn)
+                    self.learned["model_adapt"] = self.adapted(pl)
+                    return True
+                self.note("its model's short way: it does not hold there")
+            elif astray:
+                self.note(f"its model's short way: at {where} it is {e:+.0f} MHz from the target, "
+                          f"{self.MODEL_ASTRAY} readings in a row on a mode none of the ways it has it arrive passes: "
+                          f"no further")
+            else:
+                self.note(f"its model's short way: at {where} it is {e:+.0f} MHz from the target, not on its right "
+                          f"mode")
+            avoid.append((plan.i, plan.turn))
+            if not math.isfinite(e):
+                return False
+            yield Think(pl.fit)  # (what it read on the way: its model as the laser is, for the next)
+            self.model_tuning(pl)
+        return False
+
+    def astray(self, ways, slope: float, tol: float, run=None):
+        """A sweep's watch (Sample -> stop?) for a way its model planned: ways [(mA measured, [GHz from the target,
+        ...])], the modes any of its members that arrive expects at each point of it (slope: GHz/mA a mode tunes
+        along it). Where on the way the laser hops from one to the next its model knows only so well (its hysteresis:
+        to a few tenths of a mA), so a reading is as expected if it is on any mode they pass on this way, wherever;
+        MODEL_ASTRAY in a row on a mode none of them passes at all (tol GHz from each): none of them is the laser as
+        it is, and the ramp stops there. run: [in a row, in all], counted for the caller."""
+        run = [0, 0] if run is None else run
+        a0 = ways[0][0] if ways else 0.0
+        lines = sorted({round(gk - slope * (ak - a0), 3) for ak, gs in ways for gk in gs})  # (each mode, at a0)
+
+        def watch(x: Sample) -> bool:
+            if x.e is None or not math.isfinite(x.e) or not lines:
+                return False
+            g = x.e / 1e3 - slope * (self.mA(x.i) - a0)
+            miss = all(abs(g - line) > tol for line in lines)
+            run[0], run[1] = (run[0] + 1 if miss else 0), run[1] + miss
+            return run[0] >= self.MODEL_ASTRAY
+
+        return watch
 
     def right_band(self, pl, bands):
         """Where the map just made has its right mode lasing (the band whose mode its model, fitted to it, says is the
@@ -1635,7 +1923,7 @@ class Recenter(CavitySteps):
         if not (lo + 1e-9 < i_set < hi - 1e-9 and self.v_lo <= v <= self.v_hi) or pl.right is None:
             return False
         i, lo_m, hi_m = self.mA(i_set, v), self.mA(lo, v), self.mA(hi, v)
-        step_s = self.model.step_s or 0.25
+        step_s = (self.gap or Runner.GAP) if self.p.smooth else (self.model.step_s or 0.25)
         nominal, shares = self.mA(self.nominal), {}
         for up in (True, False):
             shares[up] = yield Think(lambda up=up: pl.arrives(i, v, up, lo_m, hi_m, self.p.step, nominal, step_s,
@@ -1651,9 +1939,15 @@ class Recenter(CavitySteps):
                 yield from self.move(offset=v, read=False)
             yield from self.come_to(up)
             seg = pl.segment()
-            for x in _steps(self.i_lo if up else self.i_hi, i_set, self.p.step):
-                e = yield from self.move(current=x)
-                pl.observe(seg, self.t, self.mA(x), self.V, up, e / 1e3)
+            if self.p.smooth:  # ramped steadily, read on the way
+                got = yield from self.sweep(current=i_set)
+                for x in got.samples:
+                    if x.e is not None:
+                        pl.observe(seg, x.t, self.mA(x.i), self.V, up, x.e / 1e3)
+            else:
+                for x in _steps(self.i_lo if up else self.i_hi, i_set, self.p.step):
+                    e = yield from self.move(current=x)
+                    pl.observe(seg, self.t, self.mA(x), self.V, up, e / 1e3)
             e = yield from self.steady()
             tried.append([way, round(e, 1) if math.isfinite(e) else None])
             where = f"back where it was on target ({self.mA(self.I):.2f} mA, {self.V:.2f} V), come to sweeping {way}"
@@ -1732,15 +2026,27 @@ class Recenter(CavitySteps):
             sweeps.append(s)
             traces.append(cavity.decimate(self._last_trace, 300) if s is not None else None)
 
+        smooth = self.p.smooth and not self.shg_ok  # (with an SHG stage, its sweep is looked at at every point)
         yield from at(lo, (yield from self.read()), 1, True)
         for leg, (a, b, up) in enumerate(((lo, hi, True), (hi, lo, False)), start=1):
             if leg == 2:  # the top reading starts the sweep down as well: the same laser, the same place
                 points.append(Point(hi, points[-1].e, 2, False, t=points[-1].t))
                 sweeps.append(sweeps[-1])
                 traces.append(traces[-1])
+            if smooth:  # ramped steadily, every reading on the way kept with the current it was read at
+                got = yield from self.sweep(current=b)
+                for x in got.samples:
+                    if x.e is not None:
+                        points.append(Point(x.i, x.e, leg, up, t=x.t))
+                        sweeps.append(None)
+                        traces.append(None)
+                continue
             for i in _steps(a, b, step):
                 yield from at(i, (yield from self.move(current=i)), leg, up)
         self.edge = "lo"
+        if smooth:  # (how far apart its readings were, as they came: what tells one stretch of a mode from two)
+            gaps = [abs(q.i - p_.i) for p_, q in zip(points, points[1:]) if q.leg == p_.leg and q.i != p_.i]
+            step = max(step, _median(gaps)) if gaps else step
         if any(s is not None for s in sweeps):
             ref = cavity.reference_from([s for s in sweeps if s is not None])
             if ref is not None:
@@ -1894,11 +2200,33 @@ class Recenter(CavitySteps):
             yield from self.move(offset=band.v, read=False)
         yield from self.come_to(band.up)
         e, pts = math.nan, []
-        for i in _steps(start, band.op, self.p.step):
-            e = yield from self.move(current=i)
-            pts.append([round(self.mA(i), 4), round(e, 1) if math.isfinite(e) else None, 3, False])
-        if self.record["maps"]:
-            self.record["maps"][-1]["points"] += pts
+        if self.p.smooth:  # ramped steadily; not on the map's mode where the map had it on it: no further
+            tol, past, off = max(0.5 * self.threshold, 50.0), max(2 * self.p.step, self.MIN_MARGIN), [0]
+
+            def astray(x: Sample) -> bool:
+                on = x.i >= band.lo + past if band.up else x.i <= band.hi - past
+                if x.e is None or not math.isfinite(x.e) or not on:
+                    return False
+                off[0] = off[0] + 1 if abs(x.e - band.mode.at(x.i)) > tol else 0
+                return off[0] >= 2
+
+            got = yield from self.sweep(current=band.op, watch=astray)
+            pts = [[round(self.mA(x.i), 4), round(x.e, 1) if math.isfinite(x.e) else None, 3, False]
+                   for x in got.samples if x.e is not None]
+            if self.record["maps"]:
+                self.record["maps"][-1]["points"] += pts
+            if got.stopped:
+                self.note(f"parking at {self.mA(band.op):.2f} mA sweeping {band.way}: at {self.mA(self.I):.2f} mA it "
+                          f"is {self.e:+.0f} MHz from the target, not on the mode the map found there "
+                          f"({band.mode.at(self.I):+.0f} MHz): it did not come back the same way")
+                return False
+            e = self.e
+        else:
+            for i in _steps(start, band.op, self.p.step):
+                e = yield from self.move(current=i)
+                pts.append([round(self.mA(i), 4), round(e, 1) if math.isfinite(e) else None, 3, False])
+            if self.record["maps"]:
+                self.record["maps"][-1]["points"] += pts
         es = [e]
         for _ in range(2):  # the middle of three: not fooled by one odd reading
             es.append((yield from self.read()))
@@ -1973,6 +2301,8 @@ class Recenter(CavitySteps):
         self.stage = "checking the margins"
         ic, ec = self.I, self.e
         lo, hi = max(ic - m, self.i_lo), min(ic + m, self.i_hi)
+        if self.p.smooth:
+            return (yield from self.check_smooth(m, loop, seen, ic, ec, lo, hi))
         xs, es, modes = [0.0], [ec], []
         last = ic
         for i in (0.5 * (ic + hi), hi, ic, 0.5 * (ic + lo), lo, ic):
@@ -2004,6 +2334,110 @@ class Recenter(CavitySteps):
         if abs(self.e) > self.tol():
             return (yield from self.tune()) == "ok"
         return True
+
+    CHECK_N = 7       # checking the margins, ramped: this many readings from one end of the margins to the other
+    LATENCY = 0.05    # s a reading may be older than the current it is kept with, besides the time between two
+    #                   readings (its exposure, the wavemeter's sums, the way here; ramped, it is off its line by its
+    #                   slope times how far the ramp went meanwhile, one way going up, the other coming down)
+
+    def check_smooth(self, m: float, loop: float, seen, ic: float, ec: float, lo: float, hi: float):
+        """check(), the current ramped steadily (up to the margin, down to it, back: every reading on the way against
+        the mode's line through where it began, the ramp stopped at the second in a row off it, once its slope is
+        known; then all of them against one line, with what they say of how late they come: _line), with an SHG
+        stage its sweep looked at at both ends."""
+        per = max(hi - lo, 1e-3) / self.CHECK_N
+        gap = self.gap or Runner.GAP
+        rate = per / gap
+        slope = self.slope
+        late = rate * (self.LATENCY + gap)  # mA the ramp may have gone on since a reading was taken
+        ahead = abs(slope) * late
+        tol = max(25.0, 6.0 * self.noise, 0.15 * abs(slope) * m, 1.5 * loop, 0.5 * self.threshold) + ahead
+        modes, off, coarse = [], [0], 0.0
+        knots, pts = [], []  # where the ramp was when: (s, mA from where it began); its readings: (s, MHz)
+
+        def hop(x: Sample) -> bool:
+            if x.e is None or not math.isfinite(x.e) or abs(slope) < 20.0:
+                return False
+            off[0] = off[0] + 1 if abs(x.e - ec - slope * (x.i - ic)) > tol else 0
+            return off[0] >= 2
+
+        last = ic
+        for i in (hi, lo, ic):
+            got = yield from self.sweep(current=i, per=per, watch=hop)
+            coarse = max(coarse, got.step)
+            for x in got.samples:
+                if x.e is None:
+                    continue
+                if not knots:  # (it set out from where it began, at its rate, a little before its first reading)
+                    knots.append((x.t - abs(x.i - ic) / rate, 0.0))
+                if x.rest and knots[-1][1] != x.i - ic:  # (there before it was read at rest there)
+                    knots.append((min(knots[-1][0] + abs(x.i - ic - knots[-1][1]) / rate, x.t), x.i - ic))
+                knots.append((x.t, x.i - ic))
+                pts.append((x.t, x.e))
+                if seen is not None:
+                    seen(x.i, x.e, x.i > last if x.i != last else i > last)
+                last = x.i
+            if got.stopped:
+                self.note(f"hop within {m:.2f} mA of {self.mA(ic):.2f} mA (at {self.mA(self.I):.2f} mA, "
+                          f"{self.e - ec - slope * (self.I - ic):+.0f} MHz off its mode's line)")
+                return False
+            if self.shg_ok and i != ic:
+                sw = yield from self.shg_sweep()
+                ok, text = self.judge(sw) if sw is not None else (None, "")
+                if sw is not None:
+                    self.keep_sweep(sw, f"check {i - ic:+.2f} mA")
+                if ok is False:
+                    modes.append(f"{i - ic:+.2f} mA: {text}")
+        if not pts or not all(math.isfinite(e) for _, e in pts):
+            return False
+        # one line through them all, each reading kept with the current as it was when it was taken: a little
+        # before it came (its exposure, the wavemeter's sums, the way here: up to the time between two readings and
+        # LATENCY). How long before is not known, and is the same for all of them: the delay that fits them best
+        # (going up, a late reading is off the line one way; coming down, the other; at rest, not at all: a hop
+        # is off it whatever the delay)
+        worst, b, delay = self._line(knots, pts, 0.0)
+        fit = max(25.0, 6.0 * self.noise, 0.15 * abs(b) * m, 1.5 * loop)
+        if worst > 0.5 * fit:
+            for k in range(1, int((gap + self.LATENCY) / 0.01) + 2):
+                got = self._line(knots, pts, 0.01 * k)
+                if got[0] < worst:
+                    worst, b, delay = got
+        # (between two writes the laser stands still: a reading is off a steady ramp's line by a write's worth)
+        fit = max(25.0, 6.0 * self.noise, 0.15 * abs(b) * m, 1.5 * loop) + abs(b) * coarse
+        if delay:  # (how old its readings are, as the ramps there and back say)
+            if "late_s" not in self.record and delay >= 0.03:
+                self.note(f"its readings are some {1e3 * delay:.0f} ms old when they come, by its ramps there and "
+                          f"back (kept with the current as it was then)")
+            self.record["late_s"] = round(delay, 3)
+        if worst > fit:
+            self.note(f"hop within {m:.2f} mA of {self.mA(ic):.2f} mA (off the line by {worst:.0f} MHz)")
+            return False
+        if modes:
+            self.note(f"two modes within {m:.2f} mA of {self.mA(ic):.2f} mA ({'; '.join(modes)})")
+            return False
+        if abs(self.e) > self.tol():
+            return (yield from self.tune()) == "ok"
+        return True
+
+    @staticmethod
+    def _line(knots, pts, delay: float) -> tuple:
+        """Readings (s, MHz) taken `delay` s before they came, along a ramp that was at knots (s, mA) then: the
+        straight line through them against where the ramp was when each was taken: (the furthest any is off it, MHz;
+        its slope, MHz/mA; the delay)."""
+        xs, k = [], 0
+        for t, _ in pts:
+            t -= delay
+            while k and knots[k][0] > t:  # (the knots are in order of time; so are the readings)
+                k -= 1
+            while k + 1 < len(knots) and knots[k + 1][0] <= t:
+                k += 1
+            (t0, x0), (t1, x1) = knots[k], knots[min(k + 1, len(knots) - 1)]
+            xs.append(x0 if t <= t0 or t1 <= t0 else x0 + (x1 - x0) * min((t - t0) / (t1 - t0), 1.0))
+        n = len(pts)
+        mx, me = sum(xs) / n, sum(e for _, e in pts) / n
+        sxx = sum((x - mx) ** 2 for x in xs)
+        b = sum((x - mx) * (e - me) for x, (_, e) in zip(xs, pts)) / sxx if sxx > 0 else 0.0
+        return max(abs(e - me - b * (x - mx)) for x, (_, e) in zip(xs, pts)), b, delay
 
     # --------------------------------------------------------------- the walk
     def walk(self):
@@ -2658,9 +3092,16 @@ class Recenter(CavitySteps):
         yield from self.arrive()
         pts = []
         self.stage = f"reset ({n}): current back down"
-        for k in _steps(up, slow, 1.0) + (_steps(slow, 0.0, p.step) if slow > 0 else []):
-            e = yield from self.move(current=at(a_nom + k), top=True)
-            pts.append([round(self.mA(self.I), 4), round(e, 1) if math.isfinite(e) else None])
+        if p.smooth:  # ramped steadily: a mA a reading down to reset_slow above, then a step a reading
+            for to, per in ((slow, 1.0), (0.0, p.step)):
+                if abs(self.I - at(a_nom + to)) > 1e-9:
+                    got = yield from self.sweep(current=at(a_nom + to), per=per, top=True, rest=to == 0.0)
+                    pts += [[round(self.mA(x.i), 4), round(x.e, 1) if math.isfinite(x.e) else None]
+                            for x in got.samples if x.e is not None]
+        else:
+            for k in _steps(up, slow, 1.0) + (_steps(slow, 0.0, p.step) if slow > 0 else []):
+                e = yield from self.move(current=at(a_nom + k), top=True)
+                pts.append([round(self.mA(self.I), 4), round(e, 1) if math.isfinite(e) else None])
         yield from self.steady()  # (one odd reading does not count)
         on, q = self.right_mode(), None
         if on and self.shg_ok:
@@ -2751,6 +3192,15 @@ class Recenter(CavitySteps):
         self.stage = f"catching the right mode ({self.tries}): sweeping down"
         yield from self.read()
         pts, seen, caught, best, above = [], False, False, None, False
+        if p.smooth and math.isfinite(self.e) and not self.right_mode():
+            # down to where it is on the right mode, ramped steadily, read on the way (from there a step at a time,
+            # its SHG peak looked at after each, as below)
+            got = yield from self.sweep(current=self.i_lo, watch=self.on_right_mode())
+            pts = [[round(self.mA(x.i), 4), round(x.e, 1) if math.isfinite(x.e) else None, None]
+                   for x in got.samples[:-1] if x.e is not None]
+            above = got.stopped
+            if got.stopped:
+                yield from self.steady()  # (where it is now, at rest)
         while True:
             on, q = self.right_mode(), None
             if not on and not above and not seen and not self.shg_ok and math.isfinite(self.e):
@@ -2802,6 +3252,29 @@ class Recenter(CavitySteps):
                 (f"on the right mode, but its SHG peak no more than {best:.2f} of the optimum's, down to "
                  if best is not None else "on the right mode, not for long, down to ")) + f"{self.mA(self.I):.2f} mA")
         return caught
+
+    def on_right_mode(self):
+        """A sweep's watch (Sample -> stop?): True at the second reading in a row on the right mode (off_right, of
+        the reading as it was read on the way). What the readings on the way tell is taken along: how the current
+        tunes a mode (two readings on one mode), and the hops (their sizes: what its modes are apart)."""
+        run, was = [0], [None]
+        dv = self.V - self.v_ref
+        blind = abs(dv) > 0.5 and not self.kv_known
+
+        def watch(x: Sample) -> bool:
+            if x.e is None or not math.isfinite(x.e):
+                return False
+            a, was[0] = was[0], x
+            if a is not None and abs(x.i - a.i) > 1e-9:
+                if abs(x.e - a.e - self.slope * (x.i - a.i)) <= self.threshold:
+                    self.learn_slope(x.i - a.i, x.e - a.e)
+                else:
+                    self.hop_seen(a.e, x.e, x.i - a.i)
+            d = x.e - self.kv * dv - self.slope * (x.i - self.i_ref)
+            run[0] = run[0] + 1 if not blind and abs(d) <= self.RIGHT * self.spacing_now() else 0
+            return run[0] >= 2
+
+        return watch
 
     def center(self, edge: bool):
         """On the right mode with nothing but the wavemeter to tell how the mode is (no SHG sweep), where the mode
@@ -3188,6 +3661,451 @@ class Recenter(CavitySteps):
                   f"{base:.3f} V); back up at {self.mA(back):.3f} mA going down, and kept {p.upkeep_back:g} mA below: "
                   f"{self.mA(start):.3f} → {self.mA(self.I):.3f} mA")
 
+    # keeping it off the edge of its mode (locked: a second mode beginning, its signal dipping)
+    KEEP_PROBE = 0.05      # mA: the current this far either way, to see which way its signal comes back up...
+    KEEP_PROBES = (1, 2, 4)  # ...then, if neither way tells, twice and four times as far (a mode wide in current)
+    KEEP_N = 12            # a probe read this many times on the way (so slowly: its locks follow)
+    KEEP_S = 0.1           # s between two readings of its SHG signal
+    KEEP_LAST = 4          # its signal as it is: the middle of its last this many readings
+    KEEP_UP = 3            # back up: this many readings running each as high as it should be
+    KEEP_SD = 4.0          # ...changed, if by this many times their noise
+    KEEP_PART = 0.05       # ...and by this part of its dip at least (less: the current makes no difference to it)
+    KEEP_MEND = 0.5        # mended: this part of its dip made good, at least (less: the current back where it was)
+    KEEP_MAX = 0.5         # mA: no further than this from where it began
+    KEEP_OFF = (4, 5)      # off its target on the way: this many of its last so many readings (not one odd one, or two)
+    KEEP_END = 3           # where the wavemeter has it, before and after: this many readings (most of them)
+    KEEP_LAG = 0.3         # of how far off its target it may be: so far off on the way (the middle of its last five
+    #                        readings), the lock that holds it is behind: waited for, and on half as fast
+    KEEP_WAIT = 20         # ...readings at most
+    KEEP_SLOW = 8          # ...down to this part of its pace, and no more often than KEEP_LAGS times a ramp: a lock
+    KEEP_LAGS = 12         # that still does not keep up is not one to move its current under
+    KEEP_BLIND = 6         # readings in a row that came without its fringes: no further
+    KEEP_SILENT = (4.0, 1.0)  # no valid reading for this many of the wavemeter's intervals (s, at least): no further
+
+    def keep_there(self, n: int):
+        """Where the wavemeter has it: n readings. Most of them off its target (not the odd one two modes read):
+        self.keep_off says so (MHz: their middle). What their times say of how often it is read: self.gap. Returns
+        what is left of its fringes at each that came with it."""
+        es, ts, qs, tol = [], [], [], self.p.off_target()
+        for _ in range(n):
+            e = yield from self.read()
+            ts.append(self.t)
+            if math.isfinite(e):
+                es.append(e)
+            if self.fringes is not None:
+                qs.append(self.fringes)
+        if len(ts) > 2 and ts[-1] > ts[0]:
+            self.gap = (ts[-1] - ts[0]) / (len(ts) - 1)
+        if len(es) >= 5:  # (how its readings scatter now: on two modes, more than they did)
+            mid = _median(es)
+            self.keep_scatter = 1.4826 * _median([abs(e - mid) for e in es])
+        if es and sum(abs(e) > tol for e in es) > 0.6 * len(es):
+            self.keep_off = _median(es)
+        return qs
+
+    def keep_level(self, shg: bool, n: int):
+        """Its signal now (V of its SHG signal locked, or what is left of its fringes on the wavemeter): n readings,
+        the median of their later half (a signal on its way down is where it has got to, not where it was); None:
+        it cannot be read. self.keep_noise: their scatter (a reading's, as the signal is now: with a second mode
+        there it is noisier than it was). Its fringes read, most of the wavemeter's readings off its target:
+        self.keep_off says so (MHz)."""
+        if shg:
+            xs = yield from self.intra(n)
+        else:
+            xs = yield from self.keep_there(n)
+        if len(xs) < max(2, n // 3):
+            return None
+        mid = _median(xs)
+        self.keep_noise = 1.4826 * _median([abs(x - mid) for x in xs])
+        return _median(xs[-max(n // 2, 2 * self.KEEP_LAST):])  # (as it is now: on its way down, its later half)
+
+    def keep_locks(self, shg: bool):
+        """Its locks, as its DLC pro says them (its cavity lock, if its DLC pro locks it; its SHG cavity's, if that
+        is what is watched): '' if each says locked, else what they say."""
+        names = ((("dl:lock:state-txt", "dl:lock:lock-enabled") if self.cavity else ())
+                 + (("nlo:shg:lock:state-txt", "nlo:shg:lock:lock-enabled") if shg else ()))
+        if not names:
+            return ""
+        got = list((yield Get(names)))
+        said = []
+        for what in (("its cavity lock",) if self.cavity else ()) + (("its SHG cavity",) if shg else ()):
+            txt, on = got.pop(0), got.pop(0)
+            if not (on and says_locked(txt)):
+                said.append(f"{what} “{txt or '?'}”")
+        return ", ".join(said)
+
+    def keep_ramp(self, shg: bool, to: float, stop=None):
+        """The current to `to` (set mA), slowly, its locks on, its signal read on the way: [(set mA, signal)]. As
+        slowly as a probe's worth (KEEP_PROBE) in KEEP_N readings of its signal: its SHG signal's, KEEP_S apart; a
+        laser this program's lock holds (not its DLC pro's): the wavemeter's, however seldom they come (its lock
+        steps its piezo once a reading: it must follow). stop(points): True ends it there. It ends, too, where
+        things are not as they should be:
+        - off its target (the wavemeter's readings, KEEP_OFF of them: it hopped, a lock lost it): self.keep_off;
+        - its lock behind (the middle of its last five readings KEEP_LAG of its tolerance off, and twice what its
+          readings scatter): the ramp waits for it to catch up (KEEP_WAIT readings at most: else self.keep_off),
+          and goes on half as fast;
+        - no valid reading for a while (KEEP_SILENT), or its readings without their fringes (KEEP_BLIND running):
+          self.keep_blind says which. Nothing is moved unseen."""
+        seen, off, lag = [], deque(maxlen=self.KEEP_OFF[1]), deque(maxlen=5)
+        tol, held = self.p.off_target(), not self.cavity  # (held: by this program's lock, a step a reading)
+        behind = min(max(self.KEEP_LAG * tol, 2.0 * self.keep_scatter), 0.6 * tol)
+        why, dark = [""], [0]
+
+        def watch(x: Sample) -> bool:
+            if x.e is not None:  # (a reading: still on target? and, without an SHG stage, its fringes)
+                if math.isfinite(x.e):  # (on two modes the wavemeter reads nonsense now and then: most of the last few)
+                    off.append(abs(x.e) > tol)
+                    lag.append(x.e)
+                if sum(off) >= self.KEEP_OFF[0]:
+                    self.keep_off, why[0] = x.e, "off"
+                    return True
+                if held and len(lag) == lag.maxlen and abs(_median(lag)) > behind:
+                    why[0] = "lag"
+                    return True
+                if shg:
+                    return False
+                if x.q is None:
+                    dark[0] += 1
+                    if dark[0] >= self.KEEP_BLIND:
+                        self.keep_blind, why[0] = f"its last {dark[0]} readings came without their fringes", "blind"
+                        return True
+                    return False
+                dark[0] = 0
+                seen.append((x.i, x.q))
+            elif shg and x.values and _num(x.values[0]):
+                seen.append((x.i, float(x.values[0])))
+            else:
+                return False
+            if stop is not None and stop(seen):
+                why[0] = "stop"
+                return True
+            return False
+
+        gap = self.gap or Runner.GAP
+        pace = self.KEEP_PROBE / (self.KEEP_N * (max(gap, self.KEEP_S) if held or not shg else self.KEEP_S))
+        rate, lags = pace, 0
+        quiet = max(self.KEEP_SILENT[0] * gap, self.KEEP_SILENT[1])
+        while abs(self.I - to) > 1e-9:
+            why[0] = ""
+            lag.clear()
+            got = yield from self.sweep(current=to, rate=rate, watch=watch, check=False, rest=False,
+                                        names=(INTRA,) if shg else (), every=self.KEEP_S, silence=quiet)
+            if got.silent:
+                self.keep_blind = f"no valid reading of it for {quiet:.1f} s"
+                break
+            if why[0] != "lag":
+                break
+            lags += 1
+            if lags > self.KEEP_LAGS:
+                self.keep_blind = (f"its lock does not keep up with its current ({abs(_median(lag)):.0f} MHz behind, "
+                                   f"{lags} times, at a {self.KEEP_SLOW}th of the pace)")
+                break
+            near = deque(maxlen=3)
+            for _ in range(self.KEEP_WAIT):  # (its lock is behind: waited for, where it is)
+                e = yield from self.read()
+                if math.isfinite(e):
+                    near.append(e)
+                if len(near) == 3 and abs(_median(near)) <= 0.5 * behind:
+                    break
+            else:
+                self.keep_off = _median(near) if near else math.nan
+                break
+            rate = max(0.5 * rate, pace / self.KEEP_SLOW)
+        return seen
+
+    @staticmethod
+    def keep_rise(seen, noise: float) -> tuple:
+        """What a ramp of keep's did to its signal: (its rise from the ramp's beginning to its end, how well that is
+        known: its standard deviation), by the straight line through all that was read on the way (noise: a
+        reading's scatter; what the line leaves over, if that is more). (0, inf): too little read to tell."""
+        n = len(seen)
+        if n < 3:
+            return 0.0, math.inf
+        mx, my = sum(x for x, _ in seen) / n, sum(y for _, y in seen) / n
+        sxx = sum((x - mx) ** 2 for x, _ in seen)
+        span = seen[-1][0] - seen[0][0]
+        if sxx <= 0 or abs(span) < 1e-9:
+            return 0.0, math.inf
+        b = sum((x - mx) * (y - my) for x, y in seen) / sxx
+        left = math.sqrt(sum((y - my - b * (x - mx)) ** 2 for x, y in seen) / (n - 2))
+        return b * span, max(noise, left) * abs(span) / math.sqrt(sxx)
+
+    def keep(self):
+        """Kept off the edge of its mode, before it hops: locked, its signal (its SHG cavity's intra-cavity signal,
+        or what is left of its fringes on the wavemeter) has dipped below what it is as it should be (self.keeping:
+        what its watch said, keep.ModeWatch): a second mode is beginning to lase, and the mode it is on will give way
+        next. As by hand, but steadily and with its locks on (its cavity lock, its SHG cavity's, or this program's
+        wavemeter lock, which goes on holding it): the current KEEP_PROBE mA one way, slowly (keep_ramp), its signal
+        read all the way (no further, and back, the moment it falls); back up already, or rising (its last readings
+        above where it began, or the line through what was read on the way rising, keep_rise: by KEEP_SD of how well
+        that is known, and KEEP_PART of its dip, at least): on that way while it rises, until it is back up (within
+        its noise of what it should be, or rising no more), and keep_back mA further (a narrow mode: no further
+        than where it dips again, a second mode beginning on its other side, and back to the middle of where it
+        was as it should be); else the other way the same;
+        neither telling, both again twice as far, and four times (a mode wide in current: KEEP_PROBES). Read again
+        there: KEEP_MEND of its dip made good, it is mended, and its current stays. Else (or neither way brings it
+        up): not its mode's doing (its TA weaker, its SHG cavity's alignment, the wavemeter's own fringes): the
+        current back where it was, as slowly, and self.kept says so (its watch takes the signal for what it is from
+        then on). Before, after every ramp and at the end, where the wavemeter has it and what its locks say are
+        looked at (keep_ok): a lock lost or the signal gone, the current back where it was, as slowly; off its
+        target or no longer read, left where it is; and Failed."""
+        k, p = self.keeping, self.p
+        shg = k["signal"] == "shg"
+        what = "SHG signal" if shg else "fringes on the wavemeter"
+        be, have, dips, comes = ("is", "has", "dips", "comes") if shg else ("are", "have", "dip", "come")
+        base = k["base"]
+        quiet = max(k.get("noise") or 0.0, 1e-4 * base)  # (a reading's scatter as it should be: its watch's)
+        self.keep_off, self.keep_blind, self.keep_noise, self.keep_scatter = None, "", 0.0, 0.0
+        self.stage = f"keeping its mode: its {what} dipping"
+        said = yield from self.keep_locks(shg)
+        if said:
+            raise Failed(f"not locked now ({said}): its mode not kept")
+        lo, hi, _ = self.window()
+        if not lo - 1e-9 <= self.I <= hi + 1e-9:
+            raise Failed(f"the current, {self.mA(self.I):.3f} mA, is outside its window ({self.mA(lo):.2f} … "
+                         f"{self.mA(hi):.2f} mA): its mode not kept")
+        if shg:  # (its fringes read, the wavemeter is: else asked now, where it has the laser and how often)
+            yield from self.keep_there(self.KEEP_END)
+        level = yield from self.keep_level(shg, 2 * self.KEEP_N)
+        if self.keep_off is not None:
+            raise Failed(f"it is {self.keep_off:+.0f} MHz from its target (it hopped, or its lock lost it): its mode "
+                         f"not kept")
+        if level is None:
+            raise Failed(f"cannot read its {what}: its mode not kept")
+        start = self.I
+        self.back_pace = self.step_max * self.KEEP_N * max(self.gap or Runner.GAP, self.KEEP_S) / self.KEEP_PROBE
+        noise = max(quiet, self.keep_noise)  # (...and as it is now: with a second mode coming and going, more)
+        self.kept = {"mended": False, "way": 0, "from": round(self.mA(start), 4), "to": round(self.mA(start), 4),
+                     "signal": k["signal"], "base": round(base, 5), "dip": round(1 - level / base, 4), "why": ""}
+        if level >= base * (1 - 0.5 * p.keep_dip):
+            self.kept.update(mended=True, why="back up by itself")
+            w = k.get("way") or 0
+            to = min(max(start + w * p.keep_back, lo), hi)
+            if not (k.get("again") and w and abs(to - start) > 1e-9):
+                self.note(f"its {what} {be} back up by itself ({level:.4g}, {100 * (1 - level / base):.1f} % below "
+                          f"what it should be): nothing moved")
+                return
+            # (dipped, and back up when looked at, twice running: a second mode coming and going, at its mode's
+            # edge: a little further in, the way that mended it last; back, if that brings it down)
+            yield from self.ask(f"Its {what} {dips} and {comes} back up by itself, time and again (a second mode coming "
+                                f"and going: the edge of its mode): the current {'up' if w > 0 else 'down'} "
+                                f"{abs(to - start):g} mA, slowly, its locks on, the way that mended it last time")
+            self.stage = f"keeping its mode: the current {'up' if w > 0 else 'down'} a little, its {what} watched"
+            floor = base * (1 - p.keep_dip)
+            got = yield from self.keep_ramp(shg, to, lambda more: len(more) >= 3 and
+                                            max(x for _, x in more[-3:]) < floor)
+            yield from self.keep_ok(shg, start, level, got)
+            short = abs(self.I - to) > 1e-9  # (stopped on the way: it dipped)
+            level1 = yield from self.keep_level(shg, self.KEEP_N)
+            if shg:
+                yield from self.keep_there(self.KEEP_END)
+            yield from self.keep_ok(shg, start, level, None)
+            if short or level1 is None or level1 < floor:
+                yield from self.keep_home(shg, start, level)
+                self.note(f"its {what} {dips} and {comes} back up by itself; the current {self.mA(to) - self.mA(start):+.3f} "
+                          f"mA (the way that mended it last time) brings it down: back at {self.mA(self.I):.3f} mA")
+                return
+            self.kept.update(way=w, to=round(self.mA(self.I), 4), level=round(level1, 5), why="coming and going")
+            self.note(f"its {what} {dips} and {comes} back up by itself, time and again (a second mode coming and going: "
+                      f"the edge of its mode): the current {self.mA(start):.3f} → {self.mA(self.I):.3f} mA, the way "
+                      f"that mended it last time, its signal {level1:.4g} there (it should be {base:.4g})")
+            return
+        way0 = k.get("way") or -1
+        yield from self.ask(f"Its {what} {have} dipped {100 * (1 - level / base):.1f} % below what it should be (a "
+                            f"second mode beginning: a hop would come next): the current "
+                            f"{'down' if way0 < 0 else 'up'} {self.KEEP_PROBE:g} mA, slowly, its locks on, and on that "
+                            f"way while the signal comes back up (the other way if it falls), then "
+                            f"{p.keep_back:g} mA further")
+        dip = base - level
+        sd = noise / math.sqrt(self.KEEP_LAST)  # (of the middle of its last few readings)
+        tells = max(self.KEEP_SD * sd, self.KEEP_PART * dip)  # (a change of its signal worth the name)
+        fell = level - tells
+        # (as high as it should be: within its noise of that, and three quarters of its dip made good at least)
+        near = base - min(max(3 * quiet, self.KEEP_PART * dip), 0.25 * dip)
+
+        def last(seen) -> float:
+            return _median([x for _, x in seen[-self.KEEP_LAST:]])
+
+        def falls(seen) -> bool:  # (the wrong way: no further; two readings running say so, or its last few's middle:
+            if len(seen) < 3:     # below where it began, and below where this ramp began, if that was lower already)
+                return False
+            floor = min(fell, max(x for _, x in seen[:2]) - tells)
+            return (max(x for _, x in seen[-2:]) < floor
+                    or len(seen) >= self.KEEP_LAST + 2 and last(seen) < floor)
+
+        def up(seen) -> bool:  # (its last readings, each as high as it should be)
+            return len(seen) >= self.KEEP_UP and min(x for _, x in seen[-self.KEEP_UP:]) >= near
+
+        def back_up(seen) -> bool:  # (as high as it should be, or rising no more: over its last half a probe's way)
+            if up(seen):
+                return True
+            if len(seen) < 2 * self.KEEP_LAST:
+                return False
+            now, at = last(seen), seen[-1][0]
+            if now >= near:
+                return True
+            before = [x for i, x in seen if abs(i - at) >= 0.5 * self.KEEP_PROBE]
+            return (len(seen) >= self.KEEP_N and len(before) >= self.KEEP_LAST
+                    and now - _median(before[-self.KEEP_LAST:]) < 2 * sd)
+
+        low = near - (base - near)  # (dipping again: below what it should be by twice what counts as back up)
+
+        def high(path):
+            """The last stretch of a way where its signal was as high as it should be, KEEP_UP readings running at
+            least: (set mA where it began, where it ended, still so at the way's end); None: nowhere."""
+            best, run, dipped = None, [], False
+            for i, x in path:
+                if x >= near:
+                    if dipped:  # (come back up: not a way that began up, its signal flickering)
+                        run.append(i)
+                    continue
+                dipped = True
+                if len(run) >= self.KEEP_UP:
+                    best = (run[0], run[-1], False)
+                run = []
+            return (run[0], run[-1], True) if len(run) >= self.KEEP_UP else best
+
+        def narrow(path):
+            """Its mode is narrow here: its signal was back up, and further on dips again (a second mode beginning
+            on its other side): the middle of where it was up (set mA); None: not so."""
+            h = high(path)
+            if h is None or h[2] or len(path) < 2 or max(x for _, x in path[-2:]) >= low:
+                return None
+            return 0.5 * (h[0] + h[1])
+
+        way, seen, edge = 0, [], ""
+        for far in self.KEEP_PROBES:
+            edge = ""
+            for w in (way0, -way0):
+                self.stage = f"keeping its mode: the current {'up' if w > 0 else 'down'} a little, its {what} watched"
+                to = start + w * far * self.KEEP_PROBE
+                if abs(min(max(to, lo), hi) - start) < 0.5 * self.KEEP_PROBE:
+                    edge = "top" if w > 0 else "bottom"  # (its window ends here: not this way)
+                    continue
+                seen = yield from self.keep_ramp(shg, to, falls)
+                yield from self.keep_ok(shg, start, level, seen)
+                rise, known = self.keep_rise(seen, quiet)
+                if (up(seen) or high(seen) is not None or rise >= max(self.KEEP_SD * known, self.KEEP_PART * dip)
+                        or len(seen) >= self.KEEP_LAST and last(seen) > level + tells):
+                    way = w  # (this way: back up already (or on the way), rising steadily, or higher than it was)
+                    break
+                yield from self.keep_home(shg, start, level)  # (not this way: back, the other way from there)
+            if way:
+                break
+        if not way and edge:
+            self.kept.update(why=f"its current is at the {edge} of its window", edge=edge)
+            self.note(f"its {what} {be} {100 * (1 - level / base):.1f} % below what it should be (a second mode "
+                      f"beginning), and its current, {self.mA(self.I):.3f} mA, is at the {edge} of its window "
+                      f"({self.mA(lo):.2f} … {self.mA(hi):.2f} mA): it cannot be kept off the edge of its mode from "
+                      f"there (the other way does not bring the signal up). Its mode has walked out of its window: "
+                      f"its temperature, or its nominal current (Mode-hop recovery…), wants adjusting")
+            return
+        if not way:
+            self.kept.update(why="the current makes no difference")
+            self.note(f"its {what} {be} {100 * (1 - level / base):.1f} % below what it should be, and the current "
+                      f"{self.KEEP_PROBES[-1] * self.KEEP_PROBE:g} mA up or down does not bring it up: not its mode's "
+                      f"doing (it is taken for what it is from now on); the current back at {self.mA(self.I):.3f} mA")
+            return
+        self.stage = f"keeping its mode: the current {'up' if way > 0 else 'down'} while its {what} comes back up"
+        path = list(seen)
+        mid = narrow(path)
+        if mid is None and not back_up(path):
+            end = min(max(start + way * self.KEEP_MAX, lo), hi)
+            got = yield from self.keep_ramp(shg, end, lambda more: back_up(path + more))
+            yield from self.keep_ok(shg, start, level, got)
+            path += got
+            mid = narrow(path)
+        top = self.I
+        if mid is None and p.keep_back > 0:  # (a little further in; no further than where it dips again)
+            got = yield from self.keep_ramp(shg, min(max(top + way * p.keep_back, lo), hi),
+                                            lambda more: narrow(path + more) is not None)
+            yield from self.keep_ok(shg, start, level, got)
+            path += got
+            mid = narrow(path)
+        if mid is not None:  # (a narrow mode: a second mode begins again on its other side: in between)
+            got = yield from self.keep_ramp(shg, min(max(mid, lo), hi))
+            yield from self.keep_ok(shg, start, level, got)
+            a, b, _ = high(path)
+            self.note(f"its mode is narrow here: its {what} {be} as it should be only from {self.mA(a):.3f} to "
+                      f"{self.mA(b):.3f} mA, a second mode beginning either side: left in the middle of that, "
+                      f"{self.mA(self.I):.3f} mA (a wider mode would hold better: Recenter now, or its temperature)")
+            self.kept["narrow"] = [round(self.mA(a), 4), round(self.mA(b), 4)]
+        level1 = yield from self.keep_level(shg, self.KEEP_N)
+        if shg:
+            yield from self.keep_there(self.KEEP_END)  # (and where the wavemeter has it, there)
+        yield from self.keep_ok(shg, start, level, None)
+        if level1 is not None and level1 - level < self.KEEP_MEND * dip and level1 > level + tells \
+                and abs(self.I - (hi if way > 0 else lo)) < 1e-6:
+            edge = "top" if way > 0 else "bottom"  # (the right way, and its window ends here: as far as it may go)
+            self.kept.update(why=f"its current is at the {edge} of its window", edge=edge, way=way,
+                             to=round(self.mA(self.I), 4), level=round(level1, 5))
+            self.note(f"its {what} had dipped {100 * (1 - level / base):.1f} % (a second mode beginning); the current "
+                      f"{'up' if way > 0 else 'down'}, slowly, its locks on, brings it back up ({level:.4g} → "
+                      f"{level1:.4g}, it should be {base:.4g}) but only as far as its window goes: left at its "
+                      f"{edge}, {self.mA(self.I):.3f} mA ({self.mA(lo):.2f} … {self.mA(hi):.2f} mA). Its mode has "
+                      f"walked out of its window: its temperature, or its nominal current (Mode-hop recovery…), "
+                      f"wants adjusting")
+            return
+        if level1 is None or level1 - level < self.KEEP_MEND * dip:
+            yield from self.keep_home(shg, start, level)
+            self.kept.update(why="it did not come back up")
+            self.note(f"its {what} did not come back up with the current {self.mA(top) - self.mA(start):+.3f} mA "
+                      f"({'?' if level1 is None else f'{level1:.4g}'}, it should be {base:.4g}; it was {level:.4g}): "
+                      f"not its mode's doing; the current back at {self.mA(self.I):.3f} mA")
+            return
+        self.kept.update(mended=True, way=way, to=round(self.mA(self.I), 4), level=round(level1, 5))
+        self.record["keep"] = dict(self.kept, up_at=round(self.mA(top), 4))
+        self.note(f"kept off the edge of its mode: its {what} had dipped {100 * (1 - level / base):.1f} % (a second "
+                  f"mode beginning); the current {'up' if way > 0 else 'down'}, slowly, its locks on, until it was "
+                  f"back up at {self.mA(top):.3f} mA, and "
+                  + (f"{p.keep_back:g} mA further" if mid is None else "to the middle of where it is")
+                  + f": {self.mA(start):.3f} → {self.mA(self.I):.3f} mA, its signal {level:.4g} → {level1:.4g} "
+                  f"(it should be {base:.4g})")
+
+    def keep_home(self, shg: bool, start: float, level: float):
+        """Back where it began, as slowly as it came (the lock that holds it follows), and still as it should be
+        there (keep_ok)."""
+        got = yield from self.keep_ramp(shg, start)
+        yield from self.keep_ok(shg, start, level, got)
+
+    def keep_ok(self, shg: bool, start: float, level: float, got):
+        """After a ramp of keep's (got: what it read; None: after its last look): still as it should be?
+        - Off its target, by the wavemeter: looked at again (KEEP_OFF readings: a glitch of the wavemeter's, the lock
+          a moment behind, and it goes on). Still off (it hopped, or its lock lost it), or no longer read (keep_blind):
+          Failed, the current left where it is: where it was last seen on target, the lock that holds it having
+          followed it there (put back, the laser would be taken off its target by that much, and a laser that had
+          not hopped be recovered as if it had). It is watched as ever: recovered, if it hopped.
+        - Its signal gone (under half of what it was when the keeping began: level), or a lock not saying locked:
+          the current back where it began, as slowly as it came (the lock that holds it follows), and Failed."""
+        if self.keep_off is not None:
+            was, self.keep_off = self.keep_off, None
+            yield from self.keep_there(self.KEEP_OFF[1])
+            if self.keep_off is None and math.isfinite(was):
+                self.note(f"keeping its mode: {was:+.0f} MHz from its target for a moment at {self.mA(self.I):.3f} "
+                          f"mA, and back on it (looked at again)")
+        why, left = "", True
+        if self.keep_off is not None:
+            off = f"{self.keep_off:+.0f} MHz" if math.isfinite(self.keep_off) else "no telling how far"
+            why = f"it is {off} from its target (it hopped, or its lock lost it)"
+        elif self.keep_blind:
+            why = self.keep_blind
+        elif got and _median([x for _, x in got[-3:]]) < 0.5 * level:
+            why, left = f"its signal fell to {_median([x for _, x in got[-3:]]):.4g} (it was {level:.4g})", False
+        else:
+            said = yield from self.keep_locks(shg)
+            if said:
+                why, left = f"{said} (not locked)", False
+        if not why:
+            return
+        at = self.mA(self.I)
+        if not left and abs(self.I - start) > 1e-9:  # (still on target: back as slowly as it came)
+            yield from self.keep_ramp(shg, start)
+            left = self.keep_off is not None or bool(self.keep_blind)
+        if left and abs(self.I - start) > 1e-9:
+            raise Failed(f"keeping its mode, at {at:.3f} mA {why}: the current left where it is, "
+                         f"{self.mA(self.I):.3f} mA", keep=True)
+        raise Failed(f"keeping its mode, at {at:.3f} mA {why}: the current put back")
+
     def ease_down(self, level: float):
         """Its SHG cavity just locked (level: its signal, V). At the top of its mode, a second mode beginning (a hop
         comes next), its signal dips below what the mode gives; as by hand, the current down while the signal rises
@@ -3345,7 +4263,28 @@ class Recenter(CavitySteps):
     def result(self) -> Result:
         now = self.final_act if self.final_act is not None else self.mA(self.I)
         began = self.mA(self.I_start, self.V0)
-        if self.upkeeping and self.upkept is not None:
+        if self.upkeeping and self.kept is not None:
+            k = self.kept
+            what = "SHG signal" if k["signal"] == "shg" else "fringes on the wavemeter"
+            be, dips, comes = ("is", "dips", "comes") if k["signal"] == "shg" else ("are", "dip", "come")
+            if k["mended"] and k["way"] and k["why"] == "coming and going":
+                summary = (f"kept off the edge of its mode: its {what} {dips} and {comes} back up by itself, time and "
+                           f"again; the current {k['from']:.3f} → {k['to']:.3f} mA ({k['to'] - k['from']:+.3f}), the "
+                           f"way that mended it last time, its locks on")
+            elif k["mended"] and k["way"]:
+                summary = (f"kept off the edge of its mode: its {what} had dipped {100 * k['dip']:.1f} %, the current "
+                           f"{k['from']:.3f} → {k['to']:.3f} mA ({k['to'] - k['from']:+.3f}), its locks on, and "
+                           f"{'it is' if k['signal'] == 'shg' else 'they are'} back up")
+            elif k["mended"]:
+                summary = f"its {what} had dipped, and {be} back up by itself: nothing moved"
+            elif k.get("edge"):
+                summary = (f"its {what} {be} {100 * k['dip']:.1f} % below what it should be (a second mode beginning), "
+                           f"and {k['why']} ({k['to']:.3f} mA): not kept off the edge of its mode; its temperature, "
+                           f"or its nominal current, wants adjusting")
+            else:
+                summary = (f"its {what} {be} {100 * k['dip']:.1f} % below what it should be, and {k['why']}: not its "
+                           f"mode's doing; the current back at {k['from']:.3f} mA")
+        elif self.upkeeping and self.upkept is not None:
             a, top, b, back = self.upkept
             summary = (f"the top of its mode not found within {self.UP_MAX:g} mA: left at {b:.3f} mA" if top is None
                        else f"the top of its mode at {top:.3f} mA, the current {a:.3f} → {b:.3f} mA ({b - a:+.3f})"
@@ -3361,10 +4300,16 @@ class Recenter(CavitySteps):
                           f", then to the top end of where it is at its best, {self.topped[1]:.2f} mA")
                        + f", the piezo {v:.2f} → {self.V:.2f} V, current {began:.2f} → {now:.2f} mA measured "
                        f"({self.readings} readings)")
+        elif self.short_at is not None:
+            turn = "" if self.short_at[1] is None else f" by way of {self.short_at[1]:.2f} mA"
+            summary = (f"back on its right mode by its model's short way from where it hopped to: the current{turn} "
+                       f"to {self.short_at[0]:.2f} mA, {began:.2f} → {now:.2f} mA measured, {self.V0:.2f} → "
+                       f"{self.V:.2f} V ({self.readings} readings)")
         elif self.back_at:
             summary = (f"back where it was on target, its current come to sweeping {self.back_at}: {began:.2f} → "
                        f"{now:.2f} mA measured, {self.V0:.2f} → {self.V:.2f} V ({self.readings} readings)")
-        elif self.method in ("walk", "catch") and not self.trims and abs(self.V - self.V0) < 0.5 and not self.panics:
+        elif (self.method in ("walk", "catch") and not self.trims and abs(self.V - self.V0) < 0.5 and not self.panics
+              and self.caught is None):  # (caught by its current: not fine, however little its piezo then moved)
             summary = f"the laser itself was fine; piezo {self.V0:.2f} → {self.V:.2f} V"
         elif self.method == "catch" and self.caught is not None:
             v, at = self.caught
@@ -3436,6 +4381,10 @@ class Runner:
     lasing, by way of the top, as a panic would. finished(runner) is called once, when it is over."""
 
     SETTLE = 1
+    REST = (0.03, 0.5)   # s after a sweep's last write before a reading counts as read at rest there: the time
+    #                      between two readings (it may be as old as that when it comes), within these
+    GAP = 0.2            # s between readings taken for a sweep's pace, before any have been heard
+    RATE = (0.02, 5.0)   # mA/s (V/s): the slowest and the fastest a sweep paced by the readings goes
     FIRST = ("dl:lock:lock-enabled",)  # put back before the rest (see above)
     INVALID = 3          # invalid readings in a row passed over before one is handed on
     ACK_TIMEOUT = 5.0    # s
@@ -3443,8 +4392,11 @@ class Runner:
     READ_GAP = 2.5       # s (at least) without anything new from the wavemeter: no valid reading, if it can tell why
     CONFIRM_TIMEOUT = 900.0  # s: step by step, nobody answering for this long stops it
 
-    def __init__(self, rec: Recenter, io, now: float, timeout: float = 600.0, finished=None):
-        self.rec, self.io, self.finished = rec, io, finished
+    def __init__(self, rec: Recenter, io, now: float, timeout: float = 600.0, finished=None, clock=None):
+        """clock: () -> s, the time now (the engine's: time.monotonic), asked whenever an answer comes back, so that a
+        pause, a wait or a ramp's pace begins when it does; without one its time is that of the last reading or
+        tick (a bench's, whose operations take no time)."""
+        self.rec, self.io, self.finished, self.clock = rec, io, finished, clock
         self.gen = rec.run()
         self.started = now
         self.deadline = now + timeout
@@ -3472,6 +4424,8 @@ class Runner:
         self._written_at = now    # when the last write landed
         self._token = 0
         self._keep = False
+        self._sweep = None        # the sweep going on (a dict: _sweep_begin)
+        self._lat = 0.0           # s its controller takes over a write, of late (with a clock: else not known, 0)
         self._send(None)
 
     @property
@@ -3509,6 +4463,8 @@ class Runner:
                 self._ramp(req.current)
             self._then = "read" if req.read else "advance"
             self._next()
+        elif isinstance(req, Sweep):
+            self._sweep_begin(req)
         elif isinstance(req, Read):
             self._expect_reading()
         elif isinstance(req, Set):
@@ -3561,45 +4517,59 @@ class Runner:
         """What a Think worked out, or how it failed (a bug: stop, and put things back)."""
         if tok != self._token or self.state != "running" or self._waiting != "think":
             return  # (stopped meanwhile)
+        self._told()
         self._waiting = None
         if exc is not None:
             self._fail(f"internal error: {exc}")
         else:
             self._send(result)
 
-    def _ramp(self, target: float, pace: float = 0.0):
-        """Current from where the last operation leaves it to target, STEP_MAX a write; with pace, a
-        pause of that many seconds after each step down."""
+    def _ramp(self, target: float, pace: float = 0.0, step: float | None = None):
+        """Current from where the last operation leaves it to target, in writes of the Recenter's step_max
+        (HopParams.fine; `step`, if given), STEP_MAX at most; with pace, a pause of that many seconds after each
+        step down."""
         lo, top = self.rec.allowed(self._ops_offset())
         target = min(max(float(target), lo), top)
         last = self._ops_current()
-        for i in _steps(last, target, self.rec.step_max) if abs(target - last) > 1e-9 else [target]:
+        step = min(step or self._fine(), STEP_MAX)
+        for i in _steps(last, target, step) if abs(target - last) > 1e-9 else [target]:
             self._ops.append(("current", i))
             if pace and i < last:
                 self._ops.append(("pause", pace))
             last = i
 
+    def _fine(self) -> float:
+        """mA a write of a move: the Recenter's step_max (HopParams.fine); more (STEP_MAX at most) where its
+        controller takes so long over a write that a move in such steps would crawl (slower than the fastest a
+        sweep goes): as fine as it can be had at that pace. An upkeep's, a keeping's: as they are."""
+        r = self.rec
+        return r.step_max if r.upkeeping else min(max(r.step_max, self.RATE[1] * self._lat), STEP_MAX)
+
     def _offset(self, target: float, pace: float = 0.0):
         """Offset from where the last operation leaves it to target: with the feedforward on, in steps that move
         the measured current by STEP_MAX at most; with pace, a pause of that many seconds after each step that
         takes it down."""
-        ff, last = self.rec.ff, self._ops_offset()
-        far = abs(ff * (target - last)) > STEP_MAX + 1e-9
-        for v in _steps(last, target, STEP_MAX / abs(ff)) if far else [target]:
+        r = self.rec
+        ff, last = r.ff, self._ops_offset()
+        step = min(r.v_fine * self._fine() / r.step_max, self._fine() / abs(ff) if ff else math.inf)
+        far = abs(target - last) > step + 1e-9
+        for v in _steps(last, target, step) if far else [target]:
             self._ops.append(("offset", v))
             if pace and ff * (v - last) < 0:
                 self._ops.append(("pause", pace))
             last = v
 
-    def _glide(self, current: float, offset: float, pace: float = 0.0):
+    def _glide(self, current: float, offset: float, pace: float = 0.0, every: bool = False):
         """Current and offset together from where the last operations leave them to (current, offset), in steps
         of at most STEP_MAX each way on the current, measured or set (a step: the offset, then the current, or
         the other way round as Recenter._step has it); with pace, a pause after each step that takes the
-        measured current down."""
+        measured current down (every: after each step, whichever way)."""
         r, i0, v0 = self.rec, self._ops_current(), self._ops_offset()
         lo, top = r.allowed(offset)
         current = min(max(float(current), lo), top)
-        n = max(1, math.ceil(max(abs(current - i0), abs(r.ff * (offset - v0))) / r.step_max - 1e-9))
+        fine = self._fine()
+        n = max(1, math.ceil(max(abs(current - i0) / fine, abs(r.ff * (offset - v0)) / fine,
+                                 abs(offset - v0) / (r.v_fine * fine / r.step_max)) - 1e-9))
         for k in range(1, n + 1):
             v, i = v0 + (offset - v0) * k / n, i0 + (current - i0) * k / n
             dv, di = v - self._ops_offset(), i - self._ops_current()
@@ -3609,8 +4579,124 @@ class Runner:
                 first = r.ff * dv * di < 0 and lo - 1e-9 <= i <= top + 1e-9
                 ops.insert(0 if first else len(ops), ("current", i))
             self._ops.extend(ops)
-            if pace and di + r.ff * dv < 0:
+            if pace and (every or di + r.ff * dv < 0):
                 self._ops.append(("pause", pace))
+
+    # ------------------------------------------------------------------ sweeps
+    def _gap(self) -> float:
+        """s between the wavemeter's readings of the laser, of late (their median; GAP before any were heard)."""
+        return _median(self._gaps) if self._gaps else self.GAP
+
+    def _sweep_begin(self, req: Sweep):
+        """A Sweep: its way, from where the last write left current and offset, in steps of the Recenter's step_max
+        and v_fine at most (and so that the feedforward moves the measured current no more a step), a step every dt
+        s; kept within the windows, as any write."""
+        r = self.rec
+        i0, v0 = self.i_written, self.v_written
+        v1 = v0 if req.offset is None else min(max(float(req.offset), r.v_lo), r.v_hi)
+        lo, top = r.allowed(v1)
+        i1 = i0 if req.current is None else min(max(float(req.current), lo), top)
+        di, dv = i1 - i0, v1 - v0
+        n = max(1, math.ceil(max(abs(di) / r.step_max, abs(dv) / r.v_fine, abs(r.ff * dv) / r.step_max) - 1e-9))
+        span = abs(di) if abs(di) > 1e-12 else abs(dv)
+        rate = req.rate if req.rate > 0 else min(max(req.per / self._gap(), self.RATE[0]), self.RATE[1])
+        took = 1.25 * self._lat * ((abs(di) > 1e-12) + (abs(dv) > 1e-12))  # s a step's writes take its controller
+        if n > 1 and span / rate / n < took:  # (longer than its pace allows: fewer, larger steps, STEP_MAX at most
+            least = max(1, math.ceil(max(abs(di), abs(r.ff * dv)) / STEP_MAX - 1e-9))  # a write, so that it keeps it)
+            n = min(n, max(least, int(span / rate / took)))
+        self._sweep = {"req": req, "samples": [], "i0": i0, "v0": v0, "i1": i1, "v1": v1, "n": n, "k": 0,
+                       "t0": self.now, "dt": span / rate / n, "probe": self.now, "stopped": False,
+                       "resting": False, "heard": self.now, "silent": False, "tail": False}
+        self._sweep_step()
+
+    def _sweep_step(self):
+        """The sweep's next step: its parameters read if they are due, then (no sooner than its pace has it) the
+        offset and the current written (which first: as _glide has it); over, or stopped: _sweep_end."""
+        s, r = self._sweep, self.rec
+        req = s["req"]
+        if req.silence > 0 and not s["stopped"] and self.now - s["heard"] > req.silence:
+            s["stopped"] = s["silent"] = True  # (nothing heard of the laser for too long: no further, unseen)
+        if s["stopped"] or s["k"] >= s["n"]:
+            if req.names and not s["stopped"] and not s["tail"]:  # (where it ended: read once more, after its time)
+                s["tail"] = True
+                self._ops.extend([("until", s["t0"] + (s["n"] + 1) * s["dt"]), ("get", tuple(req.names))])
+                self._then = "sweep"
+                self._next()
+                return
+            self._sweep_end()
+            return
+        k = s["k"] = s["k"] + 1
+        f = k / s["n"]
+        i, v = s["i0"] + (s["i1"] - s["i0"]) * f, s["v0"] + (s["v1"] - s["v0"]) * f
+        due = s["t0"] + k * s["dt"]
+        late = self.now - due - max(self._gap(), s["dt"])
+        if late > 0:  # (held up: on from here at its pace; what a reading's time brings is caught up with, no more)
+            s["t0"] += late
+            due += late
+        self._ops.append(("until", due))
+        if req.names and due >= s["probe"]:  # (its parameters: read after the last step has had its time)
+            s["probe"] = due + max(req.every, 0.0)
+            self._ops.append(("get", tuple(req.names)))
+        dv, di = v - self.v_written, i - self.i_written
+        ops = [("offset", v)] if abs(dv) > 1e-12 else []
+        if abs(di) > 1e-12:
+            lo, top = r.allowed(self.v_written)
+            first = r.ff * dv * di < 0 and lo - 1e-9 <= i <= top + 1e-9
+            ops.insert(0 if first else len(ops), ("current", i))
+        if not ops:  # (nowhere to go: a sweep to where it is)
+            s["k"] = s["n"]
+            self._ops.clear()
+            self._sweep_end()
+            return
+        self._ops.extend(ops)
+        self._then = "sweep"
+        self._next()
+
+    def _sweep_seen(self, sample: Sample):
+        """A sample on a sweep's way: kept, and its watch asked; True from it stops the ramp where it is (the write
+        on its way, if one is, lands first)."""
+        s = self._sweep
+        s["samples"].append(sample)
+        if sample.e is not None and math.isfinite(sample.e):
+            s["heard"] = max(s["heard"], sample.t)
+        watch = s["req"].watch
+        if s["stopped"] or s["resting"] or watch is None:
+            return
+        try:
+            stop = watch(sample)
+        except Exception as exc:  # a bug: stop, and put things back
+            log.exception("recovery")
+            self._fail(f"internal error: {exc}")
+            return
+        if stop:
+            s["stopped"] = True
+            self._ops.clear()
+            if self._waiting == "pause":  # (between two steps: over now; else once the write on its way has landed)
+                self._waiting = None
+                self._sweep_end()
+
+    def _sweep_end(self):
+        """The ramp is over: one more reading, at rest (unless it was stopped, or none is asked for), then back to
+        the procedure."""
+        s = self._sweep
+        self._then = None
+        if s["req"].rest and not s["stopped"]:
+            s["resting"] = True
+            self._waiting, self._since = "read", self.now
+            self._skip = self._invalid = 0
+            return
+        self._sweep_done()
+
+    def _sweep_done(self):
+        s, self._sweep = self._sweep, None
+        span = abs(s["i1"] - s["i0"]) or abs(s["v1"] - s["v0"])
+        self._send(Swept(s["samples"], self.i_written, self.v_written, s["stopped"], self._gap(), s["silent"],
+                         span / s["n"]))
+
+    def wake(self) -> float:
+        """When it next wants a tick though no reading comes (a pause's or a wait's end, a sweep's next step): s, as
+        its clock has it; inf: not before something else happens."""
+        return self._until if self.busy and self._waiting in ("pause", "wait") else math.inf
 
     def _ops_current(self) -> float:
         for op in reversed(self._ops):
@@ -3655,7 +4741,9 @@ class Runner:
     def _next(self):
         if not self._ops:
             then, self._then = self._then, None
-            if then == "read":
+            if then == "sweep":
+                self._sweep_step()
+            elif then == "read":
                 self._expect_reading()
             elif then == "restored":
                 self.restored = not self.trouble and not self._keep
@@ -3668,6 +4756,11 @@ class Runner:
         if op[0] == "pause":
             self._waiting, self._until = "pause", self.now + op[1]
             return
+        if op[0] == "until":  # (a sweep's pace: its next write no sooner than then)
+            if self.now < op[1]:
+                self._waiting, self._until = "pause", op[1]
+                return
+            op = self._ops.popleft()
         why = self._refusal(op)
         if why:
             self._ops.clear()
@@ -3695,10 +4788,17 @@ class Runner:
             self.journal.pop(op[1], None)
             self._unsure = None
 
+    def _told(self):
+        if self.clock is not None:
+            self.now = max(self.now, self.clock())
+
     def _acked(self, tok: int, op, result):
         if tok != self._token or not self.busy:
             return
+        self._told()
         kind = op[0]
+        if kind in ("current", "offset") and self.now > self._since:
+            self._lat = self.now - self._since if not self._lat else 0.8 * self._lat + 0.2 * (self.now - self._since)
         if kind == "set" and op[1] == self._unsure:
             self._unsure = None
         if kind == "current":
@@ -3709,6 +4809,10 @@ class Runner:
             self._dirty = True
             self._written_at = self.now
         self._waiting = None
+        if self._sweep is not None and kind == "get" and self.state == "running":  # (read on a sweep's way)
+            self._sweep_seen(Sample(self.now, self.i_written, self.v_written, values=result))
+            if self.state != "running":  # (its watch failed: things are being put back)
+                return
         if self.state == "stopping":  # the operation on its way has landed: now put things back
             self._restore()
         elif self._then == "answer" and not self._ops:
@@ -3720,6 +4824,7 @@ class Runner:
     def _write_failed(self, tok: int, op, exc: Exception):
         if tok != self._token or not self.busy:
             return
+        self._told()
         self._waiting = None
         if self.state == "restoring":
             if op[0] == "set":  # one setting could not be put back: say so (and why), put back the rest
@@ -3748,21 +4853,37 @@ class Runner:
         self._invalid = 0
 
     # ------------------------------------------------------------------ inputs
-    def on_reading(self, t: float, e: float):
+    def on_reading(self, t: float, e: float, q: float | None = None):
+        """A reading of the laser: e MHz from its target (NaN: no valid one); q: what is left of its fringes on the
+        wavemeter (keep.Fringes), if that is watched."""
         self.now = max(self.now, t)
         if t > self._heard:
             self._gaps.append(t - self._heard)
         self._heard = max(self._heard, t)
-        if self._waiting == "read":
+        self.rec.fringes = q
+        sweep = self._sweep
+        if sweep is not None and not sweep["resting"] and self.state == "running":  # (on a sweep's way: as it comes)
+            self._sweep_seen(Sample(t, self.i_written, self.v_written, e, q=q))
+        elif self._waiting == "read":
             if self._skip > 0:
                 self._skip -= 1
                 return
+            if sweep is not None and t < self._written_at + min(max(self._gap(), self.REST[0]), self.REST[1]):
+                return  # (a sweep just over: this one may have been read before it was there)
             if not math.isfinite(e) and self._invalid < self.INVALID:
                 self._invalid += 1
                 return
-            self._waiting, self._dirty = None, False
-            self._send((t, e))
+            self._read(t, e)
         self.tick(t)
+
+    def _read(self, t: float, e: float):
+        """The reading waited for (e NaN: none to be had): to the procedure, or the last of a sweep's, at rest."""
+        self._waiting, self._dirty = None, False
+        if self._sweep is not None:
+            self._sweep["samples"].append(Sample(t, self.i_written, self.v_written, e, rest=True))
+            self._sweep_done()
+        else:
+            self._send((t, e))
 
     def tick(self, now: float):
         self.now = max(self.now, now)
@@ -3783,8 +4904,7 @@ class Runner:
                 now - max(self._since, self._heard) > self._quiet():
             # nothing new from the wavemeter (a laser that does not lase gives it no signal, the same each time,
             # which is not passed on): handed on as no valid reading, for the procedure to ask whether it lases
-            self._waiting, self._dirty = None, False
-            self._send((now, math.nan))
+            self._read(now, math.nan)
         elif self.state == "running" and self._waiting == "read" and now - self._since > self.READ_TIMEOUT:
             self._fail("no valid readings")
         elif self.state == "running" and now > self.deadline:
@@ -3809,6 +4929,7 @@ class Runner:
     def confirm(self):
         """Step by step: the user says go on."""
         if self.state == "running" and self._waiting == "confirm":
+            self._told()
             self.deadline += self.now - self._since  # waiting for the user does not count
             self._waiting, self.prompt = None, ""
             self._send(True)
@@ -3824,6 +4945,9 @@ class Runner:
         self.error, self._keep = why, keep
         self.prompt = ""
         self._ops.clear()
+        self._sweep = None
+        if self._waiting == "pause":  # (between a sweep's steps, a ramp's: nothing on its way)
+            self._waiting = None
         if self._waiting == "ack":  # let the operation on its way land first, so the ramp back starts from it
             self.state = "stopping"
             return
@@ -3837,11 +4961,14 @@ class Runner:
         if not self._keep:
             r = self.rec
             pace = r.step_max / max(r.p.ramp, 0.01) if r.seed_name else 0.0
-            if r.lasing is False:  # not lasing: by way of the top, as a panic would
-                self._ramp(min(r.nominal + r.p.jump_max, r.i_top))
+            if r.lasing is False:  # not lasing: by way of the top, as a panic would (at once: STEP_MAX a write)
+                self._ramp(min(r.nominal + r.p.jump_max, r.i_top), step=STEP_MAX)
                 self._ops.append(("pause", 1.0))
             if abs(self._ops_offset() - r.V0) > 1e-9 or abs(self._ops_current() - r.I0) > 1e-9:
-                self._glide(r.I0, r.V0, pace)
+                if r.back_pace > 0:  # (a keeping: its locks are on: back as slowly as it came, so that they follow)
+                    self._glide(r.I0, r.V0, r.back_pace, every=True)
+                else:
+                    self._glide(r.I0, r.V0, pace)
         if not self._ops:
             self.restored = not self._keep
             self._end("failed")
@@ -3862,13 +4989,18 @@ class Runner:
 # ---------------------------------------------------------------------- guard
 class Guard:
     """Decides that a laser has hopped: it was on target (within tolerance) for SETTLED
-    readings, then is off by more than the tolerance for `grace` seconds and two readings.
+    readings, then is off by more than the tolerance for `grace` seconds and two readings; or
+    at once, without the wait, where the readings leave no doubt: QUICK of them in a row as far
+    off as a mode is from the next (`jump`), all in one place (within SAME of each other): no
+    glitch of the wavemeter's does that, and no lock comes back from there by itself.
 
     For a laser locked to a cavity by its DLC pro, `track` follows the wavemeter's slow drift
     while the laser is on target, so the target moves with the wavemeter's frame."""
 
     SETTLED = 5
     TRACK_S = 600.0
+    QUICK = 3      # readings in a row, a mode off and in one place, that are a hop without the grace
+    SAME = 50.0    # MHz: ...within this of each other
 
     def __init__(self):
         self.recent = deque()  # start times of recent recoveries
@@ -3880,10 +5012,13 @@ class Guard:
         self.armed = False
         self.off_since = None
         self.off_count = 0
+        self.off_last = deque(maxlen=self.QUICK)  # MHz: its last readings off target, in a row
+        self.quick = False     # the hop it last said was by those (not waited out: was it a hand? the engine asks)
         self._t = None
 
-    def update(self, t: float, e: float, tol: float, grace: float, track: bool = False) -> bool:
-        """One reading, e = deviation from the target in MHz (before tracking). True: a hop."""
+    def update(self, t: float, e: float, tol: float, grace: float, track: bool = False, jump: float = 0.0) -> bool:
+        """One reading, e = deviation from the target in MHz (before tracking). True: a hop. jump: MHz; as far off
+        as that, QUICK readings in a row in one place are a hop at once (0: only after the grace)."""
         if not math.isfinite(e):
             return False
         dt = 0.0 if self._t is None else max(t - self._t, 0.0)
@@ -3892,6 +5027,7 @@ class Guard:
         if abs(e) <= tol:
             self.on_target += 1
             self.off_since, self.off_count = None, 0
+            self.off_last.clear()
             if self.on_target >= self.SETTLED:
                 self.armed = True
                 if track:
@@ -3903,7 +5039,13 @@ class Guard:
         if self.off_since is None:
             self.off_since = t
         self.off_count += 1
-        return self.off_count >= 2 and t - self.off_since >= grace
+        self.off_last.append(e)
+        if self.off_count >= 2 and t - self.off_since >= grace:
+            self.quick = False
+            return True
+        self.quick = (jump > 0 and len(self.off_last) >= self.QUICK and min(abs(x) for x in self.off_last) >= jump
+                      and max(self.off_last) - min(self.off_last) <= self.SAME)
+        return self.quick
 
     def pause(self):
         """No readings for a while (its channel switched off): the next is not taken for a long step in time.

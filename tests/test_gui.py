@@ -236,6 +236,34 @@ def test_hop_dialog_round_trip(app):
                           confirm=True, falc_max=0.02, peak_tol=40.0, lock_min=0.3)  # measured values forgotten
 
 
+def test_hop_dialog_keeping_its_mode_and_ramped_sweeps(app):
+    from wmlock.engine import Channel
+    from wmlock.modehop import HopParams
+
+    ch = Channel(5, {"link": {"device": "192.168.1.30", "laser": 1}, "hop": {"enabled": True}})
+    d = gui.HopDialog(None, ch)
+    assert not d.keep.isChecked() and d.keep_dip.value() == 2.0 and d.keep_back.value() == 0.05  # (as they come:
+    assert d.smooth.isChecked() and d.fine.value() == 0.02 and d.fine_v.value() == 0.1         # not kept, ramped)
+    assert d.params() == HopParams(enabled=True)
+    d.keep.setChecked(True)
+    assert "begins to lase as well" in d.keep.toolTip() and "fringes on the wavemeter fade" in d.keep.toolTip()
+    assert "step" in d.smooth.toolTip()
+    d.keep_dip.setValue(3.5)
+    d.keep_back.setValue(0.03)
+    d.fine.setValue(0.01)
+    d.fine_v.setValue(0.05)
+    p = d.params()
+    assert (p.keep, p.keep_dip, p.keep_back, p.smooth, p.fine, p.fine_v) == (True, 0.035, 0.03, True, 0.01, 0.05)
+    d.keep.setChecked(False)
+    d.smooth.setChecked(False)
+    p = d.params()
+    assert not p.keep and not p.smooth
+    assert HopParams.from_dict(p.to_dict()) == p  # (kept in the settings file)
+    ch = Channel(5, {"hop": {"enabled": True, "keep": True, "keep_dip": 0.05, "smooth": False, "fine": 0.2}})
+    d = gui.HopDialog(None, ch)
+    assert d.keep.isChecked() and d.keep_dip.value() == 5.0 and not d.smooth.isChecked() and d.fine.value() == 0.2
+
+
 def test_hop_dialog_fits_the_screen_with_ok_and_cancel_in_view(app):
     from wmlock.engine import Channel
     from wmlock.qt import Qt, QtGui

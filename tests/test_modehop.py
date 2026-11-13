@@ -9,12 +9,25 @@ import re
 
 import pytest
 
+from dataclasses import dataclass
+
+from wmlock import modehop
 from wmlock.dlcpro import DecopError, DLCPro, lock_points
-from wmlock.modehop import (BUSY_TRIES, COMMANDS, FALC_OFFSET, STEP_MAX, WRITABLE, Failed, Guard, HopParams, Move,
-                            Point, Read, Recenter, Runner, Set, _steps, analyse, perform)
+from wmlock.modehop import (BUSY_TRIES, COMMANDS, FALC_OFFSET, STEP_MAX, WRITABLE, Failed, Guard, Move, Point, Read,
+                            Recenter, Runner, Set, _steps, analyse, perform)
 from wmlock.sim import ECDL, CommandError, FakeDLCPro, SimLocked
 
 I0, V0 = 150.0, 70.0
+
+
+@dataclass
+class HopParams(modehop.HopParams):
+    """The settings these tests are written for: a step at a time, a reading after each (smooth off), a move's
+    writes as large as they may be (STEP_MAX, the piezo's whole), as before the sweeps were ramped; the ramped ones
+    have tests of their own (test_sweep.py)."""
+    smooth: "bool" = False
+    fine: "float" = STEP_MAX
+    fine_v: "float" = 0.0
 
 
 class Loopback(DLCPro):
