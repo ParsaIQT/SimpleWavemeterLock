@@ -207,11 +207,13 @@ class HopParams:
     keep_dip: float = 0.02    # ...begun once the signal has dipped this much below what it is as it should be...
     keep_back: float = 0.05   # ...and taken this many mA further than where it is back up
     step: float = 0.1         # mA between readings while mapping, and of a trim
-    smooth: bool = True       # its sweeps ramped steadily, read on the way (Sweep: each reading with the current it
-    #                           was read at, the ramp stopped the moment they are not as expected); False: a step at a
-    #                           time, a reading after each has settled (as before)
-    fine: float = 0.02        # mA: the most the current changes in one write (every move: in steps this small, a
-    #                           write after another; STEP_MAX at the very most)
+    smooth: bool = False      # its sweeps ramped steadily, read on the way (Sweep: each reading with the current it
+    #                           was read at, the ramp stopped the moment they are not as expected), every move in
+    #                           writes of fine (fine_v) at most; False: a step at a time, a reading after each has
+    #                           settled, every move in writes of STEP_MAX at most (the piezo's whole), as before
+    #                           (off as it comes: tried on one laser first)
+    fine: float = 0.02        # mA, ramped (smooth): the most the current changes in one write (every move: in steps
+    #                           this small, a write after another; STEP_MAX at the very most)
     fine_v: float = 0.1       # V: the same of the piezo
     margin: float = 0.5       # mA: wanted distance from a hop, both ways (the map checks it)
     tolerance: float = 100.0  # MHz: further than this from the target is off target (locked to a cavity: peak_tol)...
@@ -914,10 +916,10 @@ class Recenter(CavitySteps):
         #                                     locks are on, and follow; 0: at once)
         self.fringes = None                 # what is left of its fringes on the wavemeter, at its last reading (the
         #                                     Runner's, if that is watched)
-        fine = min(max(p.fine, 1e-4), STEP_MAX) if p.fine > 0 else STEP_MAX
+        fine = min(max(p.fine, 1e-4), STEP_MAX) if p.smooth and p.fine > 0 else STEP_MAX
         self.step_max = min(self.UP_STEP, fine) if self.upkeeping else fine  # mA: the most the Runner moves the
-        #                                     current a write
-        self.v_fine = max(p.fine_v, 1e-3) if p.fine_v > 0 else math.inf  # V: ...and the piezo
+        #                                     current a write (by steps: STEP_MAX, as before the ramps)
+        self.v_fine = max(p.fine_v, 1e-3) if p.smooth and p.fine_v > 0 else math.inf  # V: ...and the piezo
         self.gap = 0.0                      # s between the wavemeter's readings of it, as its sweeps saw it (0: not yet)
         self.back_at = ""                   # by its model: back where it was on target, come to sweeping this way
         self.short_at = None                # by its model: (mA measured, its turning point or None) of the short way

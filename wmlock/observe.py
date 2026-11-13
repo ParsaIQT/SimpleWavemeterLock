@@ -3,12 +3,14 @@ observation begins until it ends, every time the laser was not locked, as [unix 
 
   its lock dropouts   a laser its DLC pro locks to a cavity: its dropout monitor's (dropouts.py), of a few ms on
   its unlocks         its state anything but 'on' (locked; a laser its DLC pro locks: watched): unlocked, locking,
-                      being recovered, being mapped
+                      being recovered, being mapped (its upkeep, its mode being kept, its locks left on: locked while
+                      they hold, Channel.reported)
   off target          if asked (mhz): its readings further than that from its setpoint, from the first such reading
                       to the first back within
 
 One still going on when the observation ends lasts until then; one that began before it began, from when it began.
-Overlapping ones are one. The engine feeds it (Engine.observe): state() at each change of the channel's state,
+Overlapping ones are one. The engine feeds it (Engine.observe): state() at each change of the channel's state as
+reported (not each on the way: an upkeep that ends locked is not off for a moment in between),
 reading() at each reading, drop() at each dropout its monitor reads (a few seconds' worth at a time: after the end, the
 observation waits for those up to its end).
 """

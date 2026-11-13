@@ -649,6 +649,77 @@ def test_drifting_towards_its_hop_it_hops_left_alone_and_does_not_kept(kind, see
     #                                                       went on; within what counts as off target at the worst)
 
 
+# ------------------------------------------------------------ as it is told
+def test_its_upkeep_and_its_mode_kept_are_locked_as_told_while_its_locks_hold():
+    """An upkeep, a keeping: not a recovery. Its locks are left on, and while they hold (as polled) it is told locked:
+    its row (and so ARTIQ's is_ok and is_locked, another PC's), its observers, a PLL's slave whose master it is. Its
+    lock lost meanwhile: not locked from then on. Over and locked: its observers are never told it was off for a
+    moment on the way (Engine._recovery_done goes by way of off); over and not locked: from when it went off."""
+    import time
+    import types
+
+    from wmlock import view
+    from wmlock.engine import Channel, Engine
+    from wmlock.observe import Observation
+
+    ch = Channel(5, {"hop": {"enabled": True, "cavity": True}})
+    ch.state, ch.cavity_on, ch.cavity_txt = "on", True, "Locked"
+    o = Observation(5, "t", 0.0, ch.reported, ch.state_t)
+    ch.observers.append(o)
+    ch.upkeeping = True
+    ch.state = "recovering"
+    assert ch.kept_on and ch.reported == "on" and o.unlocked is None and Engine.holds_of(ch) == (True, "")
+    e = types.SimpleNamespace(channels={5: ch}, reference=None, holds_of=Engine.holds_of)
+    v = view.row(e, 5, time.monotonic())
+    assert v["state"] == "on" and v["holds"] is True and v["info_c"] == "warn"  # (its info: what goes on)
+    ch.lasing = False  # (what would be wrong with a laser locked: said, so that is_ok says it)
+    v = view.row(e, 5, time.monotonic())
+    assert v["state"] == "on" and v["info"].startswith("NOT LASING · ") and v["info_c"] == "err"
+    ch.lasing = None
+    with ch.quiet():  # (as _recovery_done has it: off, then on again)
+        ch.state = "off"
+        ch.upkeeping = False
+        ch.state = "on"
+    assert o.unlocked is None and o.times == []
+    # its lock lost during one: told at once (its DLC pro's poll), unlocked until it is locked again
+    ch.upkeeping = True
+    ch.state = "recovering"
+    ch.cavity_txt = "Unlocked"
+    ch.tell()
+    assert ch.reported == "recovering" and o.unlocked is not None and Engine.holds_of(ch)[0] is False
+    assert view.row(e, 5, time.monotonic())["state"] == "recovering"
+    with ch.quiet():
+        ch.state = "off"
+        ch.upkeeping = False
+        ch.state = "recovering"  # (relocked: a recovery)
+    assert o.unlocked is not None
+    ch.cavity_txt = "Locked"
+    ch.state = "on"
+    assert o.unlocked is None and len(o.times) == 1
+    # one that ends with it not locked (stopped): from when it went off, not from when that settled
+    ch.upkeeping = True
+    ch.state = "recovering"
+    with ch.quiet():
+        ch.state = "off"
+        t_off = ch.state_t
+        ch.upkeeping = False
+        time.sleep(0.01)
+    assert o.unlocked == t_off and ch.told == "off"
+    # a recovery is not locked, whatever its locks say; nor is a keeping whose wavemeter lock is off
+    ch.state = "recovering"
+    assert ch.reported == "recovering"
+    w = Channel(6, {"hop": {"enabled": True}})
+    w.state, w.upkeeping, w.keep_locked = "recovering", True, True
+    assert w.reported == "recovering"
+    w.lock.active = True
+    assert w.reported == "on"
+    # step by step, a keeping waiting for Continue: its row asks
+    ch.state, ch.upkeeping, ch.cavity_txt = "on", True, "Locked"
+    ch.state = "recovering"
+    ch.runner = types.SimpleNamespace(asking="the current down 0.05 mA", stage="keeping its mode")
+    assert view.row(e, 5, time.monotonic())["state"] == "asking"
+
+
 # ------------------------------------------------------------ through the engine
 @pytest.fixture
 def brisk(monkeypatch):
@@ -689,10 +760,17 @@ def test_the_engine_keeps_an_shg_laser_off_the_edge_of_its_mode(brisk):
             assert wait_for(lambda: ch.hop.shg_lock > 0 and ch.watch.signals["shg"].now() is not None, 30)
             assert e._keep_due(ch, 1e9) is None and view.keep_text(ch) == ""  # (as it should be: nothing to do)
             relocks, i0 = shg.lock.relocks, dlc.current(1)
+            assert e.observe(demo.SHG, "kept") == ""  # (ARTIQ's observe: its lock, from now on)
+            o, d0 = e.observations["kept"], ch.drops_total
             into_its_zone(shg, 0.25)
             assert 0.05 < second_mode(shg) < 0.2
+            assert wait_for(lambda: ch.keeping is not None and ch.runner is not None, 40)
+            import time
+            v = view.row(e, demo.SHG, time.monotonic())  # (locked all the while, as told: is_ok goes by its row)
+            assert v["state"] == "on" and v["holds"] is True and o.unlocked is None
             assert wait_for(lambda: ch.keep_said.startswith("kept off the edge of its mode"), 40), ch.keep_said
             assert wait_for(lambda: ch.state == "on" and ch.runner is None, 5)
+            assert o.unlocked is None and len(o.times) == ch.drops_total - d0  # (never told it was unlocked)
             assert second_mode(shg) == 0.0 and shg.lock.locked() and shg.lock.relocks == relocks  # (never unlocked)
             assert 0.03 < abs(dlc.current(1) - i0) < 0.6 and ch.message == ""
             assert ch.note.startswith("its SHG signal dipping") and "kept off the edge of its mode" in ch.note
@@ -707,7 +785,6 @@ def test_the_engine_keeps_an_shg_laser_off_the_edge_of_its_mode(brisk):
             e.set_hop_params(demo.SHG, p)
             said = ch.keep_said
             into_its_zone(shg, 0.25)
-            import time
             time.sleep(6.0)
             assert ch.keep_said == said and second_mode(shg) > 0.05 and ch.state == "on"
         finally:
@@ -815,11 +892,15 @@ def test_asked_to_unlock_while_its_mode_is_kept_it_is_unlocked_once_that_has_sto
             e.engage(1)
             assert wait_for(lambda: ch.state == "on" and ch.guard.armed, 5)
             assert wait_for(lambda: ch.fringes is not None and ch.watch.signals["fringes"].now() is not None, 40)
+            assert e.observe(1, "kept") == ""
+            o = e.observations["kept"]
             into_its_zone(las, 0.3)
             assert wait_for(lambda: ch.keeping is not None and ch.runner is not None and ch.keep_locked, 60)
+            assert ch.reported == "on" and o.unlocked is None  # (its wavemeter lock holds it meanwhile: locked)
             e.on_active([2, 3, 4, 5, 6, 7])  # (its 'Use' unticked for good in the WLM software)
             assert wait_for(lambda: ch.runner is None, 30)
             assert ch.state == "off" and not ch.lock.active and ch.message == "unlocked: channel no longer measured"
+            assert o.unlocked is not None  # (its observers: unlocked from then on)
             assert ch.note.startswith("its mode not kept: unlocked: channel no longer measured")
             assert not ch.keep_locked and ch.keeping is None and ch.unlock_why is None
         finally:

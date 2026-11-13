@@ -16,7 +16,7 @@ from test_modehop import Bench  # noqa: E402
 
 from wmlock import lasermodel as lm  # noqa: E402
 from wmlock.engine import Channel, Engine  # noqa: E402
-from wmlock.modehop import STEP_MAX, HopParams, Recenter  # noqa: E402
+from wmlock.modehop import HopParams, Recenter  # noqa: E402
 from wmlock.modelhop import AVOID_V, WINDOW_IN, Planner, _apply, _grid  # noqa: E402
 from wmlock.sim import ModelLaser  # noqa: E402
 
@@ -99,10 +99,10 @@ def hopped(model: lm.LaserModel, seed: int, true=None, bench_of=None):
 
 
 def recover(model: lm.LaserModel, seed: int, true=None, given=None, smooth=True):
-    """smooth False: by steps, a reading after each (HopParams.smooth off, its writes whole steps), as it was."""
+    """smooth: ramped (HopParams.smooth), its model's short way tried first; False: by steps, a reading after each,
+    its writes whole steps (as it comes, and as it was)."""
     bench, laser, p, (i_nom, v_nom, target) = hopped(model, seed, true)
-    if not smooth:
-        p.smooth, p.fine, p.fine_v = False, STEP_MAX, 0.0
+    p.smooth = smooth
     hop = (laser.freq(v_nom, i_nom) - target) * 1e3
     rec = Recenter(p, i_nom, v_nom, i_nom - 1.0, i_nom + 2.0, v_nom - 25.0, v_nom + 25.0, ref=(v_nom, i_nom),
                    model=model if given is None else given, target=target)

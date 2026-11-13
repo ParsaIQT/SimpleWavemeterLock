@@ -1,4 +1,5 @@
-"""Ramps instead of steps (modehop.Sweep, HopParams.smooth, fine, fine_v), on the simulated laser in simulated time
+"""Ramps instead of steps (modehop.Sweep, HopParams.smooth, fine, fine_v: ticked here, off as they come), on the
+simulated laser in simulated time
 (trials.Rig: an operation on the controller takes its 2 ms, the wavemeter reads every dt, the runner is woken for each
 step of a ramp as the engine's ticker wakes it): what a Sweep is, what the recoveries make of it (faster than a step
 and a reading, the same safety rules), and a hop seen at once by where the readings are (Guard's jump)."""
@@ -37,7 +38,7 @@ def bench(dt=0.1, p=None, ff=None, **kw):
     if ff is not None:
         rig.dlc.params["laser1:dl:cc:feedforward-enabled"] = True
         rig.dlc.params["laser1:dl:cc:feedforward-factor"] = ff
-    return rig, p or HopParams(enabled=True, i_nom=I0)
+    return rig, p or HopParams(enabled=True, i_nom=I0, smooth=True)
 
 
 def run(rig, p, steps, lo=I0 - 2.0, hi=I0 + 2.0, v=10.0):
@@ -99,7 +100,8 @@ def test_a_sweep_paced_by_the_readings_has_one_every_so_many_mA():
     assert statistics.median(gaps) == pytest.approx(0.1, abs=0.021)
     # the wavemeter slower than a sweep may wait for: no slower than RATE's least; faster: no faster than its most
     slow, _ = bench(dt=20.0)
-    slow_r = Runner(Script(lambda rec: iter(()), HopParams(enabled=True, i_nom=I0), I0, V0, I0 - 2, I0 + 2, 60, 80),
+    slow_r = Runner(Script(lambda rec: iter(()), HopParams(enabled=True, i_nom=I0, smooth=True), I0, V0, I0 - 2,
+                           I0 + 2, 60, 80),
                     slow, 0.0)
     slow_r._gaps.extend([20.0] * 5)
     slow_r._sweep_begin(Sweep(current=I0 + 1.0, per=0.1))
@@ -197,8 +199,11 @@ def test_a_move_is_written_in_fine_steps_too_and_as_it_was_with_fine_as_large_as
     rig, p = bench(p=HopParams(enabled=True, i_nom=I0, smooth=False, fine=STEP_MAX, fine_v=0.0))
     r, _ = run(rig, p, steps)  # (as before: 0.2 mA a write, the piezo at once)
     assert r.state == "done" and len(writes(rig)) == 3 and writes(rig, OFFSET) == [V0 + 1.0]
-    rig, p = bench(p=HopParams(enabled=True, i_nom=I0, fine=5.0))  # (never more than STEP_MAX, whatever is asked)
+    rig, p = bench(p=HopParams(enabled=True, i_nom=I0))  # (as it comes: by steps, whatever fine and fine_v say)
     r, _ = run(rig, p, steps)
+    assert r.state == "done" and len(writes(rig)) == 3 and writes(rig, OFFSET) == [V0 + 1.0]
+    rig, p = bench(p=HopParams(enabled=True, i_nom=I0, smooth=True, fine=5.0))  # (never more than STEP_MAX,
+    r, _ = run(rig, p, steps)                                                     # whatever is asked)
     assert r.state == "done" and max(steps_of(I0, writes(rig))) <= STEP_MAX + 1e-9
 
 
@@ -246,7 +251,7 @@ def safe(case, rig):
 def test_a_map_ramped_recovers_what_a_map_by_steps_does_in_less_time(seed):
     """The far lasers (a DL pro with the wavemeter alone): mapped by ramps, on target on a mode that holds, as mapped
     a step and a reading at a time, in about two thirds of the time."""
-    ramped, stepped = make_case("far", seed), make_case("far", seed, smooth=False, fine=STEP_MAX, fine_v=0.0)
+    ramped, stepped = make_case("far", seed, smooth=True), make_case("far", seed)
     a, b = recover(ramped), recover(stepped)
     assert a.on_target and b.on_target, (a.error, b.error)
     assert a.margin >= min(0.3, 0.8 * b.margin) and a.second == 0.0
@@ -262,8 +267,8 @@ def test_ramped_and_by_steps_do_about_as_well_over_random_lasers():
     """A small Monte Carlo (trials.py runs the large one): every laser that can be recovered is, either way; ramped,
     the median recovery is the shorter by a third at least."""
     seeds = range(20, 32)
-    a = [recover(make_case("far", s)) for s in seeds]
-    b = [recover(make_case("far", s, smooth=False, fine=STEP_MAX, fine_v=0.0)) for s in seeds]
+    a = [recover(make_case("far", s, smooth=True)) for s in seeds]
+    b = [recover(make_case("far", s)) for s in seeds]
     can = [k for k, o in enumerate(a) if o.feasible]
     assert len(can) >= 8 and all(a[k].on_target for k in can) and all(b[k].on_target for k in can)
     ta, tb = (statistics.median(o[k].seconds for k in can) for o in (a, b))
@@ -273,7 +278,7 @@ def test_ramped_and_by_steps_do_about_as_well_over_random_lasers():
 
 @pytest.mark.parametrize("kind,seed", [("near", 1), ("near", 4), ("shg", 2), ("strong", 5), ("strong", 8)])
 def test_the_other_lasers_come_back_ramped(kind, seed):
-    case = make_case(kind, seed)
+    case = make_case(kind, seed, smooth=True)
     assert case.feasible
     o = recover(case)
     assert o.on_target, o.error
@@ -285,14 +290,14 @@ ALLOWED = {CURRENT, OFFSET} | {"laser1:" + name for name in modehop.WRITABLE}
 
 @pytest.mark.parametrize("kind,n", [("far", 40), ("strong", 40), ("near", 24), ("shg", 24)])
 def test_monte_carlo_ramped_every_write_keeps_the_safety_rules(kind, n):
-    """As test_modehop's Monte Carlos (which run a step at a time), with the settings as they come: ramped, written
-    in fine steps, on the rig's clock. Every laser that can be recovered is (the walk's: all but one in twenty), and
+    """As test_modehop's Monte Carlos (which run a step at a time, as it comes), ramped: written in fine steps, on
+    the rig's clock. Every laser that can be recovered is (the walk's: all but one in twenty), and
     on every write: the current within its window (the catch's reset: up to where a laser not lasing may go), no
     write of it further than HopParams.fine from the last (none of these lasers stops lasing: no jump), nothing
     written that is not allowed."""
     done = can = 0
     for seed in range(200, 200 + n):
-        case = make_case(kind, seed)
+        case = make_case(kind, seed, smooth=True)
         rig, p = case.rig, case.p
         o = recover(case)
         can += case.feasible
@@ -320,7 +325,7 @@ def test_readings_that_come_late_and_a_controller_that_takes_its_time(latency, o
     steps are as fine as the controller's pace allows)."""
     outs = []
     for seed in range(3, 17):
-        case = make_case("far", seed)
+        case = make_case("far", seed, smooth=True)
         if case.feasible:
             case.rig.latency, case.rig.op_s = latency, op
             outs.append(recover(case))
@@ -536,7 +541,7 @@ def test_a_laser_that_stops_lasing_is_jumped_in_as_few_writes_as_ever_whatever_i
             time.sleep(0.02)
             return execute(cmd)
 
-        e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True))
+        e, ch = hop_engine(demo, demo.SHG, dlc.key, 1, dict(enabled=True, cavity=True, shg=True, smooth=True))
         try:
             e.engage(demo.SHG)
             assert wait_for(lambda: ch.guard.armed and ch.seed_name == "amp:pd:seed:power" and ch.hop.seed_ok, 8)

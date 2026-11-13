@@ -607,7 +607,8 @@ class Api:
     def is_ok(self, *lasers, mhz=OK_MHZ) -> tuple:
         """(True, '') if every laser named is fine to run with: locked (a laser its DLC pro locks: watched, its cavity
         lock holding), its reading of the last 3 s within mhz (MHz) of its setpoint, lasing, neither being recovered
-        nor mapped; else (False, what is wrong, laser by laser). Before an oven run, say: is_ok('399', '935')."""
+        nor mapped (its upkeep, its mode being kept: locked, its locks left on, while they hold); else (False, what
+        is wrong, laser by laser). Before an oven run, say: is_ok('399', '935')."""
         names = []
         for x in lasers:
             names += list(x) if isinstance(x, (list, tuple, set)) else [x]
