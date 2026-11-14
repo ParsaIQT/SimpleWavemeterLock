@@ -48,7 +48,8 @@ Things to weigh:
   - the piezo within its window;
   - everything put back on failure.
 - The existing methods, their settings and their defaults stay as they are. Nothing changes for a laser
-  that has not chosen the new method.
+  that has not chosen the new method. One exception, from round 2 below: the margin test may change for
+  every method.
 - No lab data, IP addresses or credentials in the repository.
 - Keep the test suite passing (`pytest tests`; the GUI tests need Qt, and the model tests need scipy).
   Add tests of your own: the new method run through the trials' rig on many random lasers, with its
@@ -82,3 +83,52 @@ table in the README.
 - Don't open pull requests.
 - Keep a short log in this folder (`LOG.md`) of what you tried and how it did, including what didn't
   work.
+
+## Round 2: what the first tests on the 493 nm laser showed
+
+On 14 November the learned method was tried on the real 493 nm laser. The policy had two real goes and
+neither brought the laser back:
+
+- The first three recoveries ran on the old method, because the policy was still being trained in the
+  background (several minutes on the lab PC).
+- In its first go, the policy took the current to the top of its window and judged the laser to be on its
+  right mode, 3.3 GHz off. The piezo could not bring it onto the target, and the old method took over.
+- In its second go, it found no manoeuvre with a chance within the window. The old method then brought
+  the laser back in 15 s, to a spot the person had just found by hand.
+
+Before these tests, the person changed the laser's temperature, because it was running on two modes at
+its set point. Its model was fitted on 25 October, at the old temperature, so it no longer describes the
+laser. The lab will map it again at the new temperature.
+
+### To fix
+
+- **The margin test destroys good spots.** The old method, which is also the learned method's fallback,
+  put the laser on its right mode near the target 14 times that morning. Each time, the margin test (at
+  least 0.15 mA, hard-coded) pushed the current over the mode's edge. Because of hysteresis, the laser did
+  not come back, and the spot was given up. Make the test non-destructive: when it knocks the laser off a
+  spot that was on target, bring it back the way it came in, and move away from the edge it found. If
+  nowhere has the full margin, settle on target at the best spot found and say so, rather than leave the
+  laser unlocked. This may change for every method.
+- **The memory counted a failure as a success.** Reaching what the model calls the right mode is not
+  success: count a manoeuvre as good only if it ends with the laser on target.
+- **A recapture by hand was not learned from.** It ended on target, but the model judged its end point
+  not to be the right mode, so it was not taken into the memory. On target is the right mode: trust the
+  wavemeter over the model.
+- **Training takes too long.** Recoveries in the meantime used the old method. Make it faster, or train
+  ahead of time (when a model is taken, say).
+- **The window got in the way.** Both of the policy's goes ran into the current window's limits.
+
+### New: temperature as a slow knob
+
+What fixed the laser by hand was its temperature. Temperature moves the diode's modes relative to the
+external cavity, and that decides how wide the right mode's range is at the target. Allow the recovery,
+and the keeping, to change it:
+
+- It is slow: the diode takes seconds to tens of seconds to settle after a step. So it can't be the fast
+  recapture. Use it as a second stage: recapture with current and piezo first, then, locked on target,
+  move the temperature in small steps until the operating point sits in the middle of its mode, so that
+  the next hop is days away rather than minutes. The keeping could use it the same way.
+- The model must know what temperature does. That needs a map with temperature steps, which
+  *Laser map…* can already make. The simulator already models the temperature controller.
+- Rules: off unless chosen for a laser; the temperature only within a small window around where it was
+  set, and in small, slow steps, settled before anything else moves; put back on failure.
