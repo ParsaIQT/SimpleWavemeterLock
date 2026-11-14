@@ -2454,6 +2454,79 @@ def test_too_little_of_the_right_mode_in_the_window_has_the_modes_mapped_instead
         r.result.summary
 
 
+def destructive(ds, rest=0.06):
+    """A margins' check that finds a hop nearer than wanted every time (ds: how near, in turn; then `rest`), and leaves
+    the laser off its mode, as one that goes over the edge of its mode does (the current to the window's top)."""
+    ds = list(ds)
+
+    def check(self, m, loop=0.0, seen=None):
+        self.hop_d = ds.pop(0) if ds else rest
+        self.note(f"hop within {m:.2f} mA (as this test has it: {self.hop_d:.2f} mA away)")
+        yield from self.move(current=self.i_hi)
+        return False
+
+    return check
+
+
+def test_nowhere_holding_the_margins_it_settles_on_target_where_it_came_furthest_from_a_hop(monkeypatch):
+    """The 493 nm laser at a new temperature: wherever it is put on target, its margins' check finds a hop nearer than
+    wanted, and throws it off its mode. Rather than give up and leave it off target, it goes back to the spot that came
+    furthest from a hop, the way it came to it then (the current round by the far end of the window and swept that
+    way: with hysteresis, setting it back is not enough), and leaves it on target there, saying so."""
+    laser, target = hopped_laser()
+    monkeypatch.setattr(Recenter, "check", destructive([0.08, 0.12, 0.1]))
+    b, rec, r = recover(laser, target, quick=False)
+    assert r.state == "done", r.error
+    assert laser.m == 0 and abs(b.off_mhz()) < 5  # (its right mode, on target)
+    assert len(rec.spots) >= 2 and rec.settled["d"] == max(sp["d"] for sp in rec.spots)
+    assert rec.record["settled"]["how"].startswith("parked at") and rec.maps == Recenter.MAX_MAPS
+    assert r.result.summary.startswith("on target where it came furthest from a hop"), r.result.summary
+    assert any(n.startswith("nowhere held the margins wanted: settled for") for n in rec.notes)
+
+
+def test_a_hop_too_near_wherever_it_was_on_target_and_it_fails_as_it_did(monkeypatch):
+    """A hop nearer than SETTLE_MIN wherever it was on target: nothing worth settling for; it fails (put back), as
+    ever."""
+    laser, target = hopped_laser()
+    monkeypatch.setattr(Recenter, "check", destructive([], rest=0.02))
+    b, rec, r = recover(laser, target, quick=False)
+    assert r.state == "failed" and "no mode that holds reaches the target" in r.error, (r.state, r.error)
+    assert not rec.spots and rec.settled is None
+
+
+class Probe(Recenter):
+    """A procedure of the test's own in a recovery's place: steps(rec) yields its requests."""
+
+    def __init__(self, steps, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.steps = steps
+
+    def run(self):
+        return (yield from self.steps(self))
+
+
+@pytest.mark.parametrize("short,d", [(0.3, 0.2), (0.1, 0.0)])
+def test_a_margins_check_that_finds_a_hop_says_how_far_it_held(short, d):
+    """On its mode `short` mA short of where it hops off going up (and far from it going down), a check of 0.4 mA in
+    steps finds the hop, and says how far up it last read the laser on its mode (its step before: 0.2 mA): the hop
+    is that far at least. Its first step off its mode already: 0."""
+    laser = ECDL(400.0, seed=1, multimode=0.0, mm_noise=0.0)
+    edge = laser.limits()[1] - short * abs(laser.ki - laser.ksi)  # (the misalignment `short` mA below the hop)
+    laser.nudge(laser.misalignment(0, V0, I0) - edge)
+    b = Bench(laser, laser.freq(V0, I0), 0.5, seed=1)
+
+    def steps(rec):
+        yield from rec.read()
+        rec.slope = laser.ki * 1e3  # MHz/mA on its mode
+        return (yield from rec.check(0.4))
+
+    rec = Probe(steps, HopParams(enabled=True, i_nom=I0, i_below=2.0), b.I, b.V, I0 - 2.0, I0 + 2.0, b.V - 25.0,
+                b.V + 25.0)
+    r = b.run(rec)
+    assert r.state == "done" and r.result is False and rec.notes[-1].startswith("hop within 0.40 mA")
+    assert rec.hop_d == pytest.approx(d, abs=1e-9)
+
+
 def test_recenter_now_puts_a_laser_on_its_mode_in_the_middle_of_it():
     """On its right mode and on target, but near the edge of the mode (where it drifted to, locked): Recenter now looks
     at where it is in the mode too, by the wavemeter, and parks it in the middle (else only the piezo would move)."""

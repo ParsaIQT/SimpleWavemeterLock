@@ -499,6 +499,11 @@ class Failed(Exception):
         self.keep = keep  # leave current and offset where they are (else put them back)
 
 
+class NoHold(Failed):
+    """Nowhere it came to holds the margins wanted (find's end): where it was on target all the same, the best of
+    those is settled for (Recenter.settle_best), else this is the recovery's failure."""
+
+
 class NotLasing(Exception):
     """The laser stopped lasing (its seed power, or its SHG sweep, says so), at this set current (None: it
     has not been seen lasing in this recovery, so where it stopped is not known)."""
@@ -760,6 +765,8 @@ class Recenter(CavitySteps):
     MAX_TUNE = 12
     RELOCK_TRIES = 3
     MIN_MARGIN = 0.15      # mA: the least distance from a hop worth having
+    SETTLE_MIN = 0.05      # mA: nowhere holding that, a spot on target with a hop this far at least is settled for
+    SETTLE_TRIES = 2       # ...the best few of them (each come back to as it was found)
     SHIFT = 0.15           # mA/V: how far a mode's current range may move per volt of piezo (rather more)
     KV_GUESS = 300.0       # MHz/V, before anything is known
     KV_PLAUSIBLE = (20.0, 3000.0)
@@ -916,6 +923,12 @@ class Recenter(CavitySteps):
         self.narrow = ""                    # ...the right mode alone over too little of the window for that (why)
         self.topped = None                  # (from, to), mA measured: on the right mode, not caught, the current
         #                                     parked at the top end of where it is at its best (park_top) all the same
+        self.hop_d = None                   # mA: its last margins' check that found a hop, how far from where it
+        #                                     began it read the laser on its mode last before (None: no telling)
+        self.spots = []                     # where it was on target, but its margins' check found a hop nearer than
+        #                                     wanted: {v, up, i, e, d, how} (keep_spot), settled for if nowhere holds
+        self.settled = None                 # ...the one settled for (settle_best)
+        self.parked_e = math.nan            # MHz: where park left it, before the piezo moved (the middle of three)
         self.upkeeping = upkeep or keep is not None  # not a recovery: the upkeep...
         self.upkept = None                  # ...(mA measured: where it began, the top of its mode, where it is left;
         #                                     back up below the top)
@@ -1454,8 +1467,12 @@ class Recenter(CavitySteps):
         while True:
             try:
                 yield from self.come_inside()
-                yield from {"walk": self.walk, "catch": self.catch_mode, "model": self.by_model,
-                            "learned": self.by_learning}.get(self.method, self.find)()
+                try:
+                    yield from {"walk": self.walk, "catch": self.catch_mode, "model": self.by_model,
+                                "learned": self.by_learning}.get(self.method, self.find)()
+                except NoHold:  # (where it was on target nearer a hop than wanted: the best of those, else this)
+                    if not (yield from self.settle_best()):
+                        raise
                 if not self.cavity and not self.shg:
                     return (yield from self.finish())
                 if (yield from self.hand_back()):
@@ -1568,7 +1585,7 @@ class Recenter(CavitySteps):
             bands = list(mapped) if k == 0 and mapped is not None else (yield from self.map())
             if not bands:
                 yield from self.go_home()
-                raise Failed(f"no mode within {lo:.2f} … {hi:.2f} mA, sweeping up or down, "
+                raise NoHold(f"no mode within {lo:.2f} … {hi:.2f} mA, sweeping up or down, "
                              + ("that the piezo can bring onto the target" if self.kv_measured else "at all")
                              + self.nearest())
             while bands:
@@ -1587,12 +1604,15 @@ class Recenter(CavitySteps):
                     break                 # it hopped while tuning: map again, here
                 if abs(self.V - band.v) > self.REMAP_V and self.maps < self.MAX_MAPS:
                     break                 # the piezo moved the modes too: map again, here
-                if ((yield from self.check(max(self.MIN_MARGIN, min(self.p.margin, 0.8 * band.margin))))
-                        and (yield from self.mode_ok())):
+                held = yield from self.check(max(self.MIN_MARGIN, min(self.p.margin, 0.8 * band.margin)))
+                if held and (yield from self.mode_ok()):
                     return
+                if not held:  # (on target there all the same: kept, in case nowhere holds the margins wanted)
+                    self.keep_spot(band.v, band.up, band.op, self.parked_e,
+                                   f"parked at {self.mA(band.op):.2f} mA sweeping {band.way}")
                 break                     # too close to a hop: map again, here
         yield from self.go_home()
-        raise Failed(f"no mode that holds reaches the target within {lo:.2f} … {hi:.2f} mA" + self.nearest())
+        raise NoHold(f"no mode that holds reaches the target within {lo:.2f} … {hi:.2f} mA" + self.nearest())
 
     # --------------------------------------------------------- by its policy
     FLY_TRIES = 3        # manoeuvres its policy may fly before the methods of old take over
@@ -2117,10 +2137,13 @@ class Recenter(CavitySteps):
                 self.note(f"{where}: {e:+.0f} MHz from the target, not on its right mode")
                 continue
             self.note(f"{where}: on its right mode, {e:+.0f} MHz from the target")
-            if ((yield from self.tune()) == "ok" and (yield from self.check(self.quick_margin()))
-                    and (yield from self.mode_ok())):
+            tuned = (yield from self.tune()) == "ok"
+            held = tuned and (yield from self.check(self.quick_margin()))
+            if held and (yield from self.mode_ok()):
                 self.back_at = way
                 return True
+            if tuned and not held:  # (on target there all the same: kept, in case nowhere holds the margins wanted)
+                self.keep_spot(v, up, i_set, e, f"back where it was on target, come to sweeping {way}")
             self.note("it does not hold there")
         return False
 
@@ -2146,6 +2169,62 @@ class Recenter(CavitySteps):
         self.kv_known = self.kv_measured = True
         self.spacing = pl.m.ext.spacing * 1e3
         self.threshold = max(HOP_MIN, 0.4 * self.spacing)
+
+    def keep_spot(self, v: float, up: bool, i: float, e: float, how: str):
+        """It was on its right mode there (come to as `how` says: the piezo at v, the current come round by the far end
+        of the window and swept up, or down, to i, set mA; e MHz from the target then, before the piezo moved) and on
+        target, but its margins' check found a hop nearer than wanted (hop_d mA away, at least): kept, to be settled
+        for if nowhere holds the margins wanted (settle_best). Nearer than SETTLE_MIN, or no telling how near: not."""
+        d = self.hop_d
+        if d is None or d < self.SETTLE_MIN or not math.isfinite(e):
+            return
+        self.spots.append({"v": v, "up": up, "i": i, "e": e, "d": d, "how": how})
+
+    def return_to(self, spot):
+        """Back to a spot kept (keep_spot) the way it was come to: the piezo there, the current round by the far end of
+        the window and swept up (or down) to it, a reading a step (its margins' check took it off its mode: with
+        hysteresis, the current set back is not enough). On the mode it was on there (read as then, within half the
+        hop threshold), the piezo onto the target: True."""
+        v, up, i = spot["v"], spot["up"], spot["i"]
+        lo, hi, _ = self.window(v)
+        if not (lo - 1e-9 <= i <= hi + 1e-9 and self.v_lo <= v <= self.v_hi):
+            return False
+        if abs(self.V - v) > 1e-6:
+            yield from self.move(offset=v, read=False)
+        yield from self.come_to(up)
+        if self.p.smooth:  # ramped steadily
+            yield from self.sweep(current=i)
+        else:
+            for x in _steps(self.i_lo if up else self.i_hi, i, self.p.step):
+                yield from self.move(current=x)
+        e = yield from self.steady()
+        if not (math.isfinite(e) and abs(e - spot["e"]) <= max(0.5 * self.threshold, 50.0)):
+            self.note(f"back at {self.mA(i):.2f} mA sweeping {'up' if up else 'down'}, but {e:+.0f} MHz from the "
+                      f"target, not {spot['e']:+.0f} MHz as it was there: not on that mode")
+            return False
+        return (yield from self.tune()) == "ok"
+
+    def settle_best(self):
+        """Nowhere it came to held the margins wanted (NoHold). Where it was on target all the same (spots: its
+        margins' check found a hop there, SETTLE_MIN away at least), the one furthest from its hop is settled for: come
+        back to as it was found (return_to), on target there, single-mode if that can be told, and left so, as by
+        hand, rather than not on target at all. It may well hop again sooner than where the margins held; recovered
+        again then. True: settled (SETTLE_TRIES spots at most tried, the furthest from a hop first)."""
+        for spot in sorted(self.spots, key=lambda x: -x["d"])[:self.SETTLE_TRIES]:
+            way = "up" if spot["up"] else "down"
+            where = f"{self.mA(spot['i'], spot['v']):.2f} mA, {spot['v']:.2f} V"
+            yield from self.ask(f"Nowhere held the margins wanted: back to {where} sweeping {way}, as it was found "
+                                f"({spot['how']}; a hop some {spot['d']:.2f} mA from there), and left on target there")
+            self.stage = f"settling for {where}, sweeping {way}: a hop some {spot['d']:.2f} mA from there"
+            if (yield from self.return_to(spot)) and (yield from self.mode_ok()):
+                self.settled = dict(spot, at=round(self.mA(self.I), 3), v_at=round(self.V, 3))
+                self.record["settled"] = {k: round(x, 3) if isinstance(x, float) else x
+                                          for k, x in self.settled.items()}
+                self.note(f"nowhere held the margins wanted: settled for {where}, come to sweeping {way} as before "
+                          f"({spot['how']}), on target there; a hop some {spot['d']:.2f} mA from it, so it may hop "
+                          f"again before long")
+                return True
+        return False
 
     def go_home(self):
         """Before giving up: back to the current it began at, the way that gives the mode it was on
@@ -2397,6 +2476,7 @@ class Recenter(CavitySteps):
         if math.isfinite(e) and abs(e - want) <= max(0.5 * self.threshold, 50.0):
             self.note(f"parked at {self.mA(band.op):.2f} mA sweeping {band.way}: {e:+.0f} MHz from the target, "
                       f"on the mode the map found there")
+            self.parked_e = e
             return True
         self.note(f"parked at {self.mA(band.op):.2f} mA sweeping {band.way}, but {e:+.0f} MHz from the target, not "
                   f"the map's {want:+.0f} MHz: it did not come back the same way")
@@ -2463,6 +2543,7 @@ class Recenter(CavitySteps):
         self.stage = "checking the margins"
         ic, ec = self.I, self.e
         lo, hi = max(ic - m, self.i_lo), min(ic + m, self.i_hi)
+        self.hop_d = None
         if self.p.smooth:
             return (yield from self.check_smooth(m, loop, seen, ic, ec, lo, hi))
         xs, es, modes = [0.0], [ec], []
@@ -2487,7 +2568,9 @@ class Recenter(CavitySteps):
         sxx = sum((x - mx) ** 2 for x in xs)
         b = sum((x - mx) * (y - me) for x, y in zip(xs, es)) / sxx if sxx > 0 else 0.0
         worst = max(abs(y - me - b * (x - mx)) for x, y in zip(xs, es))
-        if worst > max(25.0, 6.0 * self.noise, 0.15 * abs(b) * m, 1.5 * loop):
+        tol = max(25.0, 6.0 * self.noise, 0.15 * abs(b) * m, 1.5 * loop)
+        if worst > tol:
+            self.hop_d = self._hop_d(xs, es, ec, b, tol)
             self.note(f"hop within {m:.2f} mA of {self.mA(ic):.2f} mA (off the line by {worst:.0f} MHz)")
             return False
         if modes:
@@ -2514,13 +2597,14 @@ class Recenter(CavitySteps):
         late = rate * (self.LATENCY + gap)  # mA the ramp may have gone on since a reading was taken
         ahead = abs(slope) * late
         tol = max(25.0, 6.0 * self.noise, 0.15 * abs(slope) * m, 1.5 * loop, 0.5 * self.threshold) + ahead
-        modes, off, coarse = [], [0], 0.0
-        knots, pts = [], []  # where the ramp was when: (s, mA from where it began); its readings: (s, MHz)
+        modes, off, coarse, first = [], [0], 0.0, [None]
+        knots, pts, read = [], [], []  # where the ramp was when: (s, mA from where it began); its readings: (s, MHz)
 
         def hop(x: Sample) -> bool:
             if x.e is None or not math.isfinite(x.e) or abs(slope) < 20.0:
                 return False
             off[0] = off[0] + 1 if abs(x.e - ec - slope * (x.i - ic)) > tol else 0
+            first[0] = (first[0] if first[0] is not None else x.i) if off[0] else None  # (the first off it, of a run)
             return off[0] >= 2
 
         last = ic
@@ -2536,10 +2620,13 @@ class Recenter(CavitySteps):
                     knots.append((min(knots[-1][0] + abs(x.i - ic - knots[-1][1]) / rate, x.t), x.i - ic))
                 knots.append((x.t, x.i - ic))
                 pts.append((x.t, x.e))
+                read.append((x.i - ic, x.e))
                 if seen is not None:
                     seen(x.i, x.e, x.i > last if x.i != last else i > last)
                 last = x.i
             if got.stopped:
+                if first[0] is not None:  # (read off its line there first: the hop is nearer, by how late that was)
+                    self.hop_d = max(abs(first[0] - ic) - late, 0.0)
                 self.note(f"hop within {m:.2f} mA of {self.mA(ic):.2f} mA (at {self.mA(self.I):.2f} mA, "
                           f"{self.e - ec - slope * (self.I - ic):+.0f} MHz off its mode's line)")
                 return False
@@ -2572,6 +2659,8 @@ class Recenter(CavitySteps):
                           f"back (kept with the current as it was then)")
             self.record["late_s"] = round(delay, 3)
         if worst > fit:
+            d = self._hop_d([x for x, _ in read], [e for _, e in read], ec, slope, tol)
+            self.hop_d = None if d is None else max(d - late, 0.0)
             self.note(f"hop within {m:.2f} mA of {self.mA(ic):.2f} mA (off the line by {worst:.0f} MHz)")
             return False
         if modes:
@@ -2580,6 +2669,21 @@ class Recenter(CavitySteps):
         if abs(self.e) > self.tol():
             return (yield from self.tune()) == "ok"
         return True
+
+    def _hop_d(self, xs, es, ec: float, slope: float, tol: float):
+        """A margins' check that found a hop: how far from where it began (mA) it read the laser on its mode's line
+        last, the way it then read it off it first (xs: mA from there, es: MHz, as read, in order; its line: ec there,
+        and the mode's slope, else `slope`): the hop is that far at least. 0 where the first reading that way was off
+        it already; None: none was (no telling)."""
+        s = self.slope if abs(self.slope) >= 20.0 else slope
+        last = 0.0
+        for x, e in zip(xs, es):
+            if not math.isfinite(e):
+                continue
+            if abs(e - ec - s * x) > tol:
+                return abs(last) if last * x > 0 else 0.0
+            last = x
+        return None
 
     @staticmethod
     def _line(knots, pts, delay: float) -> tuple:
@@ -4464,6 +4568,11 @@ class Recenter(CavitySteps):
                           f", then to the top end of where it is at its best, {self.topped[1]:.2f} mA")
                        + f", the piezo {v:.2f} → {self.V:.2f} V, current {began:.2f} → {now:.2f} mA measured "
                        f"({self.readings} readings)")
+        elif self.settled is not None:
+            sp = self.settled
+            summary = (f"on target where it came furthest from a hop of where it was on target (nowhere held the "
+                       f"margins wanted): {sp['how']}, a hop some {sp['d']:.2f} mA from there; {began:.2f} → "
+                       f"{now:.2f} mA measured, {self.V0:.2f} → {self.V:.2f} V ({self.readings} readings)")
         elif self.flown is not None:
             f = self.flown
             summary = ("back on its right mode by its policy: the current "

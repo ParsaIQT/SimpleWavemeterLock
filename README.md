@@ -994,6 +994,16 @@ way the map found its mode there.
    frequency must stay on one straight line and come back, and with an SHG stage the laser
    must be single-mode at both ends and in the middle. If not, or if the piezo moved a lot
    (the modes move with it), it maps again there, up to three times.
+6. **Settle for the best.** A laser whose mode is narrow at its target (the 493 nm laser, say, at
+   a new temperature) may be on target at every place it comes to, and still have a hop nearer
+   than the check wants at each: the check itself then takes it over the edge (with hysteresis it
+   does not come back), and every place is given up. So each place it was on target at is kept,
+   with how far the check read it on its mode before the hop (0.05 mA at least). If nowhere holds
+   the margins wanted, it goes back to the one furthest from its hop, the way it came to it then
+   (the current round by the far end of the window and swept the same way, as when it was
+   parked), puts it on target there, and says so (*on target where it came furthest from a hop
+   …*): it may hop again sooner, and is recovered again then. Nowhere kept: it gives up, as
+   before. *Back where it was on target* (by its model, below) keeps its places the same way.
 
 **Ramps, not steps** (off as it comes: *Sweeps ramped steadily…*, ticked for one laser first). A
 sweep is a step and a wait: 0.1 mA written at once, the reading whose exposure straddled the write
@@ -1098,7 +1108,9 @@ chip lagging the current.
 3. **Back where it was on target**, as you would by hand: the piezo there, and the current come to
    where it was sweeping up from the window's bottom, then down from its top (the way its model says
    lands it on its right mode there first), a reading a step. On its right mode there, the piezo onto
-   the target and the least margins checked: done, before any map (a few seconds each way).
+   the target and the least margins checked: done, before any map (a few seconds each way). On target
+   there, but a hop nearer than that: kept, to settle for if nowhere holds (*Settle for the best*,
+   above).
 4. **A map here**, as the map method's: the current over its window, up and down, at the piezo voltage
    it is at. The model is fitted to it: its external modes where the readings have them, then how far its
    chip's modes have moved since its map (their temperature, their age) and where it lases (its window),

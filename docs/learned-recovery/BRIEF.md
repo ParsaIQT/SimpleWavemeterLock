@@ -105,10 +105,11 @@ laser. The lab will map it again at the new temperature.
 - **The margin test destroys good spots.** The old method, which is also the learned method's fallback,
   put the laser on its right mode near the target 14 times that morning. Each time, the margin test (at
   least 0.15 mA, hard-coded) pushed the current over the mode's edge. Because of hysteresis, the laser did
-  not come back, and the spot was given up. Make the test non-destructive: when it knocks the laser off a
-  spot that was on target, bring it back the way it came in, and move away from the edge it found. If
-  nowhere has the full margin, settle on target at the best spot found and say so, rather than leave the
-  laser unlocked. This may change for every method.
+  not come back, and the spot was given up. *Done on main since* (`Recenter.settle_best`, *Settle for the
+  best* in the README): each spot that was on target is kept with how far the test found its hop, and if
+  nowhere holds the margins wanted, the recovery goes back to the best one the way it came to it and leaves
+  the laser on target there. Still open: moving away from the edge the test found, rather than going back
+  to the very same spot. This may change for every method.
 - **The memory counted a failure as a success.** Reaching what the model calls the right mode is not
   success: count a manoeuvre as good only if it ends with the laser on target.
 - **A recapture by hand was not learned from.** It ended on target, but the model judged its end point

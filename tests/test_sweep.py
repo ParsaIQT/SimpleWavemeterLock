@@ -207,6 +207,25 @@ def test_a_move_is_written_in_fine_steps_too_and_as_it_was_with_fine_as_large_as
     assert r.state == "done" and max(steps_of(I0, writes(rig))) <= STEP_MAX + 1e-9
 
 
+def test_a_ramped_margins_check_that_finds_a_hop_says_how_far_it_held_at_least():
+    """Ramped, its readings kept with where the ramp was: on its mode 0.3 mA short of where it hops off going up, a
+    check of 0.5 mA stops at the hop, and says how far up it read the laser on its mode (less how far the ramp may have
+    gone on meanwhile): no further than the hop is, and some way towards it."""
+    las = laser()
+    las.nudge(las.misalignment(0, V0, I0) - (las.limits()[1] - 0.3 * abs(las.ki - las.ksi)))
+    rig = Rig(las, las.freq(V0, I0), noise=0.5, dt=0.1)
+    p = HopParams(enabled=True, i_nom=I0, smooth=True)
+
+    def steps(rec):
+        yield from rec.read()
+        rec.slope = las.ki * 1e3  # MHz/mA on its mode
+        return (yield from rec.check(0.5))
+
+    r, rec = run(rig, p, steps)
+    assert r.state == "done" and r.result is False and rec.notes[-1].startswith("hop within 0.50 mA")
+    assert rec.hop_d is not None and 0.0 < rec.hop_d <= 0.3 + 1e-9, rec.hop_d
+
+
 def test_the_runner_says_when_it_wants_waking_for_a_ramps_next_step():
     rig, p = bench()
     rec = Script(lambda rec: (yield Sweep(current=I0 - 0.2, rate=0.1)), p, I0, V0, I0 - 2, I0 + 2, 60, 80)
