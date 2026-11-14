@@ -171,7 +171,9 @@ class HopParams:
     #                           the piezo onto the target), walk (a single-mode mode, then the piezo onto the target),
     #                           map (sweep the current), model (the laser's own model, from its map: where its right
     #                           mode is on target and holds, and the way to it), auto (the model if it has one and no
-    #                           SHG stage, else catch with an SHG stage, else map)
+    #                           SHG stage, else catch with an SHG stage, else map), learned (a policy learned for
+    #                           its model flies it back, learned.py: by_learning; without one, or where that does
+    #                           not get it back: as auto)
     relock: str = "auto"      # the DLC pro's lock: auto | lockpoint (pick the peak) | plain (re-enable)
     falc: bool = True         # null the error signal's DC with the FALC pro's input offset first
     falc_max: float = 0.05    # V: the most the input offset may move from where it was
@@ -286,8 +288,11 @@ class HopParams:
         wavemeter is never that far off)."""
         return self.peak_tol if self.cavity else self.tolerance
 
-    def how(self, shg: bool | None = None, model: bool = False) -> str:
-        """The method it uses: 'catch', 'walk', 'map' or 'model' (model: it has one; else 'model' is 'map')."""
+    def how(self, shg: bool | None = None, model: bool = False, policy: bool = False) -> str:
+        """The method it uses: 'catch', 'walk', 'map', 'model' or 'learned' (model: it has one; else 'model' is
+        'map'; policy: it has one, learned for its model: else 'learned' is what 'auto' is)."""
+        if self.method == "learned" and model and policy:
+            return "learned"
         if self.method == "model":
             return "model" if model else "map"
         if self.method in ("catch", "walk", "map"):
@@ -798,7 +803,7 @@ class Recenter(CavitySteps):
                  v_lo: float, v_hi: float, kv: float = 0.0, cavity: bool = False, quick: bool = True,
                  shg: bool | None = None, act_offset: float = 0.0, i_top: float | None = None,
                  i_clip: float = math.inf, ref=None, upkeep: bool = False, model=None, target: float = math.nan,
-                 keep: dict | None = None):
+                 keep: dict | None = None, policy=None, memory=None):
         """Currents are set currents (what is written); act_offset is the measured current minus
         the set current (with the piezo at `offset`), for showing them as measured, and for the
         nominal current, which is.
@@ -816,7 +821,8 @@ class Recenter(CavitySteps):
         off from (upkeep), the locks left as they are. model: the laser's own (lasermodel.LaserModel, from its map:
         the method 'model'), target: THz (what the readings are from). keep: not a recovery either: locked, a second
         mode beginning (its signal dipping: what keep.ModeWatch.alarm said), its current trimmed to where the signal
-        is back up (keep), the locks left as they are."""
+        is back up (keep), the locks left as they are. policy: learned for its model (learned.Policy: the method
+        'learned'), memory: what its recoveries by that found on the laser itself (learned.Memory)."""
         self.p = p
         self.quick = quick
         self.I0, self.V0 = current, offset  # where the laser was when this began (where it lases, after a panic)
@@ -860,7 +866,10 @@ class Recenter(CavitySteps):
         self.learned = {}                   # HopParams fields to keep, beyond kv and spacing
         self.record = {"notes": [], "maps": [], "sweeps": []}
         self.model, self.target = model, target
-        self.method = p.how(shg, model is not None and math.isfinite(target))
+        self.policy, self.memory = policy, memory
+        self.flown = None                   # by its policy: {turn, way, depth, at: mA measured, tries} of the
+        #                                     manoeuvre that brought it back (by_learning)
+        self.method = p.how(shg, model is not None and math.isfinite(target), policy is not None)
         self.mapped = None                  # (V, [Point]) of the last map
         # whether it lases
         self.seed_name = ""                 # the parameter that shows the seed power ('': not watched)
@@ -1444,8 +1453,8 @@ class Recenter(CavitySteps):
         while True:
             try:
                 yield from self.come_inside()
-                yield from {"walk": self.walk, "catch": self.catch_mode, "model": self.by_model}.get(self.method,
-                                                                                                  self.find)()
+                yield from {"walk": self.walk, "catch": self.catch_mode, "model": self.by_model,
+                            "learned": self.by_learning}.get(self.method, self.find)()
                 if not self.cavity and not self.shg:
                     return (yield from self.finish())
                 if (yield from self.hand_back()):
@@ -1583,6 +1592,145 @@ class Recenter(CavitySteps):
                 break                     # too close to a hop: map again, here
         yield from self.go_home()
         raise Failed(f"no mode that holds reaches the target within {lo:.2f} … {hi:.2f} mA" + self.nearest())
+
+    # --------------------------------------------------------- by its policy
+    FLY_TRIES = 3        # manoeuvres its policy may fly before the methods of old take over
+    FLY_LEAST = 0.15     # ...each with this chance at least of ending on its right mode, as its policy has it
+    FLY_FINE = 0.04      # mA: a write of a manoeuvre's ramps, at most (its piezo: FLY_FINE_V)
+    FLY_FINE_V = 0.1     # V
+    FLY_RIGHT = 0.3      # on its right mode: within this part of its modes' spacing of where that mode is
+
+    def by_learning(self):
+        """Method 'learned': a policy learned for its laser's model (learned.Policy: fitted to thousands of simulated
+        hops of lasers like it) says which manoeuvre of its current has the best prospects, and that is flown, as
+        learned.fly has it simulated: the piezo going along all the way, to where its right mode stays on target (the
+        mode on target where it last ran: ref); its current to a turning point (if any) and held there while its chip
+        warms to it; then ramped up or down, a fifth of a mA a reading, until a reading has it on its right mode;
+        from where it must have come onto it (its chip lags its current, the reading its chip: learned.entered) as
+        deep into it as its policy chose, and held. Read there: on its right mode, the piezo onto the target, and
+        done, in seconds. Not on it: its policy is asked again, with where that manoeuvre left it (FLY_TRIES in
+        all). What each manoeuvre came to goes into its laser's memory (learned.Memory: its policy's word mended by
+        the laser's own). Near its target (a drift, no hop), where it last ran not known, a model of several
+        temperatures, no manoeuvre with a chance, or none that brought it back: the model's way (by_model), from
+        where it is. Every write is a sweep's or a move's of this recovery's: within its window, in small steps."""
+        try:
+            import numpy as np
+
+            from . import fastsim, learned
+            from .modelhop import Planner
+        except ImportError as exc:  # (numpy)
+            self.note(f"its policy needs numpy ({exc}): its model's way instead")
+            return (yield from self.by_model())
+        pol, m = self.policy, self.model
+        e = yield from self.steady()
+        t_a = self.t
+        if (pol is None or not self.ref_given or getattr(m, "T0", None) is not None or not math.isfinite(e)
+                or (self.quick and abs(e) <= self.near())):
+            return (yield from self.by_model())  # (nothing for it to go by; or a drift, which the piezo alone mends)
+        e2 = yield from self.read()
+        gap = self.t - t_a if math.isfinite(e2) and 0.02 <= self.t - t_a <= 2.0 else (self.gap or Runner.GAP)
+        e = e2 if math.isfinite(e2) else e
+        de, vsa = m.ext.spacing, m.v_set_to_act
+        b = fastsim.Batch.of(m, 1)
+        i_ref, v_ref = self.mA(self.i_ref, self.v_ref), self.v_ref
+
+        def v_for(a: float) -> float:  # the piezo (as set) that has its right mode on target at `a` mA measured
+            return float(b.piezo_for(a, i_ref, v_ref + vsa)[0]) - vsa
+
+        def right_at(a: float, v: float) -> float:  # GHz its right mode is from the target at (a mA measured, v V)
+            return float(b.mode_ghz(0, a, v + vsa)[0] - b.mode_ghz(0, i_ref, v_ref + vsa)[0])
+
+        def jump_at(x: float, a: float, v: float) -> int:  # external orders from its right mode, by a reading x MHz
+            return int(round((x / 1e3 - right_at(a, v)) / de))
+
+        def go(a: float, rate: float, watch=None):  # its current to `a` mA measured, its piezo along: a sweep
+            v = min(max(v_for(a), self.v_lo), self.v_hi)
+            return (yield from self.sweep(current=a - self.act_offset - self.ff * (v - self.V0), offset=v, rate=rate,
+                                          watch=watch, rest=False))
+
+        lo, hi, _ = self.window(self.V)
+        lo = min(max(self.mA(lo) - i_ref, -2.5), 0.0)
+        hi = max(min(self.mA(hi) - i_ref, 2.5), 0.0)
+        jump0 = jump = jump_at(e, self.mA(self.I), self.V)
+        if not jump:
+            return (yield from self.by_model())  # (on its right mode: off its target for another reason)
+        pl = Planner(m, self.target, ref=(i_ref, v_ref))
+        self.model_tuning(pl)
+        rec = self.record.setdefault("learned", {"key": pol.meta.get("key"), "gap": round(gap, 3), "tries": []})
+        x = learned.features(m, i_ref, v_ref + vsa, jump, lo, hi)[0]
+        was, tried, memory = (self.step_max, self.v_fine), [], self.memory
+        self.step_max, self.v_fine = min(self.step_max, self.FLY_FINE), min(self.v_fine, self.FLY_FINE_V)
+        try:
+            for k in range(self.FLY_TRIES):
+                c = pol.choose(x, lo, hi, bonus=memory.bonus(x) if memory is not None else None,
+                               least=self.FLY_LEAST, skip=tried)
+                if c is None:
+                    self.note("its policy has no manoeuvre with a chance from here"
+                              + (" (those tried apart)" if tried else ""))
+                    break
+                way, rate = c.way, learned.catch_rate(gap)
+                turn = "" if c.turn is None else f"to {i_ref + c.turn:.2f} mA and held {pol.hold:.2f} s, then "
+                yield from self.ask(f"Its policy: the current {turn}{'up' if way > 0 else 'down'} at {rate:.2f} mA/s, "
+                                    f"the piezo along, until a reading has it on its right mode, and {c.depth:.2f} mA "
+                                    f"into it ({c.on:.0%} to end on it, {c.margin:.2f} mA from a hop there)")
+                self.stage = f"by its policy: {turn}{'up' if way > 0 else 'down'} until it is on its right mode"
+                if c.turn is not None:
+                    yield from go(i_ref + c.turn, learned.RATE)
+                    yield Wait(pol.hold)
+                seen = []
+
+                def caught(s: Sample) -> bool:
+                    if s.e is None or not math.isfinite(s.e):
+                        return False
+                    a = self.mA(s.i, s.v)
+                    if abs(s.e / 1e3 - right_at(a, s.v)) < self.FLY_RIGHT * de:
+                        seen.append(a)
+                    return bool(seen)
+
+                yield from go(i_ref + (hi if way > 0 else lo), rate, caught)
+                if seen:
+                    at = learned.entered(seen[0], way, rate, pol.lag, gap) + way * c.depth
+                    yield from go(min(max(at, i_ref + lo), i_ref + hi), learned.RATE)
+                yield Wait(pol.hold)
+                self.e = math.nan
+                e = yield from self.steady()
+                a, tried = self.mA(self.I), tried + [c.k]
+                jump = jump_at(e, a, self.V) if math.isfinite(e) else None
+                rec["tries"].append({"k": c.k, "turn": c.turn, "way": way, "depth": c.depth, "on": round(c.on, 3),
+                                     "seen": round(seen[0], 3) if seen else None, "at": round(a, 3),
+                                     "v": round(self.V, 3), "e": None if not math.isfinite(e) else round(e, 1),
+                                     "jump": jump})
+                if memory is not None:
+                    memory.add(x, c.k, jump == 0)
+                if jump is None:
+                    self.note(f"its policy's manoeuvre: no valid reading at {a:.2f} mA, {self.V:.2f} V")
+                    break
+                if jump == 0:
+                    self.model_tuning(pl)
+                    self.note(f"its policy: on its right mode at {a:.2f} mA, {self.V:.2f} V ("
+                              + ("" if c.turn is None else f"by way of {i_ref + c.turn:.2f} mA, ")
+                              + (f"seen on it at {seen[0]:.2f} mA going {'up' if way > 0 else 'down'}" if seen else
+                                 "at its window's end") + f"), {e:+.0f} MHz from the target")
+                    if (yield from self.tune()) == "ok" and (yield from self.mode_ok()):
+                        self.flown = {"turn": None if c.turn is None else round(i_ref + c.turn, 3), "way": way,
+                                      "depth": c.depth, "at": round(self.mA(self.I), 3), "tries": k + 1}
+                        if memory is not None:
+                            self.learned["policy_memory"] = memory.to_list()
+                        return
+                    self.note("its policy: on its right mode, but the piezo does not bring it onto the target")
+                    break
+                self.note(f"its policy's manoeuvre ({turn}{'up' if way > 0 else 'down'}"
+                          + (f", seen on its right mode at {seen[0]:.2f} mA" if seen else ", not seen on its right mode")
+                          + f") leaves it at {a:.2f} mA, {self.V:.2f} V, {e:+.0f} MHz from the target, {jump:+d} modes "
+                          f"from its right one")
+                x = learned.features(m, i_ref, v_ref + vsa, jump, lo, hi, here=a - i_ref, came=way,
+                                     turned=np.nan if c.turn is None else c.turn, jump0=jump0)[0]
+        finally:
+            self.step_max, self.v_fine = was
+        if memory is not None:
+            self.learned["policy_memory"] = memory.to_list()
+        self.note("its policy did not bring it back onto its right mode: its model's way from here")
+        return (yield from self.by_model())
 
     # ------------------------------------------------------------ by its model
     MODEL_TRIES = 6      # plans tried, each after the model is fitted again to all it has seen (one that did not
@@ -4314,6 +4462,14 @@ class Recenter(CavitySteps):
                           if self.topped[1] <= self.topped[0] + 1e-6 else
                           f", then to the top end of where it is at its best, {self.topped[1]:.2f} mA")
                        + f", the piezo {v:.2f} → {self.V:.2f} V, current {began:.2f} → {now:.2f} mA measured "
+                       f"({self.readings} readings)")
+        elif self.flown is not None:
+            f = self.flown
+            summary = ("back on its right mode by its policy: the current "
+                       + ("" if f["turn"] is None else f"by way of {f['turn']:.2f} mA, ")
+                       + f"{'up' if f['way'] > 0 else 'down'} until it was on it and {f['depth']:.2f} mA in"
+                       + (f" (its {_nth(f['tries'])} manoeuvre)" if f["tries"] > 1 else "")
+                       + f", {began:.2f} → {now:.2f} mA measured, {self.V0:.2f} → {self.V:.2f} V "
                        f"({self.readings} readings)")
         elif self.short_at is not None:
             turn = "" if self.short_at[1] is None else f" by way of {self.short_at[1]:.2f} mA"

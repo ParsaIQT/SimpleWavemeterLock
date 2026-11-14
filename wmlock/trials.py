@@ -34,9 +34,11 @@ import argparse
 import copy
 import json
 import math
+import os
 import random
 import statistics
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 
@@ -420,6 +422,10 @@ def unlike(model, rng, spread: float = 1.0):
 
 
 # ------------------------------------------------------------------ recoveries
+POLICIES = os.environ.get("WMLOCK_POLICIES") or os.path.join(tempfile.gettempdir(), "wmlock-policies")  # where the
+#                         policies learned for the trials' lasers' models are kept (learned.policy_for)
+
+
 @dataclass
 class Case:
     """A laser that needs recovering: its rig, the settings and the arguments its Recenter is made with, and what
@@ -567,9 +573,16 @@ def case_model(kind: str, seed: int, drift: float = 0.0004, spread: float = 1.0,
         rig.t += 0.15
         rig._settle()
     rig.due = rig.t + rig.dt
-    p = HopParams(enabled=True, method="model", i_nom=i_nom, i_below=1.0, i_window=2.0, v_window=25.0, **hop)
+    hop = dict(hop)
+    p = HopParams(enabled=True, method=hop.pop("method", "model"), i_nom=i_nom, i_below=1.0, i_window=2.0,
+                  v_window=25.0, **hop)
+    more = {}
+    if p.method == "learned":  # (a policy learned for the model the program has of it: made now, if it is not kept)
+        from . import learned
+
+        more["policy"] = learned.policy_for(model, POLICIES)
     return Case(kind, seed, rig, p, (i_nom, v_nom, i_nom - 1.0, i_nom + 2.0, v_nom - 25.0, v_nom + 25.0),
-                {"ref": (v_nom, i_nom), "model": model, "target": target},
+                {"ref": (v_nom, i_nom), "model": model, "target": target, **more},
                 hop=(laser.freq(v_nom, i_nom) - target) * 1e3, right=lambda: laser._state[0] == right, tol=20.0)
 
 
