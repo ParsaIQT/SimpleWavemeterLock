@@ -243,3 +243,165 @@ def test_step_by_step_it_asks_before_each_manoeuvre(kept):
     while r.busy:
         case.rig.step(r)
     assert len(case.rig.dlc.log) == before and r.state == "failed"
+
+
+# -------------------------------------------------------------- the engine
+def test_the_engine_keeps_a_policy_for_its_lasers_model_and_what_its_manoeuvres_found(kept, tmp_path, monkeypatch):
+    """A channel with a model, its method 'learned': its policy is the one kept for that model beside the recoveries'
+    log; none kept, one is learned in a thread of its own, the recoveries going by the model meanwhile; what its
+    recoveries have since found of the model (where its chip's modes are, how its piezo tunes it) leaves the policy
+    its own; another model, another policy. What its manoeuvres came to is kept with its model."""
+    import functools
+    import threading
+    import time
+    import types
+
+    from wmlock.engine import Channel, Engine
+
+    model = trials.lab650()
+    made = kept(model)
+    key = learned.model_key(model)
+    ch = Channel(3, {"link": {"device": "192.168.1.30", "laser": 1}})
+    ch.adopt_model(model, "map.sqlite")
+    eng = types.SimpleNamespace(lock=threading.RLock(), dirty=False, policy_dir=trials.POLICIES)
+    for name in ("_policy", "_policy_said", "_memory"):
+        setattr(eng, name, getattr(Engine, name) if isinstance(Engine.__dict__[name], staticmethod) else
+                types.MethodType(getattr(Engine, name), eng))
+    got = eng._policy(ch)  # (kept: read)
+    assert got is not None and ch.policy is got and ch.policy_key == key and not ch.policy_busy
+    x = learned.features(model, model.i0, model.v0, 6, -1.0, 2.0)[0]
+    assert got.choose(x, -1.0, 2.0).k == made.choose(x, -1.0, 2.0).k
+    assert ch.policy_note.startswith("learned from its laser's model: ") and "back by its first manoeuvre" in ch.policy_note
+    ch.adapt_model({"phi": 3.2, "p_v": 0.43})  # (what a recovery found since: its policy still)
+    assert learned.model_key(ch.laser_model()) == key and eng._policy(ch) is got
+    # none kept: learned on the side
+    eng.policy_dir = str(tmp_path / "none-yet")
+    ch.policy = None
+    monkeypatch.setattr(learned, "train", functools.partial(learned.train, n=200, again=300, epochs=10))
+    assert eng._policy(ch) is None and ch.policy_busy and ch.policy_note == "being learned from its laser's model…"
+    assert eng._policy(ch) is None  # (asked again meanwhile: not begun twice)
+    end = time.monotonic() + 120
+    while ch.policy is None and time.monotonic() < end:
+        time.sleep(0.2)
+    assert ch.policy is not None and not ch.policy_busy and ch.policy_key == key
+    assert learned.policy_for(model, eng.policy_dir, make=False) is not None  # (kept for the next time)
+    # its memory, kept with its model in its settings
+    assert eng._memory(ch).items == []
+    m = learned.Memory()
+    m.add(learned.features(model, model.i0, model.v0, 6, -1.0, 2.0)[0], 5, True)
+    ch.model_dict.setdefault("learned", {})["memory"] = m.to_list()
+    again = Channel(3, ch.to_config())
+    assert eng._memory(again).to_list() == m.to_list()
+    # another model: not this policy
+    other = trials.lab650()
+    other.h_down *= 2
+    ch.adopt_model(other, "other.sqlite")
+    eng.policy_dir = str(tmp_path / "nowhere")
+    monkeypatch.setattr(learned, "train", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no")))
+    assert eng._policy(ch) is None and eng._memory(ch).items == []
+    end = time.monotonic() + 10
+    while ch.policy_busy and time.monotonic() < end:
+        time.sleep(0.05)
+    assert ch.policy is None and ch.policy_note == "not learned: no"
+
+
+# ------------------------------------------------------ a recapture by hand
+def recorded(kind, seed):
+    """A trial's laser brought back while every reading is recorded with its current and its piezo, as a hand at it
+    would be (here the hand is the policy's): (the case, its recovery's record, the recording)."""
+    from wmlock import handrec
+
+    case = make_case(kind, seed, method="learned")
+    rig = case.rig
+    v_ref, i_ref = case.kwargs["ref"]
+    rec = handrec.Recording(1, "red", target=case.kwargs["target"], ref=[v_ref, i_ref],
+                            window=[case.args[2], case.args[3]], tol=case.tol)
+    rig.also = lambda t, e: rec.add(t, rig.I, rig.act, rig.V, e) and None
+    recovery = Recenter(case.p, *case.args, **case.kwargs)
+    r = rig.run(recovery)
+    assert r.state == "done"
+    for _ in range(40):  # (and left there, locked: on target for a while)
+        t, e = rig.reading()
+        if rec.add(t, rig.I, rig.act, rig.V, e):
+            break
+    return case, recovery, rec
+
+
+def test_a_recapture_by_hand_is_recorded_and_read_as_a_manoeuvre(kept, tmp_path):
+    """What is recorded while a laser is brought back (its current, its piezo, its readings) ends by itself once it
+    has been on target a while, is kept as a line of JSON, and reads as the manoeuvre it was: the way its current
+    was going as it came onto its right mode, how far it had been the other way, how deep it was left; which its
+    laser's memory then holds for the next hop of that kind."""
+    from wmlock import handrec
+
+    kept(trials.lab650())
+    case, recovery, rec = recorded("red", 304)
+    model = case.kwargs["model"]
+    assert rec.end == "on target" and len(rec.samples) > 15 and rec.samples[0][0] == 0.0
+    path = tmp_path / "hand.jsonl"
+    handrec.save(path, rec)
+    handrec.save(path, rec)
+    back = handrec.load(path)
+    assert len(back) == 2 and back[0].samples == rec.samples and back[0].ref == rec.ref and back[0].end == "on target"
+    got = handrec.read(back[0], model)
+    flown = recovery.record["learned"]["tries"][-1]
+    assert got["why"] == "" and got["ok"] and got["jump"] == round(case.hop / model.ext.spacing)
+    assert got["way"] == flown["way"] and (got["turn"] is None) == (flown["turn"] is None or
+                                                                    got["way"] * flown["turn"] > -0.2)
+    assert got["left"] == pytest.approx(flown["at"], abs=0.02) and 0.0 < got["depth"] < 1.0
+    turns, ways, _ = learned.actions()
+    assert ways[got["k"]] == got["way"] and np.isnan(turns[got["k"]]) == (got["turn"] is None)
+    memory = learned.Memory()
+    memory.add(got["x"], got["k"], True)
+    v_ref, i_ref = case.kwargs["ref"]
+    x = learned.features(model, i_ref, v_ref + model.v_set_to_act, got["jump"], case.args[2] - i_ref,
+                         case.args[3] - i_ref)[0]
+    assert x == pytest.approx(np.array(got["x"]), abs=1e-3) and memory.bonus(x)[got["k"]] > 0.4
+    # what is not a manoeuvre says why
+    still = handrec.Recording(1, target=rec.target, ref=rec.ref, tol=rec.tol)
+    for k in range(30):
+        still.add(0.1 * k, i_ref, i_ref, v_ref, 3.0)
+    assert still.end == "" and handrec.read(still, model)["why"] == "it was on its right mode all along"
+    off = [smp for smp in rec.samples if abs(smp[4]) > 1000.0]  # (given up while it was still a mode away)
+    lost = handrec.Recording.from_dict(dict(rec.to_dict(), samples=(off * 5)[:max(len(off), 6)]))
+    assert handrec.read(lost, model)["why"] == "it did not end on its right mode"
+    assert handrec.read(handrec.Recording(1), model)["why"].startswith("too few readings")
+    long = handrec.Recording(1, tol=5.0)
+    assert not long.add(0.0, 1, 1, 1, 500.0) and long.add(handrec.MOST_S + 1, 1, 1, 1, 500.0) and long.end == "too long"
+
+
+def test_the_engine_records_a_recapture_by_hand_and_takes_it_into_its_memory(kept, tmp_path):
+    import threading
+    import types
+
+    from wmlock import handrec
+    from wmlock.engine import Channel, Engine
+
+    kept(trials.lab650())
+    case, recovery, rec = recorded("red", 306)
+    model = case.kwargs["model"]
+    v_ref, i_ref = case.kwargs["ref"]
+    ch = Channel(3, {"link": {"device": "192.168.1.30", "laser": 1}, "name": "650"})
+    ch.adopt_model(model, "map.sqlite")
+    ch.hop = HopParams(enabled=True, method="learned", i_nom=case.p.i_nom, i_below=1.0, i_window=2.0)
+    ch.f_set, ch.current, ch.current_set, ch.offset = case.kwargs["target"], i_ref, i_ref, v_ref
+    ch.fine_at = (0.0, v_ref, i_ref)
+    eng = types.SimpleNamespace(lock=threading.RLock(), dirty=False, channels={3: ch},
+                                hand_path=str(tmp_path / "x-hand.jsonl"), _memory=Engine._memory)
+    eng._hand_done = types.MethodType(Engine._hand_done, eng)
+    assert Engine.record_hand(eng, 3, False) == "no recapture by hand is being recorded"
+    assert Engine.record_hand(eng, 3).startswith("recording a recapture by hand") and ch.hand is not None
+    assert ch.hand.ref == [v_ref, i_ref] and ch.hand.window == [case.args[2], case.args[3]] and ch.hand.name == "650"
+    assert Engine.record_hand(eng, 3, True) == "a recapture by hand is being recorded already"
+    on = next(k for k, smp in enumerate(rec.samples) if abs(smp[4]) <= 20.0)  # (on target; stopped a second later)
+    for t, i_set, i_act, v, e in rec.samples[:on + 8]:  # (as its readings would feed it)
+        assert not ch.hand.add(t, i_set, i_act, v, e)
+    said = Engine.record_hand(eng, 3)  # (stopped by hand)
+    assert ch.hand is None and "taken into its policy's memory" in said and "onto its right mode at" in said
+    assert ch.note == said and eng.dirty
+    kept_ = handrec.load(eng.hand_path)
+    assert len(kept_) == 1 and kept_[0].end == "stopped" and len(kept_[0].samples) == on + 8
+    items = ch.model_dict["learned"]["memory"]
+    assert len(items) == 1 and items[0][2] is True and Engine._memory(ch).bonus(items[0][0])[items[0][1]] > 0.4
+    ch.device = ""
+    assert Engine.record_hand(eng, 3).startswith("recording a recapture by hand needs a laser on a DLC pro")

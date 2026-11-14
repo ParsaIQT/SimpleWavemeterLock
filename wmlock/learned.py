@@ -404,10 +404,14 @@ class Policy:
 
 
 def model_key(model) -> str:
-    """What tells one laser's model from another (and from itself fitted again): a hash of its terms."""
-    d = model.to_dict()
-    d.pop("notes", None)
-    return hashlib.sha1(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    """What tells one laser's model from another, for its policy: a hash of its rule's and its combs' terms. Not of
+    where its chip's modes or its external modes are, nor of how its piezo tunes them: a policy is learned for
+    lasers with those anywhere, and what its recoveries have since found of them (Channel.adapt_model) leaves it
+    the laser's."""
+    t = {k: round(float(v), 6) for k, v in fastsim.terms(model).items() if k not in ("offset", "e0", "c0", "e_v")}
+    alt = {k: round(float(v), 6) for k, v in sorted((model.alt or {}).items()) if k not in ("offset", "right")}
+    text = json.dumps([VERSION, t, alt, round(float(model.v_set_to_act), 4)], sort_keys=True)
+    return hashlib.sha1(text.encode()).hexdigest()[:16]
 
 
 # ----------------------------------------------------------------- training
@@ -440,11 +444,11 @@ def hopped(model, n: int, rng, **kw) -> dict:
             "gap": gap[idx], "jump": (b.order - right[idx]).astype(float), "way": way[idx]}
 
 
-def examples(model, n: int, rng, policy: Policy | None = None, **kw) -> tuple:
+def examples(model, n: int, rng, policy: Policy | None = None, most: int | None = None, **kw) -> tuple:
     """n lasers like the model, each hopped: (x: their situations as the network takes them, y: the oracle's word on
     each manoeuvre, took: the s each took; lasers x manoeuvres). With a policy: each is first flown through what
     that policy would choose (now and then another manoeuvre, at random), and those it leaves off their right mode
-    are the situations (the oracle's word from there): what a second try must know."""
+    are the situations (the oracle's word from there; `most` of them at most): what a second try must know."""
     hold, lag = hold_s(model), model.lag or 0.0
     s = hopped(model, n, rng, **kw)
     b, right, i_ref, v_ref, lo, hi, gap, jump0 = (s[k] for k in ("b", "right", "i_ref", "v_ref", "lo", "hi", "gap",
@@ -464,6 +468,8 @@ def examples(model, n: int, rng, policy: Policy | None = None, **kw) -> tuple:
     end, _, _ = fly(b, right, i_ref, v_ref, turns[pick], ways[pick], depths[pick], lo, hi, hold, gap, lag, rng)
     b.step(b.x, b.piezo_for(b.x, i_ref, v_ref), 0.3)
     off = np.flatnonzero(b.order != right)
+    if most is not None and len(off) > most:  # (a laser that cannot be brought back at all: no need of them all)
+        off = np.sort(rng.choice(off, most, replace=False))
     b2 = b.take(off)
     x2 = features(model, i_ref[off], v_ref[off], (b2.order - right[off]).astype(float), lo[off], hi[off],
                   here=end[off], came=ways[pick][off], turned=turns[pick][off], jump0=jump0[off])
@@ -484,7 +490,7 @@ def train(model, n: int = 1000, again: int = 2000, seed: int = 0, say=None, epoc
     say(f"{len(x1)} hops looked at by the oracle ({time.time() - t0:.0f} s)")
     first = Net(N_FEATURES, y1.shape[1], seed=seed)
     first.fit(x1, y1, t1, epochs=max(epochs // 2, 10), seed=seed)
-    x2, y2, t2 = examples(model, again, rng, policy=Policy(first, hold, lag))
+    x2, y2, t2 = examples(model, again, rng, policy=Policy(first, hold, lag), most=n)
     say(f"{len(x2)} of {again} more not brought back by a first manoeuvre: looked at from there "
         f"({time.time() - t0:.0f} s)")
     net = Net(N_FEATURES, y1.shape[1], seed=seed + 1)
@@ -637,7 +643,7 @@ def main(argv=None):
     if args.map:
         from . import lasermap, lasermodel
 
-        with lasermap.LaserMap(args.map) as m:
+        with lasermap.load(args.map) as m:
             model = lasermodel.stored(m)
         if model is None:
             ap.error(f"{args.map} keeps no model (fit one: python -m wmlock.lasermap FILE --model)")
