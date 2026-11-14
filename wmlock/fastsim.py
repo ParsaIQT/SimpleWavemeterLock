@@ -104,19 +104,39 @@ class Batch:
         shift = self.w_v * dv + self.w_i * di
         return b, chip, self.lo + shift, self.hi + shift
 
-    def _modes(self, b, lo, hi):
-        """(the first order looked at, the last, GHz of each: n x m, which of them count)."""
-        first = np.floor((lo - 30.0 - b) / self.de).astype(np.int64)
-        last = np.ceil((hi + 30.0 - b) / self.de).astype(np.int64)
-        m = int((last - first).max()) + 1
-        k = np.arange(m)
-        modes = b[:, None] + (first[:, None] + k[None, :]) * self.de[:, None]
-        return first, last, modes, k[None, :] <= (last - first)[:, None]
+    def _range(self, b, lo, hi):
+        """(the first external order looked at, the last): those within 30 GHz of its window (LaserModel.step)."""
+        return (np.floor((lo - 30.0 - b) / self.de).astype(np.int64),
+                np.ceil((hi + 30.0 - b) / self.de).astype(np.int64))
 
-    def _loss(self, modes, mid, lo, hi, counts):
-        g = np.sin(np.pi * (modes - mid[:, None]) / self.dc[:, None]) ** 2 + \
+    def _best(self, b, mid, lo, hi, first, last):
+        """The external order of least loss among those looked at (first .. last), each laser's, and that loss; its
+        chip's resonances' best places at mid and dc apart. Not every order is tried: the least is next to one of
+        those places (its loss there the least its sin² can be), or at an edge of its window (where what it loses
+        beyond the edge begins), so only the two orders about each place and the four about the two edges are."""
+        n = self.n
+        de, dc = self.de[:, None], self.dc[:, None]
+        places = int(np.ceil(((hi - lo + 60.0) / self.dc).max())) + 2
+        m0 = np.floor((lo - 30.0 - mid) / self.dc)
+        centre = mid[:, None] + (m0[:, None] + np.arange(places)[None, :]) * dc
+        under = np.floor((centre - b[:, None]) / de)
+        edge_lo, edge_hi = np.floor((lo - b) / self.de)[:, None], np.floor((hi - b) / self.de)[:, None]
+        orders = np.concatenate([under, under + 1, edge_lo, edge_lo + 1, edge_hi, edge_hi + 1], axis=1)
+        counts = (orders >= first[:, None]) & (orders <= last[:, None])
+        modes = b[:, None] + orders * de
+        g = np.sin(np.pi * (modes - mid[:, None]) / dc) ** 2 + \
             ((np.maximum(modes - hi[:, None], 0.0) + np.maximum(lo[:, None] - modes, 0.0)) / self.soft[:, None]) ** 2
-        return np.where(counts, g, np.inf)
+        g = np.where(counts, g, np.inf)
+        # (the least; of equals, the lowest order, as an argmin over every order in turn has it)
+        least = g.min(axis=1)
+        k = np.where(g == least[:, None], orders, np.inf).min(axis=1)
+        return k.astype(np.int64), least
+
+    def _loss_of(self, order, b, mid, lo, hi):
+        """Each laser's loss on that external order."""
+        mode = b + order * self.de
+        return np.sin(np.pi * (mode - mid) / self.dc) ** 2 + \
+            ((np.maximum(mode - hi, 0.0) + np.maximum(lo - mode, 0.0)) / self.soft) ** 2
 
     def _fold(self, d):
         return (d + self.dc / 2) % self.dc - self.dc / 2
@@ -126,15 +146,15 @@ class Batch:
         i, v = (np.broadcast_to(np.asarray(a, dtype=float), (self.n,)) for a in (i, v))
         self.warm, self.x, self.up = i.copy(), i.copy(), np.ones(self.n, dtype=bool)
         b, chip, lo, hi = self._combs(i, v, self.warm, self.up)
-        first, _, modes, counts = self._modes(b, lo, hi)
-        self.order = first + self._first(modes, chip, lo, hi, counts)
+        first, last = self._range(b, lo, hi)
+        self.order = self._first(b, chip, lo, hi, first, last)
         return self._settle(b, chip)
 
-    def _first(self, modes, chip, lo, hi, counts):
-        rows = np.arange(self.n)
-        k = np.argmin(self._loss(modes, chip, lo, hi, counts), axis=1)
-        mid = chip + self.pull * self._fold(modes[rows, k] - chip)
-        return np.argmin(self._loss(modes, mid, lo, hi, counts), axis=1)
+    def _first(self, b, chip, lo, hi, first, last):
+        """The order it lases on with no past (LaserModel._first): the best, its chip's resonance pulled to it."""
+        k, _ = self._best(b, chip, lo, hi, first, last)
+        mid = chip + self.pull * self._fold(b + k * self.de - chip)
+        return self._best(b, mid, lo, hi, first, last)[0]
 
     def _settle(self, b, chip):
         mode = b + self.order * self.de
@@ -168,18 +188,15 @@ class Batch:
             decay = np.where(self.lag > 0, np.exp(-dt / np.where(self.lag > 0, self.lag, 1.0)), 0.0)
         warm = np.where(dt > 0, i + (self.warm - i) * decay, np.where(self.lag > 0, self.warm, i))
         b, chip, lo, hi = self._combs(i, v, warm, up)
-        first, last, modes, counts = self._modes(b, lo, hi)
-        rows = np.arange(n)
+        first, last = self._range(b, lo, hi)
         inside = (self.order >= first) & (self.order <= last)
-        k = np.clip(self.order - first, 0, modes.shape[1] - 1)
-        mid = chip + self.pull * self._fold(modes[rows, k] - chip)
-        g = self._loss(modes, mid, lo, hi, counts)
-        best = np.argmin(g, axis=1)
-        hop = g[rows, k] > g[rows, best] + np.where(up, self.h_up, self.h_down)
-        k = np.where(hop, best, k)
+        mid = chip + self.pull * self._fold(b + self.order * self.de - chip)
+        best, least = self._best(b, mid, lo, hi, first, last)
+        hop = self._loss_of(self.order, b, mid, lo, hi) > least + np.where(up, self.h_up, self.h_down)
+        order = np.where(hop, best, self.order)
         if not inside.all():  # (off the orders looked at: afresh, the best there)
-            k = np.where(inside, k, self._first(modes, chip, lo, hi, counts))
-        self.order, self.warm, self.x, self.up = first + k, warm, i.copy(), up
+            order = np.where(inside, order, self._first(b, chip, lo, hi, first, last))
+        self.order, self.warm, self.x, self.up = order, warm, i.copy(), up
         return self._settle(b, chip)
 
     def run(self, i, v, dt) -> np.ndarray:

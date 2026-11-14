@@ -189,7 +189,8 @@ def test_a_manoeuvre_flown_on_the_rig_ends_where_the_simulation_has_it(kept):
 def test_without_a_model_or_a_policy_it_is_what_auto_is():
     h = HopParams(method="learned")
     assert h.how(model=True, policy=True) == "learned" and h.how(model=True) == "model" and h.how() == "map"
-    assert h.how(shg=True, model=True) == "catch" and h.how(shg=True, model=True, policy=True) == "learned"
+    assert h.how(shg=True, model=True) == "catch" and h.how(shg=True, model=True, policy=True) == "catch"
+    assert HopParams(method="learned", cavity=True).how(model=True, policy=True) == "model"  # (neither tried: as auto)
     assert HopParams().how(model=True, policy=True) == "model"  # (not chosen: nothing changes)
     for kind, seed in (("far", 3), ("strong", 5)):  # (no model: the map, to the reading the same)
         a, b = recover(make_case(kind, seed, method="learned")), recover(make_case(kind, seed))

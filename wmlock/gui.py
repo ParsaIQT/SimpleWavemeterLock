@@ -1487,7 +1487,8 @@ class HopDialog(QtWidgets.QDialog):
                         "first, to see how far its modes moved"),
               ("learned", "learned: a policy learned for its laser's model (thousands of simulated hops of lasers like "
                           "it) flies its current back onto its right mode, reading on the way: seconds; where that "
-                          "does not get it back, or it has no model: as auto"))
+                          "does not get it back, or it has no model, or it has an SHG stage or is locked by its DLC "
+                          "pro: as auto"))
 
     def __init__(self, parent, ch, take=None):
         """take: take the optimum now (Engine.take_optimum for this channel), if it can be."""

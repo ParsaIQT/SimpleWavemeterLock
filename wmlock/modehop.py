@@ -172,8 +172,8 @@ class HopParams:
     #                           map (sweep the current), model (the laser's own model, from its map: where its right
     #                           mode is on target and holds, and the way to it), auto (the model if it has one and no
     #                           SHG stage, else catch with an SHG stage, else map), learned (a policy learned for
-    #                           its model flies it back, learned.py: by_learning; without one, or where that does
-    #                           not get it back: as auto)
+    #                           its model flies it back, learned.py: by_learning; without one, with an SHG stage or
+    #                           locked by its DLC pro, or where that does not get it back: as auto)
     relock: str = "auto"      # the DLC pro's lock: auto | lockpoint (pick the peak) | plain (re-enable)
     falc: bool = True         # null the error signal's DC with the FALC pro's input offset first
     falc_max: float = 0.05    # V: the most the input offset may move from where it was
@@ -290,14 +290,15 @@ class HopParams:
 
     def how(self, shg: bool | None = None, model: bool = False, policy: bool = False) -> str:
         """The method it uses: 'catch', 'walk', 'map', 'model' or 'learned' (model: it has one; else 'model' is
-        'map'; policy: it has one, learned for its model: else 'learned' is what 'auto' is)."""
-        if self.method == "learned" and model and policy:
+        'map'; policy: it has one, learned for its model: else 'learned' is what 'auto' is, as it is for a laser
+        with an SHG stage or one its DLC pro locks to a cavity: a policy has been tried on neither)."""
+        shg = self.shg if shg is None else shg
+        if self.method == "learned" and model and policy and not shg and not self.cavity:
             return "learned"
         if self.method == "model":
             return "model" if model else "map"
         if self.method in ("catch", "walk", "map"):
             return self.method
-        shg = self.shg if shg is None else shg
         return "catch" if shg else "model" if model else "map"
 
     @property
