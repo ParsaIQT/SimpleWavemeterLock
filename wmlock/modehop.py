@@ -1591,6 +1591,7 @@ class Recenter(CavitySteps):
     MODEL_BETTER = 0.1   # this many more than a model that never hops, or fewer than MODEL_COMB of them on its
     MODEL_COMB = 0.7     # external comb: not this laser's now (it was realigned, its temperature changed a lot)
     MODEL_V = 5.0        # V beyond the piezo voltages its map covered that the model is trusted
+    MODEL_LATE = 0.5     # ...on the later part of its way (this part of it from the window's end: before, not)
     MODEL_ASTRAY = 3     # ramped to a plan's point: this many readings in a row on a mode none of the ways its model
     #                      has it arrive passes on the way, and no further: none of them is the laser as it is (astray)
     PLAN_V = 3.0         # V: its plans this near where it has been seen in this recovery first (its model is only as
@@ -1704,7 +1705,17 @@ class Recenter(CavitySteps):
             want = {round(i, 6): g for i, g in plan.path}
             if self.p.smooth:  # ramped steadily, each reading against what its model expects there
                 run = [0, 0]  # (readings in a row not as it said, in all)
-                unexpected = self.astray(plan.ways, self.slope / 1e3, 0.35 * pl.m.ext.spacing, run)
+                astray_ = self.astray(plan.ways, self.slope / 1e3, 0.35 * pl.m.ext.spacing, run)
+                half = start + self.MODEL_LATE * (i_set - start)
+
+                def unexpected(x: Sample, up=plan.up) -> bool:
+                    # (on the first part of its way, from the window's end, where it sets out from is its past's
+                    # doing, which its model knows least: only further on is a mode none of them passes held
+                    # against it)
+                    if (x.i < half) if up else (x.i > half):
+                        return False
+                    return astray_(x)
+
                 got = yield from self.sweep(current=i_set, watch=unexpected)
                 for x in got.samples:
                     if x.e is not None:
@@ -3679,8 +3690,9 @@ class Recenter(CavitySteps):
     KEEP_LAG = 0.3         # of how far off its target it may be: so far off on the way (the middle of its last five
     #                        readings), the lock that holds it is behind: waited for, and on half as fast
     KEEP_WAIT = 20         # ...readings at most
-    KEEP_SLOW = 8          # ...down to this part of its pace, and no more often than KEEP_LAGS times a ramp: a lock
-    KEEP_LAGS = 12         # that still does not keep up is not one to move its current under
+    KEEP_SLOW = 8          # ...down to this part of its pace, and no more often than KEEP_LAGS times running without
+    KEEP_LAGS = 12         # getting a quarter of a probe further: a lock that does not keep up is not one to move
+    #                        its current under
     KEEP_BLIND = 6         # readings in a row that came without its fringes: no further
     KEEP_SILENT = (4.0, 1.0)  # no valid reading for this many of the wavemeter's intervals (s, at least): no further
 
@@ -3785,7 +3797,7 @@ class Recenter(CavitySteps):
 
         gap = self.gap or Runner.GAP
         pace = self.KEEP_PROBE / (self.KEEP_N * (max(gap, self.KEEP_S) if held or not shg else self.KEEP_S))
-        rate, lags = pace, 0
+        rate, lags, at = pace, 0, self.I
         quiet = max(self.KEEP_SILENT[0] * gap, self.KEEP_SILENT[1])
         while abs(self.I - to) > 1e-9:
             why[0] = ""
@@ -3797,7 +3809,8 @@ class Recenter(CavitySteps):
                 break
             if why[0] != "lag":
                 break
-            lags += 1
+            # (behind again: counted while it gets nowhere; a quarter of a probe further since, it is following)
+            lags, at = (lags + 1 if abs(self.I - at) < 0.25 * self.KEEP_PROBE else 1), self.I
             if lags > self.KEEP_LAGS:
                 self.keep_blind = (f"its lock does not keep up with its current ({abs(_median(lag)):.0f} MHz behind, "
                                    f"{lags} times, at a {self.KEEP_SLOW}th of the pace)")
@@ -4393,6 +4406,7 @@ class Runner:
     READ_TIMEOUT = 10.0  # s
     READ_GAP = 2.5       # s (at least) without anything new from the wavemeter: no valid reading, if it can tell why
     CONFIRM_TIMEOUT = 900.0  # s: step by step, nobody answering for this long stops it
+    HAND = 0.02          # mA: a keeping's set current read back this far from what it wrote last: set by hand
 
     def __init__(self, rec: Recenter, io, now: float, timeout: float = 600.0, finished=None, clock=None):
         """clock: () -> s, the time now (the engine's: time.monotonic), asked whenever an answer comes back, so that a
@@ -4428,6 +4442,7 @@ class Runner:
         self._keep = False
         self._sweep = None        # the sweep going on (a dict: _sweep_begin)
         self._lat = 0.0           # s its controller takes over a write, of late (with a clock: else not known, 0)
+        self._sent = deque([rec.I], maxlen=60)  # mA: the set current where it began, and as it wrote it of late
         self._send(None)
 
     @property
@@ -4645,6 +4660,8 @@ class Runner:
             lo, top = r.allowed(self.v_written)
             first = r.ff * dv * di < 0 and lo - 1e-9 <= i <= top + 1e-9
             ops.insert(0 if first else len(ops), ("current", i))
+            if r.keeping is not None:  # (its locks on, the laser in use: its set current as its controller has it,
+                ops.insert(0, ("mine",))  # first: someone at it meanwhile is not written over)
         if not ops:  # (nowhere to go: a sweep to where it is)
             s["k"] = s["n"]
             self._ops.clear()
@@ -4779,6 +4796,8 @@ class Runner:
             wire = ("set", CURRENT, op[1])
         elif op[0] == "offset":
             wire = ("set", OFFSET, op[1])
+        elif op[0] == "mine":
+            wire = ("get", (CURRENT,))
         else:
             wire = op
         self.io.do(wire, lambda result=None: self._acked(tok, op, result), lambda exc: self._write_failed(tok, op, exc))
@@ -4794,6 +4813,12 @@ class Runner:
         if self.clock is not None:
             self.now = max(self.now, self.clock())
 
+    def wrote(self, current: float) -> bool:
+        """A poll of its set current read that: one of this runner's writes of late (or where it began, or the one
+        on its way), not a hand's (within half of HAND: a controller may round what it is told)."""
+        on_way = [op[1] for op in list(self._ops) if op[0] == "current"]
+        return any(abs(current - x) <= 0.5 * self.HAND for x in list(self._sent) + on_way)
+
     def _acked(self, tok: int, op, result):
         if tok != self._token or not self.busy:
             return
@@ -4805,12 +4830,19 @@ class Runner:
             self._unsure = None
         if kind == "current":
             self.i_written = op[1]
+            self._sent.append(op[1])
         elif kind == "offset":
             self.v_written = op[1]
         if kind in ("current", "offset", "set"):
             self._dirty = True
             self._written_at = self.now
         self._waiting = None
+        if kind == "mine" and self.state == "running":  # (a keeping, before its next write: its set current, read)
+            v = result[0] if isinstance(result, (list, tuple)) and result else None
+            if _num(v) and abs(v - self.i_written) > self.HAND:  # (not as written last: a hand's: left as it is)
+                self.i_written = float(v)
+                self._fail("its current was set by hand meanwhile", keep=True)
+                return
         if self._sweep is not None and kind == "get" and self.state == "running":  # (read on a sweep's way)
             self._sweep_seen(Sample(self.now, self.i_written, self.v_written, values=result))
             if self.state != "running":  # (its watch failed: things are being put back)

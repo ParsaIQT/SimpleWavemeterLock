@@ -396,21 +396,24 @@ def two_modes(model, part: float):
     return model
 
 
-def unlike(model, rng):
+def unlike(model, rng, spread: float = 1.0):
     """A laser like the model, not it (as another fit of its map would have it): its rule's terms a little off, its
-    chip's modes anywhere, its cavity drifted. rng: numpy's."""
+    chip's modes anywhere, its cavity drifted. rng: numpy's. spread: how unlike (1: as fits of one map differ: its
+    hysteresis by a factor e^0.4 either way, its pull by 0.05, its lag by e^0.3, its window's edges by 3 % of its
+    width, how it moves by 15 %; 2.5: a model that is a poor likeness)."""
     import numpy as np
 
+    k = spread
     true = copy.deepcopy(model)
-    true.h_up *= float(np.exp(rng.normal(0, 0.4)))
-    true.h_down *= float(np.exp(rng.normal(0, 0.4)))
-    true.pull = float(np.clip(true.pull + rng.normal(0, 0.05), -0.4, 0.8))
-    true.lag *= float(np.exp(rng.normal(0, 0.3)))
+    true.h_up *= float(np.exp(rng.normal(0, 0.4 * k)))
+    true.h_down *= float(np.exp(rng.normal(0, 0.4 * k)))
+    true.pull = float(np.clip(true.pull + rng.normal(0, 0.05 * k), -0.4, 0.8))
+    true.lag *= float(np.exp(rng.normal(0, 0.3 * k)))
     w = true.hi - true.lo
-    true.lo += float(rng.normal(0, 0.03 * w))
-    true.hi += float(rng.normal(0, 0.03 * w))
-    true.w_v *= float(1 + rng.normal(0, 0.15))
-    true.w_i *= float(1 + rng.normal(0, 0.15))
+    true.lo += float(rng.normal(0, 0.03 * k * w))
+    true.hi += float(rng.normal(0, 0.03 * k * w))
+    true.w_v *= float(1 + rng.normal(0, min(0.15 * k, 0.4)))
+    true.w_i *= float(1 + rng.normal(0, min(0.15 * k, 0.4)))
     true.offset += float(rng.uniform(-0.5, 0.5) * true.dc)
     true.ext.p0 += float(rng.uniform(-5, 5))
     return true
@@ -536,18 +539,21 @@ def case_near(seed: int, **hop) -> Case:
                 tol=1.0)
 
 
-def case_model(kind: str, seed: int, drift: float = 0.0004, **hop) -> Case:
-    """A laser a model describes (kind: blue, red, or model: a random one), unlike it by seed, on target where it
-    lases coming down onto its nominal current; its chip's modes then move a little at a time until it hops."""
+def case_model(kind: str, seed: int, drift: float = 0.0004, spread: float = 1.0, sided: bool = False, **hop) -> Case:
+    """A laser a model describes (kind: blue, red, or model: a random one), unlike it by seed (spread: how unlike:
+    unlike()), on target where it lases coming down onto its nominal current; its chip's modes then move a little at
+    a time until it hops. sided: the laser's hysteresis is by the edge of its mode it is at, not by the way its
+    current last moved as the model has it (sim.ModelLaser): a laser that is not of the model's kind there."""
     import numpy as np
 
     model = {"blue": lab493, "red": lab650}[kind]() if kind in ("blue", "red") else random_model(seed)
     rng = np.random.default_rng(seed)
-    true = unlike(model, rng)
+    true = unlike(model, rng, spread) if spread != 1.0 else unlike(model, rng)
     i_nom = round(float(model.i0 + rng.uniform(-1, 1)), 2)
     v_nom = round(float(model.v0 - model.v_set_to_act + rng.uniform(-3, 3)), 2)
     rig = None
-    laser = ModelLaser(true, clock=lambda: rig.t if rig is not None else 0.0)
+    laser = (ModelLaser(true, clock=lambda: rig.t if rig is not None else 0.0, sided=True) if sided else
+             ModelLaser(true, clock=lambda: rig.t if rig is not None else 0.0))
     rig = Rig(laser, 0.0, current=i_nom + 2.0, offset=v_nom, dt=0.15, seed=seed)
     for k in range(21):  # (onto it from 2 mA above, as by hand)
         rig.client.set("laser1:dl:cc:current-set", i_nom + 2.0 - 0.1 * k)
@@ -567,7 +573,8 @@ def case_model(kind: str, seed: int, drift: float = 0.0004, **hop) -> Case:
                 hop=(laser.freq(v_nom, i_nom) - target) * 1e3, right=lambda: laser._state[0] == right, tol=20.0)
 
 
-def make_case(kind: str, seed: int, **hop) -> Case:
+def make_case(kind: str, seed: int, spread: float = 1.0, sided: bool = False, **hop) -> Case:
+    """spread, sided: a model's laser less like its model (case_model); the others' are as they come."""
     if kind == "far":
         return case_far(seed, **hop)
     if kind == "strong":
@@ -577,7 +584,7 @@ def make_case(kind: str, seed: int, **hop) -> Case:
     if kind == "near":
         return case_near(seed, **hop)
     if kind in ("blue", "red", "model"):
-        return case_model(kind, seed, **hop)
+        return case_model(kind, seed, spread=spread, sided=sided, **hop)
     raise ValueError(f"no such laser: {kind!r} (one of {', '.join(KINDS)})")
 
 
@@ -598,12 +605,17 @@ def recover(case: Case) -> Outcome:
 
 def recoveries(kind: str, n: int, first: int = 0, say=None, rig: dict | None = None, **hop) -> list:
     """n cases of that kind (seeds first ..), each recovered: their outcomes. rig: its rigs' own (Rig's attributes:
-    latency, op_s, dt), if not as they come."""
+    latency, op_s, dt; noise_x: the wavemeter's noise that many times what it is), if not as they come."""
     out = []
     for seed in range(first, first + n):
         case = make_case(kind, seed, **hop)
         for name, value in (rig or {}).items():
-            setattr(case.rig, name, value)
+            if name == "noise_x":
+                case.tol += 3 * case.rig.noise * max(value - 1, 0)  # (on target: within what its readings tell)
+                case.rig.noise *= value
+            elif value is not None:
+                setattr(case.rig, name, value)
+        case.rig.due = case.rig.t + case.rig.dt
         o = recover(case)
         out.append(o)
         if say is not None:
@@ -674,7 +686,8 @@ class Kept:
     notes: list = field(default_factory=list)
 
 
-def keep_trial(kind: str, seed: int, hours: float = 6.0, keep: bool = True, rate: float | None = None) -> Kept:
+def keep_trial(kind: str, seed: int, hours: float = 6.0, keep: bool = True, rate: float | None = None,
+               zone: float | None = None, dt: float = 0.5, noise: float = 1.0) -> Kept:
     """One laser, locked, its selection drifting to and fro over hours, further each way than where it hops (rate:
     steadily instead, GHz/h), and wandering a little: left alone it hops within an hour or two. Watched
     (keep.ModeWatch) and kept (Recenter.keep) as the engine would, or left alone:
@@ -684,7 +697,10 @@ def keep_trial(kind: str, seed: int, hours: float = 6.0, keep: bool = True, rate
             keeping): the wavemeter's interference patterns are what is watched (their fringes fading)
       blue, red  the lab's two DL pros as their models have them (a model's laser: its chip's modes drifting; two
             modes over a fifth of each mode's range before a hop; its hysteresis by the edge of its mode it is at:
-            ModelLaser's sided), locked to the wavemeter likewise."""
+            ModelLaser's sided), locked to the wavemeter likewise.
+    What the keeping rests on can be taken away, to see what is left of it: zone: the part of a mode's range that
+    runs on two modes before it hops (None: as above; 0: none: it hops out of the blue); dt: s between the
+    wavemeter's readings (and the polls of its SHG signal); noise: its signal's noise, that many times what it is."""
     from .keep import ModeWatch
     from .lock import Lock, LockParams
     from .sim import SimCCD
@@ -694,28 +710,31 @@ def keep_trial(kind: str, seed: int, hours: float = 6.0, keep: bool = True, rate
     locked, ccd, wm_lock, model = None, None, None, kind in ("blue", "red")
     if kind == "shg":
         laser, _ = near_ecdl(seed)
+        if zone is not None:
+            laser.multimode = zone * laser.fsr
         rig, locked = _locked(laser, seed, shg=True, lockpoints=True, pdh_dc=rng.uniform(-0.03, 0.03))
         locked.shg_slope = rng.uniform(-0.015, 0.015)  # (its signal goes a little with its master's current, too)
+        locked.shg_noise *= noise
         p = HopParams(enabled=True, i_nom=I0, cavity=True, shg=True, opt_i=I0, opt_v=V0, opt_shg=rig.shg_usual,
                       shg_lock=rig.shg_usual, keep=keep, i_below=2.0)
         watch.signals["shg"].prior = rig.shg_usual
-        rig.dt = 0.5  # (its SHG signal polled twice a second, as the engine does; the wavemeter as often)
+        rig.dt = dt  # (its SHG signal polled twice a second, as the engine does; the wavemeter as often)
         i_nom, v_nom = I0, V0
     elif kind == "dl":
         laser, _, noise = far_ecdl(2000 + seed)
         laser.shift, laser.m = 0.0, 0
-        laser.multimode = rng.uniform(0.1, 0.25) * laser.fsr
-        rig = Rig(laser, laser.freq(V0, I0), noise, seed=seed, dt=0.5)
+        laser.multimode = rng.uniform(0.1, 0.25) * laser.fsr if zone is None else zone * laser.fsr
+        rig = Rig(laser, laser.freq(V0, I0), noise, seed=seed, dt=dt)
         p = HopParams(enabled=True, i_nom=I0, keep=keep, i_below=2.0)
         i_nom, v_nom = I0, V0
     elif model:
         true = two_modes(unlike({"blue": lab493, "red": lab650}[kind](), __import__("numpy").random.default_rng(seed)),
-                         0.2)
+                         0.2 if zone is None else zone)
         i_nom = round(true.i0 + rng.uniform(-1, 1), 2)
         v_nom = round(true.v0 - true.v_set_to_act + rng.uniform(-3, 3), 2)
         rig = None
         laser = ModelLaser(true, clock=lambda: rig.t if rig is not None else 0.0, seed=seed, sided=True)
-        rig = Rig(laser, 0.0, current=i_nom + 2.0, offset=v_nom, dt=0.5, seed=seed)
+        rig = Rig(laser, 0.0, current=i_nom + 2.0, offset=v_nom, dt=dt, seed=seed)
         for k in range(21):  # (onto its mode from 2 mA above, as by hand; then into the middle of where it holds)
             rig.client.set("laser1:dl:cc:current-set", i_nom + 2.0 - 0.1 * k)
             rig.t += 0.15
@@ -733,9 +752,14 @@ def keep_trial(kind: str, seed: int, hours: float = 6.0, keep: bool = True, rate
         p = HopParams(enabled=True, i_nom=i_nom, keep=keep, i_below=2.0)
     else:
         raise ValueError(f"no such laser to keep: {kind!r} (one of {', '.join(KEEPS)})")
+    if zone == 0 and isinstance(laser, ECDL):  # (never two modes at once: it hops out of the blue)
+        laser.components = lambda v, i: [(1.0, laser.mode_ghz(v, i))] if laser.lasing else []
+        laser.mm_noise = 0.0
     lo, hi, top = _windows(p, i_nom)
     if locked is None:  # this program's wavemeter lock, on its piezo; the wavemeter's patterns of it
-        ccd = SimCCD(seed=seed, amp_noise=3.0)
+        ccd = SimCCD(seed=seed, amp_noise=3.0 * noise)
+        if noise != 1.0:  # (its CCD's noise, a pixel's)
+            ccd._noise = [ccd.rng.gauss(0.0, 2.0 * noise) for _ in range(ccd.PIXELS)]
         kv = laser.kv if isinstance(laser, ECDL) else laser.model.ext.p_v
         wm_lock = Lock(LockParams(ki=0.3 / kv, excursion=0.0))
         wm_lock.engage(rig.V)
@@ -781,7 +805,7 @@ def keep_trial(kind: str, seed: int, hours: float = 6.0, keep: bool = True, rate
     t0, t_end = rig.t, rig.t + hours * 3600
     out = Kept(kind, seed, hours, None, 0, 0, 0, 0.0, False, rate if rate is not None else sign * swing, 0.0)
     right = laser.m if isinstance(laser, ECDL) else laser._state[0]
-    was = 0.0
+    was, thin = 0.0, max(1, round(2.0 / rig.dt))
     while rig.t < t_end:
         now = drifted(rig.t - t0 + rig.dt)
         step, was = now - was + rng.gauss(0.0, 0.002), now
@@ -799,7 +823,7 @@ def keep_trial(kind: str, seed: int, hours: float = 6.0, keep: bool = True, rate
             rig._settle()
             t, e = rig.reading()
             state["k"] = state.get("k", 0) + 1
-            if state["k"] % 4 == 0:  # (its patterns looked at every 2 s here: the simulated CCD's take a while)
+            if state["k"] % thin == 0:  # (its patterns looked at every 2 s here: the simulated CCD's take a while)
                 q = also(t, e)
                 if q is not None:
                     watch.feed("fringes", t, q)
@@ -836,10 +860,10 @@ def keep_trial(kind: str, seed: int, hours: float = 6.0, keep: bool = True, rate
     return out
 
 
-def keepings(kind: str, n: int, hours: float = 6.0, first: int = 0, keep: bool = True, say=None) -> list:
+def keepings(kind: str, n: int, hours: float = 6.0, first: int = 0, keep: bool = True, say=None, **how) -> list:
     out = []
     for seed in range(first, first + n):
-        k = keep_trial(kind, seed, hours, keep)
+        k = keep_trial(kind, seed, hours, keep, **how)
         out.append(k)
         if say is not None:
             say(k)
@@ -876,12 +900,19 @@ def main(argv=None) -> int:
                     help="a mode-hop recovery setting (HopParams), as method=map")
     rc.add_argument("--latency", type=float, default=0.0, help="s a reading is old when it comes (0)")
     rc.add_argument("--op", type=float, default=0.002, help="s an operation on its controller takes (0.002)")
+    rc.add_argument("--dt", type=float, help="s between the wavemeter's readings (0.1; the model's lasers 0.15)")
+    rc.add_argument("--noise", type=float, default=1.0, help="the wavemeter's noise, times what it is")
+    rc.add_argument("--unlike", type=float, default=1.0, help="a model's laser this much less like its model (1)")
+    rc.add_argument("--sided", action="store_true", help="a model's laser whose hysteresis is by the edge it is at")
     rc.add_argument("-v", "--verbose", action="store_true", help="each laser as it goes")
     kp = sub.add_parser("keep", help="lasers locked and drifting towards a hop: kept off the edge of their mode, or not")
     kp.add_argument("kind", choices=KEEPS + ("all",))
     kp.add_argument("--n", type=int, default=20)
     kp.add_argument("--first", type=int, default=0)
     kp.add_argument("--hours", type=float, default=6.0)
+    kp.add_argument("--zone", type=float, help="the part of a mode's range on two modes before a hop (0: none)")
+    kp.add_argument("--dt", type=float, default=0.5, help="s between readings (0.5)")
+    kp.add_argument("--noise", type=float, default=1.0, help="its signal's noise, times what it is")
     kp.add_argument("--json")
     kp.add_argument("-v", "--verbose", action="store_true")
     ls = sub.add_parser("lasers", help="what the random lasers are")
@@ -911,7 +942,8 @@ def main(argv=None) -> int:
                               + (f"hopped after {k.hop:.2f} h" if k.hop is not None else "no hop")
                               + f", kept {k.kept} times, current {k.moved:+.2f} mA" + (" (the window's edge)"
                                                                                        if k.at_edge else ""), flush=True)
-                outs = keepings(kind, args.n, args.hours, args.first, keep, say)
+                outs = keepings(kind, args.n, args.hours, args.first, keep, say, zone=args.zone, dt=args.dt,
+                                noise=args.noise)
                 every[f"{kind} {'kept' if keep else 'alone'}"] = outs
                 print(kept_said(kind, outs, keep), flush=True)
         if args.json:
@@ -934,12 +966,15 @@ def main(argv=None) -> int:
                 print(f"  {o.kind} {o.seed}: {'on target' if o.on_target else 'NOT: ' + (o.error or 'off target')}, "
                       f"{o.seconds:.1f} s, {o.readings} readings" + (f", margin {o.margin:.2f} mA" if o.ok else ""),
                       flush=True)
-        outs = recoveries(kind, args.n, args.first, say, {"latency": args.latency, "op_s": args.op}, **hop)
+        how = {"spread": args.unlike, "sided": args.sided} if kind in ("blue", "red", "model") else {}
+        outs = recoveries(kind, args.n, args.first, say, {"latency": args.latency, "op_s": args.op, "dt": args.dt,
+                                                         "noise_x": args.noise}, **how, **hop)
         every[kind] = outs
         print(said(kind, summary(outs)), flush=True)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({"took_s": round(time.monotonic() - t0, 1), "set": hop, "latency": args.latency, "op_s": args.op,
+                       "dt": args.dt, "noise": args.noise, "unlike": args.unlike, "sided": args.sided,
                        "summary": {k: summary(v) for k, v in every.items()},
                        "outcomes": {k: [asdict(o) for o in v] for k, v in every.items()}}, f, indent=1)
     return 0

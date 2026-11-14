@@ -327,6 +327,31 @@ def test_not_locked_or_hopping_on_the_way_it_fails_and_the_current_goes_back():
     only_the_current(rig)  # that would take a laser that had not hopped off its target; its guard has it from here)
 
 
+def test_its_current_set_by_hand_on_the_way_is_not_written_over():
+    """Its set current is read back before each of a keeping's writes: someone at it meanwhile, and the keeping
+    stops there, the current left as the hand has it (its next write, from where it was, would be a jump back)."""
+    rig, locked, p, alarm = shg_bench(0, way=1)
+    state = {"n": 0}
+
+    def also(t, e):
+        if abs(rig.I - I0) >= 0.03 and not state["n"]:  # (on its way: by hand, 0.2 mA on)
+            state["n"] = len(rig.dlc.log)
+            rig.dlc.params["laser1:dl:cc:current-set"] = state["i"] = round(rig.I - 0.2, 3)
+        return None
+
+    rig.also = also
+    r, rec = keeping(rig, p, alarm)
+    assert state["n"], "the hand never came"
+    assert r.state == "failed" and r.error == "its current was set by hand meanwhile" and not r.restored
+    assert rig.I == state["i"] and r.i_written == state["i"]  # (left as the hand has it)
+    assert len(rig.dlc.log) <= state["n"] + 1  # (the write that was on its way, at most)
+    rig, locked, p, alarm = shg_bench(0, way=1)  # (a controller that rounds what it is told is not a hand)
+    rig.dlc.on_set["laser1:dl:cc:current-set"] = lambda v=None: rig.dlc.params.__setitem__(
+        "laser1:dl:cc:current-set", round(rig.I, 2)) or rig._settle()
+    r, rec = keeping(rig, p, alarm)
+    assert r.state == "done" and rec.kept["mended"], r.error
+
+
 def test_step_by_step_it_asks_before_it_moves_anything():
     rig, locked, p, alarm = shg_bench(0, way=-1, confirm=True)
     a, b, top = _windows(p, I0)
@@ -909,6 +934,39 @@ def test_asked_to_unlock_while_its_mode_is_kept_it_is_unlocked_once_that_has_sto
         demo.close()
 
 
+def test_a_hand_at_its_current_while_its_mode_is_kept_stops_the_keeping(brisk):
+    """Someone sets its current at the DLC pro in the middle of a keeping: the keeping stops and leaves the current
+    as the hand has it (it would otherwise write its next step from where it was, a jump back); locked as it was."""
+    pytest.importorskip("numpy")
+    import time
+
+    from test_engine import hop_engine, wait_for
+
+    demo = kept_demo()
+    try:
+        dlc, las = demo.dlcs[0], demo.laser(1)
+        e, ch = hop_engine(demo, 1, dlc.key, 1, dict(enabled=True, keep=True))
+        try:
+            e.engage(1)
+            assert wait_for(lambda: ch.state == "on" and ch.guard.armed, 5)
+            assert wait_for(lambda: ch.fringes is not None and ch.watch.signals["fringes"].now() is not None, 40)
+            i0 = dlc.current(1)
+            into_its_zone(las, 0.3)
+            assert wait_for(lambda: ch.keeping is not None and ch.runner is not None
+                            and abs(dlc.current(1) - i0) > 0.01, 60)  # (under way: its current on the move)
+            dlc.execute("(param-set! 'laser1:dl:cc:current-set %.3f)" % (i0 - 0.3))  # (by hand, at its DLC pro)
+            assert wait_for(lambda: ch.runner is None, 5)
+            assert ch.keep_said.startswith("its mode not kept: its current was set by hand meanwhile"), ch.keep_said
+            time.sleep(1.5)
+            assert dlc.current(1) == pytest.approx(i0 - 0.3, abs=0.011)  # (left as the hand has it: a write on its
+            assert ch.state == "on" and ch.lock.active and ch.keeping is None  # way at most; locked as it was)
+            assert ch.current_set == pytest.approx(dlc.current(1), abs=1e-3)
+        finally:
+            e.stop()
+    finally:
+        demo.close()
+
+
 def test_after_a_keeping_its_current_still_follows_its_piezo_to_a_new_setpoint(brisk):
     """A laser whose feedforward adds nothing: its lock moves its current along with its piezo as it tunes it
     (engine.Follow). Set aside while its mode is kept (the keeping moves its current), it is back afterwards, from
@@ -1007,8 +1065,12 @@ def test_a_slaves_guard_acting_while_its_mode_is_kept_recovers_it_as_ever(brisk,
             e.engage(demo.SLAVE)
             assert wait_for(lambda: s.sls_guard is not None and s.sls_guard.stage == "hold", 10)
             assert wait_for(lambda: s.hop.shg_lock > 0 and s.watch.signals["shg"].now() is not None and s.beat_ok, 60)
-            into_its_zone(slave, 0.25)
-            assert wait_for(lambda: s.keeping is not None and s.runner is not None, 60), (s.note, s.keep_said)
+            def kept():  # (its trim may step its piezo, and take it out of where its second mode begins, before its
+                if s.keeping is None and second_mode(slave) < 0.05:  # watch has seen two blocks of it: there again)
+                    into_its_zone(slave, 0.25)
+                return s.keeping is not None and s.runner is not None
+
+            assert wait_for(kept, 60), (s.note, s.keep_said)
             slave.stop_lasing()
             demo.pdh.drop(0.5)
             assert wait_for(lambda: not demo.pll.manual, 3)

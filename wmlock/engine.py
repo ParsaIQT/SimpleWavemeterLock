@@ -1312,6 +1312,8 @@ class Engine:
             return None
         elif not hop.cavity and ch.lock.watching:  # (its wavemeter lock just engaged, still watched for running
             return None                            # away: its error growing as its current is ramped would be that)
+        elif ch.follow is not None and ch.follow.tuning:  # (being tuned to a new setpoint, its current following)
+            return None
         return ch.watch.alarm(now, hop.keep_dip)
 
     def _start_keep(self, ch: Channel, alarm: dict):
@@ -1940,6 +1942,17 @@ class Engine:
 
         def on_current_set(v):
             with self.lock:
+                if mine() and ch.keeping is not None and ch.runner is not None and ch.runner.state == "running" \
+                        and _num(v) and not ch.runner.wrote(v):
+                    # (its mode being kept, and its current set by hand meanwhile: the keeping stops, the current
+                    # left as the hand has it; its guard stands by until it is on target again, as ever)
+                    log.info("channel %d: its current set by hand (%.3f mA) while its mode was being kept", ch.n, v)
+                    ch.runner.cancel("its current was set by hand meanwhile", keep=True)
+                    ch.guard.reset()
+                    ch.current_set = v
+                    if ch.follow is not None:
+                        ch.follow.by_hand(v, ch.offset, time.monotonic())
+                    return
                 if mine() and ch.state != "recovering":
                     f = ch.follow
                     if f is not None and f.mine(v):
@@ -3880,6 +3893,7 @@ class Engine:
         else:
             ch.upkeep_t = time.monotonic()
             ch.follow_kept = None
+            ch.keep_edge = ""
             ch.watch.reset(0.0)  # (recovered, relocked: its signals as they are from now on, learned afresh)
         self._release(ch)  # its wavemeter channel, if it was switched on for the recovery
         took = f"{r.now - ch.hop_t:.0f} s"

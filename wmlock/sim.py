@@ -965,6 +965,7 @@ class SimLocked:
         self.shg_h, self.shg_floor = 1.2, 0.03
         self.shg_slope, self.shg_i0 = 0.0, None  # locked, its signal goes with its master's power too: this part of
         #                                          it a mA of its current from shg_i0 (None: where it is first read)
+        self.shg_noise = 0.003  # V rms: a reading of its intra-cavity signal's
         self.collapse = collapse
         self.shg_phase = self.rng.random()
         self.shg_jitter = 0.0   # rms: each sweep shows its resonances this much taller or shorter (a real one, ±7 %)
@@ -1360,11 +1361,11 @@ class SimLocked:
                     if self.shg_i0 is None:
                         self.shg_i0 = i
                     main *= 1.0 + self.shg_slope * (i - self.shg_i0)
-                return self.shg_floor + self.shg_h * main + self.rng.gauss(0.0, 0.003)
+                return self.shg_floor + self.shg_h * main + self.rng.gauss(0.0, self.shg_noise)
             s = self._get("nlo:shg:scan:offset")
             if self._get("nlo:shg:scan:enabled"):
                 s += self._get("nlo:shg:scan:amplitude") * (self.rng.random() - 0.5)
-            return self._intra(s, comps) + self.rng.gauss(0.0, 0.003)
+            return self._intra(s, comps) + self.rng.gauss(0.0, self.shg_noise)
 
     def _shg_power(self) -> float:
         with self.mutex:
