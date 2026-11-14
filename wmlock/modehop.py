@@ -765,7 +765,8 @@ class Recenter(CavitySteps):
     MAX_TUNE = 12
     RELOCK_TRIES = 3
     MIN_MARGIN = 0.15      # mA: the least distance from a hop worth having
-    SETTLE_MIN = 0.05      # mA: nowhere holding that, a spot on target with a hop this far at least is settled for
+    SETTLE_MIN = 0.0       # mA: nowhere holding that, a spot on target with a hop this far at least is settled for
+    #                        (none: better on target, though near a hop, than not; its hop's distance only ranks them)
     SETTLE_TRIES = 2       # ...the best few of them (each come back to as it was found)
     SHIFT = 0.15           # mA/V: how far a mode's current range may move per volt of piezo (rather more)
     KV_GUESS = 300.0       # MHz/V, before anything is known
@@ -2206,23 +2207,24 @@ class Recenter(CavitySteps):
 
     def settle_best(self):
         """Nowhere it came to held the margins wanted (NoHold). Where it was on target all the same (spots: its
-        margins' check found a hop there, SETTLE_MIN away at least), the one furthest from its hop is settled for: come
-        back to as it was found (return_to), on target there, single-mode if that can be told, and left so, as by
-        hand, rather than not on target at all. It may well hop again sooner than where the margins held; recovered
-        again then. True: settled (SETTLE_TRIES spots at most tried, the furthest from a hop first)."""
+        margins' check found a hop there, SETTLE_MIN away at least: no floor), the one furthest from its hop is settled
+        for: come back to as it was found (return_to), on target there, single-mode if that can be told, and left so,
+        as by hand, rather than not on target at all. It may well hop again sooner than where the margins held;
+        recovered again then. True: settled (SETTLE_TRIES spots at most tried, the furthest from a hop first)."""
         for spot in sorted(self.spots, key=lambda x: -x["d"])[:self.SETTLE_TRIES]:
             way = "up" if spot["up"] else "down"
             where = f"{self.mA(spot['i'], spot['v']):.2f} mA, {spot['v']:.2f} V"
             yield from self.ask(f"Nowhere held the margins wanted: back to {where} sweeping {way}, as it was found "
-                                f"({spot['how']}; a hop some {spot['d']:.2f} mA from there), and left on target there")
-            self.stage = f"settling for {where}, sweeping {way}: a hop some {spot['d']:.2f} mA from there"
+                                f"({spot['how']}; its hop at least {spot['d']:.2f} mA from there), and left on target "
+                                f"there")
+            self.stage = f"settling for {where}, sweeping {way}: its hop at least {spot['d']:.2f} mA from there"
             if (yield from self.return_to(spot)) and (yield from self.mode_ok()):
                 self.settled = dict(spot, at=round(self.mA(self.I), 3), v_at=round(self.V, 3))
                 self.record["settled"] = {k: round(x, 3) if isinstance(x, float) else x
                                           for k, x in self.settled.items()}
                 self.note(f"nowhere held the margins wanted: settled for {where}, come to sweeping {way} as before "
-                          f"({spot['how']}), on target there; a hop some {spot['d']:.2f} mA from it, so it may hop "
-                          f"again before long")
+                          f"({spot['how']}), on target there; its hop at least {spot['d']:.2f} mA from it, so it "
+                          f"may hop again before long")
                 return True
         return False
 
@@ -4571,7 +4573,7 @@ class Recenter(CavitySteps):
         elif self.settled is not None:
             sp = self.settled
             summary = (f"on target where it came furthest from a hop of where it was on target (nowhere held the "
-                       f"margins wanted): {sp['how']}, a hop some {sp['d']:.2f} mA from there; {began:.2f} → "
+                       f"margins wanted): {sp['how']}, its hop at least {sp['d']:.2f} mA from there; {began:.2f} → "
                        f"{now:.2f} mA measured, {self.V0:.2f} → {self.V:.2f} V ({self.readings} readings)")
         elif self.flown is not None:
             f = self.flown

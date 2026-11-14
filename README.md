@@ -998,8 +998,9 @@ way the map found its mode there.
    a new temperature) may be on target at every place it comes to, and still have a hop nearer
    than the check wants at each: the check itself then takes it over the edge (with hysteresis it
    does not come back), and every place is given up. So each place it was on target at is kept,
-   with how far the check read it on its mode before the hop (0.05 mA at least). If nowhere holds
-   the margins wanted, it goes back to the one furthest from its hop, the way it came to it then
+   with how far the check read it on its mode before the hop (at least that far, its readings' delay
+   allowed for: on the 493 nm laser, a few hundredths of a mA). If nowhere holds the margins wanted,
+   it goes back to the one furthest from its hop, the way it came to it then
    (the current round by the far end of the window and swept the same way, as when it was
    parked), puts it on target there, and says so (*on target where it came furthest from a hop
    …*): it may hop again sooner, and is recovered again then. Nowhere kept: it gives up, as

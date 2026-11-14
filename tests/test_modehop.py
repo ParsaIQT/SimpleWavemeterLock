@@ -2461,7 +2461,7 @@ def destructive(ds, rest=0.06):
 
     def check(self, m, loop=0.0, seen=None):
         self.hop_d = ds.pop(0) if ds else rest
-        self.note(f"hop within {m:.2f} mA (as this test has it: {self.hop_d:.2f} mA away)")
+        self.note(f"hop within {m:.2f} mA (as this test has it: {self.hop_d} mA away)")
         yield from self.move(current=self.i_hi)
         return False
 
@@ -2484,11 +2484,11 @@ def test_nowhere_holding_the_margins_it_settles_on_target_where_it_came_furthest
     assert any(n.startswith("nowhere held the margins wanted: settled for") for n in rec.notes)
 
 
-def test_a_hop_too_near_wherever_it_was_on_target_and_it_fails_as_it_did(monkeypatch):
-    """A hop nearer than SETTLE_MIN wherever it was on target: nothing worth settling for; it fails (put back), as
-    ever."""
+def test_where_its_checks_could_not_tell_how_near_a_hop_is_nothing_is_kept_and_it_fails_as_it_did(monkeypatch):
+    """Its margins' checks failed for what tells no distance to a hop (its readings not on one line all the way, two
+    modes by its SHG sweep, no valid reading): nowhere kept to settle for; it fails (put back), as ever."""
     laser, target = hopped_laser()
-    monkeypatch.setattr(Recenter, "check", destructive([], rest=0.02))
+    monkeypatch.setattr(Recenter, "check", destructive([], rest=None))
     b, rec, r = recover(laser, target, quick=False)
     assert r.state == "failed" and "no mode that holds reaches the target" in r.error, (r.state, r.error)
     assert not rec.spots and rec.settled is None
