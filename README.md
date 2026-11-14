@@ -1012,7 +1012,10 @@ the moment the readings are not as expected**, where it is, not at the end of th
 * the margins' check: the second reading in a row off the mode's line through where it began is a hop
   within the margin: no further;
 * the model's ways: three readings in a row on a mode none of the ways its model has it arrive passes
-  anywhere: none of them is the laser as it is; the model is fitted to what was read, and plans again;
+  anywhere: none of them is the laser as it is; the model is fitted to what was read, and plans again
+  (a plan's sweep from the window's end: on the later half of its way only: where it sets out is its
+  past's doing, which its model knows least, and a mode held against it there stopped sweeps that
+  would have arrived);
 * the catch with the wavemeter alone, and its reset coming down: to where it is on its right mode, and
   no further;
 * the seed power, read every 0.2 s on the way (or every 0.2 mA, if that is sooner): not lasing, the
@@ -1028,10 +1031,10 @@ each kept with the current as the ramp had it that long before it came, the dela
 (up to the time between two readings and 50 ms more); a hop is off that line whatever the delay. What
 it finds is kept in the recovery's record (`late_s`; a note says so from 30 ms), as is how long the DLC
 pro took over a write (`write_s`): two things the simulator can only assume, and the first real
-recoveries will tell. In the simulator the lasers come back as well with readings 50 ms old as with
-none, and with readings a whole interval old (100 ms at ten a second) in a fifth more time (table
-below); before this, a margins' check with each way's own line called a hop that was not there at
-every turn, and half of them failed.
+recoveries will tell. In the simulator the lasers come back as well with readings 50 ms old, or a
+whole interval old (100 ms at ten a second), as with none, and a controller that takes 20 ms over a
+write costs them a sixth more time (table below); before this, a margins' check with each way's own
+line called a hop that was not there at every turn, and half of them failed.
 
 **As fine as its controller keeps up with.** Every move of a recovery, and everything it puts back, is
 written in those 0.02 mA steps, not only the sweeps. A controller that takes longer over a write than
@@ -1210,7 +1213,8 @@ every reading that is on target, the hop guard armed all the while):
    read ten times a second; a laser this program's lock holds, 0.004 mA a reading however seldom they
    come, since its lock steps the piezo once a reading and must follow (the middle of its last five
    readings 30 MHz off its target: the ramp waits for the lock, and goes on half as fast, down to an
-   eighth). The way that mended it last time first (the modes drift one way for hours), else down.
+   eighth; behind twelve times running without getting a quarter of a probe further, its lock is not
+   one to move its current under: left where it is). The way that mended it last time first (the modes drift one way for hours), else down.
    **Falling** (two readings running below where it began, by twice a reading's scatter and a twentieth
    of the dip): the wrong way: no further, and back as slowly;
 3. **which way**: back up already (three readings running as high as it should be), or higher than it
@@ -1253,7 +1257,13 @@ What can go wrong on the way, and what is done:
   was, as slowly as it came;
 * **asked to unlock** meanwhile (its channel no longer measured, its scan switched at the DLC pro,
   *Unlock*): the keeping stops, and it is unlocked; its **setpoint moved**: the keeping stops, and the
-  lock tunes it there, its current following its piezo as ever (*The lock*);
+  lock tunes it there, its current following its piezo as ever (*The lock*; no keeping begins while it
+  is being tuned);
+* **its current set by hand** at the DLC pro meanwhile: a keeping reads its set current back before
+  each of its writes; not what it wrote last (by more than 0.02 mA: a controller may round), the
+  keeping stops and leaves the current as the hand has it (its next write, from where it was, would
+  have jumped it back; the poll of its set current, twice a second, says so as well if it gets there
+  first). A recovery, which has the laser to itself, goes on writing from where it was;
 * a laser an SLS PLL holds whose guard acts meanwhile (its master's lock lost): the keeping is dropped,
   and the guard's recovery is a recovery.
 
@@ -1277,9 +1287,9 @@ before a hop, their hysteresis by the edge they are at):
 | lasers, and what is watched | left alone: hopped | kept: hopped | keepings a laser | not mended; failed | current moved (median) | from its target: rms (median), worst |
 |---|---|---|---|---|---|---|
 | **shg**: an SHG master (near), its DLC pro's locks on: its SHG signal | 20 of 20, half within 0.3 h | 0 of 20 | 48 | 0; 0 | 0.70 mA | 0.1 MHz, 0 MHz |
-| **dl**: an ECDL locked to the wavemeter by this program: its fringes | 20 of 20, half within 0.6 h | 6 of 20, all with the current at the edge of its window | 56 | 62; 3 | 1.80 mA | 8.6 MHz, 65 MHz |
+| **dl**: an ECDL locked to the wavemeter by this program: its fringes | 20 of 20, half within 0.6 h | 6 of 20, all with the current at the edge of its window | 56 | 62; 3 | 1.80 mA | 8.6 MHz, 56 MHz |
 | **blue**: the 493 nm laser's model, locked to the wavemeter: its fringes | 20 of 20, half within 0.4 h | 0 of 20 | 45 | 0; 0 | 0.80 mA | 5.2 MHz, 75 MHz |
-| **red**: the 650 nm laser's, likewise | 20 of 20, half within 0.4 h | 0 of 20 | 54 | 5; 0 | 0.85 mA | 4.0 MHz, 54 MHz |
+| **red**: the 650 nm laser's, likewise | 20 of 20, half within 0.4 h | 1 of 20, none at the edge of its window | 54 | 6; 1 | 0.85 mA | 4.0 MHz, 53 MHz |
 <!-- /trials:keep -->
 
 The two-mode zone before a hop is what all of this rests on: 5 to 25 % of a mode's range in the
@@ -2434,11 +2444,11 @@ program as it was before the ramps (a step and a reading at a time, commit f3ea4
 | **strong** (the map) | 20 of 20 | 41.4 s, 45.9 s, 51.7 s | -0.18 mA | 20 of 20 | 26.3 s, 27.8 s, 29.4 s | -0.19 mA |
 | **shg** (the walk) | 51 of 52 | 21.9 s, 36.8 s, 57.1 s | 0.57 mA | 51 of 52 | 22.1 s, 37.2 s, 58 s | 0.57 mA |
 | **near** (the catch) | 58 of 58 | 19.9 s, 114.1 s, 256.2 s | 0.13 mA | 58 of 58 | 17.4 s, 94.5 s, 216.9 s | 0.21 mA |
-| **red** (its model) | 60 of 60 | 35.9 s, 52.2 s, 74.7 s | 1.29 mA | 60 of 60 | 7.6 s, 8.9 s, 76.1 s | 1.32 mA |
-| **blue** (its model) | 59 of 60 | 45.9 s, 60.9 s, 71.1 s | 0.96 mA | 60 of 60 | 12.2 s, 50.9 s, 85.7 s | 0.95 mA |
-| **model** (their models) | 48 of 60 | 43.1 s, 61.8 s, 81.9 s | 0.51 mA | 49 of 60 | 11.3 s, 43.8 s, 74.9 s | 0.56 mA |
+| **red** (its model) | 60 of 60 | 35.9 s, 52.2 s, 74.7 s | 1.29 mA | 60 of 60 | 7.6 s, 8.9 s, 76.5 s | 1.32 mA |
+| **blue** (its model) | 59 of 60 | 45.9 s, 60.9 s, 71.1 s | 0.96 mA | 60 of 60 | 12.2 s, 54.8 s, 72.5 s | 0.95 mA |
+| **model** (their models) | 48 of 60 | 43.1 s, 61.8 s, 81.9 s | 0.51 mA | 50 of 60 | 11.3 s, 45.6 s, 113.6 s | 0.55 mA |
 
-The short way: 58 of the 650 nm laser's 60 recoveries (8 s the median; the others, by a map, 52 s); 42 of the 493 nm laser's 60 recoveries (12 s the median; the others, by a map, 47 s); 33 of the random lasers' 49 recoveries (10 s the median; the others, by a map, 38 s).
+The short way: 58 of the 650 nm laser's 60 recoveries (8 s the median; the others, by a map, 52 s); 42 of the 493 nm laser's 60 recoveries (12 s the median; the others, by a map, 47 s); 33 of the random lasers' 50 recoveries (10 s the median; the others, by a map, 39 s).
 <!-- /trials:recover -->
 
 The walk is as it was (it looks at the SHG sweep at every step: the sweep takes the time). The model's
@@ -2454,12 +2464,57 @@ What the simulator had to assume, and how much it matters (the far lasers, rampe
 <!-- trials:late -->
 | | far, ramped: recovered; s (median, nine in ten) | blue, ramped |
 |---|---|---|
-| as assumed: a reading as old as nothing, 2 ms a write | 53 of 53; 17 s, 28.8 s | 60 of 60; 12.2 s, 50.9 s |
+| as assumed: a reading as old as nothing, 2 ms a write | 53 of 53; 17 s, 28.8 s | 60 of 60; 12.2 s, 54.8 s |
 | readings 50 ms old | 53 of 53; 17 s, 30.8 s | 60 of 60; 12.4 s, 50.5 s |
-| readings 100 ms old (a whole interval, for the far lasers) | 53 of 53; 16.9 s, 28.8 s | 60 of 60; 12.6 s, 55.5 s |
-| 20 ms a write | 52 of 53; 19.7 s, 33.5 s | 60 of 60; 12.5 s, 54 s |
-| readings 100 ms old and 20 ms a write | 53 of 53; 19.6 s, 32.4 s | 59 of 60; 12.9 s, 50.5 s |
+| readings 100 ms old (a whole interval, for the far lasers) | 53 of 53; 16.9 s, 28.8 s | 60 of 60; 12.6 s, 54 s |
+| 20 ms a write | 52 of 53; 19.7 s, 33.5 s | 60 of 60; 12.5 s, 60.3 s |
+| readings 100 ms old and 20 ms a write | 53 of 53; 19.6 s, 32.4 s | 59 of 60; 12.9 s, 52.5 s |
 <!-- /trials:late -->
+
+**What the trials share with the program.** The simulator's lasers are built on the same picture of an
+ECDL as the procedures (external modes under a selection filter, hysteresis, a second mode lasing before
+the first gives way), and the model's lasers are the lab's lasers' own models run forward. A trial
+against that picture shows that the procedures are right about it, and how fast; it does not show that
+the picture is right. Where it was cheap the simulator was moved away from what the program assumes
+(`recover --unlike --sided --noise --dt`, `keep --zone --noise --dt`):
+
+<!-- trials:vary -->
+| what is not as assumed | ramped: recovered; s (median, nine in ten) | by steps |
+|---|---|---|
+| **red**, the laser 2.5 times less like the model the program has of it | 59 of 60; 8.9 s, 36.3 s | 58 of 60; 39.5 s, 45.9 s |
+| **blue**, the same | 56 of 60; 16.3 s, 56.3 s | 57 of 60; 52.8 s, 68.4 s |
+| **red**, its hysteresis by the edge of its mode it is at (a rule its model does not have) | 60 of 60; 7.6 s, 8.9 s | (not run: the bench of before does not have it) |
+| **blue**, the same | 60 of 60; 12.1 s, 34.5 s | (not run: the bench of before does not have it) |
+| **far**, the wavemeter three times as noisy | 53 of 53; 17.4 s, 30.9 s | 53 of 53; 27 s, 51.7 s |
+| **far**, read every 0.3 s (not 0.1 s) | 53 of 53; 48.6 s, 82.8 s | 53 of 53; 79.5 s, 153.3 s |
+| **far**, read every 1 s | 53 of 53; 155 s, 271 s | 52 of 53; 265 s, 511 s |
+
+| kept for 6 h, 12 lasers of each: hopped | shg | dl | blue | red |
+|---|---|---|---|---|
+| two modes over a tenth of a mode's range before a hop | 0 of 12 | 4 of 12, 3 at the edge of its window | 3 of 12 | 4 of 12 |
+| over a twentieth | 0 of 12 | 3 of 12, all at the edge of their windows | 12 of 12; half by 2.3 h (left alone: 0.5 h) | 12 of 12; half by 2.1 h (left alone: 0.4 h) |
+| no second mode before a hop: out of the blue | 12 of 12; half by 0.5 h (left alone: 0.5 h); nothing moved | 12 of 12; half by 0.6 h (left alone: 0.6 h); nothing moved | 12 of 12; half by 0.5 h (left alone: 0.5 h); nothing moved | 12 of 12; half by 0.5 h (left alone: 0.5 h); nothing moved |
+| the signal five times as noisy | 1 of 12 | 3 of 12, all at the edge of their windows | 0 of 12 | 0 of 12 |
+| a reading every 2 s (not 0.5 s) | 0 of 12 | 2 of 12, 1 at the edge of its window | 0 of 12 | 4 of 12 |
+<!-- /trials:vary -->
+
+What these say. The ramps and the short way do not rest on the model being a good likeness: with a
+laser 2.5 times less like its model the 650 nm laser comes back as before (59 of 60, in 9 s), and the
+493 nm laser 56 times in 60 (in 16 s; by steps 57 in 60, in 53 s: the short way is given up more often
+there, and one laser more is lost than by a map alone). A hysteresis that goes by the edge of its mode,
+which its model does not have, changes nothing. A noisier wavemeter costs nothing; a slower one costs
+time in proportion, ramped and by steps alike (a ramp is paced by its readings).
+
+The keeping is another matter: it rests on the second mode showing before the hop, and on nothing else.
+With none, nothing is moved, and every laser hops when it would have (no gain, no harm). With two modes
+over a tenth of a mode's range (half of what the lab's lasers' models have), a laser with an SHG stage
+is kept as before, but 3 or 4 in 12 of those watched by their fringes hop within the 6 h; over a
+twentieth, all of those do, later than left alone (half of them by 2.1 to 2.3 h, not 0.4 to 0.5 h). Its
+SHG signal is read ten times a second; its fringes twice, and its current then goes 0.004 mA a reading,
+its first probe as likely the wrong way as the right one once the drift has turned round: a zone as
+narrow as that probe is passed before it is found. A signal five times as noisy, or a wavemeter that
+reads every 2 s, costs up to 4 lasers in 12. How wide that zone is on the lab's lasers, and how soon
+their fringes show it, is the first thing to measure (*Kept off the edge of its mode*).
 
 What the simulator does not know, and the real laser will show: how long a DLC pro really takes over a
 write, and how old a reading really is (both are in every recovery's record: `write_s`, `late_s`); a
@@ -2619,9 +2674,10 @@ when it says so and how long it waits after each kind of outcome); the keeping o
 by its fringes with this program's lock going on: either edge of its mode, the wrong way first, a signal low for
 another reason or one that only goes with the current, the window's edge, a glitch of the wavemeter's, the
 wavemeter falling silent, readings without their patterns, a hop as it ends, a wavemeter that reads once a second
-and a lock that follows slowly; lasers drifting towards their hops for hours, kept and left alone; and through the
-engine: an SHG laser its DLC pro locks, a laser this program locks (a hop in the middle of a keeping recovered,
-not followed by its lock), a slave its PLL holds, a laser unlocked meanwhile, its current following its piezo
-again afterwards, one left on another peak relocked at once. The trials themselves (`tests/test_trials.py`): the
+and a lock that follows slowly, its current set by hand on the way not written over (and a controller that rounds
+what it is told not taken for a hand); lasers drifting towards their hops for hours, kept and left alone; and
+through the engine: an SHG laser its DLC pro locks, a laser this program locks (a hop in the middle of a keeping
+recovered, not followed by its lock), a slave its PLL holds, a laser unlocked meanwhile, a hand at its current
+meanwhile, its current following its piezo again afterwards, one left on another peak relocked at once. The trials themselves (`tests/test_trials.py`): the
 lasers the same for the same seed, the rig's time, an ECDL's power along its modes, a model's laser on two modes
 before it hops and its hysteresis by the edge it is at, the command line.

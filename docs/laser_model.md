@@ -262,8 +262,8 @@ mode it hopped to gives way again. Every way is run by every member (each rule, 
 either side), then on past its end and back, and the one most of them have arrive and hold is taken, if six in
 ten do. The recovery ramps along it (`Recenter.short_way`), each reading against the modes those ways pass:
 three in a row on none of them, and it stops there, fits the model to what it read, and plans again. In the
-trials (README, *Trials*) nine in ten of the 650 nm laser's hops and two in three of the 493 nm laser's are
-mended this way, in some ten seconds and without a map.
+trials (README, *Trials*) nearly all of the 650 nm laser's hops (58 in 60) and seven in ten of the 493 nm laser's
+(42 in 60) are mended this way, in some ten seconds and without a map.
 
 ### 4.3 Before a mode hop
 
