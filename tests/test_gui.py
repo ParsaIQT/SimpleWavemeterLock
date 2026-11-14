@@ -243,13 +243,16 @@ def test_hop_dialog_keeping_its_mode_and_ramped_sweeps(app):
     ch = Channel(5, {"link": {"device": "192.168.1.30", "laser": 1}, "hop": {"enabled": True}})
     d = gui.HopDialog(None, ch)
     assert not d.keep.isChecked() and d.keep_dip.value() == 2.0 and d.keep_back.value() == 0.05  # (as they come:
-    assert d.smooth.isChecked() and d.fine.value() == 0.02 and d.fine_v.value() == 0.1         # not kept, ramped)
+    assert not d.smooth.isChecked() and d.fine.value() == 0.02 and d.fine_v.value() == 0.1     # not kept, by steps,
+    assert not d.fine.isEnabled() and not d.fine_v.isEnabled()                                 # the ramps' greyed)
     assert d.params() == HopParams(enabled=True)
     d.keep.setChecked(True)
     assert "begins to lase as well" in d.keep.toolTip() and "fringes on the wavemeter fade" in d.keep.toolTip()
-    assert "step" in d.smooth.toolTip()
+    assert "step" in d.smooth.toolTip() and "as it comes" in d.smooth.toolTip()
     d.keep_dip.setValue(3.5)
     d.keep_back.setValue(0.03)
+    d.smooth.setChecked(True)
+    assert d.fine.isEnabled() and d.fine_v.isEnabled()
     d.fine.setValue(0.01)
     d.fine_v.setValue(0.05)
     p = d.params()
@@ -257,11 +260,12 @@ def test_hop_dialog_keeping_its_mode_and_ramped_sweeps(app):
     d.keep.setChecked(False)
     d.smooth.setChecked(False)
     p = d.params()
-    assert not p.keep and not p.smooth
+    assert not p.keep and not p.smooth and not d.fine.isEnabled()
     assert HopParams.from_dict(p.to_dict()) == p  # (kept in the settings file)
-    ch = Channel(5, {"hop": {"enabled": True, "keep": True, "keep_dip": 0.05, "smooth": False, "fine": 0.2}})
+    ch = Channel(5, {"hop": {"enabled": True, "keep": True, "keep_dip": 0.05, "smooth": True, "fine": 0.05}})
     d = gui.HopDialog(None, ch)
-    assert d.keep.isChecked() and d.keep_dip.value() == 5.0 and not d.smooth.isChecked() and d.fine.value() == 0.2
+    assert d.keep.isChecked() and d.keep_dip.value() == 5.0 and d.smooth.isChecked() and d.fine.value() == 0.05
+    assert d.fine.isEnabled() and d.fine_v.isEnabled()
 
 
 def test_hop_dialog_fits_the_screen_with_ok_and_cancel_in_view(app):

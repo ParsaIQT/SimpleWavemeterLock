@@ -56,7 +56,7 @@ class Script(Recenter):
 def test_a_rig_keeps_time_as_the_laser_would():
     las = ECDL(473.0, fsr=12.0, hysteresis=0.5, multimode=0.0, seed=1)
     rig = Rig(las, las.freq(V0, I0), dt=0.1, op_s=0.002, scope_s=0.05)
-    p = HopParams(enabled=True, i_nom=I0)
+    p = HopParams(enabled=True, i_nom=I0, smooth=True)
 
     def steps(rec):
         yield Move(current=I0 - 0.5, read=False)  # (25 writes of 0.02 mA, 2 ms each: no reading waited for)
@@ -213,7 +213,7 @@ def test_the_ccds_amplitudes_are_noisy_if_asked():
 
 # ------------------------------------------------------------------ the trials
 def test_recoveries_in_numbers():
-    outs = recoveries("far", 8, first=3)
+    outs = recoveries("far", 8, first=3, smooth=True)
     s = summary(outs)
     assert s["n"] == 8 and s["feasible"] >= 6 and s["done_feasible"] == s["feasible"]
     assert s["said_done_off_target"] == 0 and s["second_mode_over_10pc"] == 0
@@ -224,7 +224,7 @@ def test_recoveries_in_numbers():
     assert trials.said("far", summary([])) .endswith("none recovered")
     o = outs[0]
     assert o.kind == "far" and o.seed == 3 and o.ops > o.readings and o.method == "map" and o.notes
-    stepped = summary(recoveries("far", 8, first=3, smooth=False, fine=0.2, fine_v=0.0))
+    stepped = summary(recoveries("far", 8, first=3))  # (as it comes: by steps)
     assert stepped["done_feasible"] == stepped["feasible"] and stepped["s_median"] > 1.3 * s["s_median"]
 
 
@@ -232,7 +232,7 @@ def test_recoveries_in_numbers():
 def test_a_models_lasers_come_back_mostly_by_the_short_way(kind, least):
     pytest.importorskip("numpy")
     pytest.importorskip("scipy")
-    outs = recoveries(kind, 6)
+    outs = recoveries(kind, 6, smooth=True)
     s = summary(outs)
     assert s["done"] >= least and s["said_done_off_target"] == 0
     short = [o for o in outs if "short way" in o.summary]
@@ -247,9 +247,9 @@ def test_the_command_line(tmp_path, capsys):
     assert text.count("far 3:") == 1 and "far        3 lasers:" in text
     data = json.loads(out.read_text())
     assert data["summary"]["far"]["n"] == 3 and len(data["outcomes"]["far"]) == 3 and data["set"] == {}
-    assert trials.main(["recover", "far", "--n", "2", "--first", "3", "--set", "smooth=false", "--set", "fine=0.2",
+    assert trials.main(["recover", "far", "--n", "2", "--first", "3", "--set", "smooth=true", "--set", "fine=0.05",
                         "--json", str(out)]) == 0
-    assert json.loads(out.read_text())["set"] == {"smooth": False, "fine": 0.2}
+    assert json.loads(out.read_text())["set"] == {"smooth": True, "fine": 0.05}
     capsys.readouterr()
     assert trials.main(["lasers", "far", "--n", "2"]) == 0
     text = capsys.readouterr().out

@@ -1664,10 +1664,14 @@ class HopDialog(QtWidgets.QDialog):
         self.smooth.setToolTip("Ticked: a sweep of the current (a map's, parking, the margins' check, its model's "
                                "ways) is one steady ramp, a step\n(above) a reading at the rate the wavemeter reads "
                                "the laser, every reading kept with the current it was read at,\nand stopped the "
-                               "moment the readings are not as expected. Unticked: a step at a time, a reading after "
-                               "each\nhas settled, as before. Either way every move of the current and of the piezo "
-                               "is written in steps no larger\nthan these, one after another (0 V: the piezo in one "
-                               "write).")
+                               "moment the readings are not as expected; every move of the current and of the piezo "
+                               "is\nwritten in steps no larger than these, one after another (0 V: the piezo in one "
+                               "write). Unticked (as it comes):\na step at a time, a reading after each has settled, "
+                               "every move in writes of 0.2 mA at most (the piezo's whole),\nas before the ramps. "
+                               "Tick it for one laser first.")
+        for box in (self.fine, self.fine_v):  # (the ramps' own: they count only ticked)
+            box.setEnabled(p.smooth)
+            self.smooth.toggled.connect(box.setEnabled)
 
         heading("Lasing")
         self.seed = QtWidgets.QLineEdit(p.seed)

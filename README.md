@@ -30,9 +30,9 @@ one row per active wavemeter channel, right-click to pick a laser, click to lock
   hand; failing that, from where it was last on target ± 30 V), then the piezo walked onto the
   target, the current kept high in the mode on the way; the SHG cavity is relocked too. With a
   TA, its seed power shows whether the laser lases: if it stops, its current is jumped up at once
-  and brought back down slowly. Its sweeps are ramped steadily, every reading kept with the current it
-  was read at, and stopped the moment the readings are not as expected. And (optional, off as it
-  comes) a laser can be **kept off the edge of its mode** before it hops: locked, its SHG signal or
+  and brought back down slowly. Two options, both off as they come: its sweeps **ramped** steadily,
+  every reading kept with the current it was read at, and stopped the moment the readings are not as
+  expected; and a laser **kept off the edge of its mode** before it hops: locked, its SHG signal or
   its fringes on the wavemeter watched, its current trimmed with its locks on when a second mode begins.
 * **Lasers without a digital controller**: their piezo driver on an analog output (a DAC), as the
   LabVIEW program Epimetheus drove them, on its Measurement Computing board (see *Lasers on an
@@ -445,8 +445,8 @@ From an ARTIQ experiment, the same through its `device_db`: `device_db["wavemete
 | `set_frequency(thz, laser=None, force=False)`, `shift_setpoint(mhz, laser)` | the same, in THz; moved by `mhz` (+: bluer) |
 | `lock(laser)`, `unlock(laser)` | as Lock (a laser its DLC pro locks: Relock) and Locked clicked |
 | `wait(laser, mhz=1.0, timeout=10.0, hold=0.0)` | until it is locked within `mhz` of its setpoint (for `hold` s); its deviation then. TimeoutError, or RuntimeError at once if it is not locked |
-| `is_ok(*lasers, mhz=20.0)` | `(True, '')` if each is locked (one an SLS unit locks: holding, as its unit says), lasing, its reading within `mhz` of its setpoint and not older than 3 s, nothing being recovered or mapped; else `(False, what is wrong, laser by laser)` |
-| `observe(laser, mhz=None)` → number, `end_observe(number)` | the times it was not locked in between: its lock dropouts (a laser its DLC pro locks, from its dropout monitor: ms on; one an SLS unit locks, from its polls: 0.1 s on), and every unlock (unlocked, locking, being recovered, mapped); given `mhz`, also its readings further than that from its setpoint. A numpy array, n × 2: [unix time it began, s], in order, overlapping ones as one. One still going on at the end lasts until then; one that began before `observe`, from when it began |
+| `is_ok(*lasers, mhz=20.0)` | `(True, '')` if each is locked (one an SLS unit locks: holding, as its unit says), lasing, its reading within `mhz` of its setpoint and not older than 3 s, nothing being recovered or mapped (its upkeep, or its mode being kept, is not a recovery: its locks are left on, and while they hold it is locked); else `(False, what is wrong, laser by laser)` |
+| `observe(laser, mhz=None)` → number, `end_observe(number)` | the times it was not locked in between: its lock dropouts (a laser its DLC pro locks, from its dropout monitor: ms on; one an SLS unit locks, from its polls: 0.1 s on), and every unlock (unlocked, locking, being recovered, mapped: not its upkeep, nor its mode being kept, while its locks hold); given `mhz`, also its readings further than that from its setpoint. A numpy array, n × 2: [unix time it began, s], in order, overlapping ones as one. One still going on at the end lasts until then; one that began before `observe`, from when it began |
 | `get_wavelength(laser)`, `get_frequency(laser)` | its latest reading (nm, vacuum; THz); RuntimeError if none of the last 3 s |
 | `get_setpoint(laser)`, `get_deviation(laser)`, `is_locked(laser)` | its setpoint (nm, None: none); its reading less its setpoint (MHz); locked? |
 | `status(laser)`, `lasers()` | all about one laser, or every laser shown: name, wavemeter, PC, channel, setpoint, reading, deviation, its state, the line under its digits |
@@ -559,8 +559,9 @@ Right-click a channel ▸ **Mode-hop recovery…**:
   current trimmed, slowly, its locks on, until it is back up, and 0.05 mA further*. Unticked as it
   comes. See *Kept off the edge of its mode* below.
 * **Sweeps ramped steadily, read on the way; no write moves the current more than 0.02 mA, the piezo
-  0.1 V** (ticked as it comes). See *Ramps, not steps* below. Unticked, with 0.2 mA and 0 V: a step
-  at a time, a reading after each, as before November.
+  0.1 V** (unticked as it comes: tick it for one laser first). See *Ramps, not steps* below.
+  Unticked: a step at a time, a reading after each, every move in writes of 0.2 mA at most (the
+  piezo's whole), as before November; the two numbers are the ramps' (greyed out, unticked).
 * **Optimum**: the laser at its best as you set it up by hand: its current (measured), piezo
   voltage (scan offset) and SHG intra-cavity signal, locked. It is **taken when you first click
   Relock** on the laser (set it up by hand first); *Take now* here, or *right-click ▸ Take the
@@ -994,11 +995,12 @@ way the map found its mode there.
    must be single-mode at both ends and in the middle. If not, or if the piezo moved a lot
    (the modes move with it), it maps again there, up to three times.
 
-**Ramps, not steps.** A sweep used to be a step and a wait: 0.1 mA written at once, the reading whose
-exposure straddled the write thrown away, the next one taken: two readings' time for every point, the
-laser kicked 0.1 mA each time (and read on a chip still settling from the kick: the model's lag), and
-nothing learned between two points. Now the current (or the piezo, or both along a straight line) is
-**ramped**: written in steps of 0.02 mA at most (the piezo 0.1 V; *Sweeps ramped steadily…*), one after
+**Ramps, not steps** (off as it comes: *Sweeps ramped steadily…*, ticked for one laser first). A
+sweep is a step and a wait: 0.1 mA written at once, the reading whose exposure straddled the write
+thrown away, the next one taken: two readings' time for every point, the laser kicked 0.1 mA each time
+(and read on a chip still settling from the kick: the model's lag), and nothing learned between two
+points. Ticked, the current (or the piezo, or both along a straight line) is **ramped**: written in
+steps of 0.02 mA at most (the piezo 0.1 V), one after
 another at a steady pace (a thread of its own wakes the recovery for each step, to 5 ms), and **every**
 reading that comes on the way is kept with where the ramp was when it came: none waited for, none
 thrown away, and the laser never stands still or jumps. The pace is a step's worth (0.1 mA) a reading
@@ -1020,8 +1022,9 @@ the moment the readings are not as expected**, where it is, not at the end of th
   no further;
 * the seed power, read every 0.2 s on the way (or every 0.2 mA, if that is sooner): not lasing, the
   ramp stops where it stopped lasing and the current jumps up from there (*Lasing*);
-* keeping it off the edge of its mode (below): the signal falling, that is the wrong way; no valid
-  reading for a second, nothing is moved unseen.
+* keeping it off the edge of its mode (below; ramped whether this is ticked or not, in writes of
+  0.005 mA): the signal falling, that is the wrong way; no valid reading for a second, nothing is
+  moved unseen.
 
 **How old a reading is.** A reading is of the laser as it was a little before it came (its exposure,
 the wavemeter's sums, the way here), and ramped, the laser has moved on meanwhile: going up it reads
@@ -1036,8 +1039,8 @@ whole interval old (100 ms at ten a second), as with none, and a controller that
 write costs them a sixth more time (table below); before this, a margins' check with each way's own
 line called a hop that was not there at every turn, and half of them failed.
 
-**As fine as its controller keeps up with.** Every move of a recovery, and everything it puts back, is
-written in those 0.02 mA steps, not only the sweeps. A controller that takes longer over a write than
+**As fine as its controller keeps up with.** Ramped, every move of a recovery, and everything it puts
+back, is written in those 0.02 mA steps, not only the sweeps. A controller that takes longer over a write than
 a ramp's pace allows (the Runner times its writes) gets larger steps, as large as it takes to keep the
 pace, 0.2 mA at the very most: STEP_MAX is still the most a single write may ever change the current
 (a refused write otherwise), and no longer what any does. One thing is written in 0.2 mA steps
@@ -1048,8 +1051,8 @@ brought is caught up with, no more.
 
 Still a step at a time: whatever looks at the SHG cavity's sweep at each point (the catch's goes with
 an SHG stage, the walk's trims, an SHG laser's map, parking at the top end of its mode, easing off the
-top, the upkeep): the sweep takes its time anyway. Untick *Sweeps ramped steadily* and set 0.2 mA and
-0 V, and a recovery is step for step what it was (the older tests run so).
+top, the upkeep): the sweep takes its time anyway. Unticked (as it comes), a recovery is step for step
+what it was before the ramps, whatever the two numbers say (the older tests run so).
 
 How much sooner the lasers come back for it, and what late readings and a slow controller make of
 it: *Trials*, below.
@@ -1073,8 +1076,9 @@ chip lagging the current.
    least margins checked (as the map's quick check). A model fitted by a version before 25 October
    gave its chip's modes a drift along its map, which was its slow axis's doing (the piezo's): they
    are taken so.
-2. **The short way**, first of all (sweeps ramped): the hop itself is a measurement. The laser sat
-   where it was on target, nothing moved, and it is now on another mode: its chip's modes have just
+2. **The short way**, first of all (sweeps ramped: by steps, as it comes, not tried): the hop itself
+   is a measurement. The laser sat where it was on target, nothing moved, and it is now on another
+   mode: its chip's modes have just
    drifted to where its rule has its right mode give way to **that one**, and no further (they drift
    slowly: it hopped the moment they got there). That places them (for the model's rule and for the
    rules another fit of its map might have given: its hysteresis 0.6 to 1.6 times, its pull ± 0.05,
@@ -1269,7 +1273,10 @@ What can go wrong on the way, and what is done:
 
 A keeping writes **nothing but the current**, 0.005 mA a write, within its window; it is not a recovery
 and does not count towards *At most … recoveries an hour*; step by step, it asks before it moves
-anything. A laser an SLS PLL holds is kept the same way if its piezo is trimmed (the piezo moved along
+anything. Its locks stay on, so it is **locked all the while**: its row says *Watching* (*Locked*), its
+line what the keeping does, and to ARTIQ (`is_ok`, `observe`) it is locked as long as its locks say so
+(a lock lost on the way: not locked from then on). A laser an SLS PLL holds is kept the same way if
+its piezo is trimmed (the piezo moved along
 with the current, as for its upkeep; how its fast output follows its current is learned for it first: a
 few probes of 0.02 to 0.16 mA). The reference laser is not kept. The row says *a second mode
 beginning? its fringes 2.4 % down* while its watch is making up its mind; *Last recovery…* and the
@@ -1335,9 +1342,10 @@ with no upkeep. If its SHG signal collapses (its SHG lock lost, a hop) or its ca
 locked, the current goes back where it was, 0.005 mA a step, and the laser is watched as ever
 (relocked if it needs it). The row says *upkeep: the top of its mode at … mA, the current … → … mA
 (+…)*, as do the console and *Last recovery…*. It does not count towards *At most … recoveries an
-hour*, and it writes nothing but the current. In the simulator, over 30 lasers each from 0.4 mA below
-the top to 0.05 mA over it, it ended 0.016 to 0.058 mA below where a second mode begins (0.025 the
-median), single-mode and still locked on target.
+hour*, and it writes nothing but the current. Its locks stay on: it is locked all the while, to its row
+and to ARTIQ, as long as they say so (as a keeping, above). In the simulator, over 30 lasers each from
+0.4 mA below the top to 0.05 mA over it, it ended 0.016 to 0.058 mA below where a second mode begins
+(0.025 the median), single-mode and still locked on target.
 
 Not tried on the real laser yet: watch the first one (every 1 min for a while, say), and see where it
 puts the current against where you would.
@@ -1457,14 +1465,15 @@ before and after nulling its DC. Every recovery is also appended to
    the peak it picked, with the DC level it saw?
 5. Click **Relock** on the row: it is watched from now on (*Watching*).
 6. Untick *Step by step* once you trust it.
-7. **The ramps** (new in November, as they come; in the simulator only so far). The first recoveries'
-   records (*Last recovery…*, the recoveries' file) say two things the simulator had to assume: how
+7. **The ramps** (new in November; unticked as they come, in the simulator only so far). Tick *Sweeps
+   ramped steadily* for one laser; its first recoveries' records (*Last recovery…*, the recoveries'
+   file) say two things the simulator had to assume: how
    long the DLC pro takes over a write (`write_s`: a few ms, and a ramp is written as finely as asked;
    20 ms, and its steps are five times as large to keep its pace), and how old the wavemeter's readings
    are when they come (`late_s`, from the margins' check). Compare a map's two sweeps in *Last
    recovery…*: the same mode read going up and coming down should be one line, a little apart by that
-   delay and no more. If a recovery does worse than it did by steps, untick *Sweeps ramped steadily*
-   (and set 0.2 mA, 0 V) for that laser, and it is as it was.
+   delay and no more. If a recovery does worse than it did by steps, untick it again for that laser,
+   and it is as it was.
 8. **Keeping it off the edge of its mode** is unticked as it comes. Tick it for one laser with *Step
    by step* ticked too, and wait for its first keeping to ask (*Kept off the edge of its mode*, at its
    end, says what to look at). Then untick *Step by step*, and watch its row and *Last recovery…* for a
@@ -1476,7 +1485,7 @@ Safety:
   except that a laser that stopped lasing may be taken up to nominal + 5 mA, and that a current
   found outside the window only ever moves towards it (and back there on failure); it never
   changes by more than 0.2 mA per write, nor does the feedforward move it more than that per
-  piezo write (as they come, 0.02 mA: *Ramps, not steps*; a keeping's, 0.005 mA). Larger moves are
+  piezo write (ramped, 0.02 mA: *Ramps, not steps*; a keeping's, 0.005 mA). Larger moves are
   ramped. Each write is checked once more just before it is sent, whatever the procedure asked for.
   With a TA, the current comes down slowly (0.5 mA/s) after a jump and when it is put back.
 * The piezo moves at most ± 25 V per recovery (*Piezo moves at most*), inside the lock's
@@ -2412,8 +2421,8 @@ far as the simulation goes. Nothing here is used by the program itself.
 
 ```
 python -m wmlock.trials recover all --n 60 --json out.json    # lasers that hopped, recovered: how many, how fast
-python -m wmlock.trials recover far --n 60 --set smooth=false --set fine=0.2 --set fine_v=0   # by steps
-python -m wmlock.trials recover far --n 60 --latency 0.1 --op 0.02    # late readings, a slow controller
+python -m wmlock.trials recover far --n 60 --set smooth=true  # the same, its sweeps ramped (by steps as it comes)
+python -m wmlock.trials recover far --n 60 --set smooth=true --latency 0.1 --op 0.02   # late readings, a slow controller
 python -m wmlock.trials keep all --n 20 --hours 6             # drifting towards their hops: kept, and left alone
 python -m wmlock.trials lasers model --n 5                    # what the random lasers are
 ```
@@ -2435,7 +2444,8 @@ The lasers:
   drawn, the program's model of it as a fit of its map would have it.
 
 Recoveries, 60 lasers of each kind, from the hop being seen to the lock handed back; *by steps* is the
-program as it was before the ramps (a step and a reading at a time, commit f3ea4da) on the same bench:
+program as it was before the ramps (a step and a reading at a time, commit f3ea4da; as it comes, ramps
+unticked) on the same bench:
 
 <!-- trials:recover -->
 | lasers | by steps: recovered | s: median, nine in ten, longest | margin | ramped: recovered | s: median, nine in ten, longest | margin |
@@ -2664,7 +2674,7 @@ the dialog showing it. The ramps
 (`tests/test_sweep.py`) run on the trials' rig, in simulated time: a sweep's writes (0.02 mA, at its rate), every
 reading kept with the current it was read at, its watch stopping it where it is, parameters read on the way after
 each step has had its time, silence stopping it if asked; the same recoveries ramped and by steps (the ramped ones
-sooner); a Monte Carlo over each kind of laser with the settings as they come, the safety rules checked on every
+sooner); a Monte Carlo over each kind of laser ramped, the safety rules checked on every
 write; readings that come 50 and 100 ms late, and a controller that takes 20 ms over a write; how late readings
 are, found by ramping there and back; a hop seen at once by three readings in one place, a hand at the current not
 taken for one (through the engine), and a laser that stopped lasing jumped in as few writes as ever against a slow

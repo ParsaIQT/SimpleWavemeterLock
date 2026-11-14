@@ -2,6 +2,7 @@
 a laser off the edge of its mode, in numbers.
 
     python -m wmlock.trials recover far --n 100         # a kind of laser (below), hopped, recovered: how often, how fast
+    python -m wmlock.trials recover far --n 100 --set smooth=true   # the same, its sweeps ramped (as it comes: steps)
     python -m wmlock.trials recover all --n 60 --json out.json
     python -m wmlock.trials keep shg --n 30 --hours 6   # lasers drifting towards their hops: kept off them, or not
     python -m wmlock.trials lasers model --n 5          # what the random lasers are

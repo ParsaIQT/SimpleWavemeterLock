@@ -95,6 +95,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import dac
@@ -360,7 +361,10 @@ class Channel:
         self.t = 0.0          # monotonic time of the last new reading
         self._state = "off"   # off | engaging | on (locked, or for a cavity-locked laser: watched) | recovering
         self.state_t = time.time()  # ...since then
-        self.observers = []   # its lock observed (observe.py): each told of every change of its state
+        self.observers = []   # its lock observed (observe.py): each told of every change of its state, as reported
+        self.told = "off"     # its state as they were last told it (reported)...
+        self.told_t = self.state_t  # ...since then
+        self._quiet, self._quiet_t = 0, None  # told once it has settled (quiet()); when it first changed meanwhile
         self.message = ""     # why the lock is off, or what to do
         self.offset = None    # last known scan offset (its piezo's set value)
         self.unit = "V"
@@ -525,8 +529,56 @@ class Channel:
     def state(self, value: str):
         if value != self._state:
             self._state, self.state_t = value, time.time()
+            self.tell(self.state_t)
+
+    @property
+    def reported(self) -> str:
+        """Its state as it is told (its row, and so ARTIQ's is_ok and is_locked, another PC's; its observers; a PLL's
+        slave whose master it is): its upkeep, or its mode being kept, its locks left on and holding (kept_on), is
+        'on': it is locked all the while; else its state."""
+        return "on" if self._state == "recovering" and self.kept_on else self._state
+
+    @property
+    def kept_on(self) -> bool:
+        """Its upkeep, or its mode being kept, goes on (upkeeping), its locks left on, and they hold: its wavemeter
+        lock on (keep_locked); else its SLS unit's last poll; else its DLC pro's (polled: its cavity lock and, with
+        an SHG stage, its SHG cavity's)."""
+        if not self.upkeeping or self._state != "recovering":
+            return False
+        if self.keep_locked:
+            return self.lock.active
+        if self.sls.on:
+            v = self.sls_view
+            return (v is not None and v.holds is True and not self.sls_error
+                    and time.time() - v.t <= Engine.SLS_STALE_S)
+        return (self.relock and bool(self.cavity_on) and says_locked(self.cavity_txt)
+                and (not self.hop.shg or says_locked(self.shg_txt)))
+
+    def tell(self, t: float | None = None):
+        """Its observers told its state as reported, if that is not what they were last told (t: when it changed;
+        None: now); once it has settled, while quiet."""
+        if self._quiet:
+            if self._quiet_t is None:
+                self._quiet_t = t
+            return
+        now = self.reported
+        if now != self.told:
+            self.told, self.told_t = now, time.time() if t is None else t
             for o in self.observers:
-                o.state(self.state_t, value)
+                o.state(self.told_t, now)
+
+    @contextmanager
+    def quiet(self):
+        """Its observers told what its state comes to, not each change on the way (Engine._recovery_done: an upkeep,
+        a keeping, that ends locked has not been off for a moment, as far as they are concerned)."""
+        self._quiet += 1
+        try:
+            yield
+        finally:
+            self._quiet -= 1
+            if not self._quiet:
+                t, self._quiet_t = self._quiet_t, None
+                self.tell(t)
 
     @property
     def param(self) -> str:
@@ -1178,6 +1230,7 @@ class Engine:
             return
         self._timers_t = now
         for ch in list(self.channels.values()):
+            ch.tell()  # (its upkeep, its mode being kept: locked while its locks hold, as they are polled)
             if ch.pending is not None and now - ch.wait_since >= self.WAIT_S:
                 self._wait_over(ch)
             if ch.look_why and now >= ch.look_until:
@@ -1919,11 +1972,13 @@ class Engine:
             with self.lock:
                 if mine():
                     ch.cavity_on = v
+                    ch.tell()
 
         def on_txt(v):
             with self.lock:
                 if mine():
                     ch.cavity_txt = v
+                    ch.tell()
                     if ch.off and self._armed(ch) and isinstance(v, str) and not says_locked(v):
                         self._look(ch, f"its cavity lock said “{v}”")  # (its wavemeter channel switched off)
 
@@ -1931,6 +1986,7 @@ class Engine:
             with self.lock:
                 if mine():
                     ch.shg_txt = v
+                    ch.tell()
                     if ch.off and ch.hop.shg and self._armed(ch) and isinstance(v, str) and not says_locked(v):
                         self._look(ch, f"its SHG cavity's lock said “{v}”")
 
@@ -2444,11 +2500,12 @@ class Engine:
         v = ch.sls_view
         if ch.sls.on and v is not None and not ch.sls_error and time.time() - v.t <= Engine.SLS_STALE_S:
             return v.holds, v.why
-        if ch.state == "recovering":
+        state = ch.reported  # (its upkeep, its mode being kept, its locks holding: locked)
+        if state == "recovering":
             return False, "being recovered"
         if ch.lasing is False and ch.hop.enabled:
             return False, "not lasing"
-        return (True, "") if ch.state == "on" else (None, "")
+        return (True, "") if state == "on" else (None, "")
 
     def _master_look(self, ch: Channel):
         """A PLL's slave's master as it is now, on this wavemeter or elsewhere (Elsewhere.row's dict; None: none, or not
@@ -3780,7 +3837,12 @@ class Engine:
                 runner.blind(True)
 
     def _recovery_failed(self, ch: Channel, why: str):
-        """Before anything was touched."""
+        """Before anything was touched. Its observers told what its state comes to (an upkeep, a keeping, that did not
+        begin: locked all along)."""
+        with ch.quiet():
+            self._not_begun(ch, why)
+
+    def _not_begun(self, ch: Channel, why: str):
         if self._sls_recovered(ch, why):
             return
         if ch.upkeeping:  # (an upkeep, or a keeping, that did not begin: watched again)
@@ -3807,6 +3869,12 @@ class Engine:
         self._release(ch)
 
     def _recovery_done(self, ch: Channel, r: Runner):
+        """Its runner is over. Its observers told what its state comes to, not each change on the way (an upkeep, a
+        keeping, that ends locked: locked all along)."""
+        with ch.quiet():
+            self._recovery_over(ch, r)
+
+    def _recovery_over(self, ch: Channel, r: Runner):
         if getattr(r, "abandoned", False):  # (an upkeep its PLL's guard stopped to act itself: said there, _end_upkeep)
             return
         ch.runner = None
@@ -4160,7 +4228,8 @@ class Engine:
                 ch.observers.remove(old)
             while len(self.observations) >= self.OBSERVE_N:
                 self._unobserve(next(iter(self.observations)))
-            o = Observation(n, tag, time.time(), ch.state, ch.state_t, mhz)
+            ch.tell()  # (as reported: its upkeep, its mode being kept, its locks holding: locked)
+            o = Observation(n, tag, time.time(), ch.told, ch.told_t, mhz)
             self.observations[tag] = o
             ch.observers.append(o)
             return ""

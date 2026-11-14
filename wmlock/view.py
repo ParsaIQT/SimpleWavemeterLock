@@ -67,15 +67,16 @@ def row(e, n: int, now: float) -> dict:
     else:
         v["bad"], v["bad_c"] = ch.status or "—", "dim" if ch.borrowed else "err"
     v["ref_unit"] = ref is not None and ref.active
-    state = ch.state
+    state = ch.reported  # (its upkeep, its mode being kept, its locks holding: locked, as told; its info says what)
+    if ch.hop_prompt:  # (step by step: waiting for you, a keeping as well)
+        state = "asking"
     if valid and ch.setpoint_nm:
-        v["dev"], v["dev_c"] = ch.error_mhz, {"on": "ok", "engaging": "warn", "recovering": "warn"}.get(state, "fg")
+        v["dev"], v["dev_c"] = ch.error_mhz, {"on": "ok", "engaging": "warn", "recovering": "warn",
+                                              "asking": "warn"}.get(state, "fg")
     else:
         v["dev"], v["dev_c"] = None, "fg"
     v["sp"], v["anchor"] = ch.setpoint_nm or 0.0, None
     v["info"], v["info_c"], v["prompt"] = _info(e, ch, now)
-    if state == "recovering" and ch.hop_prompt:
-        state = "asking"
     v["state"] = state if state != "off" else ("error" if ch.message else "off")
     v["relock"] = ch.relock or ch.sls.on
     v["sls"] = ch.sls.kind if ch.sls.on else ""
@@ -142,7 +143,13 @@ def _mapping(ch, now: float):
 def _info(e, ch, now: float):
     """(text, colour, prompt) of the line under the digits."""
     if ch.state == "recovering":
-        return _recovery(ch, now)
+        text, colour, prompt = _recovery(ch, now)
+        if ch.reported == "on":  # (its upkeep, its mode being kept: locked, as told; what would be wrong with that)
+            flag = ("NOT LASING" if ch.lasing is False and ch.hop.enabled else sls_flag(ch)
+                    or ("CAVITY LOCK SLIPPING" if slipping(ch) else "SHG SIGNAL GONE" if shg_gone(ch) else ""))
+            if flag:
+                return f"{flag} · {text}", "err", prompt
+        return text, colour, prompt
     if ch.state == "mapping":
         return _mapping(ch, now)
     if ch.message:
