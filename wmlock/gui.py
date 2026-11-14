@@ -540,6 +540,10 @@ class ChannelRow(Row):
             m.addAction("Recenter now", lambda: self.engine.recenter(self.n)).setEnabled(
                 bool(ch.device) and ch.state != "engaging")
         m.addAction("Check setup…", self.setup_dialog).setEnabled(bool(ch.device))
+        if ch.hop.enabled or ch.hand is not None:  # (what someone does to get it back, kept: handrec.py)
+            m.addAction("Stop recording the recapture by hand" if ch.hand is not None else
+                        "Record a recapture by hand", lambda: self.engine.record_hand(self.n)).setEnabled(
+                ch.hand is not None or (bool(ch.device) and not ch.dac and ch.state not in ("recovering", "mapping")))
         if ch.state == "mapping":
             m.addAction("Laser map (going on)…", lambda: self.win.map_window(self.engine, self.n))
             m.addAction("Stop the laser map", lambda: self.engine.stop_map(self.n))
@@ -1480,7 +1484,11 @@ class HopDialog(QtWidgets.QDialog):
               ("map", "map: sweep the current over the window, up and down, and pick the best mode"),
               ("model", "model: its laser's model, fitted to its last map, says where a mode is on target and holds "
                         "best (its own, or another at another piezo voltage) and which way to come to it; a map here "
-                        "first, to see how far its modes moved"))
+                        "first, to see how far its modes moved"),
+              ("learned", "learned: a policy learned for its laser's model (thousands of simulated hops of lasers like "
+                          "it) flies its current back onto its right mode, reading on the way: seconds; where that "
+                          "does not get it back, or it has no model, or it has an SHG stage or is locked by its DLC "
+                          "pro: as auto"))
 
     def __init__(self, parent, ch, take=None):
         """take: take the optimum now (Engine.take_optimum for this channel), if it can be."""

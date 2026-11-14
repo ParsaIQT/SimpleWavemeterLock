@@ -519,6 +519,11 @@ class Channel:
         self.model_dict = m if isinstance(m, dict) and isinstance(m.get("model"), dict) else None  # {model, from,
         self._model = None     # (the LaserModel, made of model_dict once asked for)          laser, t, right}
         self.model_note = ""   # how taking its laser's model from a map's file went, or is going
+        self.policy = None     # the policy learned for its laser's model (learned.Policy: HopParams.method 'learned')
+        self.policy_key = ""   # ...the model's key it is of (learned.model_key)
+        self.policy_note = ""  # ...how learning it went, or is going
+        self.policy_busy = False
+        self.hand = None       # a recapture by hand being recorded (handrec.Recording)
 
     @property
     def state(self) -> str:
@@ -901,6 +906,10 @@ class Engine:
         dropout."""
         self.config = config
         self.log_path, self.drop_path = log_path, drop_path
+        # where the policies learned for its lasers' models are kept (learned.py): beside the recoveries' log
+        self.policy_dir = str(log_path).replace("-recoveries.jsonl", "") + "-policies" if log_path else None
+        # ...and where recaptures by hand are recorded (handrec.py), a line of JSON each
+        self.hand_path = str(log_path).replace("-recoveries", "-hand") if log_path else None
         self.monitors = {}  # channel -> its DropoutMonitor
         self.sls_watches = {}  # channel -> its SlsWatch (an SLS unit locks its laser)
         self.master_watches = {}  # channel -> the SlsWatch of its master's SLS servo (a PLL's slave, polled here)
@@ -947,6 +956,8 @@ class Engine:
                     if ch.watching:  # (watched when the program last stopped: watched again, guarded)
                         log.info("channel %d: watched again, as it was when the program stopped", ch.n)
                         self._arm_sls(ch)
+                if ch.hop.enabled and ch.hop.method == "learned":
+                    self._policy(ch)  # (the one kept for its model; none: learned now, ready when it hops)
         self.source.start()
         self._ticker.start()
         self.start_discovery()
@@ -1413,6 +1424,9 @@ class Engine:
                     wall = time.time() - (time.monotonic() - r.t)
                     for o in ch.observers:
                         o.reading(wall, ch.error_mhz if ch.freq > 0 else None)
+                if ch.hand is not None and ch.hand.add(r.t, ch.current_set, ch.current, ch.offset,
+                                                       ch.error_mhz if ch.freq > 0 else None):
+                    self._hand_done(ch)  # (a recapture by hand, recorded: on target for a while now, or too long)
                 if ch.mapper is not None:  # (a map has it: nothing else)
                     ch.mapper.on_reading(r)
                     continue
@@ -3526,6 +3540,8 @@ class Engine:
                 self._watch_hop(ch)
                 if params.enabled and not params.i_nom:
                     self._read_nominal(ch)
+            if params.enabled and params.method == "learned":
+                self._policy(ch)  # (learned now, if it has none: ready when it hops)
             self.dirty = True
 
     def _read_nominal(self, ch: Channel):
@@ -3585,6 +3601,72 @@ class Engine:
                 log.info("channel %d: %s", ch.n, ch.note)
 
         self._controller(key).submit(job)
+
+    def record_hand(self, n: int, on: bool | None = None) -> str:
+        """A recapture by hand recorded (handrec.py), or its recording stopped (on None: the other of what it is):
+        from now on every reading of the channel is kept with its set current and its piezo as last polled, until it
+        is stopped, the laser has been on target for a while, or a quarter of an hour has passed; then appended to
+        hand_path, and, with a policy learned for its laser's model, taken into its memory as a manoeuvre that
+        worked (learned.Memory). Nothing is written to the laser. Returns what was done."""
+        from . import handrec
+
+        with self.lock:
+            ch = self.channels[n]
+            if on is None:
+                on = ch.hand is None
+            if not on:
+                if ch.hand is None:
+                    return "no recapture by hand is being recorded"
+                ch.hand.end = ch.hand.end or "stopped"
+                return self._hand_done(ch)
+            if ch.hand is not None:
+                return "a recapture by hand is being recorded already"
+            if not ch.device or ch.dac:
+                return "recording a recapture by hand needs a laser on a DLC pro linked to the channel"
+            if ch.runner is not None or ch.mapper is not None:
+                return "not while a recovery or a map is going on"
+            hop, fine = ch.hop, ch.fine_at
+            off = (ch.current - ch.current_set) if ch.current is not None and ch.current_set is not None else 0.0
+            ch.hand = handrec.Recording(
+                ch.n, ch.name, target=ch.f_set, tol=hop.off_target(),
+                ref=[round(fine[1], 4), round(fine[2] + off, 4)] if fine else None,
+                window=[round(hop.i_nom - hop.i_below, 4), round(hop.i_nom + hop.i_window, 4)] if hop.i_nom else None)
+            ch.note, ch.note_t = "recording a recapture by hand: its current, its piezo and its readings", \
+                time.monotonic()
+            return ch.note
+
+    def _hand_done(self, ch: Channel) -> str:
+        """A recording of a recapture by hand is over: kept (hand_path), and read as a manoeuvre for its laser's
+        memory, if it has a model and the recording is of one that brought it back."""
+        from . import handrec
+
+        rec, ch.hand = ch.hand, None
+        said = f"a recapture by hand recorded ({len(rec.samples)} readings, {rec.end or 'stopped'})"
+        if self.hand_path and rec.samples:
+            try:
+                handrec.save(self.hand_path, rec)
+            except OSError as exc:
+                said += f"; not kept: {exc}"
+        model = ch.laser_model()
+        if model is not None and rec.samples:
+            try:
+                got = handrec.read(rec, model)
+            except Exception as exc:  # (numpy; a recording that makes no sense: never in the way)
+                got = {"why": str(exc) or type(exc).__name__}
+            if got.get("why"):
+                said += f"; not a manoeuvre for its policy's memory: {got['why']}"
+            else:
+                memory = self._memory(ch)
+                memory.add(got["x"], got["k"], True)
+                ch.model_dict.setdefault("learned", {})["memory"] = memory.to_list()
+                self.dirty = True
+                said += (f"; taken into its policy's memory: "
+                         + ("" if got["turn"] is None else f"by way of {got['turn']:+.2f} mA, ")
+                         + f"{'up' if got['way'] > 0 else 'down'} onto its right mode at {got['entered']:.2f} mA, "
+                         f"{got['depth']:.2f} mA in")
+        ch.note, ch.note_t = said, time.monotonic()
+        log.info("channel %d: %s", ch.n, said)
+        return said
 
     def recenter(self, n: int):
         """Recenter now, even without a hop: always maps, so it finds the best mode. A laser an SLS PLL holds,
@@ -3824,10 +3906,11 @@ class Engine:
             what = "the offset" if ch.piezo == ACTUATOR else f"its piezo voltage ({ch.piezo})"
             self._recovery_failed(ch, f"{what}, {v0:.2f} V, is outside {lp.v_min:g} … {lp.v_max:g} V")
             return
-        model = ch.laser_model() if hop.method in ("auto", "model") and not ch.upkeeping else None
+        model = ch.laser_model() if hop.method in ("auto", "model", "learned") and not ch.upkeeping else None
+        policy = self._policy(ch) if hop.method == "learned" and model is not None else None
         rec = Recenter(hop, i0, v0, i_lo, i_hi, v_lo, v_hi, cavity=locked, quick=quick, shg=hop.shg, act_offset=off,
                        i_top=i_top, i_clip=clip, ref=ref, upkeep=ch.upkeeping, model=model, target=ch.f_set,
-                       keep=ch.keeping)
+                       keep=ch.keeping, policy=policy, memory=self._memory(ch) if policy is not None else None)
         io = _HopIO(self, ch, controller)
         runner = Runner(rec, io, time.monotonic(), timeout=rec.timeout, finished=lambda r: self._recovery_done(ch, r),
                         clock=time.monotonic)
@@ -3835,6 +3918,71 @@ class Engine:
             ch.runner = runner
             if ch.off:  # (begun at once, not lasing: its channel is being switched on)
                 runner.blind(True)
+
+    def _policy(self, ch: Channel):
+        """The policy learned for its laser's model (learned.Policy; HopParams.method 'learned'): the one it has,
+        else the one kept for that model (policy_dir), else None, and one is learned now, in a thread of its own (a
+        minute or two of sums, numpy's; Channel.policy_note says how it goes): its recoveries go by its model
+        meanwhile, and by its policy from the next one on."""
+        model = ch.laser_model()
+        if model is None:
+            return None
+        try:
+            from . import learned
+        except ImportError as exc:  # (numpy)
+            ch.policy_note = f"its policy needs numpy ({exc})"
+            return None
+        key = learned.model_key(model)
+        if ch.policy is not None and ch.policy_key == key:
+            return ch.policy
+        ch.policy = None
+        if self.policy_dir:
+            try:
+                got = learned.policy_for(model, self.policy_dir, make=False)
+            except Exception as exc:  # (a file that is not one: learned again)
+                log.warning("channel %d: its policy cannot be read: %s", ch.n, exc)
+                got = None
+            if got is not None:
+                ch.policy, ch.policy_key = got, key
+                ch.policy_note = self._policy_said(got)
+                return got
+        if ch.policy_busy:
+            return None
+        ch.policy_busy, ch.policy_note = True, "being learned from its laser's model…"
+
+        def learn():
+            try:
+                if self.policy_dir:
+                    got = learned.policy_for(model, self.policy_dir)
+                else:
+                    got = learned.train(model)
+                note = self._policy_said(got)
+            except Exception as exc:  # (whatever its model: never in the way)
+                log.exception("channel %d: its policy", ch.n)
+                got, note = None, f"not learned: {exc or type(exc).__name__}"
+            with self.lock:
+                ch.policy_busy, ch.policy_note = False, note
+                if got is not None and ch.laser_model() is not None and learned.model_key(ch.laser_model()) == key:
+                    ch.policy, ch.policy_key = got, key
+            log.info("channel %d: its policy: %s", ch.n, note)
+
+        threading.Thread(target=learn, daemon=True, name=f"policy {ch.n}").start()
+        return None
+
+    @staticmethod
+    def _policy_said(policy) -> str:
+        """A policy's own word on how it did where it was tried (learned.trial: simulated hops it never saw)."""
+        t = (policy.meta.get("trial") or {})
+        said = [f"{100 * r['first']:.0f} % of simulated hops drifting {name} back by its first manoeuvre "
+                f"({100 * r['can']:.0f} % can be), in {r['s']:.1f} s" for name, r in t.items()]
+        return "learned from its laser's model" + (": " + "; ".join(said) if said else "")
+
+    @staticmethod
+    def _memory(ch: Channel):
+        """What its policy's manoeuvres came to on the laser itself so far (learned.Memory), kept with its model."""
+        from . import learned
+
+        return learned.Memory.from_list(((ch.model_dict or {}).get("learned") or {}).get("memory"))
 
     def _recovery_failed(self, ch: Channel, why: str):
         """Before anything was touched. Its observers told what its state comes to (an upkeep, a keeping, that did not
@@ -3888,6 +4036,9 @@ class Engine:
         keeping, ch.keeping = ch.keeping, None
         locked, ch.keep_locked = ch.keep_locked, False  # (its wavemeter lock went on all the while)
         asked, ch.unlock_why = ch.unlock_why, None      # (asked to unlock meanwhile: below)
+        if r.rec.memory is not None and ch.model_dict is not None:  # (what its policy's manoeuvres came to: kept)
+            ch.model_dict.setdefault("learned", {})["memory"] = r.rec.memory.to_list()
+            self.dirty = True
         if keeping is not None:
             self._kept(ch, r, keeping)
         else:
